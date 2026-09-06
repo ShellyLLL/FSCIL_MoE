@@ -1,0 +1,63 @@
+SEED: 1
+
+DEVICE:
+  DEVICE_NAME: "cuda"
+  GPU_ID: "2;"
+
+DATALOADER:
+  TRAIN:
+    BATCH_SIZE_BASE: 64
+    BATCH_SIZE_INC: 10
+  TEST:
+    BATCH_SIZE: 100
+  NUM_WORKERS: 4
+
+
+MODEL:
+  BACKBONE:
+    NAME: "ViT-B/16"  #  RN50  RN101  ViT-B/32  ViT-B/16  ViT-L/14
+  
+
+TRAINER:
+  BiMC:
+    PREC: "amp"  # fp16, fp32, amp
+
+    VISION_CALIBRATION: True
+    LAMBDA_I: 0.1 
+    TAU: 16        
+
+    TEXT_CALIBRATION: True
+    LAMBDA_T: 0.7
+
+    # ===== freeze policy =====
+    FREEZE_TEXT_ENCODER: True
+    FREEZE_VISUAL_BACKBONE: True
+
+    # ===== Visual MoE (V1) =====
+    VISUAL_MOE:
+      ENABLE: True
+      INSERT_BLOCKS: [-4, -3, -2, -1]    # 在 visual transformer 最后 * 层插入
+      NUM_EXPERTS: 4
+      TOPK: 2
+      BOTTLENECK_RATIO: 4
+      ROUTER_INPUT: "cls"
+      NOISY_GATING: True
+      RESIDUAL_SCALE_INIT: 0.5
+      DROPOUT: 0.0
+
+    # ===== optimization =====
+    OPTIM:
+      BASE_EPOCHS: 50
+      INC_EPOCHS: 20
+      LR_MOE: 1e-4
+      LR_ROUTER: 1e-4
+      LR_HEAD: 1e-4
+      WEIGHT_DECAY: 1e-4
+      BETAS: [0.9, 0.999]
+      WARMUP_EPOCHS: 0
+
+    # ===== losses =====
+    LOSS:
+      CE_WEIGHT: 1.0
+      LB_WEIGHT: 0.01
+      KD_WEIGHT: 0.5
