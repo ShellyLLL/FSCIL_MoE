@@ -226,14 +226,29 @@ class BottleneckExpert(nn.Module):
 
 
 class VisualMoEAdapter(nn.Module):
-    """Unified expert pool, descriptors and expandable soft router."""
+    """Stable base MoE plus independently gated, hard-routed session experts.
+
+    Incremental experts never enter the base router softmax. Adding an expert
+    therefore cannot renormalise the four base routing weights. At deployment
+    a sample receives either NULL or one historical incremental residual.
+    """
+
+    TOPOLOGY_VERSION = 2
 
     def __init__(self, d_model, num_experts=4, reduction=4, residual_scale_init=1.0,
-                 descriptor_dim=64, descriptor_eps=1e-4):
+                 descriptor_dim=64, descriptor_eps=1e-4,
+                 route_base_z_threshold=1.0, route_reuse_z_threshold=1.0,
+                 route_score_margin=0.05, incremental_scale_init=0.5,
+                 incremental_gate_bias_init=0.5):
         super().__init__()
         self.d_model, self.base_expert_count = int(d_model), int(num_experts)
         self.default_reduction, self.descriptor_dim = int(reduction), int(descriptor_dim)
         self.descriptor_eps = float(descriptor_eps)
+        self.route_base_z_threshold = float(route_base_z_threshold)
+        self.route_reuse_z_threshold = float(route_reuse_z_threshold)
+        self.route_score_margin = float(route_score_margin)
+        self.incremental_scale_init = float(incremental_scale_init)
+        self.incremental_gate_bias_init = float(incremental_gate_bias_init)
         self.layer_norm = LayerNorm(self.d_model)
         self.residual_scale = nn.Parameter(torch.ones(1) * float(residual_scale_init))
         self.experts = nn.ModuleList([BottleneckExpert(self.d_model, reduction)
@@ -242,8 +257,13 @@ class VisualMoEAdapter(nn.Module):
             RepresentationDescriptor(self.d_model, descriptor_dim, descriptor_eps)
             for _ in range(self.base_expert_count)
         ])
+        # ``router`` is intentionally base-only. Keep this public name for the
+        # base-session optimiser and load-balance diagnostics.
         self.router = ExpandableRouter(self.d_model, self.base_expert_count)
+        self.incremental_gates = nn.ModuleList()
+        self.incremental_scales = nn.ParameterList()
         self.expert_birth_sessions = [0] * self.base_expert_count
+        self._force_newest = False
 
     @property
     def num_experts(self):
@@ -264,6 +284,12 @@ class VisualMoEAdapter(nn.Module):
             self.assert_descriptors_ready()
         return torch.stack([descriptor.standardized_score(x) for descriptor in self.descriptors], dim=-1)
 
+    def set_force_newest(self, enabled):
+        """Force the provisional expert on support batches during training only."""
+        if enabled and self.num_incremental_experts() == 0:
+            raise RuntimeError("cannot force routing without an incremental expert.")
+        self._force_newest = bool(enabled)
+
     @torch.no_grad()
     def update_descriptor_stats(self, errors, expert_id, responsibilities=None, fit_sample_count=None):
         return self.descriptors[int(expert_id)].update_stats(
@@ -280,9 +306,11 @@ class VisualMoEAdapter(nn.Module):
         if self.num_experts <= self.base_expert_count:
             raise RuntimeError("there is no incremental expert to train.")
         self.freeze_all()
-        for module in (self.experts[-1], self.router.columns[-1]):
+        dynamic_id = self.num_incremental_experts() - 1
+        for module in (self.experts[-1], self.incremental_gates[dynamic_id]):
             for parameter in module.parameters():
                 parameter.requires_grad = True
+        self.incremental_scales[dynamic_id].requires_grad = True
         if descriptor:
             for parameter in self.descriptors[-1].parameters():
                 parameter.requires_grad = True
@@ -295,57 +323,139 @@ class VisualMoEAdapter(nn.Module):
             device=self.residual_scale.device, dtype=self.residual_scale.dtype))
         self.descriptors.append(RepresentationDescriptor(
             self.d_model, self.descriptor_dim, self.descriptor_eps).to(device=self.residual_scale.device))
-        self.router.add_column()
-        self.router.columns[-1].to(device=self.residual_scale.device, dtype=self.residual_scale.dtype)
+        gate = nn.Linear(self.d_model, 1).to(
+            device=self.residual_scale.device, dtype=self.residual_scale.dtype
+        )
+        nn.init.normal_(gate.weight, std=0.02)
+        nn.init.constant_(gate.bias, self.incremental_gate_bias_init)
+        self.incremental_gates.append(gate)
+        self.incremental_scales.append(nn.Parameter(
+            torch.ones(1, device=self.residual_scale.device, dtype=self.residual_scale.dtype)
+            * self.incremental_scale_init
+        ))
         self.expert_birth_sessions.append(int(session_id))
         self.set_newest_trainable()
         return self.num_experts - 1
 
     def newest_parameters(self, include_descriptor=False):
-        parameters = list(self.experts[-1].parameters()) + list(self.router.columns[-1].parameters())
+        dynamic_id = self.num_incremental_experts() - 1
+        parameters = (list(self.experts[-1].parameters())
+                      + list(self.incremental_gates[dynamic_id].parameters())
+                      + [self.incremental_scales[dynamic_id]])
         if include_descriptor:
             parameters += list(self.descriptors[-1].parameters())
         return parameters
 
     def historical_named_parameters(self):
         newest = self.num_experts - 1
-        prefixes = (f"experts.{newest}.", f"router.columns.{newest}.", f"descriptors.{newest}.")
+        dynamic_id = self.num_incremental_experts() - 1
+        prefixes = (f"experts.{newest}.", f"incremental_gates.{dynamic_id}.",
+                    f"incremental_scales.{dynamic_id}", f"descriptors.{newest}.")
         for name, parameter in self.named_parameters():
             if not name.startswith(prefixes):
                 yield name, parameter
 
     def export_topology(self):
-        return {"version": 1, "d_model": self.d_model, "base_expert_count": self.base_expert_count,
+        return {"version": self.TOPOLOGY_VERSION, "d_model": self.d_model,
+                "base_expert_count": self.base_expert_count,
                 "experts": [{"reduction": max(1, self.d_model // expert.c_fc.out_features),
                              "birth_session": int(self.expert_birth_sessions[index])}
                             for index, expert in enumerate(self.experts)]}
 
     def rebuild_topology(self, topology):
         if topology is None:
-            topology = {"d_model": self.d_model, "base_expert_count": self.base_expert_count,
+            topology = {"version": self.TOPOLOGY_VERSION, "d_model": self.d_model,
+                        "base_expert_count": self.base_expert_count,
                         "experts": [{"reduction": self.default_reduction, "birth_session": 0}
                                     for _ in range(self.base_expert_count)]}
         if int(topology.get("d_model", self.d_model)) != self.d_model:
             raise ValueError("MoE topology d_model mismatch.")
         if int(topology.get("base_expert_count", self.base_expert_count)) != self.base_expert_count:
             raise ValueError("MoE topology base expert count mismatch.")
+        if int(topology.get("version", 0)) != self.TOPOLOGY_VERSION:
+            raise ValueError("MoE topology uses the retired unified-router format; retrain Session 0.")
         specs = list(topology.get("experts", []))
         if len(specs) < self.base_expert_count:
             raise ValueError("MoE topology has fewer experts than the base pool.")
         self.experts, self.descriptors = nn.ModuleList(), nn.ModuleList()
-        self.router, self.expert_birth_sessions = ExpandableRouter(self.d_model), []
-        for spec in specs:
+        self.router = ExpandableRouter(self.d_model, self.base_expert_count)
+        self.incremental_gates, self.incremental_scales = nn.ModuleList(), nn.ParameterList()
+        self.expert_birth_sessions = []
+        for expert_id, spec in enumerate(specs):
             reduction = int(spec.get("reduction", self.default_reduction))
             self.experts.append(BottleneckExpert(self.d_model, reduction))
             self.descriptors.append(RepresentationDescriptor(
                 self.d_model, self.descriptor_dim, self.descriptor_eps))
-            self.router.add_column()
+            if expert_id >= self.base_expert_count:
+                gate = nn.Linear(self.d_model, 1)
+                nn.init.normal_(gate.weight, std=0.02)
+                nn.init.constant_(gate.bias, self.incremental_gate_bias_init)
+                self.incremental_gates.append(gate)
+                self.incremental_scales.append(nn.Parameter(
+                    torch.ones(1) * self.incremental_scale_init
+                ))
             self.expert_birth_sessions.append(int(spec.get("birth_session", 0)))
         device, dtype = self.residual_scale.device, self.residual_scale.dtype
         self.experts.to(device=device, dtype=dtype)
         self.router.to(device=device, dtype=dtype)
+        self.incremental_gates.to(device=device, dtype=dtype)
+        self.incremental_scales.to(device=device, dtype=dtype)
         self.descriptors.to(device=device, dtype=torch.float32)
+        self._force_newest = False
         self.freeze_all()
+
+    def _incremental_route(self, cls_in):
+        batch = cls_in.size(0)
+        count = self.num_incremental_experts()
+        route = torch.full((batch,), -1, device=cls_in.device, dtype=torch.long)
+        if count == 0:
+            empty = cls_in.new_empty((batch, 0), dtype=torch.float32)
+            return route, empty, empty, torch.ones(batch, device=cls_in.device, dtype=torch.bool)
+
+        gate_logits = torch.cat([gate(cls_in).float() for gate in self.incremental_gates], dim=-1)
+        descriptor_scores = torch.full_like(gate_logits, float("inf"))
+        ready = []
+        for dynamic_id in range(count):
+            expert_id = self.base_expert_count + dynamic_id
+            descriptor = self.descriptors[expert_id]
+            ready.append(descriptor.is_ready())
+            if ready[-1]:
+                descriptor_scores[:, dynamic_id] = descriptor.standardized_score(cls_in)
+
+        if self._force_newest:
+            route.fill_(count - 1)
+            return route, gate_logits, descriptor_scores, torch.zeros(
+                batch, device=cls_in.device, dtype=torch.bool
+            )
+
+        base_ready = all(self.descriptors[index].is_ready()
+                         for index in range(self.base_expert_count))
+        if not base_ready:
+            return route, gate_logits, descriptor_scores, torch.ones(
+                batch, device=cls_in.device, dtype=torch.bool
+            )
+        base_scores = torch.stack([
+            self.descriptors[index].standardized_score(cls_in)
+            for index in range(self.base_expert_count)
+        ], dim=-1)
+        base_uncovered = base_scores.min(dim=-1).values > self.route_base_z_threshold
+        eligible = descriptor_scores.le(self.route_reuse_z_threshold)
+        eligible = eligible & torch.tensor(ready, device=cls_in.device, dtype=torch.bool)[None, :]
+        scores = gate_logits - descriptor_scores.clamp_min(0.0)
+        scores = scores.masked_fill(~eligible, float("-inf"))
+        best = scores.max(dim=-1).values
+        use_dynamic = base_uncovered & torch.isfinite(best) & best.gt(self.route_score_margin)
+        # Near ties are equivalent; the earliest column is the oldest expert.
+        near_best = scores.ge(best[:, None] - self.route_score_margin)
+        oldest = near_best.to(torch.long).argmax(dim=-1)
+        route[use_dynamic] = oldest[use_dynamic]
+        return route, gate_logits, descriptor_scores, ~use_dynamic
+
+    @torch.no_grad()
+    def incremental_route_indices(self, cls_in):
+        """Return global expert ids, using -1 for the NULL route."""
+        route, _, _, _ = self._incremental_route(cls_in)
+        return torch.where(route.ge(0), route + self.base_expert_count, route)
 
     def forward(self, x):
         if x.ndim != 3:
@@ -353,13 +463,26 @@ class VisualMoEAdapter(nn.Module):
         x_norm = self.layer_norm(x)
         logits, weights = self.router(x_norm[0])
         residual, norms = torch.zeros_like(x_norm), []
-        for expert_id, expert in enumerate(self.experts):
+        for expert_id, expert in enumerate(self.experts[:self.base_expert_count]):
             weighted = expert(x_norm) * weights[:, expert_id].unsqueeze(0).unsqueeze(-1)
             residual = residual + weighted
             norms.append(weighted.detach().float().pow(2).mean().sqrt())
         residual = self.residual_scale.to(residual.dtype) * residual
+        dynamic_route, gate_logits, descriptor_scores, null_mask = self._incremental_route(x_norm[0])
+        for dynamic_id, expert in enumerate(self.experts[self.base_expert_count:]):
+            selected = dynamic_route.eq(dynamic_id).to(x_norm.dtype)[None, :, None]
+            weighted = expert(x_norm) * selected
+            residual = residual + self.incremental_scales[dynamic_id].to(residual.dtype) * weighted
+            norms.append(weighted.detach().float().pow(2).mean().sqrt())
         return residual, {"logits": logits, "route_weights": weights,
+                          "base_route_weights": weights,
                           "top_k_indices": weights.argmax(dim=-1, keepdim=True),
+                          "incremental_route_indices": torch.where(
+                              dynamic_route.ge(0), dynamic_route + self.base_expert_count, dynamic_route
+                          ),
+                          "incremental_gate_logits": gate_logits,
+                          "incremental_descriptor_scores": descriptor_scores,
+                          "null_mask": null_mask,
                           "cls_in": x_norm[0], "patch_mean_in": x_norm[1:].mean(dim=0),
                           "expert_residual_norms": torch.stack(norms),
                           "token_residual": residual.detach()}
@@ -602,6 +725,11 @@ def build_model(state_dict: dict, cfg=None):
                 residual_scale_init=base_scale_init,
                 descriptor_dim=descriptor_dim,
                 descriptor_eps=descriptor_eps,
+                route_base_z_threshold=getattr(moe_cfg, "ROUTE_BASE_Z_THRESHOLD", 1.0),
+                route_reuse_z_threshold=getattr(moe_cfg, "ROUTE_REUSE_Z_THRESHOLD", 1.0),
+                route_score_margin=getattr(moe_cfg, "ROUTE_SCORE_MARGIN", 0.05),
+                incremental_scale_init=getattr(moe_cfg, "INCREMENTAL_SCALE_INIT", 0.5),
+                incremental_gate_bias_init=getattr(moe_cfg, "INCREMENTAL_GATE_BIAS_INIT", 0.5),
             )
         convert_weights(model)
     return model.eval()

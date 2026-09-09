@@ -1,4 +1,6 @@
-# BiMC
+# FSCIL MoE — BiMC with demand-driven adapters
+
+Current implementation: **2.0.0-rc1** (checkpoint schema 7).
 
 This is the official implementation of paper **Enhancing Few-Shot Class-Incremental Learning via Training-Free Bi-Level Modality Calibration (CVPR 2025)**.
 
@@ -30,20 +32,11 @@ First, remember to modify the data path `ROOT` in the `dataset` configuration fi
 # CIFAR BIMC
 python main.py --data_cfg ./configs/datasets/cifar100.yaml --train_cfg ./configs/trainers/bimc.yaml
 
-# CIFAR BIMC_Ensemble
-python main.py --data_cfg ./configs/datasets/cifar100.yaml --train_cfg ./configs/trainers/bimc_ensemble.yaml
-
 # MiniImagenet BIMC
 python main.py --data_cfg ./configs/datasets/miniimagenet.yaml --train_cfg ./configs/trainers/bimc.yaml
 
-# MiniImagenet BIMC_Ensemble
-python main.py --data_cfg ./configs/datasets/miniimagenet.yaml --train_cfg ./configs/trainers/bimc_ensemble.yaml
-
 # CUB200 BIMC
 python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml
-
-# CUB200 BIMC_Ensemble
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc_ensemble.yaml
 ~~~
 
 ### Dynamic FSCIL MoE runs
@@ -57,16 +50,28 @@ variants, explicitly reuse one manifest and run a no-expansion baseline:
 python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --support_manifest checkpoints/fscil_moe/cub_seed1_support.json --expansion_mode none
 ~~~
 
-The default `auto` mode computes each layer's discriminative coverage deficit:
-only samples with a negative all-seen visual LOO margin and descriptor coverage
-excess contribute expansion evidence. The largest positive eligible layer adds
-one Linear Gate, Expert and Scale. Training uses one softmax over `NULL` and all
-dynamic experts, refreshed query-exclusive visual prototypes each epoch, and only
-visual classification plus historical-path invariance losses. Deployment uses the
-same logits with hard Top-1 routing. A candidate is retained only when its hard
-deployment LOO objective plus historical invariance is lower than the pre-candidate
-objective; otherwise the exact pre-expansion state is restored. Force/session/block
-overrides are intentionally unavailable in the production path.
+The default `auto` mode first measures an all-seen, query-exclusive BiMC LOO
+classification deficit. Only hard support sources then contribute descriptor
+coverage evidence, using fixed fitting views `[0, 1, 2]`; disjoint views
+`[100, 101]` calibrate descriptor statistics and are never used for fitting.
+Among the last four ViT blocks, the largest positive deficit may propose exactly
+one expert per session.
+
+The four base experts keep their original four-way softmax permanently.
+Incremental experts have independent gates and descriptors, so appending one
+cannot renormalise the base router. Deployment requires base coverage failure,
+descriptor coverage by a ready incremental expert, and a gate score above NULL;
+it then activates at most one incremental expert, with the older expert winning
+near ties. A new expert is zero-initialised and unavailable until its descriptor
+has been fitted and calibrated.
+
+Expansion is transactional. The candidate is trained with refreshed
+query-exclusive BiMC banks plus historical gate-invariance anchors, then evaluated
+under honest hard routing. It is committed only when new-class LOO accuracy (or
+equal accuracy with a better margin) improves, accuracy on the fixed historical
+training support subset (20 deterministic samples per class by default) does not fall, historical route preservation passes its
+threshold, and the old/new harmonic objective improves. The test split is never
+used for this decision. Otherwise the exact pre-candidate adapter is restored.
 The explicit full-auto CUB200 command is:
 
 ~~~BASH
@@ -86,16 +91,10 @@ Resume from a checkpoint produced by this safety-bounded version with:
 python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --resume checkpoints/fscil_moe/session_03.pth
 ~~~
 
-Legacy dynamic-expert checkpoint schemas are intentionally rejected when they
-predate the current logit-NULL routing and transactional safety contract.
-
-Each completed session also records per-expert/null routing and a deterministic
-support-proxy leave-one-expert-out diagnostic (`accuracy_gain` and
-`margin_gain`). It masks the selected residual without re-routing to another
-expert, so the reported value is that expert's direct marginal contribution.
-Historical experts additionally receive a support-only forward-interference
-report. Accuracy targets are kept outside runtime; use
-`python tools/report_regression.py --accuracies ...` after a run.
+Schema-7 checkpoints record topology v2, historical class-centroid routing
+anchors, support identity, per-session acceptance diagnostics and RNG state.
+Older unified-router checkpoints are intentionally rejected because loading them
+would violate the base-route invariance contract; retrain Session 0 once.
 
 ## Acknowledgment
 
@@ -106,6 +105,3 @@ In this repository, we build our code based on the following excellent open-sour
 - [FeCAM](https://github.com/dipamgoswami/FeCAM)
 - [CuPL](https://github.com/sarahpratt/CuPL)
 - [AdaptCLIPZS](https://github.com/cvl-umass/AdaptCLIPZS)
-
-
-

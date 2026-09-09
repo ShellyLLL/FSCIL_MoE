@@ -20,7 +20,7 @@ from utils.evaluator import AccuracyEvaluator
 
 
 def compute_load_balance_loss(moe_aux_list, num_experts):
-    """Base-session load balance over the unified soft router."""
+    """Base-session load balance over the immutable four-way base router."""
     if not moe_aux_list:
         return torch.tensor(0.0)
     losses = []
@@ -52,6 +52,7 @@ class Runner:
         self.model_without_dp = self.model.module if self.is_distributed else self.model
         self.acc_list, self.task_acc_list = [], []
         self.session_diagnostics = []
+        self.historical_anchor_bank = {}
         self.evaluator = AccuracyEvaluator(self.data_manager.class_index_in_task)
         self._resume_completed_session = -1
         self._resume_state_dict_list = []
@@ -189,8 +190,10 @@ class Runner:
         if not adapters:
             return {}
         totals = {
-            block: {"weight_sum": torch.zeros(adapter.num_experts), "top1": torch.zeros(adapter.num_experts),
-                    "count": 0, "classes": [set() for _ in range(adapter.num_experts)]}
+            block: {"weight_sum": torch.zeros(adapter.base_expert_count),
+                    "top1": torch.zeros(adapter.base_expert_count),
+                    "dynamic": torch.zeros(adapter.num_incremental_experts() + 1),
+                    "count": 0}
             for block, adapter in adapters.items()
         }
         self.model.eval()
@@ -202,26 +205,36 @@ class Runner:
                 top1 = weights.argmax(dim=-1)
                 item = totals[block_idx]
                 item["weight_sum"] += weights.sum(dim=0)
-                item["top1"] += F.one_hot(top1, adapter.num_experts).sum(dim=0)
+                item["top1"] += F.one_hot(top1, adapter.base_expert_count).sum(dim=0)
+                dynamic = aux["incremental_route_indices"].detach().cpu()
+                dynamic = torch.where(
+                    dynamic.lt(0), torch.zeros_like(dynamic),
+                    dynamic - adapter.base_expert_count + 1,
+                )
+                item["dynamic"] += F.one_hot(
+                    dynamic, adapter.num_incremental_experts() + 1
+                ).sum(dim=0)
                 item["count"] += weights.size(0)
-                for expert_id in range(adapter.num_experts):
-                    chosen = labels[top1.to(labels.device).eq(expert_id)]
-                    item["classes"][expert_id].update(int(value) for value in chosen.cpu().tolist())
         output = {}
         for block_idx, item in totals.items():
             count = max(1, item["count"])
             means, usage = item["weight_sum"] / count, item["top1"] / count
-            rows = []
             adapter = adapters[block_idx]
-            for expert_id in range(adapter.num_experts):
-                born = adapter.expert_birth_sessions[expert_id]
-                role = "new" if current_task is not None and born == int(current_task) else "history"
-                rows.append(
-                    f"e{expert_id}({role},birth={born}) mean_weight={means[expert_id]:.3f} "
-                    f"top1={usage[expert_id]:.3f} classes={len(item['classes'][expert_id])}"
-                )
-            print(f"=> [Router][{tag}][B{block_idx}] " + " | ".join(rows))
-            output[block_idx] = {"mean_weight": means, "top1_usage": usage}
+            dynamic_usage = item["dynamic"] / count
+            base_rows = [
+                f"base-e{expert_id} mean={means[expert_id]:.3f} top1={usage[expert_id]:.3f}"
+                for expert_id in range(adapter.base_expert_count)
+            ]
+            dynamic_rows = [f"NULL={dynamic_usage[0]:.3f}"]
+            dynamic_rows.extend(
+                f"inc-e{adapter.base_expert_count + index}={dynamic_usage[index + 1]:.3f}"
+                for index in range(adapter.num_incremental_experts())
+            )
+            print(f"=> [Router][{tag}][B{block_idx}] " + " | ".join(base_rows + dynamic_rows))
+            output[block_idx] = {
+                "base_mean_weight": means, "base_top1_usage": usage,
+                "incremental_usage_with_null": dynamic_usage,
+            }
         return output
 
     # ------------------------------------------------------------------
@@ -279,8 +292,11 @@ class Runner:
         missing = [key for key in required if key not in payload]
         if missing:
             raise ValueError(f"Resume checkpoint is missing required fields: {missing}")
-        if int(payload["schema_version"]) != 6:
-            raise ValueError("Checkpoint topology is incompatible; retrain from Session 0.")
+        if int(payload["schema_version"]) != 7:
+            raise ValueError(
+                "Checkpoint schema is incompatible with separated routing v2; "
+                "retrain from Session 0."
+            )
         if not isinstance(payload["model_state"], dict):
             raise TypeError("Resume checkpoint model_state must be a state_dict mapping.")
         if not isinstance(payload["task_states"], list):
@@ -318,6 +334,7 @@ class Runner:
         self.acc_list = payload.get("acc_list", [])
         self.task_acc_list = payload.get("task_acc_list", [])
         self.session_diagnostics = diagnostics
+        self.historical_anchor_bank = payload.get("historical_anchor_bank", {})
         self._resume_completed_session = completed_session
         if hasattr(self.model_without_dp, "restore_fused_history"):
             self.model_without_dp.restore_fused_history(self._resume_state_dict_list)
@@ -331,7 +348,8 @@ class Runner:
         directory.mkdir(parents=True, exist_ok=True)
         topology = self.model_without_dp.export_moe_topology()
         payload = {
-            "schema_version": 6,
+            "schema_version": 7,
+            "implementation_version": "2.0.0-rc1",
             "completed_session": int(completed_session),
             "model_state": self._cpu_copy(self.model_without_dp.state_dict()),
             "moe_topology": topology,
@@ -341,6 +359,7 @@ class Runner:
             "acc_list": list(self.acc_list),
             "task_acc_list": copy.deepcopy(self.task_acc_list),
             "session_diagnostics": self._cpu_copy(self.session_diagnostics),
+            "historical_anchor_bank": self._cpu_copy(self.historical_anchor_bank),
             "rng_state": self._rng_state(),
             "config": self.cfg.dump() if hasattr(self.cfg, "dump") else str(self.cfg),
         }
@@ -376,17 +395,33 @@ class Runner:
         return optim.AdamW([{ "params": moe_params, "lr": base_lr }], weight_decay=wd,
                            betas=tuple(_cfg_value(optim_cfg, "BETAS", (0.9, 0.999))))
 
-    def _train_descriptor(self, adapter, expert_id, values, responsibilities, epochs):
+    def _collect_support_views(self, task_id, view_ids):
+        """Collect and concatenate fixed source-aligned views for every MoE block."""
+        merged = {}
+        for view_id in view_ids:
+            loader = self.data_manager.get_support_view_dataloader(
+                task_id, int(view_id), mode="train"
+            )
+            current = self.model_without_dp.collect_blockwise_cls_features(loader)
+            for block_idx, item in current.items():
+                target = merged.setdefault(block_idx, {key: [] for key in item})
+                for key, value in item.items():
+                    target[key].append(value)
+        return {
+            block_idx: {key: torch.cat(values, dim=0) for key, values in item.items()}
+            for block_idx, item in merged.items()
+        }
+
+    def _train_descriptor(self, adapter, expert_id, fit_values, fit_responsibilities,
+                          calibration_values, calibration_responsibilities, epochs):
         descriptor = adapter.descriptors[int(expert_id)]
         descriptor.float()
-        values, responsibilities = values.detach(), responsibilities.detach().float()
-        count = values.size(0)
-        if count == 0:
-            raise RuntimeError("descriptor training received no features.")
-        order = torch.randperm(count, device=values.device)
-        split = max(1, min(count - 1, int(round(count * 0.8)))) if count > 1 else 1
-        train_idx = order[:split]
-        calibration_idx = order[split:] if split < count else order
+        fit_values = fit_values.detach()
+        fit_responsibilities = fit_responsibilities.detach().float()
+        calibration_values = calibration_values.detach()
+        calibration_responsibilities = calibration_responsibilities.detach().float()
+        if fit_values.size(0) == 0 or calibration_values.size(0) == 0:
+            raise RuntimeError("descriptor fit and calibration views must both be non-empty.")
         for parameter in descriptor.parameters():
             parameter.requires_grad = True
         descriptor.train()
@@ -397,34 +432,40 @@ class Runner:
         )
         for _ in range(max(1, int(epochs))):
             optimizer.zero_grad(set_to_none=True)
-            errors = descriptor.reconstruction_error(values[train_idx])
-            weights = responsibilities[train_idx]
+            errors = descriptor.reconstruction_error(fit_values)
+            weights = fit_responsibilities
             loss = (weights * errors).sum() / weights.sum().clamp_min(1e-8)
             loss.backward()
             optimizer.step()
         descriptor.eval()
         with torch.no_grad():
-            errors = descriptor.reconstruction_error(values[calibration_idx])
+            errors = descriptor.reconstruction_error(calibration_values)
             adapter.update_descriptor_stats(
-                errors, expert_id, responsibilities[calibration_idx],
-                fit_sample_count=train_idx.numel(),
+                errors, expert_id, calibration_responsibilities,
+                fit_sample_count=fit_values.size(0),
             )
         for parameter in descriptor.parameters():
             parameter.requires_grad = False
             parameter.grad = None
         return float(loss.item())
 
-    def _train_base_descriptors(self, extract_loader):
+    def _train_base_descriptors(self, task_id):
         epochs = int(_cfg_value(self.cfg.TRAINER.BiMC.OPTIM, "BASE_DESCRIPTOR_EPOCHS", 8))
-        features_by_block = self.model_without_dp.collect_blockwise_cls_features(extract_loader)
+        moe_cfg = self._visual_moe_cfg()
+        fit_by_block = self._collect_support_views(task_id, moe_cfg.TRAIN_VIEW_IDS)
+        calibration_by_block = self._collect_support_views(task_id, moe_cfg.CALIBRATION_VIEW_IDS)
         print(f"\n========== Train Base Representation Descriptors ({epochs} epochs) ==========")
         for block_idx, adapter in self._moe_adapters():
-            values = features_by_block[block_idx]["cls_in"].to(self.device)
+            fit_values = fit_by_block[block_idx]["cls_in"].to(self.device)
+            calibration_values = calibration_by_block[block_idx]["cls_in"].to(self.device)
             with torch.no_grad():
-                _, responsibilities = adapter.router(values)
+                _, fit_responsibilities = adapter.router(fit_values)
+                _, calibration_responsibilities = adapter.router(calibration_values)
             for expert_id in range(adapter.num_experts):
                 loss = self._train_descriptor(
-                    adapter, expert_id, values, responsibilities[:, expert_id], epochs
+                    adapter, expert_id,
+                    fit_values, fit_responsibilities[:, expert_id],
+                    calibration_values, calibration_responsibilities[:, expert_id], epochs,
                 )
                 descriptor = adapter.descriptors[expert_id]
                 print(
@@ -481,38 +522,27 @@ class Runner:
 
         for _, adapter in self._moe_adapters():
             adapter.freeze_all()
-        self._train_base_descriptors(extract_loader)
+        self._train_base_descriptors(task_id=0)
 
     # ------------------------------------------------------------------
     # Descriptor-driven layer-wise expansion
     # ------------------------------------------------------------------
-    def _build_incremental_loo_cache(self, extract_loader, class_index):
-        return self.model_without_dp.build_leave_one_out_prototypes(extract_loader, class_index)
-
-    def _incremental_loo_logits(self, images, labels, source_ids, support_cache, old_state):
+    def _incremental_loo_logits(self, images, labels, source_ids, loo_assessment):
         img_feat, moe_aux = self.model_without_dp.extract_img_feature_train(images)
         img_feat_norm = F.normalize(img_feat, dim=-1)
-        cache_sources = torch.as_tensor(support_cache["source_ids"]).reshape(-1)
+        cache_sources = torch.as_tensor(loo_assessment["source_ids"]).reshape(-1)
         query_sources = source_ids.detach().cpu().reshape(-1).to(cache_sources.dtype)
         matches = query_sources[:, None].eq(cache_sources[None, :])
         if not matches.any(dim=1).all():
             missing = query_sources[~matches.any(dim=1)].unique().tolist()
             raise KeyError(f"query source ids are absent from LOO cache: {missing}")
         rows = matches.long().argmax(dim=1)
-        current_visual = support_cache["loo_visual_prototypes"][rows].to(images.device, img_feat_norm.dtype)
-        old_visual = (old_state or {}).get("image_proto")
-        old_visual = (img_feat_norm.new_empty((0, img_feat_norm.size(-1))) if old_visual is None
-                      else F.normalize(torch.as_tensor(old_visual, device=images.device,
-                                                       dtype=img_feat_norm.dtype), dim=-1))
-        banks = torch.cat([old_visual.unsqueeze(0).expand(current_visual.size(0), -1, -1),
-                           current_visual], dim=1)
+        banks = loo_assessment["prototype_banks"][rows].to(images.device, img_feat_norm.dtype)
         logit_scale = float(_cfg_value(getattr(self.cfg.TRAINER.BiMC, "INCREMENTAL", None),
                                        "LOGIT_SCALE", 25.0))
         logits = logit_scale * torch.einsum("bd,bcd->bc", img_feat_norm, F.normalize(banks, dim=-1))
-        old_ids = torch.as_tensor((old_state or {}).get("class_ids", []),
-                                  device=images.device, dtype=torch.long)
-        current_ids = torch.as_tensor(support_cache["classes"], device=images.device, dtype=torch.long)
-        targets = self._targets_to_columns(labels, {"class_ids": torch.cat([old_ids, current_ids])})
+        class_ids = loo_assessment["prototype_class_ids"].to(images.device)
+        targets = self._targets_to_columns(labels, {"class_ids": class_ids})
         return logits, targets, moe_aux
 
     @staticmethod
@@ -531,16 +561,18 @@ class Runner:
                 return False, name
         return True, None
 
-    def train_descriptor_for_expert(self, block_idx, extract_loader):
+    def train_descriptor_for_expert(self, block_idx, fit_features, calibration_features):
         adapter = self._adapter_by_block(block_idx)
-        features = self.model_without_dp.collect_blockwise_cls_features(extract_loader)[block_idx]
-        values = features["cls_in"].to(self.device)
-        with torch.no_grad():
-            _, responsibilities = adapter.router(values)
+        fit_values = fit_features[block_idx]["cls_in"].to(self.device)
+        calibration_values = calibration_features[block_idx]["cls_in"].to(self.device)
+        fit_responsibilities = torch.ones(fit_values.size(0), device=self.device)
+        calibration_responsibilities = torch.ones(calibration_values.size(0), device=self.device)
         expert_id = adapter.num_experts - 1
         epochs = int(_cfg_value(self.cfg.TRAINER.BiMC.OPTIM, "INCREMENTAL_DESCRIPTOR_EPOCHS", 5))
         loss = self._train_descriptor(
-            adapter, expert_id, values, responsibilities[:, expert_id], epochs
+            adapter, expert_id,
+            fit_values, fit_responsibilities,
+            calibration_values, calibration_responsibilities, epochs,
         )
         descriptor = adapter.descriptors[expert_id]
         print(
@@ -549,22 +581,112 @@ class Runner:
         )
         adapter.assert_descriptors_ready()
 
-    def train_expanded_module(self, task_id, block_idx, train_loader, support_cache, old_state):
+    def _historical_anchor_features(self, block_idx):
+        item = self.historical_anchor_bank.get(int(block_idx), {})
+        return torch.as_tensor(item.get("features", torch.empty(0))).reshape(
+            -1, self._adapter_by_block(block_idx).d_model
+        )
+
+    @torch.no_grad()
+    def _classifier_support_metrics(self, loader, classifier_state):
+        """Evaluate old-class fixed support without using the test split."""
+        prototypes = self.model_without_dp.fuse_prototypes(classifier_state)
+        class_ids = torch.as_tensor(
+            classifier_state["class_ids"], device=self.device, dtype=torch.long
+        )
+        per_class_limit = int(_cfg_value(
+            self.cfg.TRAINER.BiMC.INCREMENTAL, "HISTORY_EVAL_SAMPLES_PER_CLASS", 20
+        ))
+        seen = {int(class_id): 0 for class_id in class_ids.detach().cpu().tolist()}
+        correct, count, margin_sum = 0, 0, 0.0
+        self.model.eval()
+        for batch in loader:
+            images, labels = self.parse_batch(batch)
+            keep = torch.zeros(labels.numel(), device=labels.device, dtype=torch.bool)
+            for index, class_id in enumerate(labels.detach().cpu().tolist()):
+                if seen[int(class_id)] < per_class_limit:
+                    keep[index] = True
+                    seen[int(class_id)] += 1
+            if not keep.any():
+                continue
+            images, labels = images[keep], labels[keep]
+            features = F.normalize(self.model_without_dp.extract_img_feature(images), dim=-1)
+            logits = features @ prototypes.t()
+            targets = self._targets_to_columns(labels, {"class_ids": class_ids})
+            positive = logits.gather(1, targets[:, None]).squeeze(1)
+            competing = logits.masked_fill(
+                F.one_hot(targets, num_classes=class_ids.numel()).bool(), float("-inf")
+            ).max(dim=1).values
+            competing = torch.where(torch.isfinite(competing), competing, positive.new_full(positive.shape, -1.0))
+            correct += int(logits.argmax(dim=-1).eq(targets).sum().item())
+            count += labels.numel()
+            margin_sum += float((positive - competing).sum().item())
+            if all(value >= per_class_limit for value in seen.values()):
+                break
+        return {"accuracy": correct / max(1, count), "mean_margin": margin_sum / max(1, count)}
+
+    @torch.no_grad()
+    def _historical_route_preservation(self, before_adapter, after_adapter, block_idx):
+        anchors = self._historical_anchor_features(block_idx)
+        if anchors.numel() == 0:
+            return 1.0
+        values = anchors.to(self.device)
+        before_adapter.eval()
+        after_adapter.eval()
+        before = before_adapter.incremental_route_indices(values)
+        after = after_adapter.incremental_route_indices(values)
+        return float(before.eq(after).float().mean().item())
+
+    @torch.no_grad()
+    def _update_historical_anchors(self, loader):
+        """Store class-centroid layer inputs; raw historical images are not retained."""
+        features = self.model_without_dp.collect_blockwise_cls_features(loader)
+        for block_idx, item in features.items():
+            rows, labels = [], []
+            for class_id in torch.unique(item["labels"], sorted=True):
+                rows.append(item["cls_in"][item["labels"].eq(class_id)].mean(dim=0))
+                labels.append(class_id)
+            incoming = {"features": torch.stack(rows).cpu(), "labels": torch.stack(labels).cpu()}
+            previous = self.historical_anchor_bank.get(int(block_idx))
+            if previous is None:
+                self.historical_anchor_bank[int(block_idx)] = incoming
+            else:
+                self.historical_anchor_bank[int(block_idx)] = {
+                    "features": torch.cat([previous["features"], incoming["features"]], dim=0),
+                    "labels": torch.cat([previous["labels"], incoming["labels"]], dim=0),
+                }
+
+    def train_expanded_module(self, task_id, block_idx, train_loader, extract_loader,
+                              class_names, class_index, old_state,
+                              enable_visual_calibration):
         adapter = self._adapter_by_block(block_idx)
         for _, item in self._moe_adapters():
             item.freeze_all()
         adapter.set_newest_trainable(descriptor=False)
+        adapter.set_force_newest(True)
         optim_cfg = self.cfg.TRAINER.BiMC.OPTIM
+        dynamic_id = adapter.num_incremental_experts() - 1
         optimizer = optim.AdamW([
             {"params": adapter.experts[-1].parameters(),
              "lr": float(_cfg_value(optim_cfg, "LR_INCREMENTAL_EXPERT", 3e-4))},
-            {"params": adapter.router.columns[-1].parameters(),
+            {"params": adapter.incremental_gates[dynamic_id].parameters(),
              "lr": float(_cfg_value(optim_cfg, "LR_INCREMENTAL_ROUTER", 3e-4))},
+            {"params": [adapter.incremental_scales[dynamic_id]],
+             "lr": float(_cfg_value(optim_cfg, "LR_INCREMENTAL_EXPERT", 3e-4))},
         ], weight_decay=float(_cfg_value(optim_cfg, "WEIGHT_DECAY", 1e-4)))
         epochs = int(_cfg_value(self.cfg.TRAINER.BiMC.INCREMENTAL, "EPOCHS", 6))
+        loss_cfg = self.cfg.TRAINER.BiMC.LOSS
+        ce_weight = float(_cfg_value(loss_cfg, "CE_WEIGHT", 1.0))
+        gate_weight = float(_cfg_value(loss_cfg, "GATE_WEIGHT", 0.1))
+        history_weight = float(_cfg_value(loss_cfg, "HISTORY_INVARIANCE_WEIGHT", 0.1))
+        history_anchors = self._historical_anchor_features(block_idx).to(self.device)
         logs = []
         for epoch in range(epochs):
             self.model.train()
+            loo_assessment = self.model_without_dp.assess_incremental_loo(
+                class_names, extract_loader, class_index, old_state,
+                enable_visual_calibration,
+            )
             total_loss, total_correct, total_count = 0.0, 0, 0
             for batch in train_loader:
                 images, labels = self.parse_batch(batch)
@@ -572,10 +694,18 @@ class Runner:
                     batch, labels.numel(), labels.device
                 )
                 optimizer.zero_grad(set_to_none=True)
-                logits, targets, _ = self._incremental_loo_logits(
-                    images, labels, source_ids, support_cache, old_state
+                logits, targets, moe_aux = self._incremental_loo_logits(
+                    images, labels, source_ids, loo_assessment
                 )
-                loss = F.cross_entropy(logits, targets)
+                aux = dict(zip((idx for idx, _ in self._moe_adapters()), moe_aux))[block_idx]
+                positive_gate = F.softplus(-aux["incremental_gate_logits"][:, dynamic_id]).mean()
+                if history_anchors.numel() > 0:
+                    historical_gate = adapter.incremental_gates[dynamic_id](history_anchors).float()
+                    history_gate = F.softplus(historical_gate + adapter.route_score_margin).mean()
+                else:
+                    history_gate = positive_gate.new_zeros(())
+                loss_ce = F.cross_entropy(logits, targets)
+                loss = ce_weight * loss_ce + gate_weight * positive_gate + history_weight * history_gate
                 if not bool(torch.isfinite(loss).item()):
                     raise FloatingPointError("non-finite incremental classification loss.")
                 loss.backward()
@@ -585,70 +715,176 @@ class Runner:
                 total_correct += int(logits.argmax(dim=-1).eq(targets).sum().item())
                 total_count += labels.numel()
             with torch.no_grad():
-                weights = []
-                for batch in train_loader:
-                    images, _ = self.parse_batch(batch)
-                    _, aux_list = self.model_without_dp.extract_img_feature_train(images)
-                    aux = dict(zip((idx for idx, _ in self._moe_adapters()), aux_list))[block_idx]
-                    weights.append(aux["route_weights"][:, -1].detach())
-                mean_weight = float(torch.cat(weights).mean().item())
+                mean_gate = float(torch.sigmoid(
+                    adapter.incremental_gates[dynamic_id](
+                        loo_assessment["features"].to(self.device)
+                    )
+                ).mean().item())
             row = {"epoch": epoch + 1, "loss": total_loss / max(1, total_count),
                    "loo_acc": total_correct / max(1, total_count),
-                   "new_router_mean_weight": mean_weight}
+                   "new_gate_probability": mean_gate}
             logs.append(row)
             print(
                 f"=> [ExpandTrain][Task {task_id}][B{block_idx}] epoch={epoch + 1} "
                 f"loss={row['loss']:.6f} loo_acc={row['loo_acc']:.3f} "
-                f"new_router_mean_weight={mean_weight:.3f}"
+                f"new_gate_probability={mean_gate:.3f}"
             )
+        adapter.set_force_newest(False)
         return logs
 
     def train_incremental_task(self, task_id, train_loader, extract_loader, class_index,
                                current_class_name, prev_state_dict_list,
                                enable_visual_calibration):
-        del current_class_name, enable_visual_calibration
         old_state = self.merge_dicts(prev_state_dict_list) if prev_state_dict_list else None
         decisions, expanded = [], []
         for _, adapter in self._moe_adapters():
             adapter.freeze_all()
+        pre = self.model_without_dp.assess_incremental_loo(
+            current_class_name, extract_loader, class_index, old_state,
+            enable_visual_calibration,
+        )
+        incremental_cfg = self.cfg.TRAINER.BiMC.INCREMENTAL
+        expansion_mode = str(_cfg_value(self._visual_moe_cfg(), "EXPANSION_MODE", "auto")).lower()
+        no_deficit = (
+            pre["accuracy"] >= float(_cfg_value(incremental_cfg, "LOO_ACC_THRESHOLD", 0.70))
+            and pre["mean_margin"] >= float(_cfg_value(incremental_cfg, "LOO_MARGIN_THRESHOLD", 0.0))
+        )
+        if expansion_mode == "none" or no_deficit or pre["hard_count"] == 0:
+            reason = "disabled" if expansion_mode == "none" else "LOO deficit absent"
+            print(f"=> [Expand][Task {task_id}] REUSE ({reason})")
+            return {
+                "trained": False, "accepted": False, "reason": reason,
+                "pre_loo": {"accuracy": pre["accuracy"], "mean_margin": pre["mean_margin"],
+                            "hard_count": pre["hard_count"]},
+                "decisions": [], "expanded": [],
+            }
+
+        moe_cfg = self._visual_moe_cfg()
+        fit_features = self._collect_support_views(task_id, moe_cfg.TRAIN_VIEW_IDS)
+        calibration_features = self._collect_support_views(task_id, moe_cfg.CALIBRATION_VIEW_IDS)
         for block_idx in sorted(self.model_without_dp.expandable_blocks()):
             decision = self.model_without_dp.plan_layer_expansion(
-                block_idx, extract_loader, class_index
+                block_idx, fit_features, class_index, pre["hard_source_ids"]
             )
             decisions.append({
                 "block_idx": decision.block_idx, "expand": decision.expand,
                 "class_scores": decision.class_scores,
                 "uncovered_classes": decision.uncovered_classes,
+                "hard_source_count": decision.hard_source_count,
             })
-            if not decision.expand:
-                continue
-            support_cache = self._build_incremental_loo_cache(extract_loader, class_index)
-            adapter = self._adapter_by_block(block_idx)
-            historical = self._historical_snapshot(adapter)
-            before = adapter.num_experts
+        eligible = [item for item in decisions if item["expand"]]
+        if not eligible:
+            return {
+                "trained": False, "accepted": False, "reason": "descriptor coverage sufficient",
+                "pre_loo": {"accuracy": pre["accuracy"], "mean_margin": pre["mean_margin"],
+                            "hard_count": pre["hard_count"]},
+                "decisions": decisions, "expanded": [],
+            }
+        threshold = float(moe_cfg.EXPANSION_Z_THRESHOLD)
+        selected = max(
+            eligible,
+            key=lambda item: (max(item["class_scores"].values()) - threshold, -item["block_idx"]),
+        )
+        block_idx = selected["block_idx"]
+        adapter = self._adapter_by_block(block_idx)
+        historical_loader = self.data_manager.get_dataloader(
+            task_id - 1, source="train", mode="test", accumulate_past=True
+        )
+        pre_history = self._classifier_support_metrics(historical_loader, old_state)
+        before_adapter = copy.deepcopy(adapter).to(self.device)
+        historical = self._historical_snapshot(adapter)
+        before = adapter.num_experts
+        try:
             expert_id = self.model_without_dp.add_expert(block_idx, task_id)
             print(
-                f"=> [Expand][Task {task_id}][B{block_idx}] new_expert={expert_id} "
+                f"=> [ExpandCandidate][Task {task_id}][B{block_idx}] expert={expert_id} "
                 f"num_experts: {before} -> {adapter.num_experts}"
             )
+            self.train_descriptor_for_expert(block_idx, fit_features, calibration_features)
             logs = self.train_expanded_module(
-                task_id, block_idx, train_loader, support_cache, old_state
+                task_id, block_idx, train_loader, extract_loader, current_class_name,
+                class_index, old_state, enable_visual_calibration,
             )
-            self.train_descriptor_for_expert(block_idx, extract_loader)
+            adapter.set_force_newest(False)
+            adapter.freeze_all()
+            post = self.model_without_dp.assess_incremental_loo(
+                current_class_name, extract_loader, class_index, old_state,
+                enable_visual_calibration,
+            )
+            post_history = self._classifier_support_metrics(historical_loader, old_state)
             unchanged, changed = self._historical_state_unchanged(adapter, historical)
             if not unchanged:
                 raise RuntimeError(f"historical parameter changed at B{block_idx}: {changed}")
-            adapter.freeze_all()
-            print(
-                f"=> [FreezeCheck][Task {task_id}][B{block_idx}] "
-                "historical_experts_unchanged=True "
-                "historical_router_columns_unchanged=True "
-                "historical_descriptors_unchanged=True"
+            preservation = self._historical_route_preservation(before_adapter, adapter, block_idx)
+            min_margin_gain = float(_cfg_value(incremental_cfg, "MIN_NEW_MARGIN_GAIN", 0.0))
+            min_preservation = float(_cfg_value(
+                incremental_cfg, "MIN_HISTORY_ROUTE_PRESERVATION", 1.0
+            ))
+            min_history_acc_delta = float(_cfg_value(
+                incremental_cfg, "MIN_HISTORY_ACCURACY_DELTA", 0.0
+            ))
+            min_history_margin_delta = float(_cfg_value(
+                incremental_cfg, "MIN_HISTORY_MARGIN_DELTA", -1e-3
+            ))
+            new_improved = (
+                post["accuracy"] > pre["accuracy"] + 1e-8
+                or (abs(post["accuracy"] - pre["accuracy"]) <= 1e-8
+                    and post["mean_margin"] > pre["mean_margin"] + min_margin_gain)
             )
-            expanded.append({"block_idx": block_idx, "expert_id": expert_id, "epochs": logs})
+            margin_weight = float(_cfg_value(incremental_cfg, "MARGIN_OBJECTIVE_WEIGHT", 0.05))
+            pre_quality = max(0.0, min(1.0, pre["accuracy"] + margin_weight * pre["mean_margin"]))
+            post_quality = max(0.0, min(1.0, post["accuracy"] + margin_weight * post["mean_margin"]))
+            history_preserved = (
+                post_history["accuracy"] >= pre_history["accuracy"] + min_history_acc_delta - 1e-8
+                and post_history["mean_margin"] >= (
+                    pre_history["mean_margin"] + min_history_margin_delta
+                )
+            )
+            pre_h = 2.0 * pre_history["accuracy"] * pre_quality / max(
+                1e-8, pre_history["accuracy"] + pre_quality
+            )
+            post_h = 2.0 * post_history["accuracy"] * post_quality / max(
+                1e-8, post_history["accuracy"] + post_quality
+            )
+            accepted = (
+                new_improved and history_preserved
+                and preservation >= min_preservation and post_h > pre_h + 1e-8
+            )
+            reason = "accepted" if accepted else "candidate did not improve protected LOO objective"
+            if not accepted:
+                self.model_without_dp.clip_model.visual.transformer.resblocks[
+                    int(block_idx)
+                ].moe_adapter = before_adapter
+                before_adapter.freeze_all()
+                print(f"=> [ExpandRollback][Task {task_id}][B{block_idx}] {reason}")
+            else:
+                print(
+                    f"=> [ExpandCommit][Task {task_id}][B{block_idx}] "
+                    f"LOO {pre['accuracy']:.3f}->{post['accuracy']:.3f}, "
+                    f"history {pre_history['accuracy']:.3f}->{post_history['accuracy']:.3f}, "
+                    f"history_route_preservation={preservation:.3f}"
+                )
+                expanded.append({"block_idx": block_idx, "expert_id": expert_id, "epochs": logs})
+        except Exception:
+            self.model_without_dp.clip_model.visual.transformer.resblocks[
+                int(block_idx)
+            ].moe_adapter = before_adapter
+            before_adapter.freeze_all()
+            raise
         for _, adapter in self._moe_adapters():
             adapter.freeze_all()
-        return {"trained": bool(expanded), "decisions": decisions, "expanded": expanded}
+        return {
+            "trained": True, "accepted": bool(expanded), "reason": reason,
+            "selected_block": int(block_idx),
+            "pre_loo": {"accuracy": pre["accuracy"], "mean_margin": pre["mean_margin"],
+                        "hard_count": pre["hard_count"]},
+            "post_loo": {"accuracy": post["accuracy"], "mean_margin": post["mean_margin"],
+                         "hard_count": post["hard_count"]},
+            "history_route_preservation": preservation,
+            "history_support": {"pre": pre_history, "post": post_history},
+            "protected_harmonic": {"pre": pre_h, "post": post_h},
+            "decisions": decisions, "expanded": expanded,
+        }
 
     def _build_and_refine_task_state(self, current_class_name, extract_loader, class_index,
                                      old_state, enable_visual_calibration):
@@ -723,6 +959,7 @@ class Runner:
                     extract_loader, f"task{task_id}-final", current_task=task_id
                 )
                 self._log_expert_topology(f"task{task_id}-final")
+                self._update_historical_anchors(extract_loader)
             start_time = time.perf_counter()
             acc = self.inference_task_bilevel(task_id, merged_state)
             if torch.cuda.is_available():

@@ -15,6 +15,7 @@ class LayerExpansionDecision:
     expand: bool
     class_scores: Dict[int, float]
     uncovered_classes: List[int]
+    hard_source_count: int = 0
 
 
 def compute_loo_classification_metrics(queries, per_query_prototypes, query_class_ids,
@@ -459,23 +460,85 @@ class BiMC(nn.Module):
                 if getattr(block, "moe_adapter", None) is not None]
 
     @torch.no_grad()
-    def plan_layer_expansion(self, block_idx, loader, class_index, threshold=None):
-        """Decide one layer solely from class-aggregated descriptor coverage."""
+    def assess_incremental_loo(self, class_names, loader, class_index, old_state,
+                               enable_visual_calibration=True):
+        """Measure query-exclusive BiMC deficit for the current support set."""
+        current_ids = torch.as_tensor(class_index, device=self.device, dtype=torch.long)
+        cache = self.build_leave_one_out_prototypes(loader, class_index)
+        text, _ = self.inference_text_feature(class_names, self.template, int(current_ids[0].item()))
+        _, _, description = self.inference_all_description_feature(
+            class_names, self.cfg.DATASET.GPT_PATH, int(current_ids[0].item())
+        )
+        visual = cache["loo_visual_prototypes"].to(self.device)
+        if (enable_visual_calibration and self.base_vision_prototype is not None
+                and visual.numel() > 0):
+            shape = visual.shape
+            visual = self.soft_calibration(
+                self.base_vision_prototype, visual.reshape(-1, shape[-1])
+            ).reshape(shape)
+        cache["loo_visual_prototypes"] = visual.detach().cpu()
+        cache["text_features"] = text.detach().cpu()
+        cache["description_proto"] = description.detach().cpu()
+        lambda_t = self.cfg.TRAINER.BiMC.LAMBDA_T if self.cfg.TRAINER.BiMC.TEXT_CALIBRATION else 0.0
+        banks = loo_fused_prototypes_for_queries(
+            cache, cache["source_ids"], old_state or {}, beta=self.cfg.DATASET.BETA,
+            lambda_t=lambda_t,
+        ).to(self.device)
+        old_ids = self._state_class_ids(old_state, self.device)
+        prototype_ids = torch.cat([old_ids, current_ids])
+        metrics = compute_loo_classification_metrics(
+            cache["features"].to(self.device), banks,
+            cache["labels"].to(self.device), prototype_ids,
+        )
+        hard_margin = float(getattr(self.cfg.TRAINER.BiMC.INCREMENTAL, "LOO_HARD_MARGIN", 0.0))
+        labels = cache["labels"].to(self.device)
+        hard = metrics["predictions"].ne(labels) | metrics["margins"].le(hard_margin)
+        hard_sources = cache["source_ids"][hard.detach().cpu()]
+        return {
+            "support_cache": cache,
+            "prototype_banks": banks.detach(),
+            "prototype_class_ids": prototype_ids.detach(),
+            "features": cache["features"].to(self.device),
+            "labels": labels,
+            "source_ids": cache["source_ids"],
+            "accuracy": float(metrics["accuracy"].item()),
+            "mean_margin": float(metrics["margins"].mean().item()),
+            "hard_source_ids": torch.unique(hard_sources, sorted=True),
+            "hard_count": int(hard.sum().item()),
+        }
+
+    @torch.no_grad()
+    def plan_layer_expansion(self, block_idx, features, class_index,
+                             hard_source_ids, threshold=None):
+        """Use multi-view descriptor coverage to locate one deficient layer.
+
+        Classification deficit is decided separately by query-exclusive BiMC;
+        descriptors only rank layers and only inspect the hard support sources.
+        """
         block_idx = int(block_idx)
         threshold = float(getattr(
             self.cfg.TRAINER.BiMC.VISUAL_MOE, "EXPANSION_Z_THRESHOLD", 1.0
         ) if threshold is None else threshold)
-        features = self.collect_blockwise_cls_features(loader).get(block_idx)
+        features = features.get(block_idx)
         if features is None:
             raise KeyError(f"Block {block_idx} did not produce support features.")
         adapter = self.clip_model.visual.transformer.resblocks[block_idx].moe_adapter
         adapter.assert_descriptors_ready()
-        values, labels = features["cls_in"].to(self.device), features["labels"].to(self.device)
-        scores = adapter.descriptor_scores(values)
-        class_scores = {
-            int(class_id.item()): float(scores[labels.eq(class_id)].mean(dim=0).min().item())
-            for class_id in torch.unique(labels, sorted=True)
-        }
+        values = features["cls_in"].to(self.device)
+        labels = features["labels"].to(self.device)
+        sources = features["source_ids"].to(self.device)
+        hard_sources = torch.as_tensor(hard_source_ids, device=self.device).reshape(-1)
+        scores = adapter.descriptor_scores(values).clamp_min(0.0).min(dim=-1).values
+        hard_mask = sources[:, None].eq(hard_sources[None, :]).any(dim=1)
+        class_scores = {}
+        for class_id in torch.unique(labels, sorted=True):
+            class_mask = labels.eq(class_id) & hard_mask
+            source_scores = []
+            for source_id in torch.unique(sources[class_mask], sorted=True):
+                source_scores.append(scores[class_mask & sources.eq(source_id)].mean())
+            class_scores[int(class_id.item())] = (
+                float(torch.stack(source_scores).mean().item()) if source_scores else 0.0
+            )
         expected = sorted(int(value) for value in class_index)
         if sorted(class_scores) != expected:
             raise RuntimeError(f"Block {block_idx} received classes {sorted(class_scores)}, expected {expected}.")
@@ -483,7 +546,10 @@ class BiMC(nn.Module):
         for class_id, score in class_scores.items():
             state = "uncovered" if class_id in uncovered else "covered"
             print(f"=> [Coverage][B{block_idx}] class={class_id} score={score:.4f} {state}")
-        decision = LayerExpansionDecision(block_idx, bool(uncovered), class_scores, uncovered)
+        decision = LayerExpansionDecision(
+            block_idx, bool(uncovered), class_scores, uncovered,
+            hard_source_count=int(hard_sources.numel()),
+        )
         print(f"=> [Coverage][B{block_idx}] decision={'EXPAND' if decision.expand else 'REUSE'}")
         return decision
 
