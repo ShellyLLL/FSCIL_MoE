@@ -224,8 +224,10 @@ class ExpansionInvariantTests(unittest.TestCase):
         self.assertEqual(evaluation["classifier_variants"]["refined"]["base_avg_acc"], 0.0)
         self.assertEqual(evaluation["base_avg_acc"], 100.0)
         self.assertEqual(evaluation["task_acc"], [100.0, 100.0])
+        self.assertEqual(evaluation["task_diagnostics"]["task_selection_acc"], 100.0)
+        self.assertEqual(evaluation["task_diagnostics"]["oracle_task_within_acc"], 100.0)
 
-    def test_new_task_offset_is_the_smallest_one_meeting_novel_recall(self):
+    def test_joint_gate_does_not_fit_one_novel_outlier_at_old_classes_expense(self):
         runner = Runner.__new__(Runner)
         runner.device, runner.task_gate_biases = "cpu", [0.0]
         runner.cfg = SimpleNamespace(DATASET=SimpleNamespace(BETA=0.3),
@@ -235,31 +237,42 @@ class ExpansionInvariantTests(unittest.TestCase):
         novel = torch.eye(4)[2:]
         old = {"class_ids": torch.tensor([0, 1]), "creation_session": 0,
                "encoder_version": 0, "anchor_fused_proto": base,
-               "anchor_features": base, "anchor_labels": torch.tensor([0, 1]),
-               "image_proto": base, "text_features": base, "fused_proto": base}
+               "anchor_features": base.repeat_interleave(3, dim=0),
+               "anchor_labels": torch.tensor([0] * 3 + [1] * 3),
+               "image_proto": base, "text_features": base,
+               "description_proto": base, "fused_proto": base}
+        novel_features = novel.repeat_interleave(5, dim=0)
+        novel_features[0] = base[0]
         current = {"class_ids": torch.tensor([2, 3]), "creation_session": 1,
                    "encoder_version": 1, "anchor_fused_proto": novel,
-                   "anchor_features": novel.repeat_interleave(3, dim=0),
-                   "anchor_labels": torch.tensor([2, 2, 2, 3, 3, 3]),
+                   "anchor_features": novel_features,
+                   "anchor_labels": torch.tensor([2] * 5 + [3] * 5),
                    "image_proto": novel, "text_features": novel,
                    "description_proto": novel, "fused_proto": novel}
-        runner._support_bank = lambda *args: None
-        def incumbent(images, labels, sources, *args):
-            old_scores = torch.zeros(len(labels), 2)
-            new_scores = torch.full((len(labels), 2), -1.0)
-            new_scores[sources < 3, 0] = 1.0
-            return torch.cat([old_scores, new_scores], dim=1), labels
-        runner._incremental_logits = incumbent
-        loader = DataLoader(TinySupport(shots=3), batch_size=2, shuffle=False)
-        outcome = runner._calibrate_task_gate(1, [old, current], loader)
-        self.assertEqual(outcome["novel_loo_accuracy_floor"], 0.5)
-        merged = runner.merge_dicts([old, current])
-        margins = (runner._anchor_task_scores(current["anchor_features"], merged,
-                   runner._anchor_leave_one_out(current))[:, 0] -
-                   runner._anchor_task_scores(current["anchor_features"], merged,
-                   runner._anchor_leave_one_out(current))[:, 1]).sort().values
-        expected = torch.nextafter(margins[2], margins.new_tensor(float("inf")))
-        self.assertEqual(outcome["new_task_bias"], expected.item())
+        outcome = runner._calibrate_task_gate(1, [old, current])
+        self.assertEqual(outcome["old_loo_task_recall"], 1.0)
+        self.assertAlmostEqual(outcome["novel_loo_task_recall"], 0.9, places=6)
+        outlier_evidence = runner._anchor_task_scores(
+            current["anchor_features"][:1], runner.merge_dicts([old, current]),
+            runner._anchor_leave_one_out(current)[:1], current["anchor_labels"][:1])
+        self.assertLess(outcome["new_task_bias"],
+                        (outlier_evidence[0, 0] - outlier_evidence[0, 1]).item())
+
+    def test_anchor_loo_removes_all_views_of_the_query_source(self):
+        runner = Runner.__new__(Runner)
+        runner.device = "cpu"
+        runner.cfg = SimpleNamespace(DATASET=SimpleNamespace(BETA=0.0),
+            TRAINER=SimpleNamespace(BiMC=SimpleNamespace(
+                VISION_CALIBRATION=False, TEXT_CALIBRATION=False)))
+        state = {"class_ids": torch.tensor([2]), "creation_session": 1,
+                 "anchor_features": torch.tensor([[1., 0.], [1., 0.], [0., 1.]]),
+                 "anchor_labels": torch.tensor([2, 2, 2]),
+                 "anchor_source_ids": torch.tensor([10, 10, 11]),
+                 "text_features": torch.tensor([[1., 0.]]),
+                 "description_proto": torch.tensor([[1., 0.]])}
+        weights = runner._anchor_leave_one_out(state)
+        torch.testing.assert_close(weights[:2], torch.tensor([[0., 1.], [0., 1.]]))
+        torch.testing.assert_close(weights[2:], torch.tensor([[1., 0.]]))
 
     def test_base_checkpoint_gains_anchor_features_without_retraining(self):
         from torch import nn
@@ -301,7 +314,7 @@ class ExpansionInvariantTests(unittest.TestCase):
                                        torch.eye(2))
             runner.save_checkpoint(0, runner._resume_state_dict_list)
             upgraded = torch.load(Path(directory) / "session_00.pth", weights_only=False)
-            self.assertEqual(upgraded["schema_version"], 8)
+            self.assertEqual(upgraded["schema_version"], 9)
             self.assertEqual(upgraded["task_gate_biases"], [0.0])
 
     def test_candidate_training_uses_fused_leave_one_out_scores(self):
@@ -373,31 +386,30 @@ class ExpansionInvariantTests(unittest.TestCase):
         dataset = TinySupport(shots=3)
         training = DataLoader(dataset, batch_size=4, shuffle=True)
         extraction = DataLoader(dataset, batch_size=4, shuffle=False)
-        old = {"class_ids": torch.tensor([0, 1]), "encoder_version": 0,
-               "image_proto": torch.eye(4)[:2], "text_features": torch.eye(4)[:2],
-               "description_proto": torch.eye(4)[:2], "fused_proto": torch.eye(4)[:2]}
         runner.model.add_expert(0, 1)
         text, description = runner._text_prototypes(["two", "three"], [2, 3])
         support_bank = runner._support_bank(extraction, [2, 3], text, description, 1)
         batch = next(iter(training))
         logits, targets = runner._incremental_logits(
             batch["image"], batch["label"], batch["source_id"], support_bank,
-            runner.merge_dicts([old]), 1, 100.0)
+            1, 100.0)
+        self.assertEqual(logits.size(1), 2)
         self.assertTrue(logits.requires_grad)
         F.cross_entropy(logits, targets).backward()
         self.assertIsNotNone(runner._adapter_by_block(0).experts[-1].c_proj.weight.grad)
         runner._adapter_by_block(0).remove_newest_expert()
+        runner._held_out_loss = lambda *args: 0.0 if args[5] == 0 else 1.0
         result = runner.train_incremental_task(
-            1, training, extraction, [2, 3], ["two", "three"], [old], True)
+            1, training, extraction, [2, 3], ["two", "three"], True)
         self.assertEqual(len(result["decisions"]), 1)
         self.assertFalse(result["trained"])
         self.assertEqual(runner._adapter_by_block(0).num_experts, 2)
 
         # Exercise the acceptance and full-support retraining path independently
         # of this synthetic support set's actual predictive quality.
-        runner._held_out_loss = lambda *args: 1.0 if args[6] == 0 else 0.0
+        runner._held_out_loss = lambda *args: 1.0 if args[5] == 0 else 0.0
         accepted = runner.train_incremental_task(
-            1, training, extraction, [2, 3], ["two", "three"], [old], True)
+            1, training, extraction, [2, 3], ["two", "three"], True)
         self.assertTrue(accepted["trained"])
         self.assertEqual(accepted["encoder_version"], 1)
         self.assertEqual(runner._adapter_by_block(0).num_experts, 3)

@@ -298,10 +298,11 @@ class Runner:
             payload["task_states"][0] = dict(payload["task_states"][0])
             payload["task_states"][0]["image_proto"] = base_proto
             payload["task_states"][0]["encoder_version"] = 0
-        elif schema not in (7, 8):
+        elif schema not in (7, 8, 9):
             raise ValueError("Checkpoint topology is incompatible; resume from Session 0.")
-        if schema == 7 and int(payload["completed_session"]) != 0:
-            raise ValueError("Anchor retention needs a base-only checkpoint or a schema 8 checkpoint.")
+        if schema in (7, 8) and int(payload["completed_session"]) != 0:
+            raise ValueError("The calibrated gate and task-local objective need a base-only "
+                             "checkpoint or a schema 9 checkpoint.")
         if not isinstance(payload["model_state"], dict):
             raise TypeError("Resume checkpoint model_state must be a state_dict mapping.")
         if not isinstance(payload["task_states"], list):
@@ -349,7 +350,7 @@ class Runner:
                                                torch.as_tensor(sources, dtype=torch.long).cpu())
             base_state["creation_session"] = 0
         self._resume_state_dict_list = payload.get("task_states", [])
-        self.task_gate_biases = ([0.0] if schema in (6, 7) else
+        self.task_gate_biases = ([0.0] if schema in (6, 7, 8) else
                                  list(payload["task_gate_biases"]))
         if len(self.task_gate_biases) != completed_session + 1:
             raise ValueError("Checkpoint task gate biases do not match completed sessions.")
@@ -369,7 +370,7 @@ class Runner:
         directory.mkdir(parents=True, exist_ok=True)
         topology = self.model_without_dp.export_moe_topology()
         payload = {
-            "schema_version": 8,
+            "schema_version": 9,
             "completed_session": int(completed_session),
             "model_state": self._cpu_copy(self.model_without_dp.state_dict()),
             "moe_topology": topology,
@@ -581,13 +582,8 @@ class Runner:
         return output
 
     def _incremental_logits(self, images, labels, source_ids, support_bank,
-                            old_state, version, scale, leave_one_out=True):
-        old_count = 0 if old_state is None else len(old_state["class_ids"])
-        if old_count:
-            old_logits = self._versioned_scores(
-                images, old_state["fused_proto"], old_state["encoder_versions"], scale)
-        else:
-            old_logits = images.new_empty((images.size(0), 0))
+                            version, scale, leave_one_out=True):
+        """Rank novel classes as they are ranked in the deployed task classifier."""
         if leave_one_out:
             cache_sources = torch.as_tensor(support_bank["source_ids"], device=source_ids.device)
             matches = source_ids.reshape(-1, 1).eq(cache_sources.reshape(1, -1))
@@ -604,14 +600,8 @@ class Runner:
             features = self.model_without_dp.extract_img_feature(
                 images, max_session=version)
         features = F.normalize(features.float(), dim=-1)
-        new_logits = scale * torch.einsum("bd,bcd->bc", features, new_prototypes.float())
-        ids = torch.cat([
-            torch.as_tensor([] if old_state is None else old_state["class_ids"],
-                            device=images.device, dtype=torch.long),
-            torch.as_tensor(support_bank["classes"], device=images.device, dtype=torch.long),
-        ])
-        return torch.cat([old_logits, new_logits], dim=1), self._targets_to_columns(
-            labels, {"class_ids": ids})
+        logits = scale * torch.einsum("bd,bcd->bc", features, new_prototypes.float())
+        return logits, self._targets_to_columns(labels, {"class_ids": support_bank["classes"]})
 
     def _text_prototypes(self, class_names, class_index):
         model = self.model_without_dp
@@ -645,7 +635,7 @@ class Runner:
         return result
 
     def _train_candidate(self, task_id, block_idx, train_loader, extract_loader,
-                         class_index, text, description, old_state, calibrate):
+                         class_index, text, description, calibrate):
         adapter = self._adapter_by_block(block_idx)
         adapter.set_newest_trainable()
         optim_cfg = self.cfg.TRAINER.BiMC.OPTIM
@@ -667,7 +657,7 @@ class Runner:
                 source_ids = self._batch_source_ids(batch, labels.numel(), labels.device)
                 optimizer.zero_grad(set_to_none=True)
                 logits, targets = self._incremental_logits(
-                    images, labels, source_ids, bank, old_state, task_id, scale)
+                    images, labels, source_ids, bank, task_id, scale)
                 loss = F.cross_entropy(logits, targets)
                 if not bool(torch.isfinite(loss).item()):
                     raise FloatingPointError("Non-finite fused incremental loss.")
@@ -682,7 +672,7 @@ class Runner:
 
     @torch.no_grad()
     def _held_out_loss(self, validation_loader, support_loader, class_index, text,
-                       description, old_state, version, calibrate):
+                       description, version, calibrate):
         self.model.eval()
         bank = self._support_bank(support_loader, class_index, text, description,
                                   version, calibrate)
@@ -690,16 +680,14 @@ class Runner:
         for batch in validation_loader:
             images, labels = self.parse_batch(batch)
             logits, targets = self._incremental_logits(
-                images, labels, None, bank, old_state, version,
+                images, labels, None, bank, version,
                 float(self.cfg.TRAINER.BiMC.INCREMENTAL.LOGIT_SCALE), leave_one_out=False)
             total += float(F.cross_entropy(logits, targets, reduction="sum").item())
             count += labels.numel()
         return total / max(count, 1)
 
     def train_incremental_task(self, task_id, train_loader, extract_loader, class_index,
-                               current_class_name, prev_state_dict_list,
-                               enable_visual_calibration):
-        old_state = self.merge_dicts(prev_state_dict_list)
+                               current_class_name, enable_visual_calibration):
         text, description = self._text_prototypes(current_class_name, class_index)
         folds = self._support_folds(train_loader, extract_loader)
         previous_version = self._current_encoder_version()
@@ -709,7 +697,7 @@ class Runner:
             return {"trained": False, "decisions": [], "expanded": [],
                     "encoder_version": previous_version}
         null_losses = [self._held_out_loss(val, fit_extract, class_index, text, description,
-                                           old_state, previous_version, enable_visual_calibration)
+                                           previous_version, enable_visual_calibration)
                        for _, fit_extract, val in folds]
         decisions = []
         for block_idx in self.model_without_dp.expandable_blocks():
@@ -722,11 +710,11 @@ class Runner:
                 adapter.experts[-1].load_state_dict(initial_expert)
                 adapter.router.columns[-1].load_state_dict(initial_router)
                 self._train_candidate(task_id, block_idx, fit_train, fit_extract,
-                                      class_index, text, description, old_state,
+                                      class_index, text, description,
                                       enable_visual_calibration)
                 candidate_losses.append(self._held_out_loss(
                     validation, fit_extract, class_index, text, description,
-                    old_state, task_id, enable_visual_calibration))
+                    task_id, enable_visual_calibration))
             adapter.remove_newest_expert()
             gains = np.asarray(null_losses) - np.asarray(candidate_losses)
             decisions.append({"block_idx": block_idx, "null_loss": float(np.mean(null_losses)),
@@ -744,7 +732,7 @@ class Runner:
         adapter = self._adapter_by_block(block_idx)
         expert_id = self.model_without_dp.add_expert(block_idx, task_id)
         epochs = self._train_candidate(task_id, block_idx, train_loader, extract_loader,
-                                       class_index, text, description, old_state,
+                                       class_index, text, description,
                                        enable_visual_calibration)
         print(f"=> [Accepted][Task {task_id}][B{block_idx}] expert={expert_id} "
               f"validation_gain={best['gain']:.5f}")
@@ -765,98 +753,107 @@ class Runner:
         state["class_ids"] = torch.as_tensor(class_index, device=self.device, dtype=torch.long)
         return state
 
-    def _anchor_task_scores(self, features, state, current_loo=None):
+    def _anchor_task_scores(self, features, state, query_loo=None, query_labels=None):
         """Comparable task evidence from the single frozen base encoder."""
         prototypes = F.normalize(state["anchor_fused_proto"].to(features.device).float(), dim=-1)
-        scores = 100.0 * F.normalize(features.float(), dim=-1) @ prototypes.T
+        queries = F.normalize(features.float(), dim=-1)
+        scores = 100.0 * queries @ prototypes.T
         task_ids = state["task_ids"].to(features.device)
-        if current_loo is not None:
-            mask = task_ids.eq(int(task_ids.max().item()))
-            scores[:, mask] = 100.0 * torch.einsum(
-                "bd,bcd->bc", F.normalize(features.float(), dim=-1), current_loo.float())
+        if query_loo is not None:
+            if query_labels is None or query_loo.shape != queries.shape:
+                raise ValueError("Source-exclusive prototypes need one label and weight per query.")
+            columns = self._targets_to_columns(query_labels, state)
+            rows = torch.arange(len(queries), device=features.device)
+            scores[rows, columns] = 100.0 * (queries * F.normalize(
+                query_loo.to(features.device).float(), dim=-1)).sum(dim=-1)
         tasks = torch.unique(task_ids, sorted=True)
         return torch.stack([torch.logsumexp(scores[:, task_ids.eq(task)], dim=1)
                             for task in tasks], dim=1).double()
 
     def _anchor_leave_one_out(self, task_state):
-        """Source-exclusive current-task weights for gate calibration."""
-        features = task_state["anchor_features"].float()
-        labels = task_state["anchor_labels"]
-        cache = build_loo_cache_from_embeddings(
-            features, labels,
-            task_state.get("anchor_source_ids", torch.arange(len(labels))),
-            task_state["class_ids"])
-        if not bool(cache["loo_valid"].all().item()):
+        """Recompute only each query's own class, excluding its source."""
+        features = F.normalize(task_state["anchor_features"].to(self.device).float(), dim=-1)
+        labels = task_state["anchor_labels"].to(self.device)
+        sources = torch.as_tensor(task_state.get(
+            "anchor_source_ids", torch.arange(len(labels))), device=self.device)
+        classes = self._targets_to_columns(labels, task_state)
+        _, source_rows = torch.unique(torch.stack([classes, sources], dim=1),
+                                      dim=0, return_inverse=True)
+        n_classes = len(task_state["class_ids"])
+        class_sums = features.new_zeros((n_classes, features.size(1))).index_add_(0, classes, features)
+        source_sums = features.new_zeros((int(source_rows.max()) + 1, features.size(1)))
+        source_sums.index_add_(0, source_rows, features)
+        class_counts = torch.bincount(classes, minlength=n_classes)
+        source_counts = torch.bincount(source_rows)
+        if not bool((class_counts[classes] > source_counts[source_rows]).all().item()):
             raise ValueError("Task gate calibration needs at least two sources per class.")
-        visual = cache["loo_visual_prototypes"].to(self.device)
-        if self.cfg.TRAINER.BiMC.VISION_CALIBRATION:
-            shape = visual.shape
+        visual = F.normalize(class_sums[classes] - source_sums[source_rows], dim=-1)
+        if (int(task_state["creation_session"]) > 0 and
+                self.cfg.TRAINER.BiMC.VISION_CALIBRATION):
             visual = self.model_without_dp.soft_calibration(
-                self.model_without_dp.base_vision_prototype,
-                visual.reshape(-1, shape[-1])).reshape(shape)
+                self.model_without_dp.base_vision_prototype, visual)
         weight = (float(self.cfg.TRAINER.BiMC.LAMBDA_T)
                   if self.cfg.TRAINER.BiMC.TEXT_CALIBRATION else 0.0)
         text = F.normalize((1.0 - weight) * task_state["text_features"] +
-                           weight * task_state["description_proto"], dim=-1)
+                           weight * task_state["description_proto"], dim=-1).to(self.device)
         beta = float(self.cfg.DATASET.BETA)
-        return F.normalize(beta * text[None] + (1.0 - beta) * visual, dim=-1)
+        return F.normalize(beta * text[classes] + (1.0 - beta) * visual, dim=-1)
 
-    @torch.no_grad()
-    def _calibrate_task_gate(self, task_id, states, extract_loader):
-        """Smallest new-task offset retaining incumbent-correct LOO examples.
-
-        Decreasing this offset can only help historical tasks; the empirical
-        novel accuracy constraint therefore has an exact boundary solution.
-        """
+    def _calibrate_task_gate(self, task_id, states):
+        """Fit all task offsets to class-balanced, source-exclusive anchor evidence."""
         if task_id == 0:
             self.task_gate_biases = [0.0]
             return {"new_task_bias": 0.0}
         if len(self.task_gate_biases) != task_id:
             raise ValueError("Historical task gate biases are missing.")
-        current, old_state = states[-1], self.merge_dicts(states[:-1])
         merged = self.merge_dicts(states)
-        features = current["anchor_features"].to(self.device).float()
-        evidence = self._anchor_task_scores(
-            features, merged, self._anchor_leave_one_out(current))
-        old_max = (evidence[:, :-1] + evidence.new_tensor(self.task_gate_biases)).max(dim=1).values
-        margins = old_max - evidence[:, -1]
+        with torch.no_grad():
+            evidences, labels, task_targets, counts = [], [], [], []
+            for state in states:
+                features = state["anchor_features"].to(self.device).float()
+                targets = state["anchor_labels"].to(self.device)
+                evidences.append(self._anchor_task_scores(
+                    features, merged, self._anchor_leave_one_out(state), targets))
+                labels.append(targets)
+                task_targets.append(torch.full_like(targets, int(state["creation_session"])))
+                counts.append(len(targets))
+            evidence = torch.cat(evidences)
+            class_labels = torch.cat(labels)
+            tasks = torch.cat(task_targets)
+            columns = self._targets_to_columns(class_labels, merged)
+            class_counts = torch.bincount(columns, minlength=len(merged["class_ids"]))
+            sample_weights = class_counts[columns].reciprocal().double()
 
-        bank = self._support_bank(
-            extract_loader, current["class_ids"], current["text_features"],
-            current["description_proto"], current["encoder_version"],
-            self.cfg.TRAINER.BiMC.VISION_CALIBRATION)
-        baseline_correct = []
-        for batch in extract_loader:
-            images, labels = self.parse_batch(batch)
-            sources = self._batch_source_ids(batch, len(labels), labels.device)
-            logits, targets = self._incremental_logits(
-                images, labels, sources, bank, old_state,
-                current["encoder_version"], 100.0)
-            baseline_correct.append(logits.argmax(dim=1).eq(targets))
-        protected = torch.cat(baseline_correct).to(margins.device)
-        if bool(protected.any().item()):
-            boundary = margins[protected].max()
-            bias = torch.nextafter(boundary, boundary.new_tensor(float("inf")))
-            while not bool((evidence[protected, -1] + bias > old_max[protected]).all().item()):
-                bias = torch.nextafter(bias, bias.new_tensor(float("inf")))
-            bias = bias.item()
-        else:
-            bias = 0.0
-        self.task_gate_biases.append(float(bias))
+        offsets = nn.Parameter(evidence.new_tensor([*self.task_gate_biases[1:], 0.0]))
+        optimizer = optim.LBFGS([offsets], lr=1.0, max_iter=200,
+                                tolerance_grad=1e-9, line_search_fn="strong_wolfe")
 
-        historical_correct, historical_count = 0, 0
-        for state in states[:-1]:
-            stored = state["anchor_features"].to(self.device).float()
-            old_evidence = self._anchor_task_scores(stored, merged)
-            predicted = (old_evidence + old_evidence.new_tensor(self.task_gate_biases)).argmax(dim=1)
-            historical_correct += int(predicted.eq(state["creation_session"]).sum().item())
-            historical_count += len(predicted)
-        result = {"new_task_bias": float(bias),
-                  "novel_loo_accuracy_floor": float(protected.float().mean().item()),
-                  "historical_anchor_task_recall": historical_correct / max(historical_count, 1)}
+        def closure():
+            optimizer.zero_grad()
+            logits = evidence + torch.cat([offsets.new_zeros(1), offsets])[None, :]
+            loss = (F.cross_entropy(logits, tasks, reduction="none") * sample_weights).sum()
+            loss = loss / sample_weights.sum()
+            loss.backward()
+            return loss
+
+        optimizer.step(closure)
+        if not bool(torch.isfinite(offsets).all().item()):
+            raise FloatingPointError("Non-finite calibrated task offsets.")
+        self.task_gate_biases = [0.0, *offsets.detach().cpu().tolist()]
+        with torch.no_grad():
+            logits = evidence + evidence.new_tensor(self.task_gate_biases)
+            correct = logits.argmax(dim=1).eq(tasks)
+            old_count = sum(counts[:-1])
+            result = {"new_task_bias": self.task_gate_biases[-1],
+                      "balanced_loo_nll": float((F.cross_entropy(
+                          logits, tasks, reduction="none") * sample_weights).sum() /
+                          sample_weights.sum()),
+                      "novel_loo_task_recall": float(correct[old_count:].float().mean()),
+                      "old_loo_task_recall": float(correct[:old_count].float().mean())}
         print(f"=> [AnchorGate][Task {task_id}] "
-              f"novel_loo_accuracy_floor={result['novel_loo_accuracy_floor']:.3f} "
-              f"old_anchor_task_recall={result['historical_anchor_task_recall']:.3f}")
+              f"novel_loo_task_recall={result['novel_loo_task_recall']:.3f} "
+              f"old_loo_task_recall={result['old_loo_task_recall']:.3f} "
+              f"balanced_loo_nll={result['balanced_loo_nll']:.3f}")
         return result
 
     def _retained_scores(self, anchor_features, state, versioned_logits):
@@ -917,7 +914,7 @@ class Runner:
                     self._routing_diagnostics(extract_loader, f"task{task_id}-before", current_task=task_id)
                     adaptation = self.train_incremental_task(
                         task_id, train_loader, extract_loader, class_index,
-                        current_class_name, state_dict_list, enable_visual_calibration,
+                        current_class_name, enable_visual_calibration,
                     )
                     plan_summary = self._cpu_copy(adaptation["decisions"])
                 self.model.eval()
@@ -930,7 +927,7 @@ class Runner:
                 state_dict_list.append(task_stat)
                 state_dict_list[-1]["creation_session"] = int(task_id)
 
-            gate_diagnostics = self._calibrate_task_gate(task_id, state_dict_list, extract_loader)
+            gate_diagnostics = self._calibrate_task_gate(task_id, state_dict_list)
             merged_state = self.merge_dicts(state_dict_list)
             if use_moe:
                 final_routing = self._routing_diagnostics(
@@ -1019,6 +1016,16 @@ class Runner:
         result = dict(variants["retained"])
         result["classifier_variants"] = variants
         logits = logits_by_variant["retained"]
+        columns = self._targets_to_columns(targets, state_dict)
+        task_ids = state_dict["task_ids"].to(logits.device)
+        true_tasks = task_ids[columns]
+        selected_tasks = task_ids[logits.argmax(dim=1)]
+        oracle_columns = logits.masked_fill(
+            ~task_ids[None, :].eq(true_tasks[:, None]), float("-inf")).argmax(dim=1)
+        result["task_diagnostics"] = {
+            "task_selection_acc": float(selected_tasks.eq(true_tasks).float().mean() * 100),
+            "oracle_task_within_acc": float(oracle_columns.eq(columns).float().mean() * 100),
+        }
         result["error_flow"] = self.evaluator.error_flow(
             logits, targets, task_id, class_ids=state_dict["class_ids"]
         )
@@ -1029,6 +1036,9 @@ class Runner:
                 variants["retained"]["mean_acc"],
             )
         )
+        print("=> [TaskDiagnostic] selected={:.2f} oracle_within={:.2f}".format(
+            result["task_diagnostics"]["task_selection_acc"],
+            result["task_diagnostics"]["oracle_task_within_acc"]))
         flow = result["error_flow"]["named_rates"]
         print(
             "=> [Flow] base->current_novel={:.3f} old_novel->current_novel={:.3f} "
