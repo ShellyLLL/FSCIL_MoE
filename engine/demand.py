@@ -186,7 +186,7 @@ class VersionedScorer:
 def source_stratified_folds(dataset, folds):
     """Deterministic class-stratified folds; each raw image belongs to one fold."""
     by_class = defaultdict(list)
-    for i in range(len(dataset)):
+    for i in range(len(dataset.source_ids)):
         by_class[int(dataset.labels[i])].append((int(dataset.source_ids[i]), i))
     min_shot = min(len(v) for v in by_class.values())
     if min_shot < 3:
