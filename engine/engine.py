@@ -16,6 +16,7 @@ from tqdm import tqdm
 
 from datasets.data_manager import DatasetManager
 from models.bimc import BiMC
+from engine.demand import DemandExpansion, topology_key
 from utils.evaluator import AccuracyEvaluator
 
 
@@ -279,8 +280,8 @@ class Runner:
         missing = [key for key in required if key not in payload]
         if missing:
             raise ValueError(f"Resume checkpoint is missing required fields: {missing}")
-        if int(payload["schema_version"]) != 6:
-            raise ValueError("Checkpoint topology is incompatible; retrain from Session 0.")
+        if int(payload["schema_version"]) != 7:
+            raise ValueError("Checkpoint lacks version-owned prototype banks; retrain from Session 0.")
         if not isinstance(payload["model_state"], dict):
             raise TypeError("Resume checkpoint model_state must be a state_dict mapping.")
         if not isinstance(payload["task_states"], list):
@@ -304,6 +305,11 @@ class Runner:
             raise TypeError("Resume checkpoint moe_topology must be a mapping.")
         self.model_without_dp.rebuild_moe_topology(topology)
         self.model_without_dp.load_state_dict(payload["model_state"], strict=True)
+        self.model_without_dp.reference_topology = self.model_without_dp.canonical_topology(
+            payload.get("reference_topology")
+        )
+        if self._visual_moe_cfg().ENABLE and self.model_without_dp.reference_topology is None:
+            raise ValueError("Versioned checkpoint must include the frozen reference topology")
         for _, adapter in self._moe_adapters():
             adapter.freeze_all()
         manifest = payload.get("support_manifest")
@@ -331,7 +337,8 @@ class Runner:
         directory.mkdir(parents=True, exist_ok=True)
         topology = self.model_without_dp.export_moe_topology()
         payload = {
-            "schema_version": 6,
+            "schema_version": 7,
+            "reference_topology": self.model_without_dp.reference_topology,
             "completed_session": int(completed_session),
             "model_state": self._cpu_copy(self.model_without_dp.state_dict()),
             "moe_topology": topology,
@@ -433,6 +440,10 @@ class Runner:
                 )
             adapter.assert_descriptors_ready()
             adapter.freeze_all()
+            for expert_id in range(adapter.num_experts):
+                adapter.set_descriptor_topology(
+                    expert_id, self.model_without_dp.current_topology()
+                )
 
     def train_base_task(self, task_stat, train_loader, extract_loader):
         optim_cfg = self.cfg.TRAINER.BiMC.OPTIM
@@ -548,6 +559,7 @@ class Runner:
             f"mean={descriptor.mean.item():.6f} std={descriptor.std.item():.6f}"
         )
         adapter.assert_descriptors_ready()
+        adapter.set_descriptor_topology(expert_id, self.model_without_dp.current_topology())
 
     def train_expanded_module(self, task_id, block_idx, train_loader, support_cache, old_state):
         adapter = self._adapter_by_block(block_idx)
@@ -666,96 +678,161 @@ class Runner:
         end_task = self.data_manager.num_tasks - 1 if configured_end < 0 else min(
             configured_end, self.data_manager.num_tasks - 1
         )
-        print(f"Start inferencing on all tasks: [0, {end_task}]")
         state_dict_list = list(self._resume_state_dict_list)
         start_task = self._resume_completed_session + 1
-        use_moe = bool(getattr(self.cfg.TRAINER.BiMC, "VISUAL_MOE", None) and self._visual_moe_cfg().ENABLE)
+        use_moe = bool(self._visual_moe_cfg().ENABLE)
         if start_task > end_task:
-            print("=> Resume checkpoint already contains all configured FSCIL sessions.")
+            print("=> Versioned checkpoint already contains all requested sessions.")
             return
-
         for task_id in range(start_task, end_task + 1):
             self.model.eval()
-            plan_summary, adaptation = None, None
-            final_routing = {}
             class_index = self.data_manager.class_index_in_task[task_id]
-            current_class_name = np.array(self.data_manager.class_names)[class_index].tolist()
-            extract_loader = self.data_manager.get_dataloader(task_id, source="train", mode="test", accumulate_past=False)
-            train_loader = self.data_manager.get_dataloader(task_id, source="train", mode="train", accumulate_past=False)
-            print(f"\n=> [Session {task_id}] support_manifest={self._support_manifest_hash()}")
+            class_names = np.array(self.data_manager.class_names)[class_index].tolist()
+            extract_loader = self.data_manager.get_dataloader(
+                task_id, source="train", mode="test", accumulate_past=False
+            )
+            train_loader = self.data_manager.get_dataloader(
+                task_id, source="train", mode="train", accumulate_past=False
+            )
+            print(f"\\n=> [Session {task_id}] support_manifest={self._support_manifest_hash()}")
             if use_moe:
                 self._log_expert_topology(f"task{task_id}-before")
-
+            adaptation = None
             if task_id == 0:
-                task_stat = self.model_without_dp.build_task_statistics(
-                    current_class_name, extract_loader, class_index, calibrate_novel_vision_proto=False
+                # S2: the original base supervised objective is retained.
+                initial = self.model_without_dp.build_task_statistics(
+                    class_names, extract_loader, class_index,
+                    calibrate_novel_vision_proto=False
                 )
-                task_stat["class_ids"] = torch.as_tensor(class_index, device=self.device, dtype=torch.long)
+                initial["class_ids"] = torch.as_tensor(
+                    class_index, device=self.device, dtype=torch.long
+                )
                 if use_moe:
-                    self.train_base_task(task_stat, train_loader, extract_loader)
-                    self.model.eval()
-                    task_stat = self.model_without_dp.build_task_statistics(
-                        current_class_name, extract_loader, class_index, calibrate_novel_vision_proto=False
-                    )
-                    task_stat["class_ids"] = torch.as_tensor(class_index, device=self.device, dtype=torch.long)
-                state_dict_list.append(task_stat)
-                state_dict_list[-1]["creation_session"] = int(task_id)
-            else:
-                old_state = self.merge_dicts(state_dict_list)
-                enable_visual_calibration = bool(self.cfg.TRAINER.BiMC.VISION_CALIBRATION)
-                if use_moe:
-                    self._routing_diagnostics(extract_loader, f"task{task_id}-before", current_task=task_id)
-                    adaptation = self.train_incremental_task(
-                        task_id, train_loader, extract_loader, class_index,
-                        current_class_name, state_dict_list, enable_visual_calibration,
-                    )
-                    plan_summary = self._cpu_copy(adaptation["decisions"])
+                    self.train_base_task(initial, train_loader, extract_loader)
                 self.model.eval()
-                task_stat = self._build_and_refine_task_state(
-                    current_class_name, extract_loader, class_index, old_state, enable_visual_calibration
+                reference = self.model_without_dp.current_topology() if use_moe else {}
+                self.model_without_dp.reference_topology = dict(reference)
+                text_state = self.model_without_dp.compute_text_state(class_names, class_index)
+                task_stat = self.model_without_dp.build_versioned_task_state(
+                    extract_loader, class_index, text_state, reference, reference,
+                    visual_calibration=False
                 )
-                state_dict_list.append(task_stat)
-                state_dict_list[-1]["creation_session"] = int(task_id)
-
-            merged_state = self.merge_dicts(state_dict_list)
-            if use_moe:
-                final_routing = self._routing_diagnostics(
-                    extract_loader, f"task{task_id}-final", current_task=task_id
+            else:
+                reference = self.model_without_dp.reference_topology
+                if reference is None:
+                    raise RuntimeError("Missing base reference topology")
+                text_state = self.model_without_dp.compute_text_state(class_names, class_index)
+                if use_moe:
+                    adaptation = DemandExpansion(self, state_dict_list, text_state).select(
+                        task_id, train_loader, extract_loader
+                    )
+                    print(f"=> [Demand][Task {task_id}] {adaptation}")
+                    self._log_expert_topology(f"task{task_id}-final")
+                self.model.eval()
+                task_stat = self.model_without_dp.build_versioned_task_state(
+                    extract_loader, class_index, text_state,
+                    self.model_without_dp.current_topology() if use_moe else {},
+                    reference,
+                    visual_calibration=bool(self.cfg.TRAINER.BiMC.VISION_CALIBRATION),
                 )
-                self._log_expert_topology(f"task{task_id}-final")
+            task_stat["creation_session"] = int(task_id)
+            state_dict_list.append(task_stat)
             start_time = time.perf_counter()
-            acc = self.inference_task_bilevel(task_id, merged_state)
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
+            acc = self.inference_task_versioned(task_id, state_dict_list)
             elapsed = time.perf_counter() - start_time
-            suffix = f", time: {elapsed:.3f}s"
-            print(f"+++++++++++ task {task_id}{suffix} ++++++++++++++++")
-            print(
-                f"=> Task [{task_id}], Acc: {acc['mean_acc']:.3f}, "
-                f"Base: {acc['base_avg_acc']:.2f}, Novel: {acc['inc_avg_acc']:.2f}, "
-                f"H: {acc['harmonic_acc']:.2f}"
-            )
-            self.acc_list.append(round(acc["mean_acc"], 3))
+            self.acc_list.append(float(acc["mean_acc"]))
             self.task_acc_list.append(acc["task_acc"])
             self.session_diagnostics.append({
                 "session": int(task_id),
                 "support_manifest_hash": self._support_manifest_hash(),
-                "plan": plan_summary,
                 "adaptation": self._cpu_copy(adaptation),
-                "routing": self._cpu_copy(final_routing),
-                "expert_counts": {
-                    int(block_idx): int(adapter.num_experts)
-                    for block_idx, adapter in self._moe_adapters()
-                },
+                "topology": self.model_without_dp.current_topology() if use_moe else {},
                 "classifier": self._cpu_copy(acc),
-                "evaluation_seconds": float(elapsed),
+                "evaluation_seconds": elapsed,
             })
             self.save_checkpoint(task_id, state_dict_list)
+            print(
+                f"=> Task [{task_id}], Acc={acc['mean_acc']:.2f}, "
+                f"Base={acc['base_avg_acc']:.2f}, "
+                f"Novel={acc['inc_avg_acc']:.2f}, H={acc['harmonic_acc']:.2f}"
+            )
+        if self.acc_list:
+            average = sum(self.acc_list) / len(self.acc_list)
+            dropping = self.acc_list[0] - self.acc_list[-1]
+            print(f"=> FSCIL AA={average:.3f} PD={dropping:.3f} "
+                  f"Final={self.acc_list[-1]:.3f}")
+        print(f"Final acc: {self.acc_list}")
 
-        print(f"\nFinal acc: {self.acc_list}")
-        print("Task-wise acc:")
-        for index, task_acc in enumerate(self.task_acc_list):
-            print(f"task {index:2d}, acc: {task_acc}")
+    @torch.no_grad()
+    def inference_task_versioned(self, task_id, states):
+        """S7: compare every seen class without test-time session identification.
+
+        Historical scores are evaluated through the precise topology in which
+        their prototypes were generated; only the reference path is universal.
+        """
+        reference = self.model_without_dp.reference_topology
+        eta = float(self.cfg.TRAINER.BiMC.DEMAND.DYNAMIC_WEIGHT)
+        all_ids = torch.cat([
+            torch.as_tensor(st["class_ids"], device=self.device, dtype=torch.long)
+            for st in states
+        ])
+        loader = self.data_manager.get_dataloader(task_id, source="test", mode="test")
+        predictions = {name: [] for name in
+                       ("visual", "text", "bimc", "dynamic", "refined")}
+        targets_all = []
+        for batch in tqdm(loader, desc=f"Eval Task {task_id}"):
+            images, labels = self.parse_batch(batch)
+            targets_all.append(labels)
+            features = {}
+            def extract(version):
+                key = topology_key(version)
+                if key not in features:
+                    features[key] = F.normalize(
+                        self.model_without_dp.clip_model.encode_image(
+                            images, active_counts=version
+                        ).float(), dim=-1
+                    )
+                return features[key]
+            ref = extract(reference)
+            per_variant = {key: [] for key in predictions}
+            for state in states:
+                owner = extract(state["topology"])
+                def similarity(f, p):
+                    return f @ F.normalize(p.to(self.device).float(), dim=-1).t()
+                ref_visual = similarity(ref, state["ref_image_proto"])
+                ref_fused = similarity(ref, state["ref_fused_proto"])
+                owner_fused = similarity(owner, state["fused_proto"])
+                lam_t = float(self.cfg.TRAINER.BiMC.LAMBDA_T) if (
+                    self.cfg.TRAINER.BiMC.TEXT_CALIBRATION) else 0.0
+                calibrated_text = F.normalize(
+                    (1.0-lam_t)*state["text_features"].to(self.device).float()
+                    + lam_t*state["description_proto"].to(self.device).float(),
+                    dim=-1
+                )
+                per_variant["visual"].append(ref_visual)
+                per_variant["text"].append(similarity(ref, calibrated_text))
+                per_variant["bimc"].append(ref_fused)
+                per_variant["dynamic"].append(owner_fused)
+                per_variant["refined"].append((1.0-eta)*ref_fused + eta*owner_fused)
+            for key in predictions:
+                predictions[key].append(
+                    100.0 * torch.cat(per_variant[key], dim=-1)
+                )
+        targets = torch.cat(targets_all)
+        logits = {key: torch.cat(value) for key, value in predictions.items()}
+        variants = {
+            key: self.evaluator.calc_accuracy(value, targets, task_id, class_ids=all_ids)
+            for key, value in logits.items()
+        }
+        result = dict(variants["refined"])
+        result["classifier_variants"] = variants
+        result["error_flow"] = self.evaluator.error_flow(
+            logits["refined"], targets, task_id, class_ids=all_ids
+        )
+        print("=> [Classifier] " + " ".join(
+            f"{key}={value['mean_acc']:.2f}" for key, value in variants.items()
+        ))
+        return result
 
     @torch.no_grad()
     def inference_task_bilevel(self, task_id, state_dict):
