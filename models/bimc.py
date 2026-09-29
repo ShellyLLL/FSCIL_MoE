@@ -314,6 +314,7 @@ class BiMC(nn.Module):
         self.description_proto = None
         self.vision_proto = None
         self.base_vision_prototype = None
+        self.reference_topology = None  # immutable after base-session training
         # Runtime cache for conflict-aware fused refinement.  Adapter coverage
         # banks remain the checkpointed source of truth for visual planning.
         self._fused_history_prototypes = None
@@ -362,7 +363,7 @@ class BiMC(nn.Module):
         return self
 
     @torch.no_grad()
-    def collect_blockwise_cls_features(self, loader):
+    def collect_blockwise_cls_features(self, loader, active_counts=None):
         """Collect current-path Adapter-LayerNorm CLS features and labels."""
         block_features, fallback_source_id = {}, 0
         moe_blocks = [idx for idx, block in enumerate(self.clip_model.visual.transformer.resblocks)
@@ -380,7 +381,9 @@ class BiMC(nn.Module):
                 fallback_source_id += labels.numel()
                 if source_ids.numel() != labels.numel():
                     raise ValueError("support source ids must align with labels.")
-                _, aux_list = self.clip_model.encode_image(images, return_moe_aux=True)
+                _, aux_list = self.clip_model.encode_image(
+                    images, return_moe_aux=True, active_counts=active_counts
+                )
                 if len(aux_list) != len(moe_blocks):
                     raise RuntimeError("MoE auxiliary outputs do not match inserted blocks.")
                 for block_idx, aux in zip(moe_blocks, aux_list):
@@ -405,7 +408,7 @@ class BiMC(nn.Module):
         return block_features
 
     @torch.no_grad()
-    def build_leave_one_out_prototypes(self, loader, class_index=None):
+    def build_leave_one_out_prototypes(self, loader, class_index=None, active_counts=None):
         """Collect a support cache with stable source ids and per-query LOO means.
 
         ``loo_visual_prototypes[i, j]`` is class ``j``'s support mean after
@@ -424,7 +427,9 @@ class BiMC(nn.Module):
                 if sid.numel() != y.numel():
                     raise ValueError("support source ids must align with labels.")
                 next_id += y.numel()
-                features.append(F.normalize(self.clip_model.encode_image(images), dim=-1).detach().cpu())
+                features.append(F.normalize(
+                    self.clip_model.encode_image(images, active_counts=active_counts), dim=-1
+                ).detach().cpu())
                 labels.append(y.detach().cpu())
                 source_ids.append(sid.detach().cpu())
         finally:
@@ -453,6 +458,19 @@ class BiMC(nn.Module):
         lambda_t = self.cfg.TRAINER.BiMC.LAMBDA_T if self.cfg.TRAINER.BiMC.TEXT_CALIBRATION else 0.0
         calibrated_text = F.normalize((1.0 - lambda_t) * text + lambda_t * description, dim=-1)
         return F.normalize(self.cfg.DATASET.BETA * calibrated_text + (1.0 - self.cfg.DATASET.BETA) * image, dim=-1)
+
+    def current_topology(self):
+        return {
+            int(index): int(block.moe_adapter.num_experts)
+            for index, block in enumerate(self.clip_model.visual.transformer.resblocks)
+            if getattr(block, "moe_adapter", None) is not None
+        }
+
+    @staticmethod
+    def canonical_topology(topology):
+        if topology is None:
+            return None
+        return {int(k): int(v) for k, v in topology.items()}
 
     def expandable_blocks(self):
         return [index for index, block in enumerate(self.clip_model.visual.transformer.resblocks)
@@ -616,8 +634,10 @@ class BiMC(nn.Module):
                 del block._temp_moe
         return teacher_features
 
-    def extract_img_feature_train(self, images):
-        return self.clip_model.encode_image(images.to(self.device), return_moe_aux=True)
+    def extract_img_feature_train(self, images, active_counts=None):
+        return self.clip_model.encode_image(
+            images.to(self.device), return_moe_aux=True, active_counts=active_counts
+        )
 
     def forward_train(self, images, task_stat, beta, compute_teacher=False):
         img_feat, moe_aux = self.extract_img_feature_train(images)
@@ -657,11 +677,13 @@ class BiMC(nn.Module):
         return F.normalize(torch.stack(clip_weights, dim=0), dim=-1), torch.cat(all_targets, dim=0)
 
     @torch.no_grad()
-    def inference_all_img_feature(self, loader):
+    def inference_all_img_feature(self, loader, active_counts=None):
         all_features, all_labels = [], []
         for batch in loader:
             images, labels = self.parse_batch(batch)
-            features = F.normalize(self.clip_model.encode_image(images), dim=-1)
+            features = F.normalize(
+                self.clip_model.encode_image(images, active_counts=active_counts), dim=-1
+            )
             all_features.append(features)
             all_labels.append(labels)
 
@@ -736,6 +758,69 @@ class BiMC(nn.Module):
             "sample_cnt": len(images_features),
             "initial_fused_proto": raw_fused,
             "fused_proto": fused_proto,
+        }
+
+    @torch.no_grad()
+    def compute_text_state(self, class_names, class_index):
+        """S6 is topology-independent; reuse one text bank across CV folds."""
+        ids = torch.as_tensor(class_index, device=self.device, dtype=torch.long)
+        # Existing text utilities expect the task's contiguous starting index.
+        if ids.numel() == 0 or not torch.equal(ids, torch.arange(
+                int(ids[0]), int(ids[0]) + ids.numel(), device=self.device)):
+            raise ValueError("text-state class ids must be consecutive in task order")
+        text, _ = self.inference_text_feature(class_names, self.template, int(ids[0]))
+        _, _, descriptions = self.inference_all_description_feature(
+            class_names, self.cfg.DATASET.GPT_PATH, int(ids[0])
+        )
+        text_lambda = (float(self.cfg.TRAINER.BiMC.LAMBDA_T)
+                       if self.cfg.TRAINER.BiMC.TEXT_CALIBRATION else 0.0)
+        calibrated = F.normalize((1.0 - text_lambda) * text + text_lambda * descriptions, dim=-1)
+        return {"class_ids": ids, "text_features": text,
+                "description_proto": descriptions, "calibrated_text": calibrated}
+
+    @torch.no_grad()
+    def build_versioned_task_state(self, loader, class_index, text_state, topology,
+                                   reference_topology, visual_calibration=True):
+        """S5-S7: maintain reference and owner-topology prototypes separately.
+
+        Never reverse-engineer a visual prototype from a normalized fused vector:
+        the latter loses its original norm. All saved prototypes have explicit
+        feature-space ownership, so old samples need not be replayed.
+        """
+        topology = self.canonical_topology(topology)
+        reference_topology = self.canonical_topology(reference_topology)
+        ids = torch.as_tensor(class_index, device=self.device, dtype=torch.long)
+        if not torch.equal(ids, text_state["class_ids"].to(self.device)):
+            raise ValueError("text/prototype class ids disagree")
+        _, own_labels, visual = self.inference_all_img_feature(loader, active_counts=topology)
+        if topology == reference_topology:
+            reference_raw = visual
+        else:
+            _, reference_labels, reference_raw = self.inference_all_img_feature(
+                loader, active_counts=reference_topology
+            )
+            if not torch.equal(own_labels, reference_labels):
+                raise ValueError("reference and owner class orders differ")
+        if int(ids[0]) == 0:
+            self.base_vision_prototype = reference_raw.detach().clone()
+        reference_visual = reference_raw
+        if int(ids[0]) != 0 and visual_calibration:
+            if self.base_vision_prototype is None:
+                raise RuntimeError("base reference prototypes must exist before an increment")
+            reference_visual = self.soft_calibration(self.base_vision_prototype, reference_raw)
+        text = text_state["calibrated_text"]
+        beta = float(self.cfg.DATASET.BETA)
+        ref_fused = F.normalize(beta * text + (1.0 - beta) * reference_visual, dim=-1)
+        dynamic_fused = F.normalize(beta * text + (1.0 - beta) * visual, dim=-1)
+        return {
+            "class_ids": ids, "class_index": ids.detach().cpu().tolist(),
+            "text_features": text_state["text_features"].detach().clone(),
+            "description_proto": text_state["description_proto"].detach().clone(),
+            "image_proto": visual.detach().clone(),
+            "fused_proto": dynamic_fused.detach().clone(),
+            "ref_image_proto": reference_visual.detach().clone(),
+            "ref_fused_proto": ref_fused.detach().clone(),
+            "topology": dict(topology),
         }
 
     @torch.no_grad()
