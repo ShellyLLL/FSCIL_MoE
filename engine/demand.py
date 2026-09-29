@@ -166,14 +166,17 @@ class VersionedScorer:
             labels = batch["label"].to(self.device).long()
             exclude = batch["source_id"].to(self.device).long() if exclude_query else None
             ref, dyn = self.current_fused(bank, exclude)
-            logits = self.logits(images, topology, ref, dyn)
+            logits = self.logits(
+                images, topology, ref, dyn,
+                logit_scale=float(self.model.cfg.TRAINER.BiMC.INCREMENTAL.LOGIT_SCALE)
+            )
             target = self.targets(labels)
             total_loss += F.cross_entropy(logits, target, reduction="sum").item()
             total_right += logits.argmax(-1).eq(target).sum().item()
             total += len(target)
             true = logits.gather(1, target[:, None]).squeeze(1)
             competing = logits.scatter(1, target[:, None], float("-inf")).max(dim=-1).values
-            margins.extend(((true - competing) / 25.0).tolist())
+            margins.extend(((true - competing) / float(self.model.cfg.TRAINER.BiMC.INCREMENTAL.LOGIT_SCALE)).tolist())
         return {
             "ce": total_loss / max(1, total), "accuracy": total_right / max(1, total),
             "margins": margins,
@@ -248,7 +251,10 @@ class DemandExpansion:
                 expert_scores.append(descriptor.standardized_score(values).detach().cpu())
             z = torch.stack(expert_scores, dim=-1)
             coverage = z.clamp_min(0).min(dim=-1).values
-            scores[block] = float((coverage * difficulty).mean().item())
+            # Novel class confusion is the necessity signal. Descriptors only
+            # rank candidate layers; a covered but nondiscriminative class is
+            # still eligible for expansion if CV demonstrates a benefit.
+            scores[block] = float(((1.0 + coverage) * difficulty).mean().item())
         return scores
 
     def train_candidate(self, block, train_loader, train_extract, old_topology,
@@ -337,14 +343,11 @@ class DemandExpansion:
                 )
                 if not ok:
                     raise RuntimeError("CV modified historical modules: " + str(changed))
-            extra = sum(p.numel() for p in (
-                # The candidate's parameter count depends only on d and reduction.
-                self.runner._adapter_by_block(block).experts[:1]
-            ) for p in []) if False else self.runner._adapter_by_block(block).d_model
+            # Two dense bottleneck projections and one independent routing column.
+            d_model = self.runner._adapter_by_block(block).d_model
             reduction = int(self.runner.cfg.TRAINER.BiMC.VISUAL_MOE.INCREMENTAL_REDUCTION)
-            width = max(1, extra // reduction)
-            trainable_count = (extra * width + width + width * extra + extra
-                               + extra + 1)
+            width = max(1, d_model // reduction)
+            trainable_count = 2 * d_model * width + width + 2 * d_model + 1
             base_count = sum(
                 p.numel() for _, adapter in self.runner._moe_adapters()
                 for expert in adapter.experts for p in expert.parameters()
