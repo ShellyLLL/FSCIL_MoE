@@ -49,53 +49,44 @@ python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/t
 ### Dynamic FSCIL MoE runs
 
 The `bimc.yaml` configuration now auto-saves a dataset/seed-specific fixed
-support manifest, alongside session checkpoints, query-exclusive LOO training
-and demand-driven dynamic experts. For reproducible comparisons across model
-variants, explicitly reuse one manifest and run a no-expansion baseline:
+support manifest alongside session checkpoints. Use the same manifest for
+comparisons. The CUB200 run is:
 
 ~~~BASH
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --support_manifest checkpoints/fscil_moe/cub_seed1_support.json --expansion_mode none
+python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --support_manifest checkpoints/fscil_moe/cub_seed1_support.json
 ~~~
 
-The default `auto` mode computes each layer's discriminative coverage deficit:
-only samples with a negative all-seen visual LOO margin and descriptor coverage
-excess contribute expansion evidence. The largest positive eligible layer adds
-one Linear Gate, Expert and Scale. Training uses one softmax over `NULL` and all
-dynamic experts, refreshed query-exclusive visual prototypes each epoch, and only
-visual classification plus historical-path invariance losses. Deployment uses the
-same logits with hard Top-1 routing. A candidate is retained only when its hard
-deployment LOO objective plus historical invariance is lower than the pre-candidate
-objective; otherwise the exact pre-expansion state is restored. Force/session/block
-overrides are intentionally unavailable in the production path.
-The explicit full-auto CUB200 command is:
-
-~~~BASH
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --expansion_mode auto
-~~~
+At each incremental session, each eligible block receives a temporary candidate
+expert. Five support folds compare its held-out, task-local fused classifier
+loss with the unchanged encoder; at most one candidate is retained if its
+gain exceeds one standard error. Training refreshes source-exclusive visual
+prototypes, updates only the new expert and router column, and freezes them
+afterward. Historical class weights and encoders retain their creation versions.
+The frozen base encoder supplies common-space task evidence. Its task offsets
+jointly minimize class-balanced task loss using source-exclusive support
+features from every observed class. Expert logits only rank classes within
+each task; no task identity is supplied at inference.
 
 For staged development, reuse Session 0 and stop after Task 3 without changing
 the normal full-run default:
 
 ~~~BASH
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --resume checkpoints/fscil_moe/session_00.pth --expansion_mode auto --end_session 3
+python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --resume checkpoints/fscil_moe/session_00.pth --end_session 3
 ~~~
 
-Resume from a checkpoint produced by this safety-bounded version with:
+Resume from a checkpoint produced by this version (schema 9) with:
 
 ~~~BASH
 python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --resume checkpoints/fscil_moe/session_03.pth
 ~~~
 
-Legacy dynamic-expert checkpoint schemas are intentionally rejected when they
-predate the current logit-NULL routing and transactional safety contract.
-
-Each completed session also records per-expert/null routing and a deterministic
-support-proxy leave-one-expert-out diagnostic (`accuracy_gain` and
-`margin_gain`). It masks the selected residual without re-routing to another
-expert, so the reported value is that expert's direct marginal contribution.
-Historical experts additionally receive a support-only forward-interference
-report. Accuracy targets are kept outside runtime; use
-`python tools/report_regression.py --accuracies ...` after a run.
+Base-only schema 7/8 checkpoints can be reused. Earlier incremental
+checkpoints cannot be resumed because their experts were optimized for a
+different classifier objective. Compare the complete 11-session accuracy list
+with the target using the same fixed support manifest; the support-only gate
+diagnostics are not a substitute for test accuracy. `TaskDiagnostic` reports
+the actual task selection rate and an oracle-task within-class upper bound;
+the latter uses test labels only for analysis, never for predictions.
 
 ## Acknowledgment
 
@@ -106,6 +97,4 @@ In this repository, we build our code based on the following excellent open-sour
 - [FeCAM](https://github.com/dipamgoswami/FeCAM)
 - [CuPL](https://github.com/sarahpratt/CuPL)
 - [AdaptCLIPZS](https://github.com/cvl-umass/AdaptCLIPZS)
-
-
 
