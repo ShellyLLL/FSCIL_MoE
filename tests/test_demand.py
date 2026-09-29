@@ -9,7 +9,17 @@ import unittest
 import torch
 import torch.nn.functional as F
 
-from models.clip.model import VisionTransformer, VisualMoEAdapter
+# Load the standalone layer file without models.clip.__init__, which imports
+# runtime image downloading/transforms irrelevant to these CPU-only invariants.
+import importlib.util
+from pathlib import Path
+_spec = importlib.util.spec_from_file_location(
+    "fscil_clip_layers", Path(__file__).resolve().parents[1] / "models" / "clip" / "model.py"
+)
+_layers = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_layers)
+VisionTransformer = _layers.VisionTransformer
+VisualMoEAdapter = _layers.VisualMoEAdapter
 from engine.demand import (
     VersionedScorer, class_prototypes, source_stratified_folds, topology_key,
 )
