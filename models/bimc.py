@@ -737,11 +737,8 @@ class BiMC(nn.Module):
         fused_proto = refine_conflict_aware_fused_prototypes(
             raw_fused, torch.as_tensor(class_index), history_fused, history_ids, strength, margin
         )
-        # Re-express refined fusion as a visual prototype so legacy engine
-        # merge/forward paths (which know only image/text/descriptor keys) use it.
-        if self.cfg.DATASET.BETA < 1.0:
-            images_proto = F.normalize((fused_proto - self.cfg.DATASET.BETA * calibrated_text) /
-                                       max(1e-6, 1.0 - self.cfg.DATASET.BETA), dim=-1)
+        # Visual prototypes are always built from visual embeddings. Never
+        # invert an L2-normalized fused prototype (the norm is lost).
         ids = torch.as_tensor(class_index, device=fused_proto.device, dtype=torch.long)
         if history_fused is None:
             self._fused_history_prototypes, self._fused_history_class_ids = fused_proto.detach(), ids.detach()
