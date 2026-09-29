@@ -46,56 +46,57 @@ python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/t
 python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc_ensemble.yaml
 ~~~
 
-### Dynamic FSCIL MoE runs
+### Versioned demand-driven FSCIL (this development branch)
 
-The `bimc.yaml` configuration now auto-saves a dataset/seed-specific fixed
-support manifest, alongside session checkpoints, query-exclusive LOO training
-and demand-driven dynamic experts. For reproducible comparisons across model
-variants, explicitly reuse one manifest and run a no-expansion baseline:
+This branch preserves the patent's S1–S7 data flow: base MoE training, reuse
+of existing experts, classification-aware expansion, visual prototype
+calibration, LLM-description text calibration, and all-seen-class inference.
+In contrast with reconstruction-threshold-only CIL expansion, the S4 controller
+uses source-exclusive LOO classification margins to identify a discriminative
+deficit, uses topology-matched descriptors to rank candidate vision layers,
+then compares each candidate against **no expansion** using class-stratified,
+source-exclusive cross-validation. The objective is validation CE plus a small
+parameter-growth term; only the winning candidate is retrained on all five
+support examples and committed. All other candidates are discarded.
 
-~~~BASH
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --support_manifest checkpoints/fscil_moe/cub_seed1_support.json --expansion_mode none
-~~~
+Forgetting protection is architectural rather than a training heuristic:
+each historical classifier bank records its owner topology. Existing expert
+and routing columns are frozen; class-specific visual scores always use the
+same historical prefix-softmax topology used to compute that class prototype.
+A frozen Session-0 MoE supplies the shared reference space for base-to-novel
+visual calibration. Final S7 scores combine a topology-consistent reference
+fused prototype score and an owner-topology dynamic fused prototype score.
+The text encoder and descriptions stay frozen. Neither old training images
+nor a test-time task ID are required.
 
-The default `auto` mode computes each layer's discriminative coverage deficit:
-only samples with a negative all-seen visual LOO margin and descriptor coverage
-excess contribute expansion evidence. The largest positive eligible layer adds
-one Linear Gate, Expert and Scale. Training uses one softmax over `NULL` and all
-dynamic experts, refreshed query-exclusive visual prototypes each epoch, and only
-visual classification plus historical-path invariance losses. Deployment uses the
-same logits with hard Top-1 routing. A candidate is retained only when its hard
-deployment LOO objective plus historical invariance is lower than the pre-candidate
-objective; otherwise the exact pre-expansion state is restored. Force/session/block
-overrides are intentionally unavailable in the production path.
-The explicit full-auto CUB200 command is:
+```bash
+# Fix support images across variants by reusing the same manifest.
+python main.py --data_cfg configs/datasets/cub200.yaml \
+  --train_cfg configs/trainers/bimc.yaml \
+  --support_manifest checkpoints/fscil_moe/cub200_support_seed1.json
 
-~~~BASH
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --expansion_mode auto
-~~~
+# Stop after Session 3, then resume without resampling its support set.
+python main.py --data_cfg configs/datasets/cub200.yaml \
+  --train_cfg configs/trainers/bimc.yaml --end_session 3
 
-For staged development, reuse Session 0 and stop after Task 3 without changing
-the normal full-run default:
+python main.py --data_cfg configs/datasets/cub200.yaml \
+  --train_cfg configs/trainers/bimc.yaml \
+  --resume checkpoints/fscil_moe/session_03.pth
 
-~~~BASH
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --resume checkpoints/fscil_moe/session_00.pth --expansion_mode auto --end_session 3
-~~~
+# CPU-only model invariants: no dataset, GPU or pretrained checkpoint required.
+python -m unittest discover -s tests -p 'test_demand.py' -v
+```
 
-Resume from a checkpoint produced by this safety-bounded version with:
-
-~~~BASH
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --resume checkpoints/fscil_moe/session_03.pth
-~~~
-
-Legacy dynamic-expert checkpoint schemas are intentionally rejected when they
-predate the current logit-NULL routing and transactional safety contract.
-
-Each completed session also records per-expert/null routing and a deterministic
-support-proxy leave-one-expert-out diagnostic (`accuracy_gain` and
-`margin_gain`). It masks the selected residual without re-routing to another
-expert, so the reported value is that expert's direct marginal contribution.
-Historical experts additionally receive a support-only forward-interference
-report. Accuracy targets are kept outside runtime; use
-`python tools/report_regression.py --accuracies ...` after a run.
+The Version 7 checkpoint contract is intentionally incompatible with old
+single-space checkpoints. Run the new architecture from Session 0.
+`TRAINER.BiMC.DEMAND.CV_FOLDS`, `COMPLEXITY_WEIGHT`, and
+`DYNAMIC_WEIGHT` are configured in `configs/trainers/bimc.yaml`.
+Complexity and fusion coefficients should be tuned on class-disjoint
+pseudo-incremental splits of **base training classes**, never on incremental
+test images. Full five-fold candidate selection can be computationally
+expensive; it is performed once per increment, with at most one final
+committed expert per session. No AA/PD improvement is claimed without a
+complete, controlled multi-seed experiment.
 
 ## Acknowledgment
 
