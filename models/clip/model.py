@@ -204,10 +204,11 @@ class ExpandableRouter(nn.Module):
         self.columns.append(column)
         return len(self.columns) - 1
 
-    def forward(self, x):
+    def forward(self, x, num_columns=None):
         if not self.columns:
             raise RuntimeError("ExpandableRouter requires at least one column.")
-        logits = torch.cat([column(x) for column in self.columns], dim=-1)
+        selected = self.columns if num_columns is None else self.columns[:int(num_columns)]
+        logits = torch.cat([column(x) for column in selected], dim=-1)
         return logits, torch.softmax(logits, dim=-1)
 
 
@@ -347,14 +348,31 @@ class VisualMoEAdapter(nn.Module):
         self.descriptors.to(device=device, dtype=torch.float32)
         self.freeze_all()
 
-    def forward(self, x):
+    def remove_newest_expert(self):
+        if self.num_experts <= self.base_expert_count:
+            raise RuntimeError("Cannot remove a base expert.")
+        self.experts.pop(-1)
+        self.descriptors.pop(-1)
+        self.router.columns.pop(-1)
+        self.expert_birth_sessions.pop()
+        self.freeze_all()
+
+    def forward(self, x, max_session=None):
         if x.ndim != 3:
             raise ValueError("VisualMoEAdapter expects [tokens, batch, dim].")
         x_norm = self.layer_norm(x)
-        logits, weights = self.router(x_norm[0])
+        # The base mixture is never renormalised when incremental experts arrive.
+        base_logits, base_weights = self.router(x_norm[0], self.base_expert_count)
+        active = [index for index, birth in enumerate(self.expert_birth_sessions)
+                  if index >= self.base_expert_count and
+                  (max_session is None or birth <= max_session)]
+        gate_logits = [self.router.columns[index](x_norm[0]) for index in active]
+        weights = (torch.cat([base_weights] + [torch.sigmoid(value) for value in gate_logits], dim=-1)
+                   if gate_logits else base_weights)
+        logits = torch.cat([base_logits] + gate_logits, dim=-1) if gate_logits else base_logits
         residual, norms = torch.zeros_like(x_norm), []
-        for expert_id, expert in enumerate(self.experts):
-            weighted = expert(x_norm) * weights[:, expert_id].unsqueeze(0).unsqueeze(-1)
+        for column, expert_id in enumerate(list(range(self.base_expert_count)) + active):
+            weighted = self.experts[expert_id](x_norm) * weights[:, column].unsqueeze(0).unsqueeze(-1)
             residual = residual + weighted
             norms.append(weighted.detach().float().pow(2).mean().sqrt())
         residual = self.residual_scale.to(residual.dtype) * residual
@@ -383,12 +401,12 @@ class ResidualAttentionBlock(nn.Module):
         self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
         return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, max_session=None):
         x = x + self.attention(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         moe_aux = None
         if self.moe_adapter is not None:
-            moe_out, moe_aux = self.moe_adapter(x)
+            moe_out, moe_aux = self.moe_adapter(x, max_session=max_session)
             x = x + moe_out
         return x, moe_aux
 
@@ -399,10 +417,10 @@ class Transformer(nn.Module):
         self.layers = layers
         self.resblocks = nn.ModuleList([ResidualAttentionBlock(width, heads, attn_mask) for _ in range(layers)])
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, max_session=None):
         moe_aux_list = []
         for block in self.resblocks:
-            x, aux = block(x)
+            x, aux = block(x, max_session=max_session)
             if aux is not None: moe_aux_list.append(aux)
         return x, moe_aux_list
 
@@ -420,7 +438,8 @@ class VisionTransformer(nn.Module):
         self.ln_post = LayerNorm(width)
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
 
-    def forward(self, x: torch.Tensor, all_layer_outputs=False, return_moe_aux=False):
+    def forward(self, x: torch.Tensor, all_layer_outputs=False, return_moe_aux=False,
+                max_session=None):
         x = self.conv1(x)  
         x = x.reshape(x.shape[0], x.shape[1], -1)  
         x = x.permute(0, 2, 1)  
@@ -430,7 +449,7 @@ class VisionTransformer(nn.Module):
 
         if not all_layer_outputs:
             x = x.permute(1, 0, 2)  
-            x, moe_aux_list = self.transformer(x)
+            x, moe_aux_list = self.transformer(x, max_session=max_session)
             x = x.permute(1, 0, 2)  
             x = self.ln_post(x[:, 0, :])
             if self.proj is not None: x = x @ self.proj
@@ -440,7 +459,7 @@ class VisionTransformer(nn.Module):
             x = x.permute(1, 0, 2)  
             outputs, moe_aux_list = [], []
             for block in self.transformer.resblocks:
-                x, aux = block(x)
+                x, aux = block(x, max_session=max_session)
                 if aux is not None: moe_aux_list.append(aux)
                 cur_output = x.permute(1, 0, 2)
                 cur_output = self.ln_post(cur_output[:, 0, :])
@@ -502,9 +521,13 @@ class CLIP(nn.Module):
     def dtype(self):
         return self.visual.conv1.weight.dtype
 
-    def encode_image(self, image, return_moe_aux=False):
-        if return_moe_aux: return self.visual(image.type(self.dtype), return_moe_aux=True)
-        return self.visual(image.type(self.dtype))
+    def encode_image(self, image, return_moe_aux=False, max_session=None):
+        if not isinstance(self.visual, VisionTransformer):
+            return self.visual(image.type(self.dtype))
+        if return_moe_aux:
+            return self.visual(image.type(self.dtype), return_moe_aux=True,
+                               max_session=max_session)
+        return self.visual(image.type(self.dtype), max_session=max_session)
 
     def encode_text(self, text):
         x = self.token_embedding(text).type(self.dtype)
