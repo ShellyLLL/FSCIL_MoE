@@ -168,10 +168,14 @@ class ExpansionInvariantTests(unittest.TestCase):
                 self.base_vision_prototype = torch.eye(4)[:2]
                 self.cfg, self.template = cfg, ["a {}"]
 
+            @torch.no_grad()
             def extract_img_feature(self, images, max_session=None):
+                return self.extract_img_feature_train(images, max_session)[0]
+
+            def extract_img_feature_train(self, images, max_session=None):
                 adapter = self.clip_model.visual.transformer.resblocks[0].moe_adapter
-                residual, _ = adapter(torch.stack([images, images]), max_session=max_session)
-                return images + residual[0]
+                residual, aux = adapter(torch.stack([images, images]), max_session=max_session)
+                return images + residual[0], [aux]
 
             def build_leave_one_out_prototypes(self, loader, class_index, max_session=None):
                 features, labels, sources = [], [], []
@@ -219,6 +223,17 @@ class ExpansionInvariantTests(unittest.TestCase):
         old = {"class_ids": torch.tensor([0, 1]), "encoder_version": 0,
                "image_proto": torch.eye(4)[:2], "text_features": torch.eye(4)[:2],
                "description_proto": torch.eye(4)[:2], "fused_proto": torch.eye(4)[:2]}
+        runner.model.add_expert(0, 1)
+        text, description = runner._text_prototypes(["two", "three"], [2, 3])
+        support_bank = runner._support_bank(extraction, [2, 3], text, description, 1)
+        batch = next(iter(training))
+        logits, targets = runner._incremental_logits(
+            batch["image"], batch["label"], batch["source_id"], support_bank,
+            runner.merge_dicts([old]), 1, 100.0)
+        self.assertTrue(logits.requires_grad)
+        F.cross_entropy(logits, targets).backward()
+        self.assertIsNotNone(runner._adapter_by_block(0).experts[-1].c_proj.weight.grad)
+        runner._adapter_by_block(0).remove_newest_expert()
         result = runner.train_incremental_task(
             1, training, extraction, [2, 3], ["two", "three"], [old], True)
         self.assertEqual(len(result["decisions"]), 1)

@@ -572,8 +572,13 @@ class Runner:
             new_prototypes = support_bank["fused_loo"][rows]
         else:
             new_prototypes = support_bank["fused_full"].unsqueeze(0).expand(images.size(0), -1, -1)
-        features = F.normalize(self.model_without_dp.extract_img_feature(
-            images, max_session=version).float(), dim=-1)
+        if torch.is_grad_enabled():
+            features, _ = self.model_without_dp.extract_img_feature_train(
+                images, max_session=version)
+        else:
+            features = self.model_without_dp.extract_img_feature(
+                images, max_session=version)
+        features = F.normalize(features.float(), dim=-1)
         new_logits = scale * torch.einsum("bd,bcd->bc", features, new_prototypes.float())
         ids = torch.cat([
             torch.as_tensor([] if old_state is None else old_state["class_ids"],
