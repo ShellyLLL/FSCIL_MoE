@@ -46,6 +46,13 @@ TRAINER:
       DESCRIPTOR_EPS: 1.0e-4
       EXPANSION_Z_THRESHOLD: 1.0
 
+    # Cross-validated expert selection, fixed before incremental evaluation.
+    # Tune complexity/fusion on class-disjoint pseudo-incremental BASE validation.
+    DEMAND:
+      CV_FOLDS: 5
+      COMPLEXITY_WEIGHT: 0.01
+      DYNAMIC_WEIGHT: 0.5
+
     INCREMENTAL:
       EPOCHS: 6
       LOGIT_SCALE: 25.0
