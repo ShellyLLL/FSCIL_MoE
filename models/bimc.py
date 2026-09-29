@@ -713,17 +713,24 @@ class BiMC(nn.Module):
         cls_begin_index = class_index[0]
         text_features, _ = self.inference_text_feature(class_names, self.template, cls_begin_index)
         _, _, description_proto = self.inference_all_description_feature(class_names, self.cfg.DATASET.GPT_PATH, cls_begin_index)
-        images_features, _, images_proto = self.inference_all_img_feature(
+        images_features, anchor_labels, images_proto = self.inference_all_img_feature(
             loader, max_session=encoder_version)
+        anchor_features = images_features
+        anchor_proto = images_proto
         if cls_begin_index != 0:
+            if encoder_version != 0:
+                anchor_features, anchor_labels, anchor_proto = self.inference_all_img_feature(
+                    loader, max_session=0)
             if calibrate_novel_vision_proto:
-                _, _, reference_proto = self.inference_all_img_feature(loader, max_session=0)
-                images_proto = self.calibrate_incremental_visual(images_proto, reference_proto)
+                images_proto = self.calibrate_incremental_visual(images_proto, anchor_proto)
+                anchor_proto = self.soft_calibration(self.base_vision_prototype, anchor_proto)
         else:
             self.base_vision_prototype = images_proto
         lambda_t = self.cfg.TRAINER.BiMC.LAMBDA_T if self.cfg.TRAINER.BiMC.TEXT_CALIBRATION else 0.0
         calibrated_text = F.normalize((1 - lambda_t) * text_features + lambda_t * description_proto, dim=-1)
         raw_fused = F.normalize(self.cfg.DATASET.BETA * calibrated_text + (1 - self.cfg.DATASET.BETA) * images_proto, dim=-1)
+        anchor_fused = F.normalize(self.cfg.DATASET.BETA * calibrated_text +
+                                   (1 - self.cfg.DATASET.BETA) * anchor_proto, dim=-1)
         history_fused = getattr(self, "_fused_history_prototypes", None)
         history_ids = getattr(self, "_fused_history_class_ids", None)
         strength = float(getattr(self.cfg.TRAINER.BiMC, "FUSED_CONFLICT_STRENGTH", 0.0))
@@ -739,6 +746,11 @@ class BiMC(nn.Module):
             keep = (history_ids[:, None].to(ids.device) != ids[None, :]).all(dim=1)
             self._fused_history_prototypes = torch.cat([history_fused[keep], fused_proto.detach()], dim=0)
             self._fused_history_class_ids = torch.cat([history_ids[keep].to(ids.device), ids.detach()], dim=0)
+        source_ids = getattr(getattr(loader, "dataset", None), "source_ids", None)
+        source_ids = (torch.arange(len(anchor_labels)) if source_ids is None else
+                      torch.as_tensor(source_ids, dtype=torch.long).cpu())
+        if len(source_ids) != len(anchor_labels):
+            raise ValueError("Anchor source ids must align with support features.")
         return {
             "description_proto": description_proto,
             "text_features": text_features,
@@ -748,6 +760,10 @@ class BiMC(nn.Module):
             "sample_cnt": len(images_features),
             "initial_fused_proto": raw_fused,
             "fused_proto": fused_proto,
+            "anchor_fused_proto": anchor_fused,
+            "anchor_features": anchor_features.detach().to(device="cpu", dtype=torch.float16),
+            "anchor_labels": anchor_labels.detach().cpu(),
+            "anchor_source_ids": source_ids,
             "encoder_version": 0 if encoder_version is None else int(encoder_version),
         }
 
