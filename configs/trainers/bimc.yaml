@@ -70,6 +70,7 @@ TRAINER:
       CE_WEIGHT: 1.0
       LB_WEIGHT: 0.01
       KD_WEIGHT: 0.5
+      ANCHOR_WEIGHT: 0.1
 
     PROTOTYPE_REFINEMENT:
       ENABLE: False
