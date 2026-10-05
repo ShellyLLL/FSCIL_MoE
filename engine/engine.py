@@ -120,6 +120,8 @@ class Runner:
             raise ValueError("Classifier states contain duplicate global class ids.")
         order = all_ids.argsort()
         result = {"class_ids": all_ids[order]}
+        result["global_objective"] = any(bool(state.get("global_objective", False))
+                                         for state in dict_list)
         result["encoder_versions"] = torch.cat([
             torch.full_like(ids, int(state.get("encoder_version", 0)))
             for ids, state in zip(per_state_ids, dict_list)
@@ -635,7 +637,8 @@ class Runner:
         return result
 
     def _train_candidate(self, task_id, block_idx, train_loader, extract_loader,
-                         class_index, text, description, calibrate):
+                         class_index, text, description, calibrate,
+                         global_state=None):
         adapter = self._adapter_by_block(block_idx)
         adapter.set_newest_trainable()
         optim_cfg = self.cfg.TRAINER.BiMC.OPTIM
@@ -658,7 +661,34 @@ class Runner:
                 optimizer.zero_grad(set_to_none=True)
                 logits, targets = self._incremental_logits(
                     images, labels, source_ids, bank, task_id, scale)
-                loss = F.cross_entropy(logits, targets)
+                if global_state is None:
+                    loss = F.cross_entropy(logits, targets)
+                else:
+                    # Train the new expert against the same global classifier
+                    # used at deployment. Historical columns are scored with
+                    # the current feature only for this objective; their
+                    # deployed predictions remain versioned and frozen.
+                    current_features, _ = self.model_without_dp.extract_img_feature_train(
+                        images, max_session=task_id)
+                    current_features = F.normalize(current_features.float(), dim=-1)
+                    old_proto = F.normalize(global_state["fused_proto"].to(self.device).float(), dim=-1)
+                    old_logits = scale * current_features @ old_proto.t()
+                    global_logits = torch.cat([old_logits, logits], dim=1)
+                    merged_ids = torch.cat([
+                        global_state["class_ids"].to(self.device),
+                        torch.as_tensor(class_index, device=self.device, dtype=torch.long),
+                    ])
+                    targets = self._targets_to_columns(labels, {"class_ids": merged_ids})
+                    loss = F.cross_entropy(global_logits, targets)
+                    # Keep the newly learned representation close to the
+                    # frozen base representation on the same support images.
+                    with torch.no_grad():
+                        teacher = self.model_without_dp.extract_teacher_features(images)
+                    loss = loss + float(getattr(
+                        self.cfg.TRAINER.BiMC.LOSS, "ANCHOR_WEIGHT", 0.1
+                    )) * (1.0 - F.cosine_similarity(
+                        current_features, F.normalize(teacher.float(), dim=-1), dim=-1
+                    ).mean())
                 if not bool(torch.isfinite(loss).item()):
                     raise FloatingPointError("Non-finite fused incremental loss.")
                 loss.backward()
@@ -672,7 +702,7 @@ class Runner:
 
     @torch.no_grad()
     def _held_out_loss(self, validation_loader, support_loader, class_index, text,
-                       description, version, calibrate):
+                       description, version, calibrate, global_state=None):
         self.model.eval()
         bank = self._support_bank(support_loader, class_index, text, description,
                                   version, calibrate)
@@ -682,12 +712,25 @@ class Runner:
             logits, targets = self._incremental_logits(
                 images, labels, None, bank, version,
                 float(self.cfg.TRAINER.BiMC.INCREMENTAL.LOGIT_SCALE), leave_one_out=False)
+            if global_state is not None:
+                scale = float(self.cfg.TRAINER.BiMC.INCREMENTAL.LOGIT_SCALE)
+                features = F.normalize(self.model_without_dp.extract_img_feature(
+                    images, max_session=version).float(), dim=-1)
+                old_proto = F.normalize(global_state["fused_proto"].to(self.device).float(), dim=-1)
+                old_logits = scale * features @ old_proto.t()
+                logits = torch.cat([old_logits, logits], dim=1)
+                merged_ids = torch.cat([
+                    global_state["class_ids"].to(self.device),
+                    torch.as_tensor(class_index, device=self.device, dtype=torch.long),
+                ])
+                targets = self._targets_to_columns(labels, {"class_ids": merged_ids})
             total += float(F.cross_entropy(logits, targets, reduction="sum").item())
             count += labels.numel()
         return total / max(count, 1)
 
     def train_incremental_task(self, task_id, train_loader, extract_loader, class_index,
-                               current_class_name, enable_visual_calibration):
+                               current_class_name, enable_visual_calibration,
+                               global_state=None):
         text, description = self._text_prototypes(current_class_name, class_index)
         folds = self._support_folds(train_loader, extract_loader)
         previous_version = self._current_encoder_version()
@@ -697,7 +740,8 @@ class Runner:
             return {"trained": False, "decisions": [], "expanded": [],
                     "encoder_version": previous_version}
         null_losses = [self._held_out_loss(val, fit_extract, class_index, text, description,
-                                           previous_version, enable_visual_calibration)
+                                           previous_version, enable_visual_calibration,
+                                           global_state)
                        for _, fit_extract, val in folds]
         decisions = []
         for block_idx in self.model_without_dp.expandable_blocks():
@@ -711,10 +755,10 @@ class Runner:
                 adapter.router.columns[-1].load_state_dict(initial_router)
                 self._train_candidate(task_id, block_idx, fit_train, fit_extract,
                                       class_index, text, description,
-                                      enable_visual_calibration)
+                                      enable_visual_calibration, global_state)
                 candidate_losses.append(self._held_out_loss(
                     validation, fit_extract, class_index, text, description,
-                    task_id, enable_visual_calibration))
+                    task_id, enable_visual_calibration, global_state))
             adapter.remove_newest_expert()
             gains = np.asarray(null_losses) - np.asarray(candidate_losses)
             decisions.append({"block_idx": block_idx, "null_loss": float(np.mean(null_losses)),
@@ -733,7 +777,7 @@ class Runner:
         expert_id = self.model_without_dp.add_expert(block_idx, task_id)
         epochs = self._train_candidate(task_id, block_idx, train_loader, extract_loader,
                                        class_index, text, description,
-                                       enable_visual_calibration)
+                                       enable_visual_calibration, global_state)
         print(f"=> [Accepted][Task {task_id}][B{block_idx}] expert={expert_id} "
               f"validation_gain={best['gain']:.5f}")
         return {"trained": True, "decisions": decisions,
@@ -915,6 +959,7 @@ class Runner:
                     adaptation = self.train_incremental_task(
                         task_id, train_loader, extract_loader, class_index,
                         current_class_name, enable_visual_calibration,
+                        global_state=old_state,
                     )
                     plan_summary = self._cpu_copy(adaptation["decisions"])
                 self.model.eval()
@@ -924,6 +969,7 @@ class Runner:
                     adaptation["encoder_version"] if adaptation is not None
                     else self._current_encoder_version(),
                 )
+                task_stat["global_objective"] = True
                 state_dict_list.append(task_stat)
                 state_dict_list[-1]["creation_session"] = int(task_id)
 
@@ -1013,9 +1059,14 @@ class Runner:
             name: self.evaluator.calc_accuracy(logits, targets, task_id, class_ids=state_dict["class_ids"])
             for name, logits in logits_by_variant.items()
         }
-        result = dict(variants["retained"])
+        # The global versioned classifier is the deployment classifier for
+        # states trained with the global objective. Keep the anchor-retained
+        # path available as a diagnostic and for legacy checkpoints.
+        use_global = bool(state_dict.get("global_objective", False))
+        deployed_name = "refined" if use_global else "retained"
+        result = dict(variants[deployed_name])
         result["classifier_variants"] = variants
-        logits = logits_by_variant["retained"]
+        logits = logits_by_variant[deployed_name]
         columns = self._targets_to_columns(targets, state_dict)
         task_ids = state_dict["task_ids"].to(logits.device)
         true_tasks = task_ids[columns]
@@ -1029,6 +1080,7 @@ class Runner:
         result["error_flow"] = self.evaluator.error_flow(
             logits, targets, task_id, class_ids=state_dict["class_ids"]
         )
+        result["deployed_classifier"] = deployed_name
         print(
             "=> [Classifier] visual={:.2f} text={:.2f} bimc={:.2f} refined={:.2f} retained={:.2f}".format(
                 variants["visual"]["mean_acc"], variants["text"]["mean_acc"],
