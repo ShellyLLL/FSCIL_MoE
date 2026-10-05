@@ -658,7 +658,22 @@ class Runner:
                 optimizer.zero_grad(set_to_none=True)
                 logits, targets = self._incremental_logits(
                     images, labels, source_ids, bank, task_id, scale)
+                # Train only the current novel classes. Historical classes keep
+                # their frozen encoder versions and retained inference path;
+                # mixing them with the current feature space causes a
+                # train/deployment mismatch. Anchor preservation regularizes
+                # the new expert against overfitting the few-shot support set.
                 loss = F.cross_entropy(logits, targets)
+                current_features, _ = self.model_without_dp.extract_img_feature_train(
+                    images, max_session=task_id)
+                current_features = F.normalize(current_features.float(), dim=-1)
+                with torch.no_grad():
+                    teacher = self.model_without_dp.extract_teacher_features(images)
+                anchor_weight = float(getattr(
+                    self.cfg.TRAINER.BiMC.LOSS, "ANCHOR_WEIGHT", 0.1))
+                loss = loss + anchor_weight * (1.0 - F.cosine_similarity(
+                    current_features, F.normalize(teacher.float(), dim=-1), dim=-1
+                ).mean())
                 if not bool(torch.isfinite(loss).item()):
                     raise FloatingPointError("Non-finite fused incremental loss.")
                 loss.backward()
