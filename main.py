@@ -93,7 +93,9 @@ def extend_cfg(cfg):
     cfg.TRAINER.BiMC.LOSS.CE_WEIGHT = 1.0
     cfg.TRAINER.BiMC.LOSS.LB_WEIGHT = 0.01
     cfg.TRAINER.BiMC.LOSS.KD_WEIGHT = 0.5
-    # Weight for keeping newly adapted features near the frozen anchor encoder.\n    cfg.TRAINER.BiMC.LOSS.ANCHOR_WEIGHT = 0.1\n
+    # Weight for keeping newly adapted features near the frozen anchor encoder.
+    cfg.TRAINER.BiMC.LOSS.ANCHOR_WEIGHT = 0.1
+
     cfg.TRAINER.BiMC.PROTOTYPE_REFINEMENT = CN()
     cfg.TRAINER.BiMC.PROTOTYPE_REFINEMENT.ENABLE = False
     cfg.TRAINER.BiMC.PROTOTYPE_REFINEMENT.EPOCHS = 30
