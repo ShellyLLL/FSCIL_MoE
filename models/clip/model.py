@@ -134,60 +134,6 @@ class QuickGELU(nn.Module):
         return x * torch.sigmoid(1.702 * x)
 
 
-class RepresentationDescriptor(nn.Module):
-    """FP32 reconstruction descriptor for one expert's local input distribution."""
-
-    def __init__(self, d_model, descriptor_dim=64, eps=1e-4):
-        super().__init__()
-        self.d_model, self.eps = int(d_model), float(eps)
-        self.descriptor_dim = max(1, min(int(descriptor_dim), self.d_model))
-        self.encoder = nn.Linear(self.d_model, self.descriptor_dim)
-        self.activation = QuickGELU()
-        self.decoder = nn.Linear(self.descriptor_dim, self.d_model)
-        self.register_buffer("mean", torch.tensor(0.0, dtype=torch.float32))
-        self.register_buffer("std", torch.tensor(1.0, dtype=torch.float32))
-        self.register_buffer("fit_sample_count", torch.tensor(0, dtype=torch.long))
-        self.register_buffer("calibration_sample_count", torch.tensor(0, dtype=torch.long))
-
-    def _reconstruct_fp32(self, x):
-        encoded = F.linear(x.float(), self.encoder.weight.float(), self.encoder.bias.float())
-        return F.linear(self.activation(encoded), self.decoder.weight.float(), self.decoder.bias.float())
-
-    def forward(self, x):
-        return self._reconstruct_fp32(x).to(dtype=x.dtype)
-
-    def reconstruction_error(self, x):
-        values = x.detach().float()
-        return (self._reconstruct_fp32(values) - values).pow(2).mean(dim=-1)
-
-    @torch.no_grad()
-    def update_stats(self, errors, responsibilities=None, fit_sample_count=None):
-        errors = torch.as_tensor(errors, device=self.mean.device, dtype=torch.float32).reshape(-1)
-        finite = torch.isfinite(errors)
-        errors = errors[finite]
-        if errors.numel() == 0:
-            raise ValueError("descriptor calibration requires finite errors.")
-        weights = torch.ones_like(errors) if responsibilities is None else torch.as_tensor(
-            responsibilities, device=self.mean.device, dtype=torch.float32
-        ).reshape(-1)[finite].clamp_min(0)
-        mass = weights.sum()
-        if not bool(mass.gt(0).item()):
-            raise ValueError("descriptor responsibilities require positive mass.")
-        mean = (weights * errors).sum() / mass
-        variance = (weights * (errors - mean).square()).sum() / mass
-        self.mean.copy_(mean)
-        self.std.copy_(variance.sqrt().clamp_min(max(self.eps, abs(float(mean.item())) * self.eps)))
-        self.fit_sample_count.fill_(errors.numel() if fit_sample_count is None else int(fit_sample_count))
-        self.calibration_sample_count.fill_(errors.numel())
-        return self.mean, self.std
-
-    def standardized_score(self, x):
-        return (self.reconstruction_error(x) - self.mean) / self.std.clamp_min(self.eps)
-
-    def is_ready(self):
-        return int(self.fit_sample_count.item()) > 0 and int(self.calibration_sample_count.item()) > 0
-
-
 class ExpandableRouter(nn.Module):
     """Soft router with independently freezable output columns."""
 
@@ -227,23 +173,18 @@ class BottleneckExpert(nn.Module):
 
 
 class VisualMoEAdapter(nn.Module):
-    """Unified expert pool, descriptors and expandable soft router."""
+    """Base mixture with session-local residual experts."""
 
-    def __init__(self, d_model, num_experts=4, reduction=4, residual_scale_init=1.0,
-                 descriptor_dim=64, descriptor_eps=1e-4):
+    def __init__(self, d_model, num_experts=4, reduction=4, residual_scale_init=1.0):
         super().__init__()
         self.d_model, self.base_expert_count = int(d_model), int(num_experts)
-        self.default_reduction, self.descriptor_dim = int(reduction), int(descriptor_dim)
-        self.descriptor_eps = float(descriptor_eps)
+        self.default_reduction = int(reduction)
         self.layer_norm = LayerNorm(self.d_model)
         self.residual_scale = nn.Parameter(torch.ones(1) * float(residual_scale_init))
         self.experts = nn.ModuleList([BottleneckExpert(self.d_model, reduction)
                                       for _ in range(self.base_expert_count)])
-        self.descriptors = nn.ModuleList([
-            RepresentationDescriptor(self.d_model, descriptor_dim, descriptor_eps)
-            for _ in range(self.base_expert_count)
-        ])
         self.router = ExpandableRouter(self.d_model, self.base_expert_count)
+        self.residual_coefficients = nn.ParameterList([nn.Parameter(torch.ones(1)) for _ in range(self.base_expert_count)])
         self.expert_birth_sessions = [0] * self.base_expert_count
 
     @property
@@ -253,40 +194,19 @@ class VisualMoEAdapter(nn.Module):
     def num_incremental_experts(self):
         return max(0, self.num_experts - self.base_expert_count)
 
-    def assert_descriptors_ready(self):
-        if len(self.descriptors) != self.num_experts:
-            raise RuntimeError("every deployed expert must own one descriptor.")
-        missing = [i for i, descriptor in enumerate(self.descriptors) if not descriptor.is_ready()]
-        if missing:
-            raise RuntimeError(f"deployed experts have uncalibrated descriptors: {missing}")
-
-    def descriptor_scores(self, x, require_ready=True):
-        if require_ready:
-            self.assert_descriptors_ready()
-        return torch.stack([descriptor.standardized_score(x) for descriptor in self.descriptors], dim=-1)
-
-    @torch.no_grad()
-    def update_descriptor_stats(self, errors, expert_id, responsibilities=None, fit_sample_count=None):
-        return self.descriptors[int(expert_id)].update_stats(
-            errors, responsibilities=responsibilities, fit_sample_count=fit_sample_count
-        )
-
     def freeze_all(self):
         for parameter in self.parameters():
             parameter.requires_grad = False
             parameter.grad = None
         self.eval()
 
-    def set_newest_trainable(self, descriptor=False):
+    def set_newest_trainable(self):
         if self.num_experts <= self.base_expert_count:
             raise RuntimeError("there is no incremental expert to train.")
         self.freeze_all()
-        for module in (self.experts[-1], self.router.columns[-1]):
-            for parameter in module.parameters():
-                parameter.requires_grad = True
-        if descriptor:
-            for parameter in self.descriptors[-1].parameters():
-                parameter.requires_grad = True
+        for parameter in self.experts[-1].parameters():
+            parameter.requires_grad = True
+        self.residual_coefficients[-1].requires_grad = True
         self.train()
 
     def add_expert(self, session_id, reduction=None):
@@ -294,23 +214,19 @@ class VisualMoEAdapter(nn.Module):
         reduction = self.default_reduction if reduction is None else int(reduction)
         self.experts.append(BottleneckExpert(self.d_model, reduction, zero_init_up=True).to(
             device=self.residual_scale.device, dtype=self.residual_scale.dtype))
-        self.descriptors.append(RepresentationDescriptor(
-            self.d_model, self.descriptor_dim, self.descriptor_eps).to(device=self.residual_scale.device))
         self.router.add_column()
+        self.residual_coefficients.append(nn.Parameter(torch.ones(1, device=self.residual_scale.device, dtype=self.residual_scale.dtype)))
         self.router.columns[-1].to(device=self.residual_scale.device, dtype=self.residual_scale.dtype)
         self.expert_birth_sessions.append(int(session_id))
         self.set_newest_trainable()
         return self.num_experts - 1
 
-    def newest_parameters(self, include_descriptor=False):
-        parameters = list(self.experts[-1].parameters()) + list(self.router.columns[-1].parameters())
-        if include_descriptor:
-            parameters += list(self.descriptors[-1].parameters())
-        return parameters
+    def newest_parameters(self):
+        return list(self.experts[-1].parameters()) + [self.residual_coefficients[-1]]
 
     def historical_named_parameters(self):
         newest = self.num_experts - 1
-        prefixes = (f"experts.{newest}.", f"router.columns.{newest}.", f"descriptors.{newest}.")
+        prefixes = (f"experts.{newest}.", f"residual_coefficients.{newest}.")
         for name, parameter in self.named_parameters():
             if not name.startswith(prefixes):
                 yield name, parameter
@@ -333,27 +249,26 @@ class VisualMoEAdapter(nn.Module):
         specs = list(topology.get("experts", []))
         if len(specs) < self.base_expert_count:
             raise ValueError("MoE topology has fewer experts than the base pool.")
-        self.experts, self.descriptors = nn.ModuleList(), nn.ModuleList()
-        self.router, self.expert_birth_sessions = ExpandableRouter(self.d_model), []
+        self.experts = nn.ModuleList()
+        self.router, self.residual_coefficients, self.expert_birth_sessions = ExpandableRouter(self.d_model), nn.ParameterList(), []
         for spec in specs:
             reduction = int(spec.get("reduction", self.default_reduction))
             self.experts.append(BottleneckExpert(self.d_model, reduction))
-            self.descriptors.append(RepresentationDescriptor(
-                self.d_model, self.descriptor_dim, self.descriptor_eps))
             self.router.add_column()
+            self.residual_coefficients.append(nn.Parameter(torch.ones(1)))
             self.expert_birth_sessions.append(int(spec.get("birth_session", 0)))
         device, dtype = self.residual_scale.device, self.residual_scale.dtype
         self.experts.to(device=device, dtype=dtype)
         self.router.to(device=device, dtype=dtype)
-        self.descriptors.to(device=device, dtype=torch.float32)
+        self.residual_coefficients.to(device=device, dtype=dtype)
         self.freeze_all()
 
     def remove_newest_expert(self):
         if self.num_experts <= self.base_expert_count:
             raise RuntimeError("Cannot remove a base expert.")
         self.experts.pop(-1)
-        self.descriptors.pop(-1)
         self.router.columns.pop(-1)
+        self.residual_coefficients = nn.ParameterList(list(self.residual_coefficients[:-1]))
         self.expert_birth_sessions.pop()
         self.freeze_all()
 
@@ -363,23 +278,27 @@ class VisualMoEAdapter(nn.Module):
         x_norm = self.layer_norm(x)
         # The base mixture is never renormalised when incremental experts arrive.
         base_logits, base_weights = self.router(x_norm[0], self.base_expert_count)
-        active = [index for index, birth in enumerate(self.expert_birth_sessions)
-                  if index >= self.base_expert_count and
-                  (max_session is None or birth <= max_session)]
-        gate_logits = [self.router.columns[index](x_norm[0]) for index in active]
-        weights = (torch.cat([base_weights] + [torch.sigmoid(value) for value in gate_logits], dim=-1)
-                   if gate_logits else base_weights)
-        logits = torch.cat([base_logits] + gate_logits, dim=-1) if gate_logits else base_logits
-        residual, norms = torch.zeros_like(x_norm), []
-        for column, expert_id in enumerate(list(range(self.base_expert_count)) + active):
-            weighted = self.experts[expert_id](x_norm) * weights[:, column].unsqueeze(0).unsqueeze(-1)
+        # Base experts retain their learned softmax mixture. Incremental capacity
+        # is a zero-initialized residual for the class/session version being queried.
+        residual = torch.zeros_like(x_norm)
+        base_terms = []
+        for column, expert_id in enumerate(range(self.base_expert_count)):
+            weighted = self.experts[expert_id](x_norm) * base_weights[:, column].unsqueeze(0).unsqueeze(-1)
             residual = residual + weighted
-            norms.append(weighted.detach().float().pow(2).mean().sqrt())
+            base_terms.append(weighted.detach().float().pow(2).mean().sqrt())
+        active = [index for index, birth in enumerate(self.expert_birth_sessions)
+                  if index >= self.base_expert_count and birth == max_session]
+        incremental_terms = []
+        for expert_id in active:
+            weighted = self.experts[expert_id](x_norm) * self.residual_coefficients[expert_id].to(x_norm.dtype)
+            residual = residual + weighted
+            incremental_terms.append(weighted.detach().float().pow(2).mean().sqrt())
         residual = self.residual_scale.to(residual.dtype) * residual
-        return residual, {"logits": logits, "route_weights": weights,
+        weights = base_weights
+        return residual, {"logits": base_logits, "route_weights": weights,
                           "top_k_indices": weights.argmax(dim=-1, keepdim=True),
                           "cls_in": x_norm[0], "patch_mean_in": x_norm[1:].mean(dim=0),
-                          "expert_residual_norms": torch.stack(norms),
+                          "expert_residual_norms": torch.stack(base_terms + incremental_terms),
                           "token_residual": residual.detach()}
 
 
@@ -613,8 +532,6 @@ def build_model(state_dict: dict, cfg=None):
             "BASE_SCALE_INIT",
             getattr(moe_cfg, "RESIDUAL_SCALE_INIT", 1.0),
         )
-        descriptor_dim = getattr(moe_cfg, "DESCRIPTOR_DIM", 64)
-        descriptor_eps = getattr(moe_cfg, "DESCRIPTOR_EPS", 1e-4)
         for idx in moe_cfg.INSERT_BLOCKS:
             if idx < 0: idx = len(model.visual.transformer.resblocks) + idx
             block = model.visual.transformer.resblocks[idx]
@@ -623,8 +540,6 @@ def build_model(state_dict: dict, cfg=None):
                 num_experts=num_base_experts,
                 reduction=base_reduction,
                 residual_scale_init=base_scale_init,
-                descriptor_dim=descriptor_dim,
-                descriptor_eps=descriptor_eps,
             )
         convert_weights(model)
     return model.eval()
