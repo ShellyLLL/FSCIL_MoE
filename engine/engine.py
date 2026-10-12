@@ -325,7 +325,15 @@ class Runner:
         if not isinstance(topology, dict):
             raise TypeError("Resume checkpoint moe_topology must be a mapping.")
         self.model_without_dp.rebuild_moe_topology(topology)
-        self.model_without_dp.load_state_dict(payload["model_state"], strict=True)
+        # Migrate pre-residual checkpoints: RD buffers are obsolete and the
+        # new residual coefficients start at their neutral value.
+        state = dict(payload["model_state"])
+        state = {key: value for key, value in state.items()
+                 if ".descriptors." not in key}
+        for key, value in self.model_without_dp.state_dict().items():
+            if "residual_coefficients." in key and key not in state:
+                state[key] = torch.ones_like(value)
+        self.model_without_dp.load_state_dict(state, strict=True)
         for _, adapter in self._moe_adapters():
             adapter.freeze_all()
         manifest = payload.get("support_manifest")
@@ -397,7 +405,7 @@ class Runner:
         return target
 
     # ------------------------------------------------------------------
-    # Base MoE and descriptors
+    # Base MoE
     # ------------------------------------------------------------------
     def build_base_optimizer(self):
         optim_cfg = self.cfg.TRAINER.BiMC.OPTIM
@@ -407,72 +415,11 @@ class Runner:
         for name, param in self.model_without_dp.named_parameters():
             if not param.requires_grad or "moe_adapter" not in name:
                 continue
-            # Descriptors are fitted in a separate reconstruction-only stage.
-            if ".descriptors." in name:
-                continue
             moe_params.append(param)
         if not moe_params:
             raise RuntimeError("No trainable Base visual MoE parameters were found.")
         return optim.AdamW([{ "params": moe_params, "lr": base_lr }], weight_decay=wd,
                            betas=tuple(_cfg_value(optim_cfg, "BETAS", (0.9, 0.999))))
-
-    def _train_descriptor(self, adapter, expert_id, values, responsibilities, epochs):
-        descriptor = adapter.descriptors[int(expert_id)]
-        descriptor.float()
-        values, responsibilities = values.detach(), responsibilities.detach().float()
-        count = values.size(0)
-        if count == 0:
-            raise RuntimeError("descriptor training received no features.")
-        order = torch.randperm(count, device=values.device)
-        split = max(1, min(count - 1, int(round(count * 0.8)))) if count > 1 else 1
-        train_idx = order[:split]
-        calibration_idx = order[split:] if split < count else order
-        for parameter in descriptor.parameters():
-            parameter.requires_grad = True
-        descriptor.train()
-        optimizer = optim.AdamW(
-            descriptor.parameters(),
-            lr=float(_cfg_value(self.cfg.TRAINER.BiMC.OPTIM, "LR_DESCRIPTOR", 1e-3)),
-            weight_decay=0.0,
-        )
-        for _ in range(max(1, int(epochs))):
-            optimizer.zero_grad(set_to_none=True)
-            errors = descriptor.reconstruction_error(values[train_idx])
-            weights = responsibilities[train_idx]
-            loss = (weights * errors).sum() / weights.sum().clamp_min(1e-8)
-            loss.backward()
-            optimizer.step()
-        descriptor.eval()
-        with torch.no_grad():
-            errors = descriptor.reconstruction_error(values[calibration_idx])
-            adapter.update_descriptor_stats(
-                errors, expert_id, responsibilities[calibration_idx],
-                fit_sample_count=train_idx.numel(),
-            )
-        for parameter in descriptor.parameters():
-            parameter.requires_grad = False
-            parameter.grad = None
-        return float(loss.item())
-
-    def _train_base_descriptors(self, extract_loader):
-        epochs = int(_cfg_value(self.cfg.TRAINER.BiMC.OPTIM, "BASE_DESCRIPTOR_EPOCHS", 8))
-        features_by_block = self.model_without_dp.collect_blockwise_cls_features(extract_loader)
-        print(f"\n========== Train Base Representation Descriptors ({epochs} epochs) ==========")
-        for block_idx, adapter in self._moe_adapters():
-            values = features_by_block[block_idx]["cls_in"].to(self.device)
-            with torch.no_grad():
-                _, responsibilities = adapter.router(values)
-            for expert_id in range(adapter.num_experts):
-                loss = self._train_descriptor(
-                    adapter, expert_id, values, responsibilities[:, expert_id], epochs
-                )
-                descriptor = adapter.descriptors[expert_id]
-                print(
-                    f"=> [Descriptor][B{block_idx}][E{expert_id}] loss={loss:.6f} "
-                    f"mean={descriptor.mean.item():.6f} std={descriptor.std.item():.6f}"
-                )
-            adapter.assert_descriptors_ready()
-            adapter.freeze_all()
 
     def train_base_task(self, task_stat, train_loader, extract_loader):
         optim_cfg = self.cfg.TRAINER.BiMC.OPTIM
@@ -521,7 +468,6 @@ class Runner:
 
         for _, adapter in self._moe_adapters():
             adapter.freeze_all()
-        self._train_base_descriptors(extract_loader)
 
     # ------------------------------------------------------------------
     # Support-risk-guided expansion
@@ -642,7 +588,7 @@ class Runner:
         optimizer = optim.AdamW([
             {"params": adapter.experts[-1].parameters(),
              "lr": float(optim_cfg.LR_INCREMENTAL_EXPERT)},
-            {"params": adapter.router.columns[-1].parameters(),
+            {"params": [adapter.residual_coefficients[-1]],
              "lr": float(optim_cfg.LR_INCREMENTAL_ROUTER)},
         ], weight_decay=float(optim_cfg.WEIGHT_DECAY))
         scale = float(self.cfg.TRAINER.BiMC.INCREMENTAL.LOGIT_SCALE)
@@ -704,11 +650,9 @@ class Runner:
             adapter = self._adapter_by_block(block_idx)
             self.model_without_dp.add_expert(block_idx, task_id)
             initial_expert = copy.deepcopy(adapter.experts[-1].state_dict())
-            initial_router = copy.deepcopy(adapter.router.columns[-1].state_dict())
             candidate_losses = []
             for fit_train, fit_extract, validation in folds:
                 adapter.experts[-1].load_state_dict(initial_expert)
-                adapter.router.columns[-1].load_state_dict(initial_router)
                 self._train_candidate(task_id, block_idx, fit_train, fit_extract,
                                       class_index, text, description,
                                       enable_visual_calibration)
