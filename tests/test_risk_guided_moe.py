@@ -30,6 +30,33 @@ class TinySupport(Dataset):
 
 
 class ExpansionInvariantTests(unittest.TestCase):
+    def test_routing_diagnostics_after_expansion_separates_residuals(self):
+        adapter = VisualMoEAdapter(4, num_experts=4, reduction=2)
+        adapter.add_expert(1, reduction=2)
+        adapter.add_expert(3, reduction=2)
+        versions = []
+
+        class DiagnosticModel(torch.nn.Module):
+            def extract_img_feature_train(self, images, max_session=None):
+                versions.append(max_session)
+                residual, aux = adapter(images.unsqueeze(0), max_session=max_session)
+                return residual[0], [aux]
+
+        runner = Runner.__new__(Runner)
+        runner.model = runner.model_without_dp = DiagnosticModel()
+        runner._moe_adapters = lambda: [(9, adapter)]
+        runner.parse_batch = lambda batch: (batch["image"], batch["label"])
+        for version, expected_active in [(0, []), (1, [4]), (3, [5]), (None, [])]:
+            result = runner._routing_diagnostics(
+                DataLoader(TinySupport(), batch_size=3), "regression", version)[9]
+            self.assertEqual(result["mean_weight"].shape, (4,))
+            self.assertEqual(result["base_top1_usage"].shape, (4,))
+            self.assertEqual(result["residual_coefficients"].shape, (2,))
+            self.assertEqual(result["active_residual_expert_ids"], expected_active)
+            torch.testing.assert_close(result["mean_weight"].sum(), torch.tensor(1.0))
+            torch.testing.assert_close(result["base_top1_usage"].sum(), torch.tensor(1.0))
+            self.assertEqual(versions[-1], version)
+
     def test_appending_an_expert_preserves_the_old_function(self):
         torch.manual_seed(7)
         adapter = VisualMoEAdapter(8, num_experts=2, reduction=2)
