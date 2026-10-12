@@ -782,12 +782,17 @@ class Runner:
             class_counts = torch.bincount(columns, minlength=len(merged["class_ids"]))
             sample_weights = class_counts[columns].reciprocal().double()
 
-        offsets = nn.Parameter(evidence.new_tensor([*self.task_gate_biases[1:], 0.0]))
-        optimizer = optim.LBFGS([offsets], lr=1.0, max_iter=200,
+        # Historical task offsets are versioned calibration state. Re-fitting
+        # them at every session moves old task boundaries and directly increases
+        # forgetting, so only the newly introduced task offset is optimized.
+        historical = evidence.new_tensor(self.task_gate_biases[1:])
+        newest = nn.Parameter(evidence.new_zeros(()))
+        optimizer = optim.LBFGS([newest], lr=1.0, max_iter=200,
                                 tolerance_grad=1e-9, line_search_fn="strong_wolfe")
 
         def closure():
             optimizer.zero_grad()
+            offsets = torch.cat([historical, newest.reshape(1)])
             logits = evidence + torch.cat([offsets.new_zeros(1), offsets])[None, :]
             loss = (F.cross_entropy(logits, tasks, reduction="none") * sample_weights).sum()
             loss = loss / sample_weights.sum()
@@ -795,9 +800,10 @@ class Runner:
             return loss
 
         optimizer.step(closure)
-        if not bool(torch.isfinite(offsets).all().item()):
-            raise FloatingPointError("Non-finite calibrated task offsets.")
-        self.task_gate_biases = [0.0, *offsets.detach().cpu().tolist()]
+        if not bool(torch.isfinite(newest).all().item()):
+            raise FloatingPointError("Non-finite calibrated task offset.")
+        self.task_gate_biases = [0.0, *historical.detach().cpu().tolist(),
+                                 float(newest.detach().cpu().item())]
         with torch.no_grad():
             logits = evidence + evidence.new_tensor(self.task_gate_biases)
             correct = logits.argmax(dim=1).eq(tasks)
