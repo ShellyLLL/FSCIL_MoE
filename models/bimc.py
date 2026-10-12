@@ -328,9 +328,7 @@ class BiMC(nn.Module):
                 # 只训练显式插入的视觉 MoE Adapter。不要使用 "proj" 模糊匹配，
                 # 否则会误解冻 attention projection、MLP projection 和 visual.proj。
                 if "moe_adapter" in name:
-                    # Descriptors are opened only by their reconstruction-only
-                    # training stage; classification never owns their gradient.
-                    param.requires_grad = ".descriptors." not in name
+                    param.requires_grad = True
         trainable = [
             name for name, param in self.clip_model.named_parameters()
             if param.requires_grad
@@ -458,35 +456,6 @@ class BiMC(nn.Module):
     def expandable_blocks(self):
         return [index for index, block in enumerate(self.clip_model.visual.transformer.resblocks)
                 if getattr(block, "moe_adapter", None) is not None]
-
-    @torch.no_grad()
-    def plan_layer_expansion(self, block_idx, loader, class_index, threshold=None):
-        """Decide one layer solely from class-aggregated descriptor coverage."""
-        block_idx = int(block_idx)
-        threshold = float(getattr(
-            self.cfg.TRAINER.BiMC.VISUAL_MOE, "EXPANSION_Z_THRESHOLD", 1.0
-        ) if threshold is None else threshold)
-        features = self.collect_blockwise_cls_features(loader).get(block_idx)
-        if features is None:
-            raise KeyError(f"Block {block_idx} did not produce support features.")
-        adapter = self.clip_model.visual.transformer.resblocks[block_idx].moe_adapter
-        adapter.assert_descriptors_ready()
-        values, labels = features["cls_in"].to(self.device), features["labels"].to(self.device)
-        scores = adapter.descriptor_scores(values)
-        class_scores = {
-            int(class_id.item()): float(scores[labels.eq(class_id)].mean(dim=0).min().item())
-            for class_id in torch.unique(labels, sorted=True)
-        }
-        expected = sorted(int(value) for value in class_index)
-        if sorted(class_scores) != expected:
-            raise RuntimeError(f"Block {block_idx} received classes {sorted(class_scores)}, expected {expected}.")
-        uncovered = [class_id for class_id, score in class_scores.items() if score > threshold]
-        for class_id, score in class_scores.items():
-            state = "uncovered" if class_id in uncovered else "covered"
-            print(f"=> [Coverage][B{block_idx}] class={class_id} score={score:.4f} {state}")
-        decision = LayerExpansionDecision(block_idx, bool(uncovered), class_scores, uncovered)
-        print(f"=> [Coverage][B{block_idx}] decision={'EXPAND' if decision.expand else 'REUSE'}")
-        return decision
 
     def add_expert(self, block_idx, session_id):
         adapter = self.clip_model.visual.transformer.resblocks[int(block_idx)].moe_adapter
