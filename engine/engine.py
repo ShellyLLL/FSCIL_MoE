@@ -199,14 +199,15 @@ class Runner:
         if not adapters:
             return {}
         totals = {
-            block: {"weight_sum": torch.zeros(adapter.num_experts),
+            block: {"weight_sum": torch.zeros(adapter.base_expert_count),
                     "base_top1": torch.zeros(adapter.base_expert_count), "count": 0}
             for block, adapter in adapters.items()
         }
         self.model.eval()
         for batch in loader:
             images, _ = self.parse_batch(batch)
-            _, aux_list = self.model_without_dp.extract_img_feature_train(images)
+            _, aux_list = self.model_without_dp.extract_img_feature_train(
+                images, max_session=current_task)
             for (block_idx, adapter), aux in zip(self._moe_adapters(), aux_list):
                 weights = aux["route_weights"].detach().float().cpu()
                 item = totals[block_idx]
@@ -228,9 +229,22 @@ class Runner:
                     rows.append(f"e{expert_id}({role},birth={born}) base_weight={means[expert_id]:.3f} "
                                 f"base_top1={usage[expert_id]:.3f}")
                 else:
-                    rows.append(f"e{expert_id}({role},birth={born}) gate_mean={means[expert_id]:.3f}")
+                    coefficient = float(adapter.residual_coefficients[expert_id].detach().float().item())
+                    active = current_task is not None and born == int(current_task)
+                    rows.append(f"e{expert_id}({role},birth={born}) "
+                                f"residual_coefficient={coefficient:.3f} active={active}")
             print(f"=> [Router][{tag}][B{block_idx}] " + " | ".join(rows))
-            output[block_idx] = {"mean_weight": means, "base_top1_usage": usage}
+            output[block_idx] = {
+                "mean_weight": means, "base_top1_usage": usage,
+                "encoder_version": current_task,
+                "residual_coefficients": torch.tensor([
+                    float(value.detach().float().item())
+                    for value in adapter.residual_coefficients[adapter.base_expert_count:]]),
+                "active_residual_expert_ids": [
+                    index for index, birth in enumerate(adapter.expert_birth_sessions)
+                    if index >= adapter.base_expert_count
+                    and current_task is not None and birth == int(current_task)],
+            }
         return output
 
     # ------------------------------------------------------------------
