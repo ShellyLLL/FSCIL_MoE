@@ -634,6 +634,22 @@ class Runner:
                            loader(extract_data, held_out, False)))
         return result
 
+    def _representation_drift(self, images, current_version, previous_version):
+        """Differentiable cosine drift on current support images only.
+
+        The teacher is the frozen previous encoder version. This introduces no
+        rehearsal images or changes to historical experts and prototypes.
+        """
+        if current_version == previous_version:
+            return images.new_zeros((), dtype=torch.float32)
+        with torch.no_grad():
+            previous = F.normalize(self.model_without_dp.extract_img_feature(
+                images, max_session=previous_version).float(), dim=-1)
+        current, _ = self.model_without_dp.extract_img_feature_train(
+            images, max_session=current_version)
+        current = F.normalize(current.float(), dim=-1)
+        return (1.0 - (current * previous).sum(dim=-1)).mean().clamp_min(0.0)
+
     def _train_candidate(self, task_id, block_idx, train_loader, extract_loader,
                          class_index, text, description, calibrate):
         adapter = self._adapter_by_block(block_idx)
@@ -659,6 +675,11 @@ class Runner:
                 logits, targets = self._incremental_logits(
                     images, labels, source_ids, bank, task_id, scale)
                 loss = F.cross_entropy(logits, targets)
+                stability_weight = float(getattr(self.cfg.TRAINER.BiMC.INCREMENTAL,
+                                                 "STABILITY_WEIGHT", 0.0))
+                if stability_weight > 0.0:
+                    loss = loss + stability_weight * self._representation_drift(
+                        images, task_id, self._candidate_previous_version)
                 if not bool(torch.isfinite(loss).item()):
                     raise FloatingPointError("Non-finite fused incremental loss.")
                 loss.backward()
@@ -672,7 +693,7 @@ class Runner:
 
     @torch.no_grad()
     def _held_out_loss(self, validation_loader, support_loader, class_index, text,
-                       description, version, calibrate):
+                       description, version, calibrate, previous_version=None):
         self.model.eval()
         bank = self._support_bank(support_loader, class_index, text, description,
                                   version, calibrate)
@@ -682,7 +703,19 @@ class Runner:
             logits, targets = self._incremental_logits(
                 images, labels, None, bank, version,
                 float(self.cfg.TRAINER.BiMC.INCREMENTAL.LOGIT_SCALE), leave_one_out=False)
-            total += float(F.cross_entropy(logits, targets, reduction="sum").item())
+            value = F.cross_entropy(logits, targets, reduction="sum")
+            stability_weight = float(getattr(self.cfg.TRAINER.BiMC.INCREMENTAL,
+                                             "STABILITY_WEIGHT", 0.0))
+            if (stability_weight > 0.0 and previous_version is not None
+                    and version != previous_version):
+                with torch.no_grad():
+                    before = F.normalize(self.model_without_dp.extract_img_feature(
+                        images, max_session=previous_version).float(), dim=-1)
+                    after = F.normalize(self.model_without_dp.extract_img_feature(
+                        images, max_session=version).float(), dim=-1)
+                    drift = (1.0 - (after * before).sum(dim=-1)).clamp_min(0.0).sum()
+                    value = value + stability_weight * drift
+            total += float(value.item())
             count += labels.numel()
         return total / max(count, 1)
 
@@ -691,6 +724,7 @@ class Runner:
         text, description = self._text_prototypes(current_class_name, class_index)
         folds = self._support_folds(train_loader, extract_loader)
         previous_version = self._current_encoder_version()
+        self._candidate_previous_version = previous_version
         for _, adapter in self._moe_adapters():
             adapter.freeze_all()
         if not folds:
@@ -714,7 +748,7 @@ class Runner:
                                       enable_visual_calibration)
                 candidate_losses.append(self._held_out_loss(
                     validation, fit_extract, class_index, text, description,
-                    task_id, enable_visual_calibration))
+                    task_id, enable_visual_calibration, previous_version=previous_version))
             adapter.remove_newest_expert()
             gains = np.asarray(null_losses) - np.asarray(candidate_losses)
             decisions.append({"block_idx": block_idx, "null_loss": float(np.mean(null_losses)),
