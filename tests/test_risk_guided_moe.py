@@ -29,6 +29,32 @@ class TinySupport(Dataset):
                 "source_id": self.source_ids[index]}
 
 
+class StabilityRiskTests(unittest.TestCase):
+    def test_zero_drift_for_same_version(self):
+        runner = Runner.__new__(Runner)
+        self.assertEqual(float(runner._representation_drift(torch.randn(2, 4), 0, 0)), 0.0)
+
+    def test_drift_is_differentiable(self):
+        class Encoder:
+            def __init__(self):
+                self.delta = torch.nn.Parameter(torch.tensor(0.2))
+
+            def extract_img_feature(self, x, max_session=None):
+                if max_session == 0:
+                    return x.clone()
+                return x + self.delta * torch.roll(x, 1, -1)
+
+            def extract_img_feature_train(self, x, max_session=None):
+                return self.extract_img_feature(x, max_session), []
+
+        runner = Runner.__new__(Runner)
+        runner.model_without_dp = Encoder()
+        loss = runner._representation_drift(torch.eye(3, 4), 1, 0)
+        self.assertGreater(float(loss.item()), 0.0)
+        loss.backward()
+        self.assertTrue(torch.isfinite(runner.model_without_dp.delta.grad))
+
+
 class ExpansionInvariantTests(unittest.TestCase):
     def test_appending_an_expert_preserves_the_old_function(self):
         torch.manual_seed(7)
