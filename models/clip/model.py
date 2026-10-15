@@ -351,9 +351,12 @@ class VisualMoEAdapter(nn.Module):
     def remove_newest_expert(self):
         if self.num_experts <= self.base_expert_count:
             raise RuntimeError("Cannot remove a base expert.")
-        self.experts.pop(-1)
-        self.descriptors.pop(-1)
-        self.router.columns.pop(-1)
+        # ModuleList.pop() is unavailable in older PyTorch releases.
+        # Deleting the last index unregisters the temporary modules and
+        # preserves the indices/state_dict keys of historical experts.
+        del self.experts[-1]
+        del self.descriptors[-1]
+        del self.router.columns[-1]
         self.expert_birth_sessions.pop()
         self.freeze_all()
 
