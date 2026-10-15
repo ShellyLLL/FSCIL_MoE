@@ -405,7 +405,7 @@ class BiMC(nn.Module):
         return block_features
 
     @torch.no_grad()
-    def build_leave_one_out_prototypes(self, loader, class_index=None):
+    def build_leave_one_out_prototypes(self, loader, class_index=None, max_session=None):
         """Collect a support cache with stable source ids and per-query LOO means.
 
         ``loo_visual_prototypes[i, j]`` is class ``j``'s support mean after
@@ -424,7 +424,8 @@ class BiMC(nn.Module):
                 if sid.numel() != y.numel():
                     raise ValueError("support source ids must align with labels.")
                 next_id += y.numel()
-                features.append(F.normalize(self.clip_model.encode_image(images), dim=-1).detach().cpu())
+                features.append(F.normalize(self.clip_model.encode_image(
+                    images, max_session=max_session), dim=-1).detach().cpu())
                 labels.append(y.detach().cpu())
                 source_ids.append(sid.detach().cpu())
         finally:
@@ -616,8 +617,9 @@ class BiMC(nn.Module):
                 del block._temp_moe
         return teacher_features
 
-    def extract_img_feature_train(self, images):
-        return self.clip_model.encode_image(images.to(self.device), return_moe_aux=True)
+    def extract_img_feature_train(self, images, max_session=None):
+        return self.clip_model.encode_image(images.to(self.device), return_moe_aux=True,
+                                            max_session=max_session)
 
     def forward_train(self, images, task_stat, beta, compute_teacher=False):
         img_feat, moe_aux = self.extract_img_feature_train(images)
@@ -657,11 +659,12 @@ class BiMC(nn.Module):
         return F.normalize(torch.stack(clip_weights, dim=0), dim=-1), torch.cat(all_targets, dim=0)
 
     @torch.no_grad()
-    def inference_all_img_feature(self, loader):
+    def inference_all_img_feature(self, loader, max_session=None):
         all_features, all_labels = [], []
         for batch in loader:
             images, labels = self.parse_batch(batch)
-            features = F.normalize(self.clip_model.encode_image(images), dim=-1)
+            features = F.normalize(self.clip_model.encode_image(
+                images, max_session=max_session), dim=-1)
             all_features.append(features)
             all_labels.append(labels)
 
@@ -694,20 +697,40 @@ class BiMC(nn.Module):
         delta_protos = F.normalize(torch.matmul(norm_weights, base_protos), p=2, dim=-1)
         return F.normalize((1 - shift_weight) * cur_protos + shift_weight * delta_protos, dim=-1)
 
+    def calibrate_incremental_visual(self, current, reference):
+        """Calibrate in the base space, then transport the paired support shift."""
+        if self.base_vision_prototype is None:
+            raise RuntimeError("Base visual prototypes must be built before an incremental session.")
+        shape = current.shape
+        reference = reference.reshape(-1, shape[-1])
+        current = current.reshape(-1, shape[-1])
+        calibrated = self.soft_calibration(self.base_vision_prototype, reference)
+        return F.normalize(calibrated + current - reference, dim=-1).reshape(shape)
+
     @torch.no_grad()
-    def build_task_statistics(self, class_names, loader, class_index, calibrate_novel_vision_proto=False):
+    def build_task_statistics(self, class_names, loader, class_index,
+                              calibrate_novel_vision_proto=False, encoder_version=None):
         cls_begin_index = class_index[0]
         text_features, _ = self.inference_text_feature(class_names, self.template, cls_begin_index)
         _, _, description_proto = self.inference_all_description_feature(class_names, self.cfg.DATASET.GPT_PATH, cls_begin_index)
-        images_features, _, images_proto = self.inference_all_img_feature(loader)
+        images_features, anchor_labels, images_proto = self.inference_all_img_feature(
+            loader, max_session=encoder_version)
+        anchor_features = images_features
+        anchor_proto = images_proto
         if cls_begin_index != 0:
+            if encoder_version != 0:
+                anchor_features, anchor_labels, anchor_proto = self.inference_all_img_feature(
+                    loader, max_session=0)
             if calibrate_novel_vision_proto:
-                images_proto = self.soft_calibration(self.base_vision_prototype, images_proto)
+                images_proto = self.calibrate_incremental_visual(images_proto, anchor_proto)
+                anchor_proto = self.soft_calibration(self.base_vision_prototype, anchor_proto)
         else:
             self.base_vision_prototype = images_proto
         lambda_t = self.cfg.TRAINER.BiMC.LAMBDA_T if self.cfg.TRAINER.BiMC.TEXT_CALIBRATION else 0.0
         calibrated_text = F.normalize((1 - lambda_t) * text_features + lambda_t * description_proto, dim=-1)
         raw_fused = F.normalize(self.cfg.DATASET.BETA * calibrated_text + (1 - self.cfg.DATASET.BETA) * images_proto, dim=-1)
+        anchor_fused = F.normalize(self.cfg.DATASET.BETA * calibrated_text +
+                                   (1 - self.cfg.DATASET.BETA) * anchor_proto, dim=-1)
         history_fused = getattr(self, "_fused_history_prototypes", None)
         history_ids = getattr(self, "_fused_history_class_ids", None)
         strength = float(getattr(self.cfg.TRAINER.BiMC, "FUSED_CONFLICT_STRENGTH", 0.0))
@@ -715,11 +738,7 @@ class BiMC(nn.Module):
         fused_proto = refine_conflict_aware_fused_prototypes(
             raw_fused, torch.as_tensor(class_index), history_fused, history_ids, strength, margin
         )
-        # Re-express refined fusion as a visual prototype so legacy engine
-        # merge/forward paths (which know only image/text/descriptor keys) use it.
-        if self.cfg.DATASET.BETA < 1.0:
-            images_proto = F.normalize((fused_proto - self.cfg.DATASET.BETA * calibrated_text) /
-                                       max(1e-6, 1.0 - self.cfg.DATASET.BETA), dim=-1)
+        # Keep the actual visual mean separate from its fused classifier weight.
         ids = torch.as_tensor(class_index, device=fused_proto.device, dtype=torch.long)
         if history_fused is None:
             self._fused_history_prototypes, self._fused_history_class_ids = fused_proto.detach(), ids.detach()
@@ -727,6 +746,11 @@ class BiMC(nn.Module):
             keep = (history_ids[:, None].to(ids.device) != ids[None, :]).all(dim=1)
             self._fused_history_prototypes = torch.cat([history_fused[keep], fused_proto.detach()], dim=0)
             self._fused_history_class_ids = torch.cat([history_ids[keep].to(ids.device), ids.detach()], dim=0)
+        source_ids = getattr(getattr(loader, "dataset", None), "source_ids", None)
+        source_ids = (torch.arange(len(anchor_labels)) if source_ids is None else
+                      torch.as_tensor(source_ids, dtype=torch.long).cpu())
+        if len(source_ids) != len(anchor_labels):
+            raise ValueError("Anchor source ids must align with support features.")
         return {
             "description_proto": description_proto,
             "text_features": text_features,
@@ -736,6 +760,11 @@ class BiMC(nn.Module):
             "sample_cnt": len(images_features),
             "initial_fused_proto": raw_fused,
             "fused_proto": fused_proto,
+            "anchor_fused_proto": anchor_fused,
+            "anchor_features": anchor_features.detach().to(device="cpu", dtype=torch.float16),
+            "anchor_labels": anchor_labels.detach().cpu(),
+            "anchor_source_ids": source_ids,
+            "encoder_version": 0 if encoder_version is None else int(encoder_version),
         }
 
     @torch.no_grad()
@@ -750,8 +779,8 @@ class BiMC(nn.Module):
         return 100.0 * img_feat @ fused_proto.t()
 
     @torch.no_grad()
-    def extract_img_feature(self, images):
-        return self.clip_model.encode_image(images.to(self.device))
+    def extract_img_feature(self, images, max_session=None):
+        return self.clip_model.encode_image(images.to(self.device), max_session=max_session)
 
     def parse_batch(self, batch):
         # NumPy-backed FSCIL datasets can yield int32 labels on Windows.  Keep
