@@ -725,7 +725,10 @@ class BiMC(nn.Module):
                 images_proto = self.calibrate_incremental_visual(images_proto, anchor_proto)
                 anchor_proto = self.soft_calibration(self.base_vision_prototype, anchor_proto)
         else:
-            self.base_vision_prototype = images_proto
+            # Keep the calibration anchor in the frozen base path, even when
+            # class prototypes are refreshed with the current full model.
+            _, _, base_images_proto = self.inference_all_img_feature(loader, max_session=0)
+            self.base_vision_prototype = base_images_proto
         lambda_t = self.cfg.TRAINER.BiMC.LAMBDA_T if self.cfg.TRAINER.BiMC.TEXT_CALIBRATION else 0.0
         calibrated_text = F.normalize((1 - lambda_t) * text_features + lambda_t * description_proto, dim=-1)
         raw_fused = F.normalize(self.cfg.DATASET.BETA * calibrated_text + (1 - self.cfg.DATASET.BETA) * images_proto, dim=-1)
