@@ -53,7 +53,6 @@ class Runner:
         self.model_without_dp = self.model.module if self.is_distributed else self.model
         self.acc_list, self.task_acc_list = [], []
         self.session_diagnostics = []
-        self.task_gate_biases = []
         self.evaluator = AccuracyEvaluator(self.data_manager.class_index_in_task)
         self._resume_completed_session = -1
         self._resume_state_dict_list = []
@@ -120,14 +119,6 @@ class Runner:
             raise ValueError("Classifier states contain duplicate global class ids.")
         order = all_ids.argsort()
         result = {"class_ids": all_ids[order]}
-        result["encoder_versions"] = torch.cat([
-            torch.full_like(ids, int(state.get("encoder_version", 0)))
-            for ids, state in zip(per_state_ids, dict_list)
-        ])[order]
-        result["task_ids"] = torch.cat([
-            torch.full_like(ids, int(state.get("creation_session", index)))
-            for index, (ids, state) in enumerate(zip(per_state_ids, dict_list))
-        ])[order]
         candidate_keys = (
             "description_proto", "text_features", "image_proto",
             "initial_fused_proto", "fused_proto", "anchor_fused_proto",
@@ -353,7 +344,6 @@ class Runner:
             base_state["creation_session"] = 0
         self._resume_state_dict_list = payload.get("task_states", [])
         # Legacy task-gate offsets are ignored: inference uses one global bank.
-        self.task_gate_biases = [0.0] * (completed_session + 1)
         self.acc_list = payload.get("acc_list", [])
         self.task_acc_list = payload.get("task_acc_list", [])
         self.session_diagnostics = diagnostics
@@ -566,19 +556,6 @@ class Runner:
         if not bool(current["loo_valid"].all().item()):
             raise ValueError("Every training query needs another source in its class.")
         return current
-
-    def _versioned_scores(self, images, prototypes, versions, scale):
-        """Score each class using the encoder which created its prototype."""
-        versions = torch.as_tensor(versions, device=images.device, dtype=torch.long)
-        output = images.new_empty((images.size(0), prototypes.size(0)))
-        for version in torch.unique(versions).tolist():
-            mask = versions.eq(version)
-            with torch.no_grad():
-                features = self.model_without_dp.extract_img_feature(images, max_session=version)
-            part = scale * F.normalize(features.float(), dim=-1) @ F.normalize(
-                prototypes[mask].to(images.device).float(), dim=-1).t()
-            output[:, mask] = part
-        return output
 
     def _incremental_logits(self, images, labels, source_ids, support_bank,
                             version, scale, leave_one_out=True):
@@ -884,134 +861,6 @@ class Runner:
                 "expanded": [{"block_idx": block_idx, "expert_id": expert_id,
                               "epochs": epochs}], "encoder_version": task_id}
 
-    def _build_and_refine_task_state(self, current_class_name, extract_loader, class_index,
-                                     old_state, enable_visual_calibration, encoder_version):
-        refinement = getattr(self.cfg.TRAINER.BiMC, "PROTOTYPE_REFINEMENT", None)
-        if refinement is not None and bool(getattr(refinement, "ENABLE", False)):
-            raise ValueError("PROTOTYPE_REFINEMENT is incompatible with versioned classifiers.")
-        state = self.model_without_dp.build_task_statistics(
-            current_class_name, extract_loader, class_index,
-            calibrate_novel_vision_proto=enable_visual_calibration,
-            encoder_version=encoder_version,
-        )
-        state["class_ids"] = torch.as_tensor(class_index, device=self.device, dtype=torch.long)
-        return state
-
-    def _anchor_task_scores(self, features, state, query_loo=None, query_labels=None):
-        """Comparable task evidence from the single frozen base encoder."""
-        prototypes = F.normalize(state["anchor_fused_proto"].to(features.device).float(), dim=-1)
-        queries = F.normalize(features.float(), dim=-1)
-        scores = 100.0 * queries @ prototypes.T
-        task_ids = state["task_ids"].to(features.device)
-        if query_loo is not None:
-            if query_labels is None or query_loo.shape != queries.shape:
-                raise ValueError("Source-exclusive prototypes need one label and weight per query.")
-            columns = self._targets_to_columns(query_labels, state)
-            rows = torch.arange(len(queries), device=features.device)
-            scores[rows, columns] = 100.0 * (queries * F.normalize(
-                query_loo.to(features.device).float(), dim=-1)).sum(dim=-1)
-        tasks = torch.unique(task_ids, sorted=True)
-        return torch.stack([torch.logsumexp(scores[:, task_ids.eq(task)], dim=1)
-                            for task in tasks], dim=1).double()
-
-    def _anchor_leave_one_out(self, task_state):
-        """Recompute only each query's own class, excluding its source."""
-        features = F.normalize(task_state["anchor_features"].to(self.device).float(), dim=-1)
-        labels = task_state["anchor_labels"].to(self.device)
-        sources = torch.as_tensor(task_state.get(
-            "anchor_source_ids", torch.arange(len(labels))), device=self.device)
-        classes = self._targets_to_columns(labels, task_state)
-        _, source_rows = torch.unique(torch.stack([classes, sources], dim=1),
-                                      dim=0, return_inverse=True)
-        n_classes = len(task_state["class_ids"])
-        class_sums = features.new_zeros((n_classes, features.size(1))).index_add_(0, classes, features)
-        source_sums = features.new_zeros((int(source_rows.max()) + 1, features.size(1)))
-        source_sums.index_add_(0, source_rows, features)
-        class_counts = torch.bincount(classes, minlength=n_classes)
-        source_counts = torch.bincount(source_rows)
-        if not bool((class_counts[classes] > source_counts[source_rows]).all().item()):
-            raise ValueError("Task gate calibration needs at least two sources per class.")
-        visual = F.normalize(class_sums[classes] - source_sums[source_rows], dim=-1)
-        if (int(task_state["creation_session"]) > 0 and
-                self.cfg.TRAINER.BiMC.VISION_CALIBRATION):
-            visual = self.model_without_dp.soft_calibration(
-                self.model_without_dp.base_vision_prototype, visual)
-        weight = (float(self.cfg.TRAINER.BiMC.LAMBDA_T)
-                  if self.cfg.TRAINER.BiMC.TEXT_CALIBRATION else 0.0)
-        text = F.normalize((1.0 - weight) * task_state["text_features"] +
-                           weight * task_state["description_proto"], dim=-1).to(self.device)
-        beta = float(self.cfg.DATASET.BETA)
-        return F.normalize(beta * text[classes] + (1.0 - beta) * visual, dim=-1)
-
-    def _calibrate_task_gate(self, task_id, states):
-        """Fit all task offsets to class-balanced, source-exclusive anchor evidence."""
-        if task_id == 0:
-            self.task_gate_biases = [0.0]
-            return {"new_task_bias": 0.0}
-        if len(self.task_gate_biases) != task_id:
-            raise ValueError("Historical task gate biases are missing.")
-        merged = self.merge_dicts(states)
-        with torch.no_grad():
-            evidences, labels, task_targets, counts = [], [], [], []
-            for state in states:
-                features = state["anchor_features"].to(self.device).float()
-                targets = state["anchor_labels"].to(self.device)
-                evidences.append(self._anchor_task_scores(
-                    features, merged, self._anchor_leave_one_out(state), targets))
-                labels.append(targets)
-                task_targets.append(torch.full_like(targets, int(state["creation_session"])))
-                counts.append(len(targets))
-            evidence = torch.cat(evidences)
-            class_labels = torch.cat(labels)
-            tasks = torch.cat(task_targets)
-            columns = self._targets_to_columns(class_labels, merged)
-            class_counts = torch.bincount(columns, minlength=len(merged["class_ids"]))
-            sample_weights = class_counts[columns].reciprocal().double()
-
-        offsets = nn.Parameter(evidence.new_tensor([*self.task_gate_biases[1:], 0.0]))
-        optimizer = optim.LBFGS([offsets], lr=1.0, max_iter=200,
-                                tolerance_grad=1e-9, line_search_fn="strong_wolfe")
-
-        def closure():
-            optimizer.zero_grad()
-            logits = evidence + torch.cat([offsets.new_zeros(1), offsets])[None, :]
-            loss = (F.cross_entropy(logits, tasks, reduction="none") * sample_weights).sum()
-            loss = loss / sample_weights.sum()
-            loss.backward()
-            return loss
-
-        optimizer.step(closure)
-        if not bool(torch.isfinite(offsets).all().item()):
-            raise FloatingPointError("Non-finite calibrated task offsets.")
-        self.task_gate_biases = [0.0, *offsets.detach().cpu().tolist()]
-        with torch.no_grad():
-            logits = evidence + evidence.new_tensor(self.task_gate_biases)
-            correct = logits.argmax(dim=1).eq(tasks)
-            old_count = sum(counts[:-1])
-            result = {"new_task_bias": self.task_gate_biases[-1],
-                      "balanced_loo_nll": float((F.cross_entropy(
-                          logits, tasks, reduction="none") * sample_weights).sum() /
-                          sample_weights.sum()),
-                      "novel_loo_task_recall": float(correct[old_count:].float().mean()),
-                      "old_loo_task_recall": float(correct[:old_count].float().mean())}
-        print(f"=> [AnchorGate][Task {task_id}] "
-              f"novel_loo_task_recall={result['novel_loo_task_recall']:.3f} "
-              f"old_loo_task_recall={result['old_loo_task_recall']:.3f} "
-              f"balanced_loo_nll={result['balanced_loo_nll']:.3f}")
-        return result
-
-    def _retained_scores(self, anchor_features, state, versioned_logits):
-        """Task evidence from the anchor; expert logits rank classes within a task."""
-        task_ids = state["task_ids"].to(versioned_logits.device)
-        evidence = self._anchor_task_scores(anchor_features, state)
-        evidence += evidence.new_tensor(self.task_gate_biases)
-        result = torch.empty_like(versioned_logits, dtype=torch.float64)
-        for task in torch.unique(task_ids, sorted=True).tolist():
-            mask = task_ids.eq(task)
-            local = versioned_logits[:, mask].double()
-            result[:, mask] = evidence[:, task:task + 1] + local - local.max(dim=1, keepdim=True).values
-        return result
-
     @torch.no_grad()
     def _rebuild_unified_task_states(self, through_task):
         """Re-encode every seen class with the current complete model.
@@ -1117,7 +966,6 @@ class Runner:
             self.model.eval()
             state_dict_list = self._rebuild_unified_task_states(task_id)
             self._resume_state_dict_list = state_dict_list
-            self.task_gate_biases = [0.0] * (task_id + 1)
             merged_state = self.merge_dicts(state_dict_list)
 
             if use_moe:
