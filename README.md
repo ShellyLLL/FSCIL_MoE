@@ -56,37 +56,33 @@ comparisons. The CUB200 run is:
 python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --support_manifest checkpoints/fscil_moe/cub_seed1_support.json
 ~~~
 
-At each incremental session, each eligible block receives a temporary candidate
-expert. Five support folds compare its held-out, task-local fused classifier
-loss with the unchanged encoder; at most one candidate is retained if its
-gain exceeds one standard error. Training refreshes source-exclusive visual
-prototypes, updates only the new expert and router column, and freezes them
-afterward. Historical class weights and encoders retain their creation versions.
-The frozen base encoder supplies common-space task evidence. Its task offsets
-jointly minimize class-balanced task loss using source-exclusive support
-features from every observed class. Expert logits only rank classes within
-each task; no task identity is supplied at inference.
+At each incremental session, the method first evaluates a **router-only** update
+with experts frozen. Five source-disjoint support folds estimate its held-out
+gain; the update is accepted only when the mean gain exceeds one standard error.
+If router-only adaptation is not supported by validation, temporary expert
+candidates are tested in eligible blocks. At most one new expert is retained
+when its gain also exceeds one standard error. During expansion, historical
+experts and their router columns stay frozen; the new expert and its new router
+column are trainable. Every active expert is combined with one shared Softmax
+router, and historical experts continue to participate in the forward pass.
 
-For staged development, reuse Session 0 and stop after Task 3 without changing
-the normal full-run default:
+After each session, visual support prototypes of **all seen classes** are
+recomputed with the current complete model. BiMC text/description fusion and
+base-path visual calibration are retained, but final inference does not use
+creation-session encoders or a task-level gate. Each test image is encoded once
+by the current model and compared against one global bank of calibrated
+prototypes for all seen classes. This is intended to reduce forgetting and
+small-shot overfitting; report AA and PD over the complete FSCIL sequence to
+verify the effect rather than assuming the changes improve them.
+
+The updated routing semantics use checkpoint schema 10. Incremental checkpoints
+from the prior versioned-classifier implementation are intentionally rejected;
+resume from a base-only checkpoint or restart at Session 0. Reuse the same fixed
+support manifest for all ablations.
 
 ~~~BASH
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --resume checkpoints/fscil_moe/session_00.pth --end_session 3
+python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --support_manifest checkpoints/fscil_moe/cub_seed1_support.json
 ~~~
-
-Resume from a checkpoint produced by this version (schema 9) with:
-
-~~~BASH
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --resume checkpoints/fscil_moe/session_03.pth
-~~~
-
-Base-only schema 7/8 checkpoints can be reused. Earlier incremental
-checkpoints cannot be resumed because their experts were optimized for a
-different classifier objective. Compare the complete 11-session accuracy list
-with the target using the same fixed support manifest; the support-only gate
-diagnostics are not a substitute for test accuracy. `TaskDiagnostic` reports
-the actual task selection rate and an oracle-task within-class upper bound;
-the latter uses test labels only for analysis, never for predictions.
 
 ## Acknowledgment
 
