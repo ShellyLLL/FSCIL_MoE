@@ -278,6 +278,7 @@ class VisualMoEAdapter(nn.Module):
         self.eval()
 
     def set_newest_trainable(self, descriptor=False):
+        """Train only the newest expert and its newly added router column."""
         if self.num_experts <= self.base_expert_count:
             raise RuntimeError("there is no incremental expert to train.")
         self.freeze_all()
@@ -287,6 +288,13 @@ class VisualMoEAdapter(nn.Module):
         if descriptor:
             for parameter in self.descriptors[-1].parameters():
                 parameter.requires_grad = True
+        self.train()
+
+    def set_router_trainable(self):
+        """Train router columns only while keeping every expert frozen."""
+        self.freeze_all()
+        for parameter in self.router.parameters():
+            parameter.requires_grad = True
         self.train()
 
     def add_expert(self, session_id, reduction=None):
@@ -361,20 +369,25 @@ class VisualMoEAdapter(nn.Module):
         self.freeze_all()
 
     def forward(self, x, max_session=None):
+        """Mix all experts visible in this model path with one normalized router.
+
+        Historical experts remain active after freezing. max_session is retained
+        only for base-path distillation/calibration; deployed classification
+        calls this method with max_session=None so every sample is encoded once
+        by the current complete model.
+        """
         if x.ndim != 3:
             raise ValueError("VisualMoEAdapter expects [tokens, batch, dim].")
         x_norm = self.layer_norm(x)
-        # The base mixture is never renormalised when incremental experts arrive.
-        base_logits, base_weights = self.router(x_norm[0], self.base_expert_count)
         active = [index for index, birth in enumerate(self.expert_birth_sessions)
-                  if index >= self.base_expert_count and
-                  (max_session is None or birth <= max_session)]
-        gate_logits = [self.router.columns[index](x_norm[0]) for index in active]
-        weights = (torch.cat([base_weights] + [torch.sigmoid(value) for value in gate_logits], dim=-1)
-                   if gate_logits else base_weights)
-        logits = torch.cat([base_logits] + gate_logits, dim=-1) if gate_logits else base_logits
+                  if max_session is None or birth <= int(max_session)]
+        if not active:
+            raise RuntimeError("No experts are active for the requested model path.")
+        # SEMA-style routing: all active experts share one Softmax denominator,
+        # including newly added experts.
+        logits, weights = self.router(x_norm[0], len(active))
         residual, norms = torch.zeros_like(x_norm), []
-        for column, expert_id in enumerate(list(range(self.base_expert_count)) + active):
+        for column, expert_id in enumerate(active):
             weighted = self.experts[expert_id](x_norm) * weights[:, column].unsqueeze(0).unsqueeze(-1)
             residual = residual + weighted
             norms.append(weighted.detach().float().pow(2).mean().sqrt())
