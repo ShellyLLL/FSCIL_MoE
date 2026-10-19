@@ -597,8 +597,8 @@ class Runner:
             # argument is retained only for backward-compatible call sites.
             features, _ = self.model_without_dp.extract_img_feature_train(images)
         else:
-            features = self.model_without_dp.extract_img_feature(
-                images, max_session=version)
+            # Validation and deployment both use the complete current expert pool.
+            features = self.model_without_dp.extract_img_feature(images)
         features = F.normalize(features.float(), dim=-1)
         logits = scale * torch.einsum("bd,bcd->bc", features, new_prototypes.float())
         return logits, self._targets_to_columns(labels, {"class_ids": support_bank["classes"]})
@@ -1156,6 +1156,23 @@ class Runner:
             self.save_checkpoint(task_id, state_dict_list)
 
         print(f"\nFinal acc: {self.acc_list}")
+        # AA: mean of all-session mean accuracies (percentage points).
+        aa = float(np.mean(self.acc_list)) if self.acc_list else 0.0
+        # PD: average drop on each earlier task from its introduction session
+        # to the final session. The final task is excluded because it has no
+        # subsequent session in which forgetting can occur.
+        if len(self.task_acc_list) > 1:
+            final_task_acc = self.task_acc_list[-1]
+            drops = [
+                float(self.task_acc_list[task_id][task_id]) -
+                float(final_task_acc[task_id])
+                for task_id in range(len(self.task_acc_list) - 1)
+            ]
+            pd = float(np.mean(drops)) if drops else 0.0
+        else:
+            drops, pd = [], 0.0
+        print(f"=> AA (mean session accuracy): {aa:.3f}")
+        print(f"=> PD (mean old-task accuracy drop, pp): {pd:.3f}; per-task={drops}")
         print("Task-wise acc:")
         for index, task_acc in enumerate(self.task_acc_list):
             print(f"task {index:2d}, acc: {task_acc}")
