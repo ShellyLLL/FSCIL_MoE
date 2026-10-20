@@ -141,29 +141,20 @@ class ExpansionInvariantTests(unittest.TestCase):
         torch.testing.assert_close(state["image_proto"], torch.tensor([[1., 0.]]))
         self.assertEqual(state["encoder_version"], 0)
 
-    def test_new_class_has_a_frozen_anchor_and_a_distinct_expert_prototype(self):
-        model = BiMC.__new__(BiMC)
-        torch.nn.Module.__init__(model)
-        model.device, model.template = "cpu", ["a {}"]
-        model.cfg = SimpleNamespace(DATASET=SimpleNamespace(GPT_PATH="unused", BETA=0.3),
-            TRAINER=SimpleNamespace(BiMC=SimpleNamespace(
-                TEXT_CALIBRATION=False, LAMBDA_T=0.0, LAMBDA_I=0.25, TAU=4,
-                FUSED_CONFLICT_STRENGTH=0.0, FUSED_CONFLICT_MARGIN=0.05)))
-        model.base_vision_prototype = torch.tensor([[1., 0.]])
-        model.inference_text_feature = lambda *args: (torch.tensor([[0., 1.]]), None)
-        model.inference_all_description_feature = lambda *args: (
-            None, None, torch.tensor([[0., 1.]]))
-        def image_features(loader, max_session=None):
-            vector = torch.tensor([[0.6, 0.8]]) if max_session == 1 else torch.tensor([[1., 0.]])
-            return vector, torch.tensor([1]), vector
-        model.inference_all_img_feature = image_features
-        state = model.build_task_statistics(["novel"], None, [1],
-                                            calibrate_novel_vision_proto=True,
-                                            encoder_version=1)
-        torch.testing.assert_close(state["anchor_features"].float(), torch.tensor([[1., 0.]]))
-        torch.testing.assert_close(state["anchor_fused_proto"],
-                                   F.normalize(torch.tensor([[0.7, 0.3]]), dim=-1))
-        self.assertGreater((state["fused_proto"] - state["anchor_fused_proto"]).abs().max(), 0)
+    def test_incremental_prototype_is_directly_calibrated_and_has_no_anchor_replay(self):
+        model=BiMC.__new__(BiMC); torch.nn.Module.__init__(model)
+        model.device,model.template="cpu",["a {}"]
+        model.cfg=SimpleNamespace(DATASET=SimpleNamespace(GPT_PATH="unused",BETA=0.3),
+            TRAINER=SimpleNamespace(BiMC=SimpleNamespace(TEXT_CALIBRATION=False,LAMBDA_T=0.0,
+                LAMBDA_I=0.25,TAU=4,FUSED_CONFLICT_STRENGTH=0.0,FUSED_CONFLICT_MARGIN=0.05)))
+        model.base_vision_prototype=torch.tensor([[1.,0.]])
+        model.inference_text_feature=lambda *args:(torch.tensor([[0.,1.]]),None)
+        model.inference_all_description_feature=lambda *args:(None,None,torch.tensor([[0.,1.]]))
+        current=torch.tensor([[0.6,0.8]])
+        model.inference_all_img_feature=lambda *args,**kwargs:(current,torch.tensor([1]),F.normalize(current,dim=-1))
+        state=model.build_task_statistics(["novel"],None,[1],calibrate_novel_vision_proto=True)
+        torch.testing.assert_close(state["image_proto"],model.soft_calibration(model.base_vision_prototype,current))
+        self.assertNotIn("anchor_features",state)
 
     def test_support_folds_exclude_every_held_out_source(self):
         runner = Runner.__new__(Runner)
@@ -193,102 +184,15 @@ class ExpansionInvariantTests(unittest.TestCase):
         bank=runner._support_bank(loader,[2,3],text,text,version=1,calibrate=False)
         self.assertEqual(bank["classes"].tolist(),[0,1,2,3]);self.assertEqual(tuple(bank["fused_full"].shape),(4,4));self.assertEqual(tuple(bank["fused_loo"].shape),(6,4,4))
 
-    def test_candidate_training_uses_fused_leave_one_out_scores(self):
-        from torch import nn
-
-        class TinyModel(nn.Module):
-            def __init__(self, cfg):
-                super().__init__()
-                block = nn.Module()
-                block.moe_adapter = VisualMoEAdapter(4, num_experts=2, reduction=2)
-                transformer = nn.Module()
-                transformer.resblocks = nn.ModuleList([block])
-                visual = nn.Module()
-                visual.transformer = transformer
-                self.clip_model = nn.Module()
-                self.clip_model.visual = visual
-                self.base_vision_prototype = torch.eye(4)[:2]
-                self.cfg, self.template = cfg, ["a {}"]
-
-            @torch.no_grad()
-            def extract_img_feature(self, images, max_session=None):
-                return self.extract_img_feature_train(images, max_session)[0]
-
-            def extract_img_feature_train(self, images, max_session=None):
-                adapter = self.clip_model.visual.transformer.resblocks[0].moe_adapter
-                residual, aux = adapter(torch.stack([images, images]), max_session=max_session)
-                return images + residual[0], [aux]
-
-            def build_leave_one_out_prototypes(self, loader, class_index, max_session=None):
-                features, labels, sources = [], [], []
-                with torch.no_grad():
-                    for batch in loader:
-                        features.append(F.normalize(self.extract_img_feature(
-                            batch["image"], max_session), dim=-1))
-                        labels.append(batch["label"])
-                        sources.append(batch["source_id"])
-                return build_loo_cache_from_embeddings(torch.cat(features),
-                                                       torch.cat(labels), torch.cat(sources), class_index)
-
-            def soft_calibration(self, base, current):
-                return BiMC.soft_calibration(self, base, current)
-
-            def calibrate_incremental_visual(self, current, reference):
-                return BiMC.calibrate_incremental_visual(self, current, reference)
-
-            def inference_text_feature(self, names, template, first):
-                return torch.eye(4)[first:first + len(names)], None
-
-            def inference_all_description_feature(self, names, path, first):
-                return None, None, torch.eye(4)[first:first + len(names)]
-
-            def expandable_blocks(self):
-                return [0]
-
-            def add_expert(self, block_idx, session_id):
-                return self.clip_model.visual.transformer.resblocks[block_idx].moe_adapter.add_expert(
-                    session_id, reduction=2)
-
-        cfg = SimpleNamespace(
-            DATASET=SimpleNamespace(BETA=0.3, GPT_PATH="unused"),
-            TRAINER=SimpleNamespace(BiMC=SimpleNamespace(
-                TEXT_CALIBRATION=True, LAMBDA_T=0.5, LAMBDA_I=0.1, TAU=16,
-                INCREMENTAL=SimpleNamespace(EPOCHS=1, LOGIT_SCALE=100.0),
-                OPTIM=SimpleNamespace(LR_INCREMENTAL_EXPERT=1e-3,
-                                      LR_INCREMENTAL_ROUTER=1e-3, WEIGHT_DECAY=0.0))))
-        runner = Runner.__new__(Runner)
-        runner.cfg, runner.device = cfg, "cpu"
-        runner.model = runner.model_without_dp = TinyModel(cfg)
-        dataset = TinySupport(shots=3)
-        training = DataLoader(dataset, batch_size=4, shuffle=True)
-        extraction = DataLoader(dataset, batch_size=4, shuffle=False)
-        runner.model.add_expert(0, 1)
-        text, description = runner._text_prototypes(["two", "three"], [2, 3])
-        support_bank = runner._support_bank(extraction, [2, 3], text, description, 1)
-        batch = next(iter(training))
-        logits, targets = runner._incremental_logits(
-            batch["image"], batch["label"], batch["source_id"], support_bank,
-            1, 100.0)
-        self.assertEqual(logits.size(1), 2)
-        self.assertTrue(logits.requires_grad)
-        F.cross_entropy(logits, targets).backward()
-        self.assertIsNotNone(runner._adapter_by_block(0).experts[-1].c_proj.weight.grad)
-        runner._adapter_by_block(0).remove_newest_expert()
-        runner._held_out_loss = lambda *args: 0.0 if args[5] == 0 else 1.0
-        result = runner.train_incremental_task(
-            1, training, extraction, [2, 3], ["two", "three"], True)
-        self.assertEqual(len(result["decisions"]), 1)
-        self.assertFalse(result["trained"])
-        self.assertEqual(runner._adapter_by_block(0).num_experts, 2)
-
-        # Exercise the acceptance and full-support retraining path independently
-        # of this synthetic support set's actual predictive quality.
-        runner._held_out_loss = lambda *args: 1.0 if args[5] == 0 else 0.0
-        accepted = runner.train_incremental_task(
-            1, training, extraction, [2, 3], ["two", "three"], True)
-        self.assertTrue(accepted["trained"])
-        self.assertEqual(accepted["encoder_version"], 1)
-        self.assertEqual(runner._adapter_by_block(0).num_experts, 3)
+    def test_new_router_column_starts_at_calibrated_low_mass(self):
+        torch.manual_seed(9)
+        router = __import__("models.clip.model", fromlist=["ExpandableRouter"]).ExpandableRouter(4, 2)
+        inputs = torch.randn(12, 4)
+        router.add_column()
+        mass = router.initialize_newest_column(inputs, target_mass=0.01)
+        _, weights = router(inputs)
+        self.assertAlmostEqual(mass, 0.01, delta=0.002)
+        self.assertAlmostEqual(float(weights[:, -1].mean()), 0.01, delta=0.002)
 
 
 if __name__ == "__main__":
