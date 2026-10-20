@@ -67,6 +67,9 @@ def extend_cfg(cfg):
     cfg.TRAINER.BiMC.VISUAL_MOE.INCREMENTAL_REDUCTION = 48
     cfg.TRAINER.BiMC.VISUAL_MOE.DESCRIPTOR_DIM = 64
     cfg.TRAINER.BiMC.VISUAL_MOE.DESCRIPTOR_EPS = 1.0e-4
+    # Expansion policy and initial routing prior for dynamically added experts.
+    cfg.TRAINER.BiMC.VISUAL_MOE.EXPANSION_Z_THRESHOLD = 1.0
+    cfg.TRAINER.BiMC.VISUAL_MOE.INITIAL_EXPERT_ROUTE_MASS = 0.01
 
     cfg.TRAINER.BiMC.INCREMENTAL = CN()
     cfg.TRAINER.BiMC.INCREMENTAL.EPOCHS = 6
