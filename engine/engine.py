@@ -520,41 +520,56 @@ class Runner:
                     for birth in adapter.expert_birth_sessions), default=0)
 
     @torch.no_grad()
-    def _support_bank(self, loader, class_index, text_features, description_proto,
-                      version, calibrate=True):
-        """Build both leave-one-source-out and full-shot deployment classifiers."""
+    def _historical_prototype_bank(self):
+        states = getattr(self, "_resume_state_dict_list", [])
+        if not states: return None, None
+        ids, prototypes = [], []
+        for state in states:
+            class_ids = torch.as_tensor(state.get("class_ids", state.get("class_index")), device=self.device, dtype=torch.long).reshape(-1)
+            fused = state.get("fused_proto")
+            if fused is None: fused = self.model_without_dp.fuse_prototypes(state)
+            fused = F.normalize(torch.as_tensor(fused, device=self.device).float(), dim=-1)
+            if fused.ndim != 2 or fused.size(0) != class_ids.numel(): raise ValueError("Historical prototypes and ids do not align.")
+            ids.append(class_ids); prototypes.append(fused)
+        ids, prototypes = torch.cat(ids), torch.cat(prototypes)
+        if torch.unique(ids).numel() != ids.numel(): raise ValueError("Duplicate historical class ids.")
+        order = ids.argsort()
+        return ids[order], prototypes[order]
+
+    @torch.no_grad()
+    def _support_bank(self, loader, class_index, text_features, description_proto, version, calibrate=True):
+        """Current query-exclusive prototypes plus immutable historical negatives."""
         model = self.model_without_dp
         current = model.build_leave_one_out_prototypes(loader, class_index, max_session=None)
-        reference = (current if version == 0 else
-                     model.build_leave_one_out_prototypes(loader, class_index, max_session=0))
-        if not torch.equal(current["source_ids"], reference["source_ids"]):
-            raise RuntimeError("Current and reference support source orders differ.")
-        labels, classes = current["labels"], current["classes"]
-        current_features, reference_features = current["features"], reference["features"]
-        visual_full = F.normalize(torch.stack([
-            current_features[labels.eq(cls)].mean(0) for cls in classes
-        ]), dim=-1)
-        reference_full = F.normalize(torch.stack([
-            reference_features[labels.eq(cls)].mean(0) for cls in classes
-        ]), dim=-1)
-        visual_loo = current["loo_visual_prototypes"]
+        device = torch.device(self.device)
+        features, labels = current["features"].to(device).float(), current["labels"].to(device).long()
+        classes = current["classes"].to(device).long()
+        if not bool(current["loo_valid"].all().item()): raise ValueError("Each query requires another same-class source.")
+        requested = torch.as_tensor(class_index, device=device, dtype=torch.long).reshape(-1)
+        matches = classes[:, None].eq(requested[None, :])
+        if not matches.sum(1).eq(1).all() or not matches.sum(0).eq(1).all(): raise ValueError("Support class ids mismatch.")
+        order_text = matches.long().argmax(1)
+        text_features = torch.as_tensor(text_features, device=device).float()[order_text]
+        description_proto = torch.as_tensor(description_proto, device=device).float()[order_text]
+        visual_full = F.normalize(torch.stack([features[labels.eq(c)].mean(0) for c in classes]), dim=-1)
+        visual_loo = current["loo_visual_prototypes"].to(device).float()
         if calibrate:
-            visual_full = model.calibrate_incremental_visual(visual_full.to(self.device),
-                                                               reference_full.to(self.device))
-            visual_loo = model.calibrate_incremental_visual(visual_loo.to(self.device),
-                                                              reference["loo_visual_prototypes"].to(self.device))
-        lambda_t = (float(self.cfg.TRAINER.BiMC.LAMBDA_T)
-                    if self.cfg.TRAINER.BiMC.TEXT_CALIBRATION else 0.0)
-        text = F.normalize((1.0 - lambda_t) * text_features
-                           + lambda_t * description_proto, dim=-1)
+            visual_full = model.calibrate_incremental_visual(visual_full)
+            visual_loo = model.calibrate_incremental_visual(visual_loo.reshape(-1, visual_loo.size(-1))).reshape_as(visual_loo)
+        lam = float(self.cfg.TRAINER.BiMC.LAMBDA_T) if self.cfg.TRAINER.BiMC.TEXT_CALIBRATION else 0.0
+        text = F.normalize((1-lam)*text_features + lam*description_proto, dim=-1)
         beta = float(self.cfg.DATASET.BETA)
-        current["visual_full"] = visual_full.to(self.device)
-        current["visual_loo"] = visual_loo.to(self.device)
-        current["fused_full"] = F.normalize(beta * text + (1.0 - beta) * current["visual_full"], dim=-1)
-        current["fused_loo"] = F.normalize(beta * text[None, :, :] +
-                                            (1.0 - beta) * current["visual_loo"], dim=-1)
-        if not bool(current["loo_valid"].all().item()):
-            raise ValueError("Every training query needs another source in its class.")
+        new_full = F.normalize(beta*text + (1-beta)*visual_full, dim=-1)
+        new_loo = F.normalize(beta*text.unsqueeze(0) + (1-beta)*visual_loo, dim=-1)
+        old_ids, old_proto = self._historical_prototype_bank()
+        if old_ids is None: all_ids, full_bank, loo_bank = classes, new_full, new_loo
+        else:
+            if torch.isin(old_ids, classes).any(): raise ValueError("Historical/current class ids overlap.")
+            all_ids = torch.cat([old_ids, classes]); order = all_ids.argsort()
+            full_bank = torch.cat([old_proto, new_full], dim=0)[order]
+            loo_bank = torch.cat([old_proto.unsqueeze(0).expand(new_loo.size(0),-1,-1), new_loo], dim=1)[:,order,:]
+        current["classes"] = all_ids.sort().values
+        current["fused_full"], current["fused_loo"] = full_bank, loo_bank
         return current
 
     def _incremental_logits(self, images, labels, source_ids, support_bank,
@@ -611,21 +626,27 @@ class Runner:
                            loader(extract_data, held_out, False)))
         return result
 
-    def _representation_drift(self, images, current_version, previous_version):
-        """Differentiable cosine drift on current support images only.
+    @torch.no_grad()
+    def _reference_features(self, images, previous_version):
+        """Evaluate the pre-update function using frozen router-column snapshots."""
+        snapshots = getattr(self, "_candidate_reference_router_states", None)
+        if not snapshots:
+            return F.normalize(self.model_without_dp.extract_img_feature(images, max_session=previous_version).float(), dim=-1)
+        adapters, live = self._moe_adapters(), {}
+        try:
+            for block, adapter in adapters:
+                live[block] = [copy.deepcopy(col.state_dict()) for col in adapter.router.columns]
+                for col, state in zip(adapter.router.columns, snapshots.get(block, [])): col.load_state_dict(state)
+            return F.normalize(self.model_without_dp.extract_img_feature(images, max_session=previous_version).float(), dim=-1)
+        finally:
+            for block, adapter in adapters:
+                for col, state in zip(adapter.router.columns, live.get(block, [])): col.load_state_dict(state)
 
-        The teacher is the frozen previous encoder version. This introduces no
-        rehearsal images or changes to historical experts and prototypes.
-        """
-        if current_version == previous_version:
-            return images.new_zeros((), dtype=torch.float32)
-        with torch.no_grad():
-            previous = F.normalize(self.model_without_dp.extract_img_feature(
-                images, max_session=previous_version).float(), dim=-1)
-        current, _ = self.model_without_dp.extract_img_feature_train(
-            images, max_session=current_version)
+    def _representation_drift(self, images, current_version, previous_version):
+        previous = self._reference_features(images, previous_version)
+        current, _ = self.model_without_dp.extract_img_feature_train(images, max_session=current_version)
         current = F.normalize(current.float(), dim=-1)
-        return (1.0 - (current * previous).sum(dim=-1)).mean().clamp_min(0.0)
+        return (1.0-(current*previous).sum(dim=-1)).mean().clamp_min(0.0)
 
     def _train_candidate(self, task_id, block_idx, train_loader, extract_loader,
                          class_index, text, description, calibrate):
@@ -701,6 +722,9 @@ class Runner:
                     images, labels, source_ids, bank, task_id, scale
                 )
                 loss = F.cross_entropy(logits, targets)
+                stability = float(getattr(self.cfg.TRAINER.BiMC.INCREMENTAL, "STABILITY_WEIGHT", 0.0))
+                if stability > 0:
+                    loss = loss + stability * self._representation_drift(images, task_id, self._candidate_previous_version)
                 if not bool(torch.isfinite(loss).item()):
                     raise FloatingPointError("Non-finite router-only incremental loss.")
                 loss.backward()
@@ -728,15 +752,8 @@ class Runner:
             value = F.cross_entropy(logits, targets, reduction="sum")
             stability_weight = float(getattr(self.cfg.TRAINER.BiMC.INCREMENTAL,
                                              "STABILITY_WEIGHT", 0.0))
-            if (stability_weight > 0.0 and previous_version is not None
-                    and version != previous_version):
-                with torch.no_grad():
-                    before = F.normalize(self.model_without_dp.extract_img_feature(
-                        images, max_session=previous_version).float(), dim=-1)
-                    after = F.normalize(self.model_without_dp.extract_img_feature(
-                        images, max_session=version).float(), dim=-1)
-                    drift = (1.0 - (after * before).sum(dim=-1)).clamp_min(0.0).sum()
-                    value = value + stability_weight * drift
+            if stability_weight > 0.0 and previous_version is not None:
+                value = value + stability_weight * self._representation_drift(images, version, previous_version) * labels.numel()
             total += float(value.item())
             count += labels.numel()
         return total / max(count, 1)
@@ -747,8 +764,11 @@ class Runner:
         folds = self._support_folds(train_loader, extract_loader)
         previous_version = self._current_encoder_version()
         self._candidate_previous_version = previous_version
-        for _, adapter in self._moe_adapters():
-            adapter.freeze_all()
+        for _, adapter in self._moe_adapters(): adapter.freeze_all()
+        self._candidate_reference_router_states = {
+            block: [copy.deepcopy(col.state_dict()) for col in adapter.router.columns]
+            for block, adapter in self._moe_adapters()
+        }
         if not folds:
             return {"trained": False, "router_adapted": False, "decisions": [],
                     "expanded": [], "encoder_version": previous_version,
@@ -807,11 +827,25 @@ class Runner:
                     "router_epochs": history, "decisions": decisions, "expanded": [],
                     "encoder_version": previous_version}
 
-        # Routing alone did not pass held-out validation. Test temporary expert
-        # additions with historical experts frozen and active in the shared Softmax.
+        # Descriptor coverage gates candidate layers before predictive validation.
+        coverage_features = self.model_without_dp.collect_blockwise_cls_features(extract_loader)
+        expansion_candidates = []
         for block_idx in self.model_without_dp.expandable_blocks():
-            adapter = self._adapter_by_block(block_idx)
-            self.model_without_dp.add_expert(block_idx, task_id)
+            coverage = self.model_without_dp.plan_layer_expansion(
+                block_idx, extract_loader, class_index, block_features=coverage_features.get(block_idx))
+            decisions.append({"mode":"descriptor_coverage","block_idx":int(block_idx),
+                "expand":bool(coverage.expand),"class_scores":dict(coverage.class_scores),
+                "uncovered_classes":list(coverage.uncovered)})
+            if coverage.expand: expansion_candidates.append(block_idx)
+        if not expansion_candidates:
+            for _, adapter in self._moe_adapters(): adapter.freeze_all()
+            return {"trained":False,"router_adapted":False,"decisions":decisions,"expanded":[],
+                    "encoder_version":previous_version,"reason":"existing descriptors cover support distribution"}
+        route_mass = float(_cfg_value(self._visual_moe_cfg(),"INITIAL_EXPERT_ROUTE_MASS",0.01))
+        for block_idx in expansion_candidates:
+            self.model_without_dp.add_expert(block_idx, task_id,
+                reference_features=coverage_features[block_idx]["cls_in"].to(self.device),
+                target_route_mass=route_mass)
             initial_expert = copy.deepcopy(adapter.experts[-1].state_dict())
             initial_router = copy.deepcopy(adapter.router.columns[-1].state_dict())
             candidate_losses = []
@@ -851,52 +885,42 @@ class Runner:
 
         block_idx = best["block_idx"]
         adapter = self._adapter_by_block(block_idx)
-        expert_id = self.model_without_dp.add_expert(block_idx, task_id)
+        expert_id = self.model_without_dp.add_expert(block_idx, task_id,
+            reference_features=coverage_features[block_idx]["cls_in"].to(self.device), target_route_mass=route_mass)
         epochs = self._train_candidate(task_id, block_idx, train_loader, extract_loader,
-                                       class_index, text, description,
-                                       enable_visual_calibration)
-        print(f"=> [Accepted][Task {task_id}][B{block_idx}] expert={expert_id} "
-              f"validation_gain={best['gain']:.5f}")
-        return {"trained": True, "router_adapted": False, "decisions": decisions,
-                "expanded": [{"block_idx": block_idx, "expert_id": expert_id,
-                              "epochs": epochs}], "encoder_version": task_id}
+            class_index, text, description, enable_visual_calibration)
+        desc_features = self.model_without_dp.collect_blockwise_cls_features(extract_loader)[block_idx]["cls_in"].to(self.device)
+        with torch.no_grad(): _, resp = adapter.router(desc_features)
+        desc_loss = self._train_descriptor(adapter, expert_id, desc_features, resp[:,expert_id],
+            int(_cfg_value(self.cfg.TRAINER.BiMC.OPTIM,"INCREMENTAL_DESCRIPTOR_EPOCHS",5)))
+        adapter.freeze_all()
+        if not adapter.descriptors[expert_id].is_ready(): raise RuntimeError("New expert descriptor is not calibrated.")
+        return {"trained":True,"router_adapted":False,"decisions":decisions,
+            "expanded":[{"block_idx":block_idx,"expert_id":expert_id,"epochs":epochs,"descriptor_loss":float(desc_loss)}],
+            "encoder_version":task_id}
 
     @torch.no_grad()
-    def _rebuild_unified_task_states(self, through_task):
-        """Re-encode every seen class with the current complete model.
-
-        Text/description prototypes remain in CLIP's semantic space. Visual
-        support prototypes are refreshed after every session, so no class is
-        evaluated with an encoder version from its creation session.
-        """
-        self.model.eval()
-        self.model_without_dp.base_vision_prototype = None
-        self.model_without_dp._fused_history_prototypes = None
-        self.model_without_dp._fused_history_class_ids = None
-        states = []
-        for session_id in range(int(through_task) + 1):
-            class_index = self.data_manager.class_index_in_task[session_id]
-            class_names = np.array(self.data_manager.class_names)[class_index].tolist()
-            support_loader = self.data_manager.get_dataloader(
-                session_id, source="train", mode="test", accumulate_past=False
-            )
-            state = self.model_without_dp.build_task_statistics(
-                class_names,
-                support_loader,
-                class_index,
-                calibrate_novel_vision_proto=(
-                    session_id > 0 and bool(self.cfg.TRAINER.BiMC.VISION_CALIBRATION)
-                ),
-                encoder_version=None,
-            )
-            state["class_ids"] = torch.as_tensor(
-                class_index, device=self.device, dtype=torch.long
-            )
-            state["creation_session"] = int(session_id)
-            # Legacy metadata only; inference never branches on this value.
-            state["encoder_version"] = 0
-            states.append(state)
-        return states
+    def _rebuild_unified_task_states(self, through_task, previous_states=None):
+        """Append current-session prototypes without reopening historical support images."""
+        self.model.eval(); through_task=int(through_task)
+        if through_task == 0:
+            self.model_without_dp.base_vision_prototype=None
+            self.model_without_dp._fused_history_prototypes=None
+            self.model_without_dp._fused_history_class_ids=None
+            states=[]
+        else:
+            states=list(previous_states if previous_states is not None else getattr(self,"_resume_state_dict_list",[]))
+            if len(states)!=through_task: raise RuntimeError(f"Expected {through_task} historical states, got {len(states)}.")
+            if self.model_without_dp.base_vision_prototype is None: raise RuntimeError("Base visual prototypes missing; resume from Session 0.")
+        ids=self.data_manager.class_index_in_task[through_task]
+        names=np.array(self.data_manager.class_names)[ids].tolist()
+        loader=self.data_manager.get_dataloader(through_task,source="train",mode="test",accumulate_past=False)
+        state=self.model_without_dp.build_task_statistics(names,loader,ids,
+            calibrate_novel_vision_proto=(through_task>0 and bool(self.cfg.TRAINER.BiMC.VISION_CALIBRATION)),
+            encoder_version=None)
+        state["class_ids"]=torch.as_tensor(ids,device=self.device,dtype=torch.long)
+        state["creation_session"]=through_task; state["encoder_version"]=0
+        return states+[state]
 
     def run(self):
         configured_end = int(_cfg_value(self.cfg.TRAINER.BiMC, "END_SESSION", -1))
@@ -964,7 +988,7 @@ class Runner:
 
             # Refresh prototypes for every seen class after any accepted update.
             self.model.eval()
-            state_dict_list = self._rebuild_unified_task_states(task_id)
+            state_dict_list = self._rebuild_unified_task_states(task_id, previous_states=state_dict_list)
             self._resume_state_dict_list = state_dict_list
             merged_state = self.merge_dicts(state_dict_list)
 

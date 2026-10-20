@@ -204,12 +204,28 @@ class ExpandableRouter(nn.Module):
         self.columns.append(column)
         return len(self.columns) - 1
 
+    @torch.no_grad()
+    def initialize_newest_column(self, inputs, target_mass=0.01):
+        """Initialize the new router column to a calibrated mean Softmax mass."""
+        target_mass=float(target_mass)
+        if not 0.0<target_mass<1.0 or len(self.columns)<2: raise ValueError("Invalid target mass or missing historical columns.")
+        newest=self.columns[-1]
+        inputs=torch.as_tensor(inputs,device=newest.weight.device,dtype=newest.weight.dtype)
+        if inputs.ndim!=2 or inputs.size(0)==0 or inputs.size(1)!=self.dim: raise ValueError("Expected non-empty [N, d_model] inputs.")
+        old=torch.cat([col(inputs) for col in self.columns[:-1]],dim=-1).float()
+        partition=torch.logsumexp(old,dim=-1); low,high=partition.min()-20,partition.max()+20
+        for _ in range(64):
+            bias=(low+high)*0.5
+            if torch.sigmoid(bias-partition).mean()<target_mass: low=bias
+            else: high=bias
+        bias=(low+high)*0.5; newest.weight.zero_(); newest.bias.fill_(float(bias.item()))
+        return float(torch.sigmoid(bias-partition).mean().item())
+
     def forward(self, x, num_columns=None):
-        if not self.columns:
-            raise RuntimeError("ExpandableRouter requires at least one column.")
-        selected = self.columns if num_columns is None else self.columns[:int(num_columns)]
-        logits = torch.cat([column(x) for column in selected], dim=-1)
-        return logits, torch.softmax(logits, dim=-1)
+        if not self.columns: raise RuntimeError("ExpandableRouter requires at least one column.")
+        selected=self.columns if num_columns is None else self.columns[:int(num_columns)]
+        logits=torch.cat([column(x) for column in selected],dim=-1)
+        return logits,torch.softmax(logits,dim=-1)
 
 
 class BottleneckExpert(nn.Module):

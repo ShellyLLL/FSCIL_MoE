@@ -106,18 +106,12 @@ class ExpansionInvariantTests(unittest.TestCase):
             torch.testing.assert_close(restored(inputs, max_session=version)[0],
                                        value, rtol=0, atol=0)
 
-    def test_visual_calibration_transports_only_the_paired_shift(self):
-        model = BiMC.__new__(BiMC)
-        torch.nn.Module.__init__(model)
-        model.cfg = SimpleNamespace(TRAINER=SimpleNamespace(BiMC=SimpleNamespace(
-            LAMBDA_I=0.25, TAU=4)))
-        model.base_vision_prototype = F.normalize(torch.eye(3)[:2], dim=-1)
-        reference = F.normalize(torch.tensor([[0.7, 0.7, 0.0]]), dim=-1)
-        current = F.normalize(torch.tensor([[0.6, 0.7, 0.4]]), dim=-1)
-        expected = F.normalize(model.soft_calibration(model.base_vision_prototype,
-                                                       reference) + current - reference, dim=-1)
-        torch.testing.assert_close(model.calibrate_incremental_visual(current, reference),
-                                   expected)
+    def test_visual_calibration_uses_current_bimc_prototype(self):
+        model=BiMC.__new__(BiMC); torch.nn.Module.__init__(model)
+        model.cfg=SimpleNamespace(TRAINER=SimpleNamespace(BiMC=SimpleNamespace(LAMBDA_I=0.25,TAU=4)))
+        model.base_vision_prototype=F.normalize(torch.eye(3)[:2],dim=-1)
+        current=F.normalize(torch.tensor([[0.6,0.7,0.4]]),dim=-1)
+        torch.testing.assert_close(model.calibrate_incremental_visual(current),model.soft_calibration(model.base_vision_prototype,current))
 
     def test_leave_one_out_excludes_the_query_source(self):
         features = F.normalize(torch.tensor([[1., 0.], [0., 1.],
@@ -185,163 +179,19 @@ class ExpansionInvariantTests(unittest.TestCase):
             self.assertEqual(len(held_out), 2)
             self.assertEqual(len(fit_train.dataset), 8)
 
-    def test_versioned_scores_keep_historical_columns_fixed(self):
-        runner = Runner.__new__(Runner)
-
-        class Encoder:
-            shift = 0.0
-
-            def extract_img_feature(self, images, max_session=None):
-                return images + (self.shift if max_session == 1 else 0.0) * torch.tensor([0., 1.])
-
-        runner.model_without_dp = Encoder()
-        images = torch.tensor([[1., 0.], [0., 1.]])
-        prototypes = torch.tensor([[1., 0.], [0., 1.]])
-        versions = torch.tensor([0, 1])
-        first = runner._versioned_scores(images, prototypes, versions, 100.0)
-        runner.model_without_dp.shift = 0.8
-        second = runner._versioned_scores(images, prototypes, versions, 100.0)
-        torch.testing.assert_close(first[:, 0], second[:, 0], rtol=0, atol=0)
-        self.assertGreater((first[:, 1] - second[:, 1]).abs().max().item(), 0)
-
-    def test_anchor_gate_and_expert_class_ranking_are_separate(self):
-        runner = Runner.__new__(Runner)
-        runner.task_gate_biases = [0.0, 2.0]
-        state = {"anchor_fused_proto": torch.eye(4),
-                 "task_ids": torch.tensor([0, 0, 1, 1])}
-        features = F.normalize(torch.tensor([[0.9, 0.1, 0.8, 0.2],
-                                              [0.1, 0.8, 0.2, 0.9]]), dim=-1)
-        within_task = torch.tensor([[4., 3., 2., 1.], [1., 2., 3., 4.]])
-        result = runner._retained_scores(features, state, within_task)
-        evidence = runner._anchor_task_scores(features, state) + torch.tensor([0., 2.])
-        torch.testing.assert_close(result.max(dim=1).values, evidence.max(dim=1).values)
-        torch.testing.assert_close(result[:, :2].max(dim=1).values, evidence[:, 0])
-        torch.testing.assert_close(result[:, 2:].max(dim=1).values, evidence[:, 1])
-        changed = within_task.clone()
-        changed[:, 2:] += 1000.0
-        torch.testing.assert_close(runner._retained_scores(features, state, changed), result)
-
-    def test_full_inference_recovers_old_class_when_new_version_steals_it(self):
-        runner = Runner.__new__(Runner)
-        runner.device, runner.task_gate_biases = "cpu", [0.0, 0.0]
-        runner.cfg = SimpleNamespace(DATASET=SimpleNamespace(BETA=0.3),
-            TRAINER=SimpleNamespace(BiMC=SimpleNamespace(
-                TEXT_CALIBRATION=False, LAMBDA_T=0.0)))
-
-        class Encoder:
-            def extract_img_feature(self, images, max_session=None):
-                return images + (10.0 * torch.tensor([0., 0., 1., 0.])
-                                 if max_session == 1 else 0.0)
-
-        runner.model_without_dp = Encoder()
-        samples = [{"image": torch.eye(4)[0], "label": 0},
-                   {"image": torch.eye(4)[2], "label": 2}]
-        runner.data_manager = SimpleNamespace(get_dataloader=lambda *args, **kwargs:
-            DataLoader(samples, batch_size=2))
-        runner.evaluator = AccuracyEvaluator([torch.tensor([0, 1]), torch.tensor([2, 3])])
-        fused = torch.eye(4)
-        fused[0] = F.normalize(torch.tensor([0.8, 0.6, 0., 0.]), dim=-1)
-        state = {"class_ids": torch.arange(4), "task_ids": torch.tensor([0, 0, 1, 1]),
-                 "encoder_versions": torch.tensor([0, 0, 1, 1]),
-                 "anchor_fused_proto": torch.eye(4), "fused_proto": fused,
-                 "image_proto": fused, "text_features": fused,
-                 "description_proto": fused}
-        evaluation = runner.inference_task_bilevel(1, state)
-        self.assertEqual(evaluation["classifier_variants"]["refined"]["base_avg_acc"], 0.0)
-        self.assertEqual(evaluation["base_avg_acc"], 100.0)
-        self.assertEqual(evaluation["task_acc"], [100.0, 100.0])
-        self.assertEqual(evaluation["task_diagnostics"]["task_selection_acc"], 100.0)
-        self.assertEqual(evaluation["task_diagnostics"]["oracle_task_within_acc"], 100.0)
-
-    def test_joint_gate_does_not_fit_one_novel_outlier_at_old_classes_expense(self):
-        runner = Runner.__new__(Runner)
-        runner.device, runner.task_gate_biases = "cpu", [0.0]
-        runner.cfg = SimpleNamespace(DATASET=SimpleNamespace(BETA=0.3),
-            TRAINER=SimpleNamespace(BiMC=SimpleNamespace(
-                VISION_CALIBRATION=False, TEXT_CALIBRATION=False, LAMBDA_T=0.0)))
-        base = torch.eye(4)[:2]
-        novel = torch.eye(4)[2:]
-        old = {"class_ids": torch.tensor([0, 1]), "creation_session": 0,
-               "encoder_version": 0, "anchor_fused_proto": base,
-               "anchor_features": base.repeat_interleave(3, dim=0),
-               "anchor_labels": torch.tensor([0] * 3 + [1] * 3),
-               "image_proto": base, "text_features": base,
-               "description_proto": base, "fused_proto": base}
-        novel_features = novel.repeat_interleave(5, dim=0)
-        novel_features[0] = base[0]
-        current = {"class_ids": torch.tensor([2, 3]), "creation_session": 1,
-                   "encoder_version": 1, "anchor_fused_proto": novel,
-                   "anchor_features": novel_features,
-                   "anchor_labels": torch.tensor([2] * 5 + [3] * 5),
-                   "image_proto": novel, "text_features": novel,
-                   "description_proto": novel, "fused_proto": novel}
-        outcome = runner._calibrate_task_gate(1, [old, current])
-        self.assertEqual(outcome["old_loo_task_recall"], 1.0)
-        self.assertAlmostEqual(outcome["novel_loo_task_recall"], 0.9, places=6)
-        outlier_evidence = runner._anchor_task_scores(
-            current["anchor_features"][:1], runner.merge_dicts([old, current]),
-            runner._anchor_leave_one_out(current)[:1], current["anchor_labels"][:1])
-        self.assertLess(outcome["new_task_bias"],
-                        (outlier_evidence[0, 0] - outlier_evidence[0, 1]).item())
-
-    def test_anchor_loo_removes_all_views_of_the_query_source(self):
-        runner = Runner.__new__(Runner)
-        runner.device = "cpu"
-        runner.cfg = SimpleNamespace(DATASET=SimpleNamespace(BETA=0.0),
-            TRAINER=SimpleNamespace(BiMC=SimpleNamespace(
-                VISION_CALIBRATION=False, TEXT_CALIBRATION=False)))
-        state = {"class_ids": torch.tensor([2]), "creation_session": 1,
-                 "anchor_features": torch.tensor([[1., 0.], [1., 0.], [0., 1.]]),
-                 "anchor_labels": torch.tensor([2, 2, 2]),
-                 "anchor_source_ids": torch.tensor([10, 10, 11]),
-                 "text_features": torch.tensor([[1., 0.]]),
-                 "description_proto": torch.tensor([[1., 0.]])}
-        weights = runner._anchor_leave_one_out(state)
-        torch.testing.assert_close(weights[:2], torch.tensor([[0., 1.], [0., 1.]]))
-        torch.testing.assert_close(weights[2:], torch.tensor([[1., 0.]]))
-
-    def test_base_checkpoint_gains_anchor_features_without_retraining(self):
-        from torch import nn
-
-        class CheckpointModel(nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.base_vision_prototype = torch.eye(2)
-
-            def rebuild_moe_topology(self, topology):
-                pass
-
-            def export_moe_topology(self):
-                return {}
-
-            def inference_all_img_feature(self, loader, max_session=None):
-                return torch.eye(2), torch.tensor([0, 1]), torch.eye(2)
-
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "base.pth"
-            old_state = {"class_ids": torch.tensor([0, 1]), "image_proto": torch.eye(2),
-                         "text_features": torch.eye(2), "fused_proto": torch.eye(2)}
-            torch.save({"schema_version": 7, "completed_session": 0,
-                        "model_state": {}, "task_states": [old_state],
-                        "base_vision_prototype": torch.eye(2), "support_manifest": {},
-                        "moe_topology": {}}, path)
-            runner = Runner.__new__(Runner)
-            runner.cfg = SimpleNamespace(TRAINER=SimpleNamespace(BiMC=SimpleNamespace(
-                CHECKPOINT=SimpleNamespace(RESUME=str(path), ENABLE=True, DIR=directory))))
-            runner.device = "cpu"
-            runner.model_without_dp = CheckpointModel()
-            runner._moe_adapters = lambda: []
-            runner.data_manager = SimpleNamespace(load_support_manifest=lambda manifest: None,
-                get_support_manifest=lambda: {}, get_dataloader=lambda *args, **kwargs: None)
-            runner.acc_list, runner.task_acc_list, runner.session_diagnostics = [], [], []
-            runner._load_resume_checkpoint_if_requested()
-            self.assertEqual(runner.task_gate_biases, [0.0])
-            torch.testing.assert_close(runner._resume_state_dict_list[0]["anchor_features"].float(),
-                                       torch.eye(2))
-            runner.save_checkpoint(0, runner._resume_state_dict_list)
-            upgraded = torch.load(Path(directory) / "session_00.pth", weights_only=False)
-            self.assertEqual(upgraded["schema_version"], 9)
-            self.assertEqual(upgraded["task_gate_biases"], [0.0])
+    def test_global_support_bank_includes_historical_negative_classes(self):
+        class Model:
+            def build_leave_one_out_prototypes(self,loader,class_index,max_session=None):
+                fs,ys,ss=[],[],[]
+                for batch in loader: fs.append(F.normalize(batch["image"],dim=-1));ys.append(batch["label"]);ss.append(batch["source_id"])
+                return build_loo_cache_from_embeddings(torch.cat(fs),torch.cat(ys),torch.cat(ss),class_index)
+            def calibrate_incremental_visual(self,current): return current
+        runner=Runner.__new__(Runner);runner.device="cpu"
+        runner.cfg=SimpleNamespace(DATASET=SimpleNamespace(BETA=0.3),TRAINER=SimpleNamespace(BiMC=SimpleNamespace(TEXT_CALIBRATION=False,LAMBDA_T=0.0)))
+        runner.model_without_dp=Model();runner._resume_state_dict_list=[{"class_ids":torch.tensor([0,1]),"fused_proto":torch.eye(4)[:2]}]
+        loader=DataLoader(TinySupport(shots=3),batch_size=4,shuffle=False);text=F.normalize(torch.eye(4)[2:4],dim=-1)
+        bank=runner._support_bank(loader,[2,3],text,text,version=1,calibrate=False)
+        self.assertEqual(bank["classes"].tolist(),[0,1,2,3]);self.assertEqual(tuple(bank["fused_full"].shape),(4,4));self.assertEqual(tuple(bank["fused_loo"].shape),(6,4,4))
 
     def test_candidate_training_uses_fused_leave_one_out_scores(self):
         from torch import nn
