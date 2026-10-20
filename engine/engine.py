@@ -782,13 +782,14 @@ class Runner:
 
         # First test the lower-capacity option: update router columns only.
         initial_router_states = {
-            block_idx: copy.deepcopy(adapter.router.state_dict())
+            block_idx: [copy.deepcopy(column.state_dict()) for column in adapter.router.columns]
             for block_idx, adapter in self._moe_adapters()
         }
         router_losses = []
         for fit_train, fit_extract, validation in folds:
             for block_idx, adapter in self._moe_adapters():
-                adapter.router.load_state_dict(initial_router_states[block_idx])
+                for column, state in zip(adapter.router.columns, initial_router_states[block_idx]):
+                    column.load_state_dict(state)
                 adapter.freeze_all()
             self._train_router_only(
                 task_id, fit_train, fit_extract, class_index, text, description,
@@ -808,7 +809,8 @@ class Runner:
 
         # Restore the exact pre-candidate state before accepting/rejecting it.
         for block_idx, adapter in self._moe_adapters():
-            adapter.router.load_state_dict(initial_router_states[block_idx])
+            for column, state in zip(adapter.router.columns, initial_router_states[block_idx]):
+                column.load_state_dict(state)
             adapter.freeze_all()
         decisions = [{
             "mode": "router_only",
@@ -843,6 +845,7 @@ class Runner:
                     "encoder_version":previous_version,"reason":"existing descriptors cover support distribution"}
         route_mass = float(_cfg_value(self._visual_moe_cfg(),"INITIAL_EXPERT_ROUTE_MASS",0.01))
         for block_idx in expansion_candidates:
+            adapter = self._adapter_by_block(block_idx)
             self.model_without_dp.add_expert(block_idx, task_id,
                 reference_features=coverage_features[block_idx]["cls_in"].to(self.device),
                 target_route_mass=route_mass)
