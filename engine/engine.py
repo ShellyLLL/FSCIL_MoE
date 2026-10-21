@@ -851,7 +851,7 @@ class Runner:
                 block_idx, extract_loader, class_index, block_features=coverage_features.get(block_idx))
             decisions.append({"mode":"descriptor_coverage","block_idx":int(block_idx),
                 "expand":bool(coverage.expand),"class_scores":dict(coverage.class_scores),
-                "uncovered_classes":list(coverage.uncovered)})
+                "uncovered_classes":list(coverage.uncovered_classes)})
             if coverage.expand: expansion_candidates.append(block_idx)
         if not expansion_candidates:
             for _, adapter in self._moe_adapters(): adapter.freeze_all()
