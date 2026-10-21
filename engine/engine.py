@@ -670,14 +670,21 @@ class Runner:
                 images, labels = self.parse_batch(batch)
                 source_ids = self._batch_source_ids(batch, labels.numel(), labels.device)
                 optimizer.zero_grad(set_to_none=True)
+                # Compute drift first: _representation_drift temporarily swaps router
+                # state_dicts to evaluate the frozen reference model. Do this before
+                # building the classification graph, otherwise load_state_dict mutates
+                # router parameters saved for backward and triggers a version-counter error.
+                stability_weight = float(getattr(self.cfg.TRAINER.BiMC.INCREMENTAL,
+                                                 "STABILITY_WEIGHT", 0.0))
+                stability_loss = None
+                if stability_weight > 0.0:
+                    stability_loss = self._representation_drift(
+                        images, task_id, self._candidate_previous_version)
                 logits, targets = self._incremental_logits(
                     images, labels, source_ids, bank, task_id, scale)
                 loss = F.cross_entropy(logits, targets)
-                stability_weight = float(getattr(self.cfg.TRAINER.BiMC.INCREMENTAL,
-                                                 "STABILITY_WEIGHT", 0.0))
-                if stability_weight > 0.0:
-                    loss = loss + stability_weight * self._representation_drift(
-                        images, task_id, self._candidate_previous_version)
+                if stability_loss is not None:
+                    loss = loss + stability_weight * stability_loss
                 if not bool(torch.isfinite(loss).item()):
                     raise FloatingPointError("Non-finite fused incremental loss.")
                 loss.backward()
@@ -718,13 +725,20 @@ class Runner:
                 images, labels = self.parse_batch(batch)
                 source_ids = self._batch_source_ids(batch, labels.numel(), labels.device)
                 optimizer.zero_grad(set_to_none=True)
+                # _representation_drift restores reference router parameters in-place;
+                # run it before constructing the classification autograd graph.
+                stability = float(getattr(self.cfg.TRAINER.BiMC.INCREMENTAL, "STABILITY_WEIGHT", 0.0))
+                stability_loss = None
+                if stability > 0:
+                    stability_loss = self._representation_drift(
+                        images, task_id, self._candidate_previous_version
+                    )
                 logits, targets = self._incremental_logits(
                     images, labels, source_ids, bank, task_id, scale
                 )
                 loss = F.cross_entropy(logits, targets)
-                stability = float(getattr(self.cfg.TRAINER.BiMC.INCREMENTAL, "STABILITY_WEIGHT", 0.0))
-                if stability > 0:
-                    loss = loss + stability * self._representation_drift(images, task_id, self._candidate_previous_version)
+                if stability_loss is not None:
+                    loss = loss + stability * stability_loss
                 if not bool(torch.isfinite(loss).item()):
                     raise FloatingPointError("Non-finite router-only incremental loss.")
                 loss.backward()
