@@ -53,6 +53,7 @@ TRAINER:
       # Regularize the change in current-support image features relative to the
       # frozen previous model. Also included in candidate held-out selection.
       STABILITY_WEIGHT: 0.1
+      MAX_REFERENCE_DRIFT: 0.20
 
     CHECKPOINT:
       ENABLE: True

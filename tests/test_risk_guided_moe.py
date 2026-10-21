@@ -194,6 +194,68 @@ class ExpansionInvariantTests(unittest.TestCase):
         self.assertAlmostEqual(mass, 0.01, delta=0.002)
         self.assertAlmostEqual(float(weights[:, -1].mean()), 0.01, delta=0.002)
 
+    def test_fixed_reference_features_restore_live_router_after_measurement(self):
+        torch.manual_seed(17)
+        adapter = VisualMoEAdapter(4, num_experts=2, reduction=2)
+
+        class Encoder:
+            def __init__(self, moe_adapter):
+                self.adapter = moe_adapter
+
+            def extract_img_feature(self, images, max_session=None):
+                return images + self.adapter.router.columns[0].bias
+
+        runner = Runner.__new__(Runner)
+        runner.model_without_dp = Encoder(adapter)
+        runner._moe_adapters = lambda: [(0, adapter)]
+        reference = [Runner._cpu_copy(column.state_dict())
+                     for column in adapter.router.columns[:adapter.base_expert_count]]
+        runner._base_reference_router_states = {"0": reference}
+        with torch.no_grad():
+            adapter.router.columns[0].bias.add_(2.0)
+        live_bias = adapter.router.columns[0].bias.detach().clone()
+        measured = runner._reference_features(torch.ones(2, 4), previous_version=1)
+        self.assertTrue(torch.isfinite(measured).all())
+        torch.testing.assert_close(adapter.router.columns[0].bias, live_bias)
+
+    def test_held_out_objective_reports_classification_and_reference_drift(self):
+        runner = Runner.__new__(Runner)
+        runner.model = type("EvalModel", (), {"eval": lambda self: None})()
+        runner.cfg = SimpleNamespace(TRAINER=SimpleNamespace(BiMC=SimpleNamespace(
+            INCREMENTAL=SimpleNamespace(LOGIT_SCALE=1.0, STABILITY_WEIGHT=0.4))))
+        runner._support_bank = lambda *args, **kwargs: {}
+        runner.parse_batch = lambda batch: (batch["image"], batch["label"])
+        runner._incremental_logits = lambda images, labels, *args, **kwargs: (
+            torch.tensor([[2.0, 0.0], [0.0, 2.0]], device=labels.device),
+            torch.tensor([0, 1], device=labels.device),
+        )
+        runner._representation_drift = lambda *args, **kwargs: torch.tensor(0.25)
+        loader = DataLoader(TinySupport(shots=1), batch_size=2, shuffle=False)
+        metrics = runner._held_out_loss(
+            loader, loader, [2, 3], None, None, 1, False,
+            previous_version=0, return_metrics=True,
+        )
+        self.assertAlmostEqual(metrics["reference_drift"], 0.25, places=6)
+        self.assertAlmostEqual(
+            metrics["loss"], metrics["classification_loss"] + 0.4 * 0.25, places=6
+        )
+
+    def test_merge_rejects_mixed_prototype_reference_spaces(self):
+        runner = Runner.__new__(Runner)
+        runner.device = "cpu"
+        base = {
+            "class_ids": torch.tensor([0]), "image_proto": torch.tensor([[1.0, 0.0]]),
+            "text_features": torch.tensor([[1.0, 0.0]]),
+            "prototype_space_id": "base_reference_v1",
+        }
+        novel = {
+            "class_ids": torch.tensor([1]), "image_proto": torch.tensor([[0.0, 1.0]]),
+            "text_features": torch.tensor([[0.0, 1.0]]),
+            "prototype_space_id": "unanchored_session_v2",
+        }
+        with self.assertRaisesRegex(ValueError, "different or unknown feature-space"):
+            runner.merge_dicts([base, novel])
+
 
 if __name__ == "__main__":
     unittest.main()

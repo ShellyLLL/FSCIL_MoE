@@ -57,28 +57,34 @@ python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/t
 ~~~
 
 At each incremental session, the method first evaluates a **router-only** update
-with experts frozen. Five source-disjoint support folds estimate its held-out
-gain; the update is accepted only when the mean gain exceeds one standard error.
-If router-only adaptation is not supported by validation, temporary expert
-candidates are tested in eligible blocks. At most one new expert is retained
-when its gain also exceeds one standard error. During expansion, historical
-experts and their router columns stay frozen; the new expert and its new router
-column are trainable. Every active expert is combined with one shared Softmax
-router, and historical experts continue to participate in the forward pass.
+with experts frozen. Source-disjoint support folds compare candidates using the
+same objective: global-class held-out cross-entropy plus a reference-drift penalty.
+The reference is the immutable post-base MoE function, not the previous session's
+mutable router state. A candidate must improve mean held-out objective by more
+than one standard error and satisfy `MAX_REFERENCE_DRIFT`; a post-fit guard checks
+the update trained on all current-session support examples. If router-only
+adaptation is not supported, descriptor coverage gates temporary expert candidates.
+At most one new expert is retained, and its candidate must pass the same validation
+and drift constraints. Rejected or failed updates restore the exact MoE topology,
+parameters, router state, and descriptor buffers from before the candidate.
+Historical experts stay frozen and continue to participate in the shared Softmax
+router.
 
-After each session, visual support prototypes of **all seen classes** are
-recomputed with the current complete model. BiMC text/description fusion and
-base-path visual calibration are retained, but final inference does not use
-creation-session encoders or a task-level gate. Each test image is encoded once
-by the current model and compared against one global bank of calibrated
-prototypes for all seen classes. This is intended to reduce forgetting and
-small-shot overfitting; report AA and PD over the complete FSCIL sequence to
-verify the effect rather than assuming the changes improve them.
+Only the **current session's** support prototypes are refreshed after an update;
+historical support images are not replayed. Each prototype state records the model
+revision and fixed target feature-space reference. The fixed-reference constraint
+reduces cross-session embedding drift, but cannot guarantee exact historical-class
+invariance without historical samples. BiMC text/description fusion and base-path
+visual calibration remain enabled. At inference, each test image is encoded once
+by the current model and compared against one global bank of prototypes for all
+seen classes. Report AA and PD over the full sequence; do not assume the added
+constraints improve them without measurement.
 
-The updated routing semantics use checkpoint schema 10. Incremental checkpoints
-from the prior versioned-classifier implementation are intentionally rejected;
-resume from a base-only checkpoint or restart at Session 0. Reuse the same fixed
-support manifest for all ablations.
+The fixed-reference state uses checkpoint schema 11. Incremental checkpoints
+from schema 10 or earlier are rejected because their historical prototypes were
+not maintained under the fixed-reference contract; resume from a base-only
+checkpoint or restart at Session 0. Reuse the same fixed support manifest for all
+ablations.
 
 ~~~BASH
 python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --support_manifest checkpoints/fscil_moe/cub_seed1_support.json

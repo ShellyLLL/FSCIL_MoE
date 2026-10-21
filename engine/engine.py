@@ -56,6 +56,9 @@ class Runner:
         self.evaluator = AccuracyEvaluator(self.data_manager.class_index_in_task)
         self._resume_completed_session = -1
         self._resume_state_dict_list = []
+        # Immutable post-base router columns define the canonical feature-space reference.
+        self._base_reference_router_states = None
+        self._reference_space_id = "base_reference_v1"
         self._load_resume_checkpoint_if_requested()
 
     # ------------------------------------------------------------------
@@ -105,6 +108,12 @@ class Runner:
         """Merge task classifier states by global class id, not append order."""
         if not dict_list:
             raise ValueError("Cannot merge an empty classifier state list.")
+        space_ids = [state.get("prototype_space_id") for state in dict_list]
+        if any(space_id is not None for space_id in space_ids):
+            if any(space_id is None for space_id in space_ids) or len(set(space_ids)) != 1:
+                raise ValueError(
+                    "Cannot merge prototypes created under different or unknown feature-space references."
+                )
         class_ids = []
         per_state_ids = []
         for state in dict_list:
@@ -119,6 +128,8 @@ class Runner:
             raise ValueError("Classifier states contain duplicate global class ids.")
         order = all_ids.argsort()
         result = {"class_ids": all_ids[order]}
+        if space_ids and space_ids[0] is not None:
+            result["prototype_space_id"] = space_ids[0]
         candidate_keys = (
             "description_proto", "text_features", "image_proto",
             "initial_fused_proto", "fused_proto", "anchor_fused_proto",
@@ -255,6 +266,66 @@ class Runner:
         if "cuda" in state and torch.cuda.is_available():
             torch.cuda.set_rng_state_all(state["cuda"])
 
+    def _capture_base_reference_state(self):
+        """Freeze post-base router columns as the canonical feature reference."""
+        self._base_reference_router_states = {
+            str(block_idx): [
+                self._cpu_copy(column.state_dict())
+                for column in adapter.router.columns[:adapter.base_expert_count]
+            ]
+            for block_idx, adapter in self._moe_adapters()
+        }
+        self._reference_space_id = "base_reference_v1"
+
+    def _snapshot_moe_state(self):
+        """Capture topology and adapter tensors for transactional candidate updates."""
+        return {
+            "topology": copy.deepcopy(self.model_without_dp.export_moe_topology()),
+            "adapter_states": {
+                str(block_idx): self._cpu_copy(adapter.state_dict())
+                for block_idx, adapter in self._moe_adapters()
+            },
+        }
+
+    def _restore_moe_state(self, snapshot):
+        """Restore the exact pre-candidate MoE state, including expert topology."""
+        self.model_without_dp.rebuild_moe_topology(snapshot["topology"])
+        for block_idx, adapter in self._moe_adapters():
+            state = snapshot["adapter_states"].get(str(block_idx))
+            if state is None:
+                raise RuntimeError(f"Transactional MoE snapshot misses block {block_idx}.")
+            adapter.load_state_dict(state, strict=True)
+            adapter.freeze_all()
+
+    def _reference_drift_limit(self):
+        return float(getattr(
+            self.cfg.TRAINER.BiMC.INCREMENTAL, "MAX_REFERENCE_DRIFT", -1.0
+        ))
+
+    def _reference_drift_allowed(self, values):
+        limit = self._reference_drift_limit()
+        if limit < 0:
+            return True
+        return all(np.isfinite(float(value)) and float(value) <= limit for value in values)
+
+    @torch.no_grad()
+    def _loader_reference_drift(self, loader, current_version, reference_version):
+        """Measure mean cosine drift from the fixed base reference on a loader."""
+        if not self._moe_adapters():
+            return 0.0
+        was_training = self.model.training
+        self.model.eval()
+        total, count = 0.0, 0
+        try:
+            for batch in loader:
+                images, labels = self.parse_batch(batch)
+                drift = self._representation_drift(images, current_version, reference_version)
+                total += float(drift.item()) * labels.numel()
+                count += labels.numel()
+        finally:
+            self.model.train(was_training)
+        return total / max(count, 1)
+
     def _load_resume_checkpoint_if_requested(self):
         resume = _cfg_value(self._checkpoint_cfg(), "RESUME", "")
         if not resume:
@@ -289,12 +360,12 @@ class Runner:
             payload["task_states"][0] = dict(payload["task_states"][0])
             payload["task_states"][0]["image_proto"] = base_proto
             payload["task_states"][0]["encoder_version"] = 0
-        elif schema not in (7, 8, 9, 10):
+        elif schema not in (7, 8, 9, 10, 11):
             raise ValueError("Checkpoint topology is incompatible; resume from Session 0.")
-        if schema in (6, 7, 8, 9) and int(payload["completed_session"]) != 0:
+        if schema in (6, 7, 8, 9, 10) and int(payload["completed_session"]) != 0:
             raise ValueError(
-                "Versioned-classifier checkpoints cannot be resumed with unified routing; "
-                "resume from a base-only checkpoint or start from Session 0."
+                "Incremental checkpoints predating fixed-reference prototype-space enforcement "
+                "cannot be resumed safely; resume from a Session 0 checkpoint or restart from Session 0."
             )
         if not isinstance(payload["model_state"], dict):
             raise TypeError("Resume checkpoint model_state must be a state_dict mapping.")
@@ -321,6 +392,15 @@ class Runner:
         self.model_without_dp.load_state_dict(payload["model_state"], strict=True)
         for _, adapter in self._moe_adapters():
             adapter.freeze_all()
+        saved_reference = payload.get("base_reference_router_states")
+        if schema >= 11 and self._moe_adapters() and saved_reference is None:
+            raise ValueError("Checkpoint is missing its fixed base-reference router state.")
+        if saved_reference is None:
+            # Safe for base-only legacy checkpoints: the loaded model is still the post-base reference.
+            self._capture_base_reference_state()
+        else:
+            self._base_reference_router_states = self._cpu_copy(saved_reference)
+            self._reference_space_id = str(payload.get("reference_space_id", "base_reference_v1"))
         manifest = payload.get("support_manifest")
         if manifest is None:
             raise ValueError("Resume checkpoint support_manifest must not be null.")
@@ -343,6 +423,11 @@ class Runner:
                                                torch.as_tensor(sources, dtype=torch.long).cpu())
             base_state["creation_session"] = 0
         self._resume_state_dict_list = payload.get("task_states", [])
+        for state in self._resume_state_dict_list:
+            if "prototype_space_id" not in state:
+                state["prototype_space_id"] = self._reference_space_id
+                state["reference_session"] = 0
+                state["prototype_space_legacy"] = True
         # Legacy task-gate offsets are ignored: inference uses one global bank.
         self.acc_list = payload.get("acc_list", [])
         self.task_acc_list = payload.get("task_acc_list", [])
@@ -360,10 +445,12 @@ class Runner:
         directory.mkdir(parents=True, exist_ok=True)
         topology = self.model_without_dp.export_moe_topology()
         payload = {
-            "schema_version": 10,
+            "schema_version": 11,
             "completed_session": int(completed_session),
             "model_state": self._cpu_copy(self.model_without_dp.state_dict()),
             "moe_topology": topology,
+            "base_reference_router_states": self._cpu_copy(self._base_reference_router_states or {}),
+            "reference_space_id": self._reference_space_id,
             "task_states": self._cpu_copy(state_dict_list),
             "base_vision_prototype": self._cpu_copy(self.model_without_dp.base_vision_prototype),
             "support_manifest": self.data_manager.get_support_manifest(),
@@ -525,6 +612,12 @@ class Runner:
         if not states: return None, None
         ids, prototypes = [], []
         for state in states:
+            state_space = state.get("prototype_space_id", self._reference_space_id)
+            if state_space != self._reference_space_id:
+                raise ValueError(
+                    f"Historical prototype space {state_space!r} does not match "
+                    f"the active reference {self._reference_space_id!r}."
+                )
             class_ids = torch.as_tensor(state.get("class_ids", state.get("class_index")), device=self.device, dtype=torch.long).reshape(-1)
             fused = state.get("fused_proto")
             if fused is None: fused = self.model_without_dp.fuse_prototypes(state)
@@ -628,19 +721,56 @@ class Runner:
 
     @torch.no_grad()
     def _reference_features(self, images, previous_version):
-        """Evaluate the pre-update function using frozen router-column snapshots."""
+        """Encode with the immutable post-base router state when available."""
+        adapters = self._moe_adapters()
+        base_snapshots = getattr(self, "_base_reference_router_states", None)
+        if base_snapshots:
+            live = {}
+            try:
+                for block, adapter in adapters:
+                    reference_columns = base_snapshots.get(str(block), base_snapshots.get(block))
+                    if reference_columns is None or len(reference_columns) != adapter.base_expert_count:
+                        raise RuntimeError(
+                            f"Fixed reference router state is incomplete for block {block}."
+                        )
+                    live[block] = [
+                        copy.deepcopy(column.state_dict())
+                        for column in adapter.router.columns[:adapter.base_expert_count]
+                    ]
+                    for column, state in zip(adapter.router.columns, reference_columns):
+                        column.load_state_dict(state)
+                return F.normalize(
+                    self.model_without_dp.extract_img_feature(images, max_session=0).float(),
+                    dim=-1,
+                )
+            finally:
+                for block, adapter in adapters:
+                    for column, state in zip(
+                        adapter.router.columns[:adapter.base_expert_count], live.get(block, [])
+                    ):
+                        column.load_state_dict(state)
+
+        # Compatibility fallback for callers that have not completed the base session.
         snapshots = getattr(self, "_candidate_reference_router_states", None)
         if not snapshots:
-            return F.normalize(self.model_without_dp.extract_img_feature(images, max_session=previous_version).float(), dim=-1)
-        adapters, live = self._moe_adapters(), {}
+            return F.normalize(
+                self.model_without_dp.extract_img_feature(images, max_session=previous_version).float(),
+                dim=-1,
+            )
+        live = {}
         try:
             for block, adapter in adapters:
                 live[block] = [copy.deepcopy(col.state_dict()) for col in adapter.router.columns]
-                for col, state in zip(adapter.router.columns, snapshots.get(block, [])): col.load_state_dict(state)
-            return F.normalize(self.model_without_dp.extract_img_feature(images, max_session=previous_version).float(), dim=-1)
+                for col, state in zip(adapter.router.columns, snapshots.get(block, [])):
+                    col.load_state_dict(state)
+            return F.normalize(
+                self.model_without_dp.extract_img_feature(images, max_session=previous_version).float(),
+                dim=-1,
+            )
         finally:
             for block, adapter in adapters:
-                for col, state in zip(adapter.router.columns, live.get(block, [])): col.load_state_dict(state)
+                for col, state in zip(adapter.router.columns, live.get(block, [])):
+                    col.load_state_dict(state)
 
     def _representation_drift(self, images, current_version, previous_version):
         previous = self._reference_features(images, previous_version)
@@ -753,27 +883,66 @@ class Runner:
 
     @torch.no_grad()
     def _held_out_loss(self, validation_loader, support_loader, class_index, text,
-                       description, version, calibrate, previous_version=None):
+                       description, version, calibrate, previous_version=None,
+                       return_metrics=False):
+        """Score every candidate with the same classification-plus-drift objective."""
         self.model.eval()
-        bank = self._support_bank(support_loader, class_index, text, description,
-                                  version, calibrate)
-        total, count = 0.0, 0
+        bank = self._support_bank(
+            support_loader, class_index, text, description, version, calibrate
+        )
+        classification_total, drift_total, count = 0.0, 0.0, 0
+        stability_weight = float(getattr(
+            self.cfg.TRAINER.BiMC.INCREMENTAL, "STABILITY_WEIGHT", 0.0
+        ))
         for batch in validation_loader:
             images, labels = self.parse_batch(batch)
             logits, targets = self._incremental_logits(
                 images, labels, None, bank, version,
-                float(self.cfg.TRAINER.BiMC.INCREMENTAL.LOGIT_SCALE), leave_one_out=False)
-            value = F.cross_entropy(logits, targets, reduction="sum")
-            stability_weight = float(getattr(self.cfg.TRAINER.BiMC.INCREMENTAL,
-                                             "STABILITY_WEIGHT", 0.0))
-            if stability_weight > 0.0 and previous_version is not None:
-                value = value + stability_weight * self._representation_drift(images, version, previous_version) * labels.numel()
-            total += float(value.item())
+                float(self.cfg.TRAINER.BiMC.INCREMENTAL.LOGIT_SCALE), leave_one_out=False
+            )
+            classification_total += float(
+                F.cross_entropy(logits, targets, reduction="sum").item()
+            )
+            if previous_version is not None:
+                drift = self._representation_drift(images, version, previous_version)
+                drift_total += float(drift.item()) * labels.numel()
             count += labels.numel()
-        return total / max(count, 1)
+        count = max(count, 1)
+        classification_loss = classification_total / count
+        reference_drift = drift_total / count
+        objective_loss = classification_loss + stability_weight * reference_drift
+        metrics = {
+            "loss": float(objective_loss),
+            "classification_loss": float(classification_loss),
+            "reference_drift": float(reference_drift),
+            "samples": int(count),
+        }
+        return metrics if return_metrics else objective_loss
 
     def train_incremental_task(self, task_id, train_loader, extract_loader, class_index,
                                current_class_name, enable_visual_calibration):
+        """Run a transactional update; rejection or exceptions restore the exact MoE state."""
+        snapshot = self._snapshot_moe_state()
+        try:
+            result = self._train_incremental_task_impl(
+                task_id, train_loader, extract_loader, class_index,
+                current_class_name, enable_visual_calibration,
+            )
+            accepted = bool(result.get("trained") or result.get("router_adapted"))
+            if not accepted:
+                self._restore_moe_state(snapshot)
+            result["state_transaction"] = {
+                "accepted": accepted,
+                "rolled_back": not accepted,
+                "reference_space_id": self._reference_space_id,
+            }
+            return result
+        except Exception:
+            self._restore_moe_state(snapshot)
+            raise
+
+    def _train_incremental_task_impl(self, task_id, train_loader, extract_loader, class_index,
+                                     current_class_name, enable_visual_calibration):
         text, description = self._text_prototypes(current_class_name, class_index)
         folds = self._support_folds(train_loader, extract_loader)
         previous_version = self._current_encoder_version()
@@ -788,18 +957,22 @@ class Runner:
                     "expanded": [], "encoder_version": previous_version,
                     "reason": "insufficient independent support folds"}
 
-        null_losses = [
-            self._held_out_loss(val, fit_extract, class_index, text, description,
-                                previous_version, enable_visual_calibration)
+        null_metrics = [
+            self._held_out_loss(
+                val, fit_extract, class_index, text, description,
+                previous_version, enable_visual_calibration,
+                previous_version=previous_version, return_metrics=True,
+            )
             for _, fit_extract, val in folds
         ]
+        null_losses = [metric["loss"] for metric in null_metrics]
 
         # First test the lower-capacity option: update router columns only.
         initial_router_states = {
             block_idx: [copy.deepcopy(column.state_dict()) for column in adapter.router.columns]
             for block_idx, adapter in self._moe_adapters()
         }
-        router_losses = []
+        router_metrics = []
         for fit_train, fit_extract, validation in folds:
             for block_idx, adapter in self._moe_adapters():
                 for column, state in zip(adapter.router.columns, initial_router_states[block_idx]):
@@ -809,19 +982,26 @@ class Runner:
                 task_id, fit_train, fit_extract, class_index, text, description,
                 enable_visual_calibration,
             )
-            router_losses.append(self._held_out_loss(
+            router_metrics.append(self._held_out_loss(
                 validation, fit_extract, class_index, text, description,
                 previous_version, enable_visual_calibration,
+                previous_version=previous_version, return_metrics=True,
             ))
+        router_losses = [metric["loss"] for metric in router_metrics]
+        router_drifts = [metric["reference_drift"] for metric in router_metrics]
         router_gains = np.asarray(null_losses) - np.asarray(router_losses)
         router_gain = float(np.mean(router_gains))
         router_gain_se = float(
             np.std(router_gains, ddof=1) / np.sqrt(len(router_gains))
         ) if len(router_gains) > 1 else float("inf")
+        router_drift_max = float(max(router_drifts, default=0.0))
+        router_drift_passed = self._reference_drift_allowed(router_drifts)
+        drift_limit = self._reference_drift_limit()
         print(f"=> [RouterOnly][Task {task_id}] gain={router_gain:.5f} "
-              f"se={router_gain_se:.5f}")
+              f"se={router_gain_se:.5f} reference_drift_max={router_drift_max:.5f} "
+              f"drift_passed={router_drift_passed}")
 
-        # Restore the exact pre-candidate state before accepting/rejecting it.
+        # Restore the exact pre-candidate state before deciding whether to keep it.
         for block_idx, adapter in self._moe_adapters():
             for column, state in zip(adapter.router.columns, initial_router_states[block_idx]):
                 column.load_state_dict(state)
@@ -830,18 +1010,40 @@ class Runner:
             "mode": "router_only",
             "null_loss": float(np.mean(null_losses)),
             "candidate_loss": float(np.mean(router_losses)),
+            "null_classification_loss": float(np.mean([m["classification_loss"] for m in null_metrics])),
+            "candidate_classification_loss": float(np.mean([m["classification_loss"] for m in router_metrics])),
             "gain": router_gain,
             "gain_se": router_gain_se,
+            "reference_drift_max": router_drift_max,
+            "reference_drift_limit": drift_limit,
+            "drift_passed": bool(router_drift_passed),
+            "accepted": False,
         }]
-        if router_gain > router_gain_se:
+        if router_gain > router_gain_se and router_drift_passed:
             history = self._train_router_only(
                 task_id, train_loader, extract_loader, class_index, text,
                 description, enable_visual_calibration,
             )
-            print(f"=> [Accepted][Task {task_id}] router-only adaptation; no expert added.")
-            return {"trained": False, "router_adapted": True,
-                    "router_epochs": history, "decisions": decisions, "expanded": [],
-                    "encoder_version": previous_version}
+            postfit_drift = self._loader_reference_drift(
+                extract_loader, task_id, previous_version
+            )
+            decisions[0]["postfit_reference_drift"] = float(postfit_drift)
+            if self._reference_drift_allowed([postfit_drift]):
+                decisions[0]["accepted"] = True
+                print(f"=> [Accepted][Task {task_id}] router-only adaptation; no expert added.")
+                return {"trained": False, "router_adapted": True,
+                        "router_epochs": history, "decisions": decisions, "expanded": [],
+                        "encoder_version": previous_version}
+            decisions[0]["reject_reason"] = "postfit_reference_drift_limit"
+            for block_idx, adapter in self._moe_adapters():
+                for column, state in zip(adapter.router.columns, initial_router_states[block_idx]):
+                    column.load_state_dict(state)
+                adapter.freeze_all()
+        else:
+            decisions[0]["reject_reason"] = (
+                "insufficient_validation_gain" if router_gain <= router_gain_se
+                else "reference_drift_limit"
+            )
 
         # Descriptor coverage gates candidate layers before predictive validation.
         coverage_features = self.model_without_dp.collect_blockwise_cls_features(extract_loader)
@@ -865,56 +1067,115 @@ class Runner:
                 target_route_mass=route_mass)
             initial_expert = copy.deepcopy(adapter.experts[-1].state_dict())
             initial_router = copy.deepcopy(adapter.router.columns[-1].state_dict())
-            candidate_losses = []
+            candidate_metrics = []
             for fit_train, fit_extract, validation in folds:
                 adapter.experts[-1].load_state_dict(initial_expert)
                 adapter.router.columns[-1].load_state_dict(initial_router)
                 self._train_candidate(task_id, block_idx, fit_train, fit_extract,
                                       class_index, text, description,
                                       enable_visual_calibration)
-                candidate_losses.append(self._held_out_loss(
+                candidate_metrics.append(self._held_out_loss(
                     validation, fit_extract, class_index, text, description,
                     task_id, enable_visual_calibration,
-                    previous_version=previous_version,
+                    previous_version=previous_version, return_metrics=True,
                 ))
             adapter.remove_newest_expert()
+            candidate_losses = [metric["loss"] for metric in candidate_metrics]
+            candidate_drifts = [metric["reference_drift"] for metric in candidate_metrics]
             gains = np.asarray(null_losses) - np.asarray(candidate_losses)
+            drift_passed = self._reference_drift_allowed(candidate_drifts)
             decisions.append({
                 "mode": "expert_expansion",
                 "block_idx": block_idx,
                 "null_loss": float(np.mean(null_losses)),
                 "candidate_loss": float(np.mean(candidate_losses)),
+                "null_classification_loss": float(np.mean([m["classification_loss"] for m in null_metrics])),
+                "candidate_classification_loss": float(np.mean([m["classification_loss"] for m in candidate_metrics])),
                 "gain": float(np.mean(gains)),
                 "gain_se": float(np.std(gains, ddof=1) / np.sqrt(len(gains))),
+                "reference_drift_max": float(max(candidate_drifts, default=0.0)),
+                "reference_drift_limit": self._reference_drift_limit(),
+                "drift_passed": bool(drift_passed),
+                "accepted": False,
             })
             print(f"=> [Candidate][Task {task_id}][B{block_idx}] "
                   f"gain={decisions[-1]['gain']:.5f} se={decisions[-1]['gain_se']:.5f}")
 
-        candidates = [row for row in decisions if row.get("mode") == "expert_expansion"]
-        best = max(candidates, key=lambda row: row["gain"], default=None)
-        if best is None or best["gain"] <= best["gain_se"]:
+        eligible = sorted(
+            [
+                row for row in decisions
+                if row.get("mode") == "expert_expansion"
+                and row["gain"] > row["gain_se"]
+                and row["drift_passed"]
+            ],
+            key=lambda row: row["gain"],
+            reverse=True,
+        )
+        if not eligible:
             for _, adapter in self._moe_adapters():
                 adapter.freeze_all()
-            return {"trained": False, "router_adapted": False,
-                    "decisions": decisions, "expanded": [],
-                    "encoder_version": previous_version,
-                    "reason": "neither router adaptation nor expansion passed validation"}
+            return {
+                "trained": False, "router_adapted": False,
+                "decisions": decisions, "expanded": [],
+                "encoder_version": previous_version,
+                "reason": "no expansion candidate passed gain and reference-drift constraints",
+            }
 
-        block_idx = best["block_idx"]
-        adapter = self._adapter_by_block(block_idx)
-        expert_id = self.model_without_dp.add_expert(block_idx, task_id,
-            reference_features=coverage_features[block_idx]["cls_in"].to(self.device), target_route_mass=route_mass)
-        epochs = self._train_candidate(task_id, block_idx, train_loader, extract_loader,
-            class_index, text, description, enable_visual_calibration)
-        desc_features = self.model_without_dp.collect_blockwise_cls_features(extract_loader)[block_idx]["cls_in"].to(self.device)
-        with torch.no_grad(): _, resp = adapter.router(desc_features)
-        desc_loss = self._train_descriptor(adapter, expert_id, desc_features, resp[:,expert_id],
-            int(_cfg_value(self.cfg.TRAINER.BiMC.OPTIM,"INCREMENTAL_DESCRIPTOR_EPOCHS",5)))
-        adapter.freeze_all()
-        if not adapter.descriptors[expert_id].is_ready(): raise RuntimeError("New expert descriptor is not calibrated.")
-        return {"trained":True,"router_adapted":False,"decisions":decisions,
-            "expanded":[{"block_idx":block_idx,"expert_id":expert_id,"epochs":epochs,"descriptor_loss":float(desc_loss)}],
-            "encoder_version":task_id}
+        # Rank candidates by cross-validated gain, then guard the full-support fit.
+        for candidate in eligible:
+            block_idx = int(candidate["block_idx"])
+            adapter = self._adapter_by_block(block_idx)
+            expert_id = self.model_without_dp.add_expert(
+                block_idx, task_id,
+                reference_features=coverage_features[block_idx]["cls_in"].to(self.device),
+                target_route_mass=route_mass,
+            )
+            epochs = self._train_candidate(
+                task_id, block_idx, train_loader, extract_loader, class_index,
+                text, description, enable_visual_calibration,
+            )
+            desc_features = self.model_without_dp.collect_blockwise_cls_features(
+                extract_loader
+            )[block_idx]["cls_in"].to(self.device)
+            with torch.no_grad():
+                _, responsibilities = adapter.router(desc_features)
+            desc_loss = self._train_descriptor(
+                adapter, expert_id, desc_features, responsibilities[:, expert_id],
+                int(_cfg_value(
+                    self.cfg.TRAINER.BiMC.OPTIM, "INCREMENTAL_DESCRIPTOR_EPOCHS", 5
+                )),
+            )
+            adapter.freeze_all()
+            if not adapter.descriptors[expert_id].is_ready():
+                raise RuntimeError("New expert descriptor is not calibrated.")
+            postfit_drift = self._loader_reference_drift(
+                extract_loader, task_id, previous_version
+            )
+            candidate["postfit_reference_drift"] = float(postfit_drift)
+            if not self._reference_drift_allowed([postfit_drift]):
+                candidate["accepted"] = False
+                candidate["postfit_reject_reason"] = "postfit_reference_drift_limit"
+                adapter.remove_newest_expert()
+                continue
+            candidate["accepted"] = True
+            return {
+                "trained": True, "router_adapted": False,
+                "decisions": decisions,
+                "expanded": [{
+                    "block_idx": block_idx, "expert_id": expert_id,
+                    "epochs": epochs, "descriptor_loss": float(desc_loss),
+                }],
+                "encoder_version": task_id,
+            }
+
+        for _, adapter in self._moe_adapters():
+            adapter.freeze_all()
+        return {
+            "trained": False, "router_adapted": False,
+            "decisions": decisions, "expanded": [],
+            "encoder_version": previous_version,
+            "reason": "all cross-validated expansion candidates failed the post-fit drift guard",
+        }
 
     @torch.no_grad()
     def _rebuild_unified_task_states(self, through_task, previous_states=None):
@@ -935,9 +1196,18 @@ class Runner:
         state=self.model_without_dp.build_task_statistics(names,loader,ids,
             calibrate_novel_vision_proto=(through_task>0 and bool(self.cfg.TRAINER.BiMC.VISION_CALIBRATION)),
             encoder_version=None)
-        state["class_ids"]=torch.as_tensor(ids,device=self.device,dtype=torch.long)
-        state["creation_session"]=through_task; state["encoder_version"]=0
-        return states+[state]
+        state["class_ids"] = torch.as_tensor(ids, device=self.device, dtype=torch.long)
+        state["creation_session"] = through_task
+        state["encoder_version"] = self._current_encoder_version()
+        # model_revision captures router-only updates too; encoder_version only tracks expert birth.
+        state["model_revision"] = through_task
+        state["prototype_space_id"] = self._reference_space_id
+        state["reference_session"] = 0
+        state["prototype_refresh_mode"] = "current_session_support_no_replay"
+        state["reference_drift"] = float(
+            self._loader_reference_drift(loader, through_task, through_task)
+        )
+        return states + [state]
 
     def run(self):
         configured_end = int(_cfg_value(self.cfg.TRAINER.BiMC, "END_SESSION", -1))
@@ -980,6 +1250,8 @@ class Runner:
                 )
                 if use_moe:
                     self.train_base_task(base_task_state, train_loader, extract_loader)
+                    # Capture the reference only after base experts/router are trained.
+                    self._capture_base_reference_state()
                 adaptation = {
                     "trained": bool(use_moe), "router_adapted": False,
                     "decisions": [], "expanded": [], "encoder_version": 0,

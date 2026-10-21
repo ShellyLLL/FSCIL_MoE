@@ -75,6 +75,9 @@ def extend_cfg(cfg):
     cfg.TRAINER.BiMC.INCREMENTAL.EPOCHS = 6
     cfg.TRAINER.BiMC.INCREMENTAL.LOGIT_SCALE = 100.0
     cfg.TRAINER.BiMC.INCREMENTAL.STABILITY_WEIGHT = 0.0
+    # Maximum mean cosine distance from the immutable post-base feature reference.
+    # Negative disables the hard guard while retaining the soft penalty.
+    cfg.TRAINER.BiMC.INCREMENTAL.MAX_REFERENCE_DRIFT = 0.20
 
     cfg.TRAINER.BiMC.CHECKPOINT = CN()
     cfg.TRAINER.BiMC.CHECKPOINT.ENABLE = True
