@@ -612,7 +612,9 @@ class Runner:
         if not states: return None, None
         ids, prototypes = [], []
         for state in states:
-            state_space = state.get("prototype_space_id", self._reference_space_id)
+            state_space = state.get(
+                "prototype_space_id", getattr(self, "_reference_space_id", "base_reference_v1")
+            )
             if state_space != self._reference_space_id:
                 raise ValueError(
                     f"Historical prototype space {state_space!r} does not match "
@@ -773,6 +775,12 @@ class Runner:
                     col.load_state_dict(state)
 
     def _representation_drift(self, images, current_version, previous_version):
+        # Before the base reference is captured, equal versions denote the same
+        # function and should produce an exact zero without requiring a model stub.
+        if current_version == previous_version and not getattr(
+            self, "_base_reference_router_states", None
+        ):
+            return images.new_zeros(())
         previous = self._reference_features(images, previous_version)
         current, _ = self.model_without_dp.extract_img_feature_train(images, max_session=current_version)
         current = F.normalize(current.float(), dim=-1)
