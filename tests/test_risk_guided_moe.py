@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from models.clip.model import VisionTransformer, VisualMoEAdapter
-from models.bimc import BiMC, build_loo_cache_from_embeddings
+from models.bimc import BiMC, build_loo_cache_from_embeddings, fit_feature_alignment
 from engine.engine import Runner
 from utils.evaluator import AccuracyEvaluator
 
@@ -30,6 +30,25 @@ class TinySupport(Dataset):
 
 
 class StabilityRiskTests(unittest.TestCase):
+    def test_feature_alignment_is_identity_when_spaces_already_match(self):
+        torch.manual_seed(31)
+        features = F.normalize(torch.randn(12, 8), dim=-1)
+        transform, fit_error = fit_feature_alignment(features, features, regularization=1.0)
+        torch.testing.assert_close(transform, torch.eye(8), rtol=1e-5, atol=1e-5)
+        self.assertLess(fit_error, 1e-5)
+
+    def test_feature_alignment_reduces_held_pair_space_error(self):
+        torch.manual_seed(32)
+        current = F.normalize(torch.randn(32, 8), dim=-1)
+        rotation, _ = torch.linalg.qr(torch.randn(8, 8))
+        reference = F.normalize(current @ rotation, dim=-1)
+        transform, fit_error = fit_feature_alignment(current, reference, regularization=0.01)
+        before = (1.0 - (current * reference).sum(-1)).mean()
+        after = (1.0 - (F.normalize(current @ transform, dim=-1) * reference).sum(-1)).mean()
+        self.assertTrue(torch.isfinite(transform).all())
+        self.assertLess(float(after), float(before))
+        self.assertAlmostEqual(float(after), fit_error, places=5)
+
     def test_zero_drift_for_same_version(self):
         runner = Runner.__new__(Runner)
         self.assertEqual(float(runner._representation_drift(torch.randn(2, 4), 0, 0)), 0.0)
@@ -239,6 +258,14 @@ class ExpansionInvariantTests(unittest.TestCase):
         self.assertAlmostEqual(
             metrics["loss"], metrics["classification_loss"] + 0.4 * 0.25, places=6
         )
+
+    def test_apply_feature_alignment_checks_dimensions_and_maps_to_unit_sphere(self):
+        features = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+        swap = torch.tensor([[0.0, 1.0], [1.0, 0.0]])
+        aligned = Runner._apply_feature_alignment(features, swap)
+        torch.testing.assert_close(aligned, torch.tensor([[0.0, 1.0], [1.0, 0.0]]))
+        with self.assertRaisesRegex(ValueError, "does not match feature dimension"):
+            Runner._apply_feature_alignment(features, torch.eye(3))
 
     def test_merge_rejects_mixed_prototype_reference_spaces(self):
         runner = Runner.__new__(Runner)
