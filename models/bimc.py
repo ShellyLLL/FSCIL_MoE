@@ -96,6 +96,42 @@ def build_loo_cache_from_embeddings(features, labels, source_ids, class_index=No
     }
 
 
+def fit_feature_alignment(current_features, reference_features, regularization=1.0):
+    """Fit a ridge-regularized residual map from current features to a fixed reference space.
+
+    The row-vector convention uses current @ transform. Regularizing toward
+    identity limits overfitting when only a few support examples are available.
+    The returned fit error is diagnostic only; acceptance uses held-out error.
+    """
+    current = torch.as_tensor(current_features).detach().float()
+    reference = torch.as_tensor(reference_features, device=current.device).detach().float()
+    if current.ndim != 2 or reference.ndim != 2 or current.shape != reference.shape:
+        raise ValueError("current/reference alignment features must have the same [N,D] shape.")
+    if current.size(0) < 2:
+        raise ValueError("Feature alignment requires at least two independent support sources.")
+    if not torch.isfinite(current).all() or not torch.isfinite(reference).all():
+        raise ValueError("Feature alignment inputs must be finite.")
+    regularization = float(regularization)
+    if not np.isfinite(regularization) or regularization <= 0:
+        raise ValueError("Feature alignment regularization must be finite and positive.")
+    current = F.normalize(current, dim=-1)
+    reference = F.normalize(reference, dim=-1)
+    identity = torch.eye(current.size(1), device=current.device, dtype=current.dtype)
+    gram = current @ current.t()
+    residual = reference - current
+    # Dual ridge solve avoids inverting a D-by-D matrix from only N few-shot pairs.
+    coefficients = torch.linalg.solve(
+        gram + regularization * torch.eye(current.size(0), device=current.device, dtype=current.dtype),
+        residual,
+    )
+    transform = identity + current.t() @ coefficients
+    if not torch.isfinite(transform).all():
+        raise FloatingPointError("Feature alignment produced non-finite transform weights.")
+    aligned = F.normalize(current @ transform, dim=-1)
+    fit_error = (1.0 - (aligned * reference).sum(dim=-1)).mean().clamp_min(0.0)
+    return transform.detach(), float(fit_error.item())
+
+
 def refine_conflict_aware_fused_prototypes(
     current_prototypes, current_class_ids, history_prototypes=None,
     history_class_ids=None, strength=0.25, margin=0.05,
@@ -652,12 +688,20 @@ class BiMC(nn.Module):
         return F.normalize(torch.stack(clip_weights, dim=0), dim=-1), torch.cat(all_targets, dim=0)
 
     @torch.no_grad()
-    def inference_all_img_feature(self, loader, max_session=None):
+    def inference_all_img_feature(self, loader, max_session=None, feature_transform=None):
+        """Extract visual features, optionally mapping them into the canonical reference space."""
         all_features, all_labels = [], []
         for batch in loader:
             images, labels = self.parse_batch(batch)
-            features = F.normalize(self.clip_model.encode_image(
-                images, max_session=max_session), dim=-1)
+            features = self.clip_model.encode_image(images, max_session=max_session).float()
+            if feature_transform is not None:
+                transform = torch.as_tensor(
+                    feature_transform, device=features.device, dtype=features.dtype
+                )
+                if transform.ndim != 2 or transform.shape != (features.size(-1), features.size(-1)):
+                    raise ValueError("Feature transform must be a square matrix matching visual feature dimension.")
+                features = features @ transform
+            features = F.normalize(features, dim=-1)
             all_features.append(features)
             all_labels.append(labels)
 
@@ -696,12 +740,15 @@ class BiMC(nn.Module):
         return self.soft_calibration(self.base_vision_prototype,current)
 
     @torch.no_grad()
-    def build_task_statistics(self,class_names,loader,class_index,calibrate_novel_vision_proto=False,encoder_version=None):
-        """Build current-session statistics only; history is append-only."""
+    def build_task_statistics(self,class_names,loader,class_index,calibrate_novel_vision_proto=False,
+                              encoder_version=None,feature_transform=None):
+        """Build current-session statistics in the requested canonical visual feature space."""
         first=class_index[0]
         text_features,_=self.inference_text_feature(class_names,self.template,first)
         _,_,description_proto=self.inference_all_description_feature(class_names,self.cfg.DATASET.GPT_PATH,first)
-        image_features,labels,image_proto=self.inference_all_img_feature(loader,max_session=None)
+        image_features,labels,image_proto=self.inference_all_img_feature(
+            loader,max_session=None,feature_transform=feature_transform
+        )
         if first==0: self.base_vision_prototype=image_proto.detach().clone()
         elif calibrate_novel_vision_proto: image_proto=self.calibrate_incremental_visual(image_proto)
         lam=self.cfg.TRAINER.BiMC.LAMBDA_T if self.cfg.TRAINER.BiMC.TEXT_CALIBRATION else 0.0
