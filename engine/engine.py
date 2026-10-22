@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from datasets.data_manager import DatasetManager
-from models.bimc import BiMC, build_loo_cache_from_embeddings
+from models.bimc import BiMC, build_loo_cache_from_embeddings, fit_feature_alignment
 from utils.evaluator import AccuracyEvaluator
 
 
@@ -59,6 +59,10 @@ class Runner:
         # Immutable post-base router columns define the canonical feature-space reference.
         self._base_reference_router_states = None
         self._reference_space_id = "base_reference_v1"
+        # Maps the active encoder output into the immutable post-base visual space.
+        # None is the identity transform used by Session 0.
+        self._active_alignment_matrix = None
+        self._alignment_version = 0
         self._load_resume_checkpoint_if_requested()
 
     # ------------------------------------------------------------------
@@ -266,8 +270,21 @@ class Runner:
         if "cuda" in state and torch.cuda.is_available():
             torch.cuda.set_rng_state_all(state["cuda"])
 
+    def _compute_reference_space_id(self):
+        """Fingerprint the exact post-base model state defining the canonical feature space."""
+        digest = hashlib.sha256()
+        for name, tensor in self.model_without_dp.state_dict().items():
+            if not torch.is_tensor(tensor):
+                continue
+            value = tensor.detach().cpu().contiguous()
+            digest.update(name.encode("utf-8"))
+            digest.update(str(value.dtype).encode("ascii"))
+            digest.update(str(tuple(value.shape)).encode("ascii"))
+            digest.update(value.view(torch.uint8).numpy().tobytes())
+        return "base_reference_v1:" + digest.hexdigest()[:16]
+
     def _capture_base_reference_state(self):
-        """Freeze post-base router columns as the canonical feature reference."""
+        """Freeze post-base router columns and fingerprint the canonical feature reference."""
         self._base_reference_router_states = {
             str(block_idx): [
                 self._cpu_copy(column.state_dict())
@@ -275,20 +292,25 @@ class Runner:
             ]
             for block_idx, adapter in self._moe_adapters()
         }
-        self._reference_space_id = "base_reference_v1"
+        self._reference_space_id = self._compute_reference_space_id()
+        self._active_alignment_matrix = None
+        self._alignment_version = 0
 
     def _snapshot_moe_state(self):
-        """Capture topology and adapter tensors for transactional candidate updates."""
+        """Capture all mutable candidate state, including the active feature alignment."""
         return {
             "topology": copy.deepcopy(self.model_without_dp.export_moe_topology()),
             "adapter_states": {
                 str(block_idx): self._cpu_copy(adapter.state_dict())
                 for block_idx, adapter in self._moe_adapters()
             },
+            "active_alignment_matrix": self._cpu_copy(self._active_alignment_matrix),
+            "alignment_version": int(self._alignment_version),
+            "reference_space_id": str(self._reference_space_id),
         }
 
     def _restore_moe_state(self, snapshot):
-        """Restore the exact pre-candidate MoE state, including expert topology."""
+        """Restore the exact pre-candidate MoE topology, tensors and alignment state."""
         self.model_without_dp.rebuild_moe_topology(snapshot["topology"])
         for block_idx, adapter in self._moe_adapters():
             state = snapshot["adapter_states"].get(str(block_idx))
@@ -296,6 +318,84 @@ class Runner:
                 raise RuntimeError(f"Transactional MoE snapshot misses block {block_idx}.")
             adapter.load_state_dict(state, strict=True)
             adapter.freeze_all()
+        matrix = snapshot.get("active_alignment_matrix")
+        self._active_alignment_matrix = (
+            None if matrix is None else torch.as_tensor(matrix, device=self.device, dtype=torch.float32).clone()
+        )
+        self._alignment_version = int(snapshot.get("alignment_version", 0))
+        self._reference_space_id = str(snapshot.get("reference_space_id", self._reference_space_id))
+
+    def _alignment_regularization(self):
+        return float(getattr(self.cfg.TRAINER.BiMC.INCREMENTAL, "ALIGNMENT_REGULARIZATION", 1.0))
+
+    def _alignment_error_limit(self):
+        return float(getattr(self.cfg.TRAINER.BiMC.INCREMENTAL, "MAX_ALIGNMENT_ERROR", 0.25))
+
+    def _alignment_weight(self):
+        return float(getattr(self.cfg.TRAINER.BiMC.INCREMENTAL, "ALIGNMENT_WEIGHT", 0.1))
+
+    def _alignment_error_allowed(self, values):
+        limit = self._alignment_error_limit()
+        return limit < 0 or all(np.isfinite(float(value)) and float(value) <= limit for value in values)
+
+    @staticmethod
+    def _apply_feature_alignment(features, transform=None):
+        features = torch.as_tensor(features).float()
+        if transform is not None:
+            matrix = torch.as_tensor(transform, device=features.device, dtype=features.dtype)
+            if matrix.ndim != 2 or matrix.shape != (features.size(-1), features.size(-1)):
+                raise ValueError(
+                    f"Feature transform shape {tuple(matrix.shape)} does not match feature dimension {features.size(-1)}."
+                )
+            features = features @ matrix
+        return F.normalize(features, dim=-1)
+
+    def _alignment_hash(self, transform=None):
+        transform = self._active_alignment_matrix if transform is None else transform
+        if transform is None:
+            return "identity"
+        value = torch.as_tensor(transform).detach().float().cpu().contiguous()
+        return hashlib.sha256(value.view(torch.uint8).numpy().tobytes()).hexdigest()[:16]
+
+    @torch.no_grad()
+    def _fit_feature_alignment(self, loader, current_version):
+        """Fit current-model features to the immutable post-base feature space on support sources only."""
+        if not hasattr(self, "model_without_dp") or not self._moe_adapters():
+            return None, 0.0
+        if not getattr(self, "_base_reference_router_states", None):
+            if int(current_version) > 0:
+                raise RuntimeError("Cannot align incremental features without the immutable base reference.")
+            return None, 0.0
+        was_training = self.model.training
+        self.model.eval()
+        current_features, reference_features = [], []
+        try:
+            for batch in loader:
+                images, _ = self.parse_batch(batch)
+                current = self.model_without_dp.extract_img_feature(images).float()
+                reference = self._reference_features(images, current_version).float()
+                current_features.append(F.normalize(current, dim=-1))
+                reference_features.append(F.normalize(reference, dim=-1))
+        finally:
+            self.model.train(was_training)
+        if not current_features:
+            raise RuntimeError("Cannot fit feature alignment on an empty support loader.")
+        current = torch.cat(current_features, dim=0)
+        reference = torch.cat(reference_features, dim=0)
+        min_samples = int(getattr(self.cfg.TRAINER.BiMC.INCREMENTAL, "MIN_ALIGNMENT_SAMPLES", 3))
+        if current.size(0) < min_samples:
+            raise RuntimeError(
+                f"Feature alignment requires at least {min_samples} independent support samples; got {current.size(0)}."
+            )
+        return fit_feature_alignment(current, reference, self._alignment_regularization())
+
+    @torch.no_grad()
+    def _alignment_validation_error(self, images, transform, current_version):
+        current = self.model_without_dp.extract_img_feature(images).float()
+        reference = self._reference_features(images, current_version).float()
+        aligned = self._apply_feature_alignment(current, transform)
+        reference = F.normalize(reference, dim=-1)
+        return (1.0 - (aligned * reference).sum(dim=-1)).mean().clamp_min(0.0)
 
     def _reference_drift_limit(self):
         return float(getattr(
@@ -360,13 +460,20 @@ class Runner:
             payload["task_states"][0] = dict(payload["task_states"][0])
             payload["task_states"][0]["image_proto"] = base_proto
             payload["task_states"][0]["encoder_version"] = 0
-        elif schema not in (7, 8, 9, 10, 11):
+        elif schema not in (7, 8, 9, 10, 11, 12):
             raise ValueError("Checkpoint topology is incompatible; resume from Session 0.")
-        if schema in (6, 7, 8, 9, 10) and int(payload["completed_session"]) != 0:
+        if schema in (6, 7, 8, 9, 10, 11) and int(payload["completed_session"]) != 0:
             raise ValueError(
-                "Incremental checkpoints predating fixed-reference prototype-space enforcement "
+                "Incremental checkpoints predating validated canonical feature alignment "
                 "cannot be resumed safely; resume from a Session 0 checkpoint or restart from Session 0."
             )
+        if schema >= 12:
+            alignment_required = (
+                "active_alignment_matrix", "alignment_version", "active_alignment_hash"
+            )
+            missing_alignment = [key for key in alignment_required if key not in payload]
+            if missing_alignment:
+                raise ValueError(f"Checkpoint is missing feature-alignment fields: {missing_alignment}")
         if not isinstance(payload["model_state"], dict):
             raise TypeError("Resume checkpoint model_state must be a state_dict mapping.")
         if not isinstance(payload["task_states"], list):
@@ -401,6 +508,20 @@ class Runner:
         else:
             self._base_reference_router_states = self._cpu_copy(saved_reference)
             self._reference_space_id = str(payload.get("reference_space_id", "base_reference_v1"))
+        if schema >= 12:
+            saved_alignment = payload.get("active_alignment_matrix")
+            if int(payload["completed_session"]) > 0 and not isinstance(saved_alignment, torch.Tensor):
+                raise ValueError("Incremental checkpoint has no active canonical feature-alignment matrix.")
+            self._active_alignment_matrix = (
+                None if saved_alignment is None
+                else torch.as_tensor(saved_alignment, device=self.device, dtype=torch.float32).clone()
+            )
+            self._alignment_version = int(payload.get("alignment_version", 0))
+            if self._alignment_hash() != str(payload.get("active_alignment_hash")):
+                raise ValueError("Checkpoint feature-alignment hash does not match its stored matrix.")
+        else:
+            self._active_alignment_matrix = None
+            self._alignment_version = 0
         manifest = payload.get("support_manifest")
         if manifest is None:
             raise ValueError("Resume checkpoint support_manifest must not be null.")
@@ -445,12 +566,15 @@ class Runner:
         directory.mkdir(parents=True, exist_ok=True)
         topology = self.model_without_dp.export_moe_topology()
         payload = {
-            "schema_version": 11,
+            "schema_version": 12,
             "completed_session": int(completed_session),
             "model_state": self._cpu_copy(self.model_without_dp.state_dict()),
             "moe_topology": topology,
             "base_reference_router_states": self._cpu_copy(self._base_reference_router_states or {}),
             "reference_space_id": self._reference_space_id,
+            "active_alignment_matrix": self._cpu_copy(self._active_alignment_matrix),
+            "alignment_version": int(self._alignment_version),
+            "active_alignment_hash": self._alignment_hash(),
             "task_states": self._cpu_copy(state_dict_list),
             "base_vision_prototype": self._cpu_copy(self.model_without_dp.base_vision_prototype),
             "support_manifest": self.data_manager.get_support_manifest(),
@@ -637,7 +761,13 @@ class Runner:
         model = self.model_without_dp
         current = model.build_leave_one_out_prototypes(loader, class_index, max_session=None)
         device = torch.device(self.device)
-        features, labels = current["features"].to(device).float(), current["labels"].to(device).long()
+        features = current["features"].to(device).float()
+        labels = current["labels"].to(device).long()
+        source_ids = current["source_ids"].to(device)
+        # Rebuild LOO prototypes after mapping every support embedding into the
+        # same fixed reference space as the historical prototype bank.
+        features = self._apply_feature_alignment(features, self._active_alignment_matrix)
+        current = build_loo_cache_from_embeddings(features, labels, source_ids, class_index)
         classes = current["classes"].to(device).long()
         if not bool(current["loo_valid"].all().item()): raise ValueError("Each query requires another same-class source.")
         requested = torch.as_tensor(class_index, device=device, dtype=torch.long).reshape(-1)
@@ -686,7 +816,7 @@ class Runner:
         else:
             # Validation and deployment both use the complete current expert pool.
             features = self.model_without_dp.extract_img_feature(images)
-        features = F.normalize(features.float(), dim=-1)
+        features = self._apply_feature_alignment(features, self._active_alignment_matrix)
         logits = scale * torch.einsum("bd,bcd->bc", features, new_prototypes.float())
         return logits, self._targets_to_columns(labels, {"class_ids": support_bank["classes"]})
 
@@ -893,39 +1023,60 @@ class Runner:
     def _held_out_loss(self, validation_loader, support_loader, class_index, text,
                        description, version, calibrate, previous_version=None,
                        return_metrics=False):
-        """Score every candidate with the same classification-plus-drift objective."""
+        """Score candidates in a fold-fitted canonical feature space plus stability guards."""
         self.model.eval()
-        bank = self._support_bank(
-            support_loader, class_index, text, description, version, calibrate
+        previous_alignment = getattr(self, "_active_alignment_matrix", None)
+        alignment_matrix, alignment_fit_error = self._fit_feature_alignment(
+            support_loader, version
         )
-        classification_total, drift_total, count = 0.0, 0.0, 0
-        stability_weight = float(getattr(
-            self.cfg.TRAINER.BiMC.INCREMENTAL, "STABILITY_WEIGHT", 0.0
-        ))
-        for batch in validation_loader:
-            images, labels = self.parse_batch(batch)
-            logits, targets = self._incremental_logits(
-                images, labels, None, bank, version,
-                float(self.cfg.TRAINER.BiMC.INCREMENTAL.LOGIT_SCALE), leave_one_out=False
+        if alignment_matrix is not None:
+            self._active_alignment_matrix = alignment_matrix
+        try:
+            bank = self._support_bank(
+                support_loader, class_index, text, description, version, calibrate
             )
-            classification_total += float(
-                F.cross_entropy(logits, targets, reduction="sum").item()
+            classification_total, drift_total, alignment_total, count = 0.0, 0.0, 0.0, 0
+            stability_weight = float(getattr(
+                self.cfg.TRAINER.BiMC.INCREMENTAL, "STABILITY_WEIGHT", 0.0
+            ))
+            alignment_weight = self._alignment_weight()
+            for batch in validation_loader:
+                images, labels = self.parse_batch(batch)
+                logits, targets = self._incremental_logits(
+                    images, labels, None, bank, version,
+                    float(self.cfg.TRAINER.BiMC.INCREMENTAL.LOGIT_SCALE), leave_one_out=False
+                )
+                classification_total += float(
+                    F.cross_entropy(logits, targets, reduction="sum").item()
+                )
+                if previous_version is not None:
+                    drift = self._representation_drift(images, version, previous_version)
+                    drift_total += float(drift.item()) * labels.numel()
+                if alignment_matrix is not None:
+                    alignment_error = self._alignment_validation_error(
+                        images, alignment_matrix, version
+                    )
+                    alignment_total += float(alignment_error.item()) * labels.numel()
+                count += labels.numel()
+            count = max(count, 1)
+            classification_loss = classification_total / count
+            reference_drift = drift_total / count
+            alignment_error = alignment_total / count
+            objective_loss = (
+                classification_loss + stability_weight * reference_drift
+                + alignment_weight * alignment_error
             )
-            if previous_version is not None:
-                drift = self._representation_drift(images, version, previous_version)
-                drift_total += float(drift.item()) * labels.numel()
-            count += labels.numel()
-        count = max(count, 1)
-        classification_loss = classification_total / count
-        reference_drift = drift_total / count
-        objective_loss = classification_loss + stability_weight * reference_drift
-        metrics = {
-            "loss": float(objective_loss),
-            "classification_loss": float(classification_loss),
-            "reference_drift": float(reference_drift),
-            "samples": int(count),
-        }
-        return metrics if return_metrics else objective_loss
+            metrics = {
+                "loss": float(objective_loss),
+                "classification_loss": float(classification_loss),
+                "reference_drift": float(reference_drift),
+                "alignment_error": float(alignment_error),
+                "alignment_fit_error": float(alignment_fit_error),
+                "samples": int(count),
+            }
+            return metrics if return_metrics else objective_loss
+        finally:
+            self._active_alignment_matrix = previous_alignment
 
     def train_incremental_task(self, task_id, train_loader, extract_loader, class_index,
                                current_class_name, enable_visual_calibration):
@@ -997,6 +1148,9 @@ class Runner:
             ))
         router_losses = [metric["loss"] for metric in router_metrics]
         router_drifts = [metric["reference_drift"] for metric in router_metrics]
+        router_alignment_errors = [metric.get("alignment_error", 0.0) for metric in router_metrics]
+        router_alignment_max = float(max(router_alignment_errors, default=0.0))
+        router_alignment_passed = self._alignment_error_allowed(router_alignment_errors)
         router_gains = np.asarray(null_losses) - np.asarray(router_losses)
         router_gain = float(np.mean(router_gains))
         router_gain_se = float(
@@ -1007,7 +1161,8 @@ class Runner:
         drift_limit = self._reference_drift_limit()
         print(f"=> [RouterOnly][Task {task_id}] gain={router_gain:.5f} "
               f"se={router_gain_se:.5f} reference_drift_max={router_drift_max:.5f} "
-              f"drift_passed={router_drift_passed}")
+              f"drift_passed={router_drift_passed} alignment_error_max={router_alignment_max:.5f} "
+              f"alignment_passed={router_alignment_passed}")
 
         # Restore the exact pre-candidate state before deciding whether to keep it.
         for block_idx, adapter in self._moe_adapters():
@@ -1025,9 +1180,12 @@ class Runner:
             "reference_drift_max": router_drift_max,
             "reference_drift_limit": drift_limit,
             "drift_passed": bool(router_drift_passed),
+            "alignment_error_max": router_alignment_max,
+            "alignment_error_limit": self._alignment_error_limit(),
+            "alignment_passed": bool(router_alignment_passed),
             "accepted": False,
         }]
-        if router_gain > router_gain_se and router_drift_passed:
+        if router_gain > router_gain_se and router_drift_passed and router_alignment_passed:
             history = self._train_router_only(
                 task_id, train_loader, extract_loader, class_index, text,
                 description, enable_visual_calibration,
@@ -1037,11 +1195,21 @@ class Runner:
             )
             decisions[0]["postfit_reference_drift"] = float(postfit_drift)
             if self._reference_drift_allowed([postfit_drift]):
+                final_alignment, final_alignment_fit_error = self._fit_feature_alignment(
+                    extract_loader, task_id
+                )
+                if final_alignment is not None:
+                    self._active_alignment_matrix = final_alignment
+                    self._alignment_version = int(task_id)
+                decisions[0]["final_alignment_fit_error"] = float(final_alignment_fit_error)
+                decisions[0]["final_alignment_hash"] = self._alignment_hash(final_alignment)
                 decisions[0]["accepted"] = True
                 print(f"=> [Accepted][Task {task_id}] router-only adaptation; no expert added.")
                 return {"trained": False, "router_adapted": True,
                         "router_epochs": history, "decisions": decisions, "expanded": [],
-                        "encoder_version": previous_version}
+                        "encoder_version": previous_version,
+                        "alignment_version": int(self._alignment_version),
+                        "alignment_hash": self._alignment_hash()}
             decisions[0]["reject_reason"] = "postfit_reference_drift_limit"
             for block_idx, adapter in self._moe_adapters():
                 for column, state in zip(adapter.router.columns, initial_router_states[block_idx]):
@@ -1050,7 +1218,8 @@ class Runner:
         else:
             decisions[0]["reject_reason"] = (
                 "insufficient_validation_gain" if router_gain <= router_gain_se
-                else "reference_drift_limit"
+                else "reference_drift_limit" if not router_drift_passed
+                else "alignment_error_limit"
             )
 
         # Descriptor coverage gates candidate layers before predictive validation.
@@ -1090,8 +1259,10 @@ class Runner:
             adapter.remove_newest_expert()
             candidate_losses = [metric["loss"] for metric in candidate_metrics]
             candidate_drifts = [metric["reference_drift"] for metric in candidate_metrics]
+            candidate_alignment_errors = [metric.get("alignment_error", 0.0) for metric in candidate_metrics]
             gains = np.asarray(null_losses) - np.asarray(candidate_losses)
             drift_passed = self._reference_drift_allowed(candidate_drifts)
+            alignment_passed = self._alignment_error_allowed(candidate_alignment_errors)
             decisions.append({
                 "mode": "expert_expansion",
                 "block_idx": block_idx,
@@ -1104,6 +1275,9 @@ class Runner:
                 "reference_drift_max": float(max(candidate_drifts, default=0.0)),
                 "reference_drift_limit": self._reference_drift_limit(),
                 "drift_passed": bool(drift_passed),
+                "alignment_error_max": float(max(candidate_alignment_errors, default=0.0)),
+                "alignment_error_limit": self._alignment_error_limit(),
+                "alignment_passed": bool(alignment_passed),
                 "accepted": False,
             })
             print(f"=> [Candidate][Task {task_id}][B{block_idx}] "
@@ -1115,6 +1289,7 @@ class Runner:
                 if row.get("mode") == "expert_expansion"
                 and row["gain"] > row["gain_se"]
                 and row["drift_passed"]
+                and row.get("alignment_passed", False)
             ],
             key=lambda row: row["gain"],
             reverse=True,
@@ -1165,6 +1340,15 @@ class Runner:
                 candidate["postfit_reject_reason"] = "postfit_reference_drift_limit"
                 adapter.remove_newest_expert()
                 continue
+            final_alignment, final_alignment_fit_error = self._fit_feature_alignment(
+                extract_loader, task_id
+            )
+            if final_alignment is None:
+                raise RuntimeError("Accepted expert expansion has no canonical feature alignment.")
+            self._active_alignment_matrix = final_alignment
+            self._alignment_version = int(task_id)
+            candidate["alignment_fit_error"] = float(final_alignment_fit_error)
+            candidate["alignment_hash"] = self._alignment_hash(final_alignment)
             candidate["accepted"] = True
             return {
                 "trained": True, "router_adapted": False,
@@ -1203,7 +1387,7 @@ class Runner:
         loader=self.data_manager.get_dataloader(through_task,source="train",mode="test",accumulate_past=False)
         state=self.model_without_dp.build_task_statistics(names,loader,ids,
             calibrate_novel_vision_proto=(through_task>0 and bool(self.cfg.TRAINER.BiMC.VISION_CALIBRATION)),
-            encoder_version=None)
+            encoder_version=None, feature_transform=self._active_alignment_matrix)
         state["class_ids"] = torch.as_tensor(ids, device=self.device, dtype=torch.long)
         state["creation_session"] = through_task
         state["encoder_version"] = self._current_encoder_version()
@@ -1211,7 +1395,9 @@ class Runner:
         state["model_revision"] = through_task
         state["prototype_space_id"] = self._reference_space_id
         state["reference_session"] = 0
-        state["prototype_refresh_mode"] = "current_session_support_no_replay"
+        state["alignment_version"] = int(self._alignment_version)
+        state["alignment_hash"] = self._alignment_hash()
+        state["prototype_refresh_mode"] = "current_session_support_aligned_to_base_reference"
         state["reference_drift"] = float(
             self._loader_reference_drift(loader, through_task, through_task)
         )
@@ -1380,8 +1566,9 @@ class Runner:
         for batch in tqdm(test_loader, desc=f"Eval Task {task_id}"):
             images, targets = self.parse_batch(batch)
             # Exactly one feature extraction through the current complete model.
-            features = F.normalize(
-                self.model_without_dp.extract_img_feature(images).float(), dim=-1
+            features = self._apply_feature_alignment(
+                self.model_without_dp.extract_img_feature(images).float(),
+                self._active_alignment_matrix,
             )
             for name, prototypes in prototype_banks.items():
                 all_logits[name].append(
