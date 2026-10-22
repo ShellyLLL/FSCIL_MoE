@@ -70,21 +70,9 @@ parameters, router state, and descriptor buffers from before the candidate.
 Historical experts stay frozen and continue to participate in the shared Softmax
 router.
 
-Only the **current session's** support prototypes are refreshed after an update;
-historical support images are not replayed. Each prototype state records the model
-revision and fixed target feature-space reference. The fixed-reference constraint
-reduces cross-session embedding drift, but cannot guarantee exact historical-class
-invariance without historical samples. BiMC text/description fusion and base-path
-visual calibration remain enabled. At inference, each test image is encoded once
-by the current model and compared against one global bank of prototypes for all
-seen classes. Report AA and PD over the full sequence; do not assume the added
-constraints improve them without measurement.
+Only the **current session's** support prototypes are refreshed after an accepted update; historical support images are not replayed. Each incremental candidate fits a ridge-regularized map from current visual features into the immutable post-base visual feature space using only that candidate's fitting support fold. The same map is applied to support prototypes, current queries, and newly stored visual prototypes. Held-out alignment error is included in candidate scoring and has an independent acceptance limit. Historical prototypes therefore remain in the canonical target space rather than being compared directly with unaligned embeddings from later model revisions. The alignment matrix, its hash/version, and the canonical reference-space fingerprint are checkpointed and restored transactionally. This reduces coordinate mismatch but does not guarantee old-class accuracy without historical examples; AA and PD must still be measured.
 
-The fixed-reference state uses checkpoint schema 11. Incremental checkpoints
-from schema 10 or earlier are rejected because their historical prototypes were
-not maintained under the fixed-reference contract; resume from a base-only
-checkpoint or restart at Session 0. Reuse the same fixed support manifest for all
-ablations.
+The fixed-reference and alignment state uses checkpoint schema 12. Incremental checkpoints from schema 11 or earlier are rejected because their historical prototypes were not produced with validated feature alignment; resume from a base-only checkpoint or restart at Session 0. Reuse the same fixed support manifest for all ablations.
 
 ~~~BASH
 python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --support_manifest checkpoints/fscil_moe/cub_seed1_support.json
