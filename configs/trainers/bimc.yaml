@@ -54,6 +54,12 @@ TRAINER:
       # frozen previous model. Also included in candidate held-out selection.
       STABILITY_WEIGHT: 0.1
       MAX_REFERENCE_DRIFT: 0.20
+      # Fit a regularized current-to-base residual map on the fitting support fold.
+      ALIGNMENT_REGULARIZATION: 1.0
+      ALIGNMENT_WEIGHT: 0.1
+      # Reject candidates whose held-out aligned features still drift too far.
+      MAX_ALIGNMENT_ERROR: 0.25
+      MIN_ALIGNMENT_SAMPLES: 3
 
     CHECKPOINT:
       ENABLE: True
