@@ -54,6 +54,10 @@ TRAINER:
       # frozen previous model. Also included in candidate held-out selection.
       STABILITY_WEIGHT: 0.1
       MAX_REFERENCE_DRIFT: 0.20
+      # Held-out cosine error after mapping current visual features to the
+      # immutable post-base reference space. Negative values disable the guard.
+      MAX_REFERENCE_ALIGNMENT_ERROR: 0.20
+      REFERENCE_MAP_RIDGE: 1.0
 
     CHECKPOINT:
       ENABLE: True

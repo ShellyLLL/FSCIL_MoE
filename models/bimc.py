@@ -17,6 +17,48 @@ class LayerExpansionDecision:
     uncovered_classes: List[int]
 
 
+def fit_reference_feature_map(current_features, reference_features, ridge=1.0):
+    """Fit a ridge-regularized residual map from current to reference features.
+
+    Features are row vectors. The returned matrix A maps x to normalize(x @ A).
+    The low-rank Woodbury form avoids solving a feature_dim by feature_dim
+    system when the number of FSCIL support samples is small.
+    """
+    current = torch.as_tensor(current_features).detach().float()
+    reference = torch.as_tensor(reference_features, device=current.device).detach().float()
+    if current.ndim != 2 or reference.ndim != 2:
+        raise ValueError("current_features and reference_features must be rank-2.")
+    if current.shape != reference.shape:
+        raise ValueError("Current and reference features must have identical [N,D] shapes.")
+    if current.size(0) < 2 or current.size(1) < 1:
+        raise ValueError("At least two paired support features are required.")
+    if not torch.isfinite(current).all() or not torch.isfinite(reference).all():
+        raise ValueError("Reference alignment features must be finite.")
+    ridge = float(ridge)
+    if not np.isfinite(ridge) or ridge <= 0.0:
+        raise ValueError("ridge must be a finite positive number.")
+    current = F.normalize(current, dim=-1)
+    reference = F.normalize(reference, dim=-1)
+    sample_gram = current @ current.t()
+    regularized = sample_gram + ridge * torch.eye(
+        current.size(0), device=current.device, dtype=current.dtype
+    )
+    coefficients = torch.linalg.solve(regularized, reference - current)
+    matrix = torch.eye(
+        current.size(1), device=current.device, dtype=current.dtype
+    ) + current.t() @ coefficients
+    aligned = F.normalize(current @ matrix, dim=-1)
+    cosine = (aligned * reference).sum(dim=-1).clamp(-1.0, 1.0)
+    fit_error = (1.0 - cosine).mean().clamp_min(0.0)
+    if not torch.isfinite(matrix).all() or not torch.isfinite(fit_error):
+        raise FloatingPointError("Reference feature map fit produced non-finite values.")
+    return matrix.detach(), {
+        "fit_cosine_error": float(fit_error.item()),
+        "fit_samples": int(current.size(0)),
+        "ridge": ridge,
+    }
+
+
 def compute_loo_classification_metrics(queries, per_query_prototypes, query_class_ids,
                                        prototype_class_ids):
     """Classify each query against its own query-exclusive prototype bank.
@@ -696,29 +738,83 @@ class BiMC(nn.Module):
         return self.soft_calibration(self.base_vision_prototype,current)
 
     @torch.no_grad()
-    def build_task_statistics(self,class_names,loader,class_index,calibrate_novel_vision_proto=False,encoder_version=None):
-        """Build current-session statistics only; history is append-only."""
-        first=class_index[0]
-        text_features,_=self.inference_text_feature(class_names,self.template,first)
-        _,_,description_proto=self.inference_all_description_feature(class_names,self.cfg.DATASET.GPT_PATH,first)
-        image_features,labels,image_proto=self.inference_all_img_feature(loader,max_session=None)
-        if first==0: self.base_vision_prototype=image_proto.detach().clone()
-        elif calibrate_novel_vision_proto: image_proto=self.calibrate_incremental_visual(image_proto)
-        lam=self.cfg.TRAINER.BiMC.LAMBDA_T if self.cfg.TRAINER.BiMC.TEXT_CALIBRATION else 0.0
-        text=F.normalize((1-lam)*text_features+lam*description_proto,dim=-1)
-        raw=F.normalize(self.cfg.DATASET.BETA*text+(1-self.cfg.DATASET.BETA)*image_proto,dim=-1)
-        history=getattr(self,"_fused_history_prototypes",None); history_ids=getattr(self,"_fused_history_class_ids",None)
-        strength=float(getattr(self.cfg.TRAINER.BiMC,"FUSED_CONFLICT_STRENGTH",0.0)); margin=float(getattr(self.cfg.TRAINER.BiMC,"FUSED_CONFLICT_MARGIN",0.05))
-        fused=refine_conflict_aware_fused_prototypes(raw,torch.as_tensor(class_index),history,history_ids,strength,margin)
-        ids=torch.as_tensor(class_index,device=fused.device,dtype=torch.long)
-        if history is None: self._fused_history_prototypes,self._fused_history_class_ids=fused.detach(),ids.detach()
+    def build_task_statistics(
+        self, class_names, loader, class_index,
+        calibrate_novel_vision_proto=False, encoder_version=None,
+        image_feature_map=None,
+    ):
+        """Build current-session statistics in the canonical reference space."""
+        first = class_index[0]
+        text_features, _ = self.inference_text_feature(class_names, self.template, first)
+        _, _, description_proto = self.inference_all_description_feature(
+            class_names, self.cfg.DATASET.GPT_PATH, first
+        )
+        image_features, labels, image_proto = self.inference_all_img_feature(
+            loader, max_session=None
+        )
+        if image_feature_map is not None:
+            feature_map = torch.as_tensor(
+                image_feature_map, device=image_features.device, dtype=torch.float32
+            )
+            if (feature_map.ndim != 2 or
+                    feature_map.size(0) != image_features.size(-1) or
+                    feature_map.size(1) != image_features.size(-1)):
+                raise ValueError("image_feature_map must have shape [feature_dim, feature_dim].")
+            image_features = F.normalize(image_features.float() @ feature_map, dim=-1)
+            class_ids = torch.as_tensor(
+                class_index, device=labels.device, dtype=torch.long
+            ).reshape(-1)
+            missing = class_ids[~torch.stack([
+                labels.eq(class_id).any() for class_id in class_ids
+            ])]
+            if missing.numel():
+                raise ValueError(
+                    f"Cannot build visual prototypes for classes without support: {missing.tolist()}."
+                )
+            image_proto = F.normalize(torch.stack([
+                image_features[labels.eq(class_id)].mean(dim=0)
+                for class_id in class_ids
+            ]), dim=-1)
+        if first == 0:
+            self.base_vision_prototype = image_proto.detach().clone()
+        elif calibrate_novel_vision_proto:
+            image_proto = self.calibrate_incremental_visual(image_proto)
+        lam = self.cfg.TRAINER.BiMC.LAMBDA_T if self.cfg.TRAINER.BiMC.TEXT_CALIBRATION else 0.0
+        text = F.normalize((1 - lam) * text_features + lam * description_proto, dim=-1)
+        raw = F.normalize(
+            self.cfg.DATASET.BETA * text + (1 - self.cfg.DATASET.BETA) * image_proto,
+            dim=-1,
+        )
+        history = getattr(self, "_fused_history_prototypes", None)
+        history_ids = getattr(self, "_fused_history_class_ids", None)
+        strength = float(getattr(self.cfg.TRAINER.BiMC, "FUSED_CONFLICT_STRENGTH", 0.0))
+        margin = float(getattr(self.cfg.TRAINER.BiMC, "FUSED_CONFLICT_MARGIN", 0.05))
+        fused = refine_conflict_aware_fused_prototypes(
+            raw, torch.as_tensor(class_index), history, history_ids, strength, margin
+        )
+        ids = torch.as_tensor(class_index, device=fused.device, dtype=torch.long)
+        if history is None:
+            self._fused_history_prototypes, self._fused_history_class_ids = fused.detach(), ids.detach()
         else:
-            history_ids=history_ids.to(ids.device); keep=(history_ids[:,None]!=ids[None,:]).all(1)
-            self._fused_history_prototypes=torch.cat([history[keep].to(fused.device),fused.detach()],0)
-            self._fused_history_class_ids=torch.cat([history_ids[keep],ids.detach()],0)
-        return {"description_proto":description_proto,"text_features":text_features,"image_proto":image_proto,
-            "class_index":class_index,"class_ids":ids,"sample_cnt":len(image_features),
-            "initial_fused_proto":raw,"fused_proto":fused,"encoder_version":0 if encoder_version is None else int(encoder_version)}
+            history_ids = history_ids.to(ids.device)
+            keep = (history_ids[:, None] != ids[None, :]).all(1)
+            self._fused_history_prototypes = torch.cat(
+                [history[keep].to(fused.device), fused.detach()], dim=0
+            )
+            self._fused_history_class_ids = torch.cat(
+                [history_ids[keep], ids.detach()], dim=0
+            )
+        return {
+            "description_proto": description_proto,
+            "text_features": text_features,
+            "image_proto": image_proto,
+            "class_index": class_index,
+            "class_ids": ids,
+            "sample_cnt": len(image_features),
+            "initial_fused_proto": raw,
+            "fused_proto": fused,
+            "encoder_version": 0 if encoder_version is None else int(encoder_version),
+        }
 
     @torch.no_grad()
     def forward_ours(self, images, image_proto, description_proto, text_features, beta, fused_proto=None):

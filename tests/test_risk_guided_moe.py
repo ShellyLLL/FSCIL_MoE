@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from models.clip.model import VisionTransformer, VisualMoEAdapter
-from models.bimc import BiMC, build_loo_cache_from_embeddings
+from models.bimc import BiMC, build_loo_cache_from_embeddings, fit_reference_feature_map
 from engine.engine import Runner
 from utils.evaluator import AccuracyEvaluator, compute_continual_metrics
 
@@ -178,6 +178,19 @@ class ExpansionInvariantTests(unittest.TestCase):
                 return build_loo_cache_from_embeddings(torch.cat(fs),torch.cat(ys),torch.cat(ss),class_index)
             def calibrate_incremental_visual(self,current): return current
         runner=Runner.__new__(Runner);runner.device="cpu"
+        def collect_pairs(loader, previous_version):
+            current_features, source_ids = [], []
+            labels = []
+            for batch in loader:
+                current_features.append(F.normalize(batch["image"].float(), dim=-1))
+                source_ids.append(batch["source_id"])
+                labels.append(batch["label"])
+            features = torch.cat(current_features, dim=0)
+            ids = torch.cat(source_ids, dim=0)
+            return features, features.clone(), ids, torch.cat(labels, dim=0)
+        runner._collect_reference_feature_pairs = collect_pairs
+        runner._reference_map_ridge = lambda: 1.0
+        runner._reference_alignment_hash = lambda matrix: "test-map-hash"
         runner.cfg=SimpleNamespace(DATASET=SimpleNamespace(BETA=0.3),TRAINER=SimpleNamespace(BiMC=SimpleNamespace(TEXT_CALIBRATION=False,LAMBDA_T=0.0)))
         runner.model_without_dp=Model();runner._resume_state_dict_list=[{"class_ids":torch.tensor([0,1]),"fused_proto":torch.eye(4)[:2]}]
         loader=DataLoader(TinySupport(shots=3),batch_size=4,shuffle=False);text=F.normalize(torch.eye(4)[2:4],dim=-1)
@@ -288,6 +301,42 @@ class ContinualMetricContractTests(unittest.TestCase):
         metrics = compute_continual_metrics([81.25], [[81.25]])
         self.assertEqual(metrics["pd"], 0.0)
         self.assertEqual(metrics["final_novel_avg_acc"], 0.0)
+
+
+
+class ReferenceFeatureMapTests(unittest.TestCase):
+    def test_identity_pairs_produce_identity_map(self):
+        torch.manual_seed(31)
+        features = F.normalize(torch.randn(12, 6), dim=-1)
+        feature_map, metrics = fit_reference_feature_map(features, features, ridge=1.0)
+        torch.testing.assert_close(feature_map, torch.eye(6), rtol=0, atol=1e-6)
+        self.assertAlmostEqual(metrics["fit_cosine_error"], 0.0, places=6)
+        self.assertEqual(metrics["fit_samples"], 12)
+
+    def test_map_reduces_error_for_a_known_feature_shift(self):
+        torch.manual_seed(37)
+        reference = F.normalize(torch.randn(24, 5), dim=-1)
+        transform = torch.tensor([
+            [1.20, 0.08, 0.00, 0.00, 0.00],
+            [0.00, 0.85, 0.05, 0.00, 0.00],
+            [0.00, 0.00, 1.10, 0.04, 0.00],
+            [0.00, 0.00, 0.00, 0.90, 0.03],
+            [0.02, 0.00, 0.00, 0.00, 1.05],
+        ])
+        current = F.normalize(reference @ torch.linalg.inv(transform), dim=-1)
+        before = (1.0 - (current * reference).sum(dim=-1)).mean()
+        feature_map, metrics = fit_reference_feature_map(current, reference, ridge=1e-3)
+        aligned = F.normalize(current @ feature_map, dim=-1)
+        after = (1.0 - (aligned * reference).sum(dim=-1)).mean()
+        self.assertTrue(torch.isfinite(feature_map).all())
+        self.assertLess(float(after), float(before))
+        self.assertAlmostEqual(metrics["fit_cosine_error"], float(after), places=5)
+
+    def test_map_rejects_invalid_pairs_and_regularization(self):
+        with self.assertRaisesRegex(ValueError, "identical"):
+            fit_reference_feature_map(torch.randn(3, 4), torch.randn(3, 5))
+        with self.assertRaisesRegex(ValueError, "positive"):
+            fit_reference_feature_map(torch.randn(3, 4), torch.randn(3, 4), ridge=0.0)
 
 
 if __name__ == "__main__":

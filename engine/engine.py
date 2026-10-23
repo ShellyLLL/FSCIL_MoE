@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
 from datasets.data_manager import DatasetManager
-from models.bimc import BiMC, build_loo_cache_from_embeddings
+from models.bimc import BiMC, build_loo_cache_from_embeddings, fit_reference_feature_map
 from utils.evaluator import AccuracyEvaluator, compute_continual_metrics
 
 
@@ -56,9 +56,18 @@ class Runner:
         self.evaluator = AccuracyEvaluator(self.data_manager.class_index_in_task)
         self._resume_completed_session = -1
         self._resume_state_dict_list = []
-        # Immutable post-base router columns define the canonical feature-space reference.
+        # The reference model is fixed after the base session; every session's
+        # visual prototypes and query features are mapped into that same space.
         self._base_reference_router_states = None
         self._reference_space_id = "base_reference_v1"
+        feature_dim = int(self.model_without_dp.clip_model.visual.output_dim)
+        self._active_reference_feature_map = torch.eye(
+            feature_dim, device=self.device, dtype=torch.float32
+        )
+        self._active_reference_alignment_info = {
+            "fit_cosine_error": 0.0, "fit_samples": 0, "ridge": 0.0
+        }
+        self._reference_model_fingerprint = None
         self._load_resume_checkpoint_if_requested()
 
     # ------------------------------------------------------------------
@@ -130,6 +139,16 @@ class Runner:
         result = {"class_ids": all_ids[order]}
         if space_ids and space_ids[0] is not None:
             result["prototype_space_id"] = space_ids[0]
+        fingerprints = [state.get("reference_model_fingerprint") for state in dict_list]
+        if any(value is not None for value in fingerprints):
+            if any(value is None for value in fingerprints) or len(set(fingerprints)) != 1:
+                raise ValueError(
+                    "Cannot merge prototypes from different or unknown reference-model fingerprints."
+                )
+            active_fingerprint = getattr(self, "_reference_model_fingerprint", None)
+            if active_fingerprint is not None and fingerprints[0] != active_fingerprint:
+                raise ValueError("Prototype reference-model fingerprint does not match the active model.")
+            result["reference_model_fingerprint"] = fingerprints[0]
         candidate_keys = (
             "description_proto", "text_features", "image_proto",
             "initial_fused_proto", "fused_proto", "anchor_fused_proto",
@@ -267,7 +286,7 @@ class Runner:
             torch.cuda.set_rng_state_all(state["cuda"])
 
     def _capture_base_reference_state(self):
-        """Freeze post-base router columns as the canonical feature reference."""
+        """Freeze post-base router columns and fingerprint the reference model."""
         self._base_reference_router_states = {
             str(block_idx): [
                 self._cpu_copy(column.state_dict())
@@ -276,6 +295,121 @@ class Runner:
             for block_idx, adapter in self._moe_adapters()
         }
         self._reference_space_id = "base_reference_v1"
+        self._reference_model_fingerprint = self._compute_reference_model_fingerprint()
+        self._active_reference_feature_map = self._identity_reference_feature_map()
+        self._active_reference_alignment_info = {
+            "fit_cosine_error": 0.0, "fit_samples": 0, "ridge": 0.0
+        }
+
+    def _identity_reference_feature_map(self):
+        feature_dim = int(self.model_without_dp.clip_model.visual.output_dim)
+        return torch.eye(feature_dim, device=self.device, dtype=torch.float32)
+
+    @staticmethod
+    def _reference_alignment_hash(feature_map):
+        value = torch.as_tensor(feature_map).detach().cpu().float().contiguous()
+        return hashlib.sha256(value.numpy().tobytes()).hexdigest()
+
+    def _compute_reference_model_fingerprint(self):
+        """Hash only the immutable visual path used to produce reference features."""
+        visual_state = self.model_without_dp.clip_model.visual.state_dict()
+        base_counts = {
+            int(block_idx): int(adapter.base_expert_count)
+            for block_idx, adapter in self._moe_adapters()
+        }
+        digest = hashlib.sha256()
+
+        def update_tensor(name, value):
+            tensor = torch.as_tensor(value).detach().cpu().contiguous()
+            digest.update(name.encode("utf-8"))
+            digest.update(str(tensor.dtype).encode("ascii"))
+            digest.update(str(tuple(tensor.shape)).encode("ascii"))
+            digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
+
+        for name, value in sorted(visual_state.items()):
+            if ".moe_adapter.router.columns." in name:
+                continue
+            family = None
+            for candidate in ("experts", "descriptors"):
+                marker = f".moe_adapter.{candidate}."
+                if marker in name:
+                    family = (candidate, marker)
+                    break
+            if family is not None:
+                candidate, marker = family
+                try:
+                    block_text = name.split(".resblocks.", 1)[1].split(".", 1)[0]
+                    block_idx = int(block_text)
+                    expert_idx = int(name.split(marker, 1)[1].split(".", 1)[0])
+                except (IndexError, ValueError):
+                    raise RuntimeError(f"Cannot identify base-reference tensor: {name}")
+                if expert_idx >= base_counts.get(block_idx, 0):
+                    continue
+            update_tensor(name, value)
+
+        for block_text, columns in sorted(
+            (getattr(self, "_base_reference_router_states", None) or {}).items(),
+            key=lambda item: int(item[0]),
+        ):
+            for column_idx, state in enumerate(columns):
+                for name, value in sorted(state.items()):
+                    update_tensor(
+                        f"reference_router.block{block_text}.column{column_idx}.{name}",
+                        value,
+                    )
+        return digest.hexdigest()
+
+    def _reference_alignment_limit(self):
+        incremental = getattr(self.cfg.TRAINER.BiMC, "INCREMENTAL", None)
+        return float(getattr(incremental, "MAX_REFERENCE_ALIGNMENT_ERROR", 0.20))
+
+    def _reference_alignment_allowed(self, values):
+        limit = self._reference_alignment_limit()
+        if limit < 0:
+            return True
+        return all(np.isfinite(float(value)) and float(value) <= limit for value in values)
+
+    def _reference_map_ridge(self):
+        incremental = getattr(self.cfg.TRAINER.BiMC, "INCREMENTAL", None)
+        return float(getattr(incremental, "REFERENCE_MAP_RIDGE", 1.0))
+
+    @torch.no_grad()
+    def _collect_reference_feature_pairs(self, loader, reference_version):
+        """Collect current/reference feature pairs in stable support-source order."""
+        current_features, reference_features, source_ids = [], [], []
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            for batch in loader:
+                images, labels = self.parse_batch(batch)
+                ids = self._batch_source_ids(batch, labels.numel(), labels.device)
+                current = F.normalize(
+                    self.model_without_dp.extract_img_feature(images).float(), dim=-1
+                )
+                reference = self._reference_features(images, reference_version)
+                current_features.append(current.detach())
+                reference_features.append(reference.detach())
+                source_ids.append(ids.detach())
+        finally:
+            self.model.train(was_training)
+        if not current_features:
+            raise ValueError("Cannot fit reference alignment from an empty support loader.")
+        ids = torch.cat(source_ids, dim=0)
+        if torch.unique(ids).numel() != ids.numel():
+            raise ValueError("Support source ids must be unique when fitting reference alignment.")
+        return torch.cat(current_features, dim=0), torch.cat(reference_features, dim=0), ids
+
+    @torch.no_grad()
+    def _fit_reference_feature_map_from_loader(self, loader, reference_version):
+        current, reference, source_ids = self._collect_reference_feature_pairs(
+            loader, reference_version
+        )
+        feature_map, metrics = fit_reference_feature_map(
+            current, reference, ridge=self._reference_map_ridge()
+        )
+        metrics["source_count"] = int(source_ids.numel())
+        metrics["map_hash"] = self._reference_alignment_hash(feature_map)
+        return feature_map.to(self.device), metrics
 
     def _snapshot_moe_state(self):
         """Capture topology and adapter tensors for transactional candidate updates."""
@@ -360,11 +494,11 @@ class Runner:
             payload["task_states"][0] = dict(payload["task_states"][0])
             payload["task_states"][0]["image_proto"] = base_proto
             payload["task_states"][0]["encoder_version"] = 0
-        elif schema not in (7, 8, 9, 10, 11):
+        elif schema not in (7, 8, 9, 10, 11, 12):
             raise ValueError("Checkpoint topology is incompatible; resume from Session 0.")
-        if schema in (6, 7, 8, 9, 10) and int(payload["completed_session"]) != 0:
+        if schema in (6, 7, 8, 9, 10, 11) and int(payload["completed_session"]) != 0:
             raise ValueError(
-                "Incremental checkpoints predating fixed-reference prototype-space enforcement "
+                "Incremental checkpoints predating validated reference-feature maps "
                 "cannot be resumed safely; resume from a Session 0 checkpoint or restart from Session 0."
             )
         if not isinstance(payload["model_state"], dict):
@@ -401,6 +535,35 @@ class Runner:
         else:
             self._base_reference_router_states = self._cpu_copy(saved_reference)
             self._reference_space_id = str(payload.get("reference_space_id", "base_reference_v1"))
+            computed_fingerprint = self._compute_reference_model_fingerprint()
+            saved_fingerprint = payload.get("reference_model_fingerprint")
+            if schema >= 12 and self._moe_adapters() and not saved_fingerprint:
+                raise ValueError("Checkpoint is missing its reference-model fingerprint.")
+            if saved_fingerprint is not None and saved_fingerprint != computed_fingerprint:
+                raise ValueError(
+                    "Checkpoint reference-model fingerprint does not match its frozen base reference."
+                )
+            self._reference_model_fingerprint = computed_fingerprint
+        if schema >= 12:
+            saved_map = payload.get("active_reference_feature_map")
+            if not isinstance(saved_map, torch.Tensor):
+                raise ValueError("Checkpoint is missing its active reference-feature map.")
+            expected_shape = tuple(self._identity_reference_feature_map().shape)
+            if tuple(saved_map.shape) != expected_shape or not torch.isfinite(saved_map).all():
+                raise ValueError("Checkpoint reference-feature map has an invalid shape or non-finite values.")
+            saved_map_hash = payload.get("active_reference_feature_map_hash")
+            if saved_map_hash != self._reference_alignment_hash(saved_map):
+                raise ValueError("Checkpoint reference-feature map hash mismatch.")
+            self._active_reference_feature_map = saved_map.to(self.device).float()
+            self._active_reference_alignment_info = payload.get(
+                "active_reference_alignment_info",
+                {"fit_cosine_error": 0.0, "fit_samples": 0, "ridge": 0.0},
+            )
+        else:
+            self._active_reference_feature_map = self._identity_reference_feature_map()
+            self._active_reference_alignment_info = {
+                "fit_cosine_error": 0.0, "fit_samples": 0, "ridge": 0.0
+            }
         manifest = payload.get("support_manifest")
         if manifest is None:
             raise ValueError("Resume checkpoint support_manifest must not be null.")
@@ -428,6 +591,18 @@ class Runner:
                 state["prototype_space_id"] = self._reference_space_id
                 state["reference_session"] = 0
                 state["prototype_space_legacy"] = True
+            state_fingerprint = state.get("reference_model_fingerprint")
+            if state_fingerprint is None and completed_session == 0 and schema < 12:
+                state["reference_model_fingerprint"] = self._reference_model_fingerprint
+                state["reference_alignment_hash"] = self._reference_alignment_hash(
+                    self._identity_reference_feature_map()
+                )
+                state["reference_alignment_error"] = 0.0
+            elif state_fingerprint != self._reference_model_fingerprint:
+                raise ValueError(
+                    "Checkpoint task prototype reference fingerprint is missing or inconsistent; "
+                    "restart from Session 0."
+                )
         # Legacy task-gate offsets are ignored: inference uses one global bank.
         self.acc_list = payload.get("acc_list", [])
         self.task_acc_list = payload.get("task_acc_list", [])
@@ -444,13 +619,31 @@ class Runner:
         directory = self._checkpoint_dir()
         directory.mkdir(parents=True, exist_ok=True)
         topology = self.model_without_dp.export_moe_topology()
+        if self._reference_model_fingerprint is None:
+            self._base_reference_router_states = self._base_reference_router_states or {}
+            self._reference_model_fingerprint = self._compute_reference_model_fingerprint()
+            for state in state_dict_list:
+                state["reference_model_fingerprint"] = self._reference_model_fingerprint
+                state.setdefault(
+                    "reference_alignment_hash",
+                    self._reference_alignment_hash(self._active_reference_feature_map),
+                )
+                state.setdefault("reference_alignment_error", 0.0)
         payload = {
-            "schema_version": 11,
+            "schema_version": 12,
             "completed_session": int(completed_session),
             "model_state": self._cpu_copy(self.model_without_dp.state_dict()),
             "moe_topology": topology,
             "base_reference_router_states": self._cpu_copy(self._base_reference_router_states or {}),
             "reference_space_id": self._reference_space_id,
+            "reference_model_fingerprint": self._reference_model_fingerprint,
+            "active_reference_feature_map": self._cpu_copy(self._active_reference_feature_map),
+            "active_reference_feature_map_hash": self._reference_alignment_hash(
+                self._active_reference_feature_map
+            ),
+            "active_reference_alignment_info": self._cpu_copy(
+                self._active_reference_alignment_info
+            ),
             "task_states": self._cpu_copy(state_dict_list),
             "base_vision_prototype": self._cpu_copy(self.model_without_dp.base_vision_prototype),
             "support_manifest": self.data_manager.get_support_manifest(),
@@ -620,6 +813,12 @@ class Runner:
                     f"Historical prototype space {state_space!r} does not match "
                     f"the active reference {self._reference_space_id!r}."
                 )
+            active_fingerprint = getattr(self, "_reference_model_fingerprint", None)
+            state_fingerprint = state.get("reference_model_fingerprint")
+            if active_fingerprint is not None and state_fingerprint != active_fingerprint:
+                raise ValueError(
+                    "Historical prototype reference-model fingerprint is missing or incompatible."
+                )
             class_ids = torch.as_tensor(state.get("class_ids", state.get("class_index")), device=self.device, dtype=torch.long).reshape(-1)
             fused = state.get("fused_proto")
             if fused is None: fused = self.model_without_dp.fuse_prototypes(state)
@@ -633,36 +832,79 @@ class Runner:
 
     @torch.no_grad()
     def _support_bank(self, loader, class_index, text_features, description_proto, version, calibrate=True):
-        """Current query-exclusive prototypes plus immutable historical negatives."""
+        """Build query-exclusive prototypes after mapping current features to reference space."""
         model = self.model_without_dp
-        current = model.build_leave_one_out_prototypes(loader, class_index, max_session=None)
+        current_features, reference_features, source_ids = self._collect_reference_feature_pairs(
+            loader, version
+        )
         device = torch.device(self.device)
-        features, labels = current["features"].to(device).float(), current["labels"].to(device).long()
-        classes = current["classes"].to(device).long()
-        if not bool(current["loo_valid"].all().item()): raise ValueError("Each query requires another same-class source.")
+        labels = []
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            for batch in loader:
+                _, batch_labels = self.parse_batch(batch)
+                labels.append(batch_labels.detach())
+        finally:
+            self.model.train(was_training)
+        labels = torch.cat(labels, dim=0).to(device).long()
         requested = torch.as_tensor(class_index, device=device, dtype=torch.long).reshape(-1)
+        classes = torch.unique(requested, sorted=True)
+        actual_classes = torch.unique(labels, sorted=True)
+        if not torch.equal(classes, actual_classes):
+            raise ValueError("Support labels do not match the requested incremental class ids.")
+        feature_map, alignment = fit_reference_feature_map(
+            current_features, reference_features, ridge=self._reference_map_ridge()
+        )
+        feature_map = feature_map.to(device)
+        features = F.normalize(current_features.to(device).float() @ feature_map, dim=-1)
+        current = build_loo_cache_from_embeddings(
+            features.detach().cpu(), labels.detach().cpu(), source_ids.detach().cpu(),
+            class_index=classes.detach().cpu(),
+        )
+        if not bool(current["loo_valid"].all().item()):
+            raise ValueError("Mapped support cache contains a query without a same-class peer.")
+        current["reference_feature_map"] = feature_map.detach()
+        current["reference_alignment_fit_error"] = float(alignment["fit_cosine_error"])
+        current["reference_alignment_fit_samples"] = int(alignment["fit_samples"])
+        current["reference_alignment_ridge"] = float(alignment["ridge"])
+        current["reference_alignment_hash"] = self._reference_alignment_hash(feature_map)
+
+        features = current["features"].to(device).float()
+        labels = current["labels"].to(device).long()
+        classes = current["classes"].to(device).long()
         matches = classes[:, None].eq(requested[None, :])
-        if not matches.sum(1).eq(1).all() or not matches.sum(0).eq(1).all(): raise ValueError("Support class ids mismatch.")
+        if not matches.sum(1).eq(1).all() or not matches.sum(0).eq(1).all():
+            raise ValueError("Support class ids mismatch.")
         order_text = matches.long().argmax(1)
         text_features = torch.as_tensor(text_features, device=device).float()[order_text]
         description_proto = torch.as_tensor(description_proto, device=device).float()[order_text]
-        visual_full = F.normalize(torch.stack([features[labels.eq(c)].mean(0) for c in classes]), dim=-1)
+        visual_full = F.normalize(
+            torch.stack([features[labels.eq(class_id)].mean(0) for class_id in classes]), dim=-1
+        )
         visual_loo = current["loo_visual_prototypes"].to(device).float()
         if calibrate:
             visual_full = model.calibrate_incremental_visual(visual_full)
-            visual_loo = model.calibrate_incremental_visual(visual_loo.reshape(-1, visual_loo.size(-1))).reshape_as(visual_loo)
+            visual_loo = model.calibrate_incremental_visual(
+                visual_loo.reshape(-1, visual_loo.size(-1))
+            ).reshape_as(visual_loo)
         lam = float(self.cfg.TRAINER.BiMC.LAMBDA_T) if self.cfg.TRAINER.BiMC.TEXT_CALIBRATION else 0.0
-        text = F.normalize((1-lam)*text_features + lam*description_proto, dim=-1)
+        text = F.normalize((1 - lam) * text_features + lam * description_proto, dim=-1)
         beta = float(self.cfg.DATASET.BETA)
-        new_full = F.normalize(beta*text + (1-beta)*visual_full, dim=-1)
-        new_loo = F.normalize(beta*text.unsqueeze(0) + (1-beta)*visual_loo, dim=-1)
+        new_full = F.normalize(beta * text + (1 - beta) * visual_full, dim=-1)
+        new_loo = F.normalize(beta * text.unsqueeze(0) + (1 - beta) * visual_loo, dim=-1)
         old_ids, old_proto = self._historical_prototype_bank()
-        if old_ids is None: all_ids, full_bank, loo_bank = classes, new_full, new_loo
+        if old_ids is None:
+            all_ids, full_bank, loo_bank = classes, new_full, new_loo
         else:
-            if torch.isin(old_ids, classes).any(): raise ValueError("Historical/current class ids overlap.")
-            all_ids = torch.cat([old_ids, classes]); order = all_ids.argsort()
+            if torch.isin(old_ids, classes).any():
+                raise ValueError("Historical/current class ids overlap.")
+            all_ids = torch.cat([old_ids, classes])
+            order = all_ids.argsort()
             full_bank = torch.cat([old_proto, new_full], dim=0)[order]
-            loo_bank = torch.cat([old_proto.unsqueeze(0).expand(new_loo.size(0),-1,-1), new_loo], dim=1)[:,order,:]
+            loo_bank = torch.cat([
+                old_proto.unsqueeze(0).expand(new_loo.size(0), -1, -1), new_loo
+            ], dim=1)[:, order, :]
         current["classes"] = all_ids.sort().values
         current["fused_full"], current["fused_loo"] = full_bank, loo_bank
         return current
@@ -687,6 +929,11 @@ class Runner:
             # Validation and deployment both use the complete current expert pool.
             features = self.model_without_dp.extract_img_feature(images)
         features = F.normalize(features.float(), dim=-1)
+        feature_map = support_bank.get("reference_feature_map")
+        if feature_map is not None:
+            features = F.normalize(
+                features @ feature_map.to(device=features.device, dtype=features.dtype), dim=-1
+            )
         logits = scale * torch.einsum("bd,bcd->bc", features, new_prototypes.float())
         return logits, self._targets_to_columns(labels, {"class_ids": support_bank["classes"]})
 
@@ -898,10 +1145,11 @@ class Runner:
         bank = self._support_bank(
             support_loader, class_index, text, description, version, calibrate
         )
-        classification_total, drift_total, count = 0.0, 0.0, 0
+        classification_total, drift_total, alignment_total, count = 0.0, 0.0, 0.0, 0
         stability_weight = float(getattr(
             self.cfg.TRAINER.BiMC.INCREMENTAL, "STABILITY_WEIGHT", 0.0
         ))
+        feature_map = bank.get("reference_feature_map")
         for batch in validation_loader:
             images, labels = self.parse_batch(batch)
             logits, targets = self._incremental_logits(
@@ -914,15 +1162,37 @@ class Runner:
             if previous_version is not None:
                 drift = self._representation_drift(images, version, previous_version)
                 drift_total += float(drift.item()) * labels.numel()
+            if feature_map is not None:
+                current_features = F.normalize(
+                    self.model_without_dp.extract_img_feature(images).float(), dim=-1
+                )
+                aligned_features = F.normalize(
+                    current_features @ feature_map.to(
+                        device=current_features.device, dtype=current_features.dtype
+                    ), dim=-1
+                )
+                reference_features = self._reference_features(images, version)
+                alignment_error = (
+                    1.0 - (aligned_features * reference_features).sum(dim=-1)
+                ).clamp_min(0.0)
+                alignment_total += float(alignment_error.sum().item())
             count += labels.numel()
         count = max(count, 1)
         classification_loss = classification_total / count
         reference_drift = drift_total / count
+        reference_alignment_error = alignment_total / count if feature_map is not None else 0.0
+        alignment_passed = (
+            self._reference_alignment_allowed([reference_alignment_error])
+            if feature_map is not None else True
+        )
         objective_loss = classification_loss + stability_weight * reference_drift
         metrics = {
             "loss": float(objective_loss),
             "classification_loss": float(classification_loss),
             "reference_drift": float(reference_drift),
+            "reference_alignment_error": float(reference_alignment_error),
+            "reference_alignment_limit": self._reference_alignment_limit(),
+            "alignment_passed": bool(alignment_passed),
             "samples": int(count),
         }
         return metrics if return_metrics else objective_loss
@@ -931,22 +1201,53 @@ class Runner:
                                current_class_name, enable_visual_calibration):
         """Run a transactional update; rejection or exceptions restore the exact MoE state."""
         snapshot = self._snapshot_moe_state()
+        previous_map = self._active_reference_feature_map.detach().clone()
+        previous_alignment_info = copy.deepcopy(self._active_reference_alignment_info)
         try:
             result = self._train_incremental_task_impl(
                 task_id, train_loader, extract_loader, class_index,
                 current_class_name, enable_visual_calibration,
             )
             accepted = bool(result.get("trained") or result.get("router_adapted"))
+            if accepted:
+                feature_map, alignment = self._fit_reference_feature_map_from_loader(
+                    extract_loader, int(task_id)
+                )
+                if not self._reference_alignment_allowed([alignment["fit_cosine_error"]]):
+                    self._restore_moe_state(snapshot)
+                    self._active_reference_feature_map = previous_map
+                    self._active_reference_alignment_info = previous_alignment_info
+                    for decision in result.get("decisions", []):
+                        if decision.get("accepted"):
+                            decision["accepted"] = False
+                            decision["postfit_reject_reason"] = "full_support_alignment_error_limit"
+                    result["trained"] = False
+                    result["router_adapted"] = False
+                    result["expanded"] = []
+                    result["reason"] = "full_support_reference_alignment_error_limit"
+                    accepted = False
+                else:
+                    self._active_reference_feature_map = feature_map.detach()
+                    self._active_reference_alignment_info = dict(alignment)
+                    result["reference_alignment"] = dict(alignment)
             if not accepted:
                 self._restore_moe_state(snapshot)
+                self._active_reference_feature_map = previous_map
+                self._active_reference_alignment_info = previous_alignment_info
             result["state_transaction"] = {
                 "accepted": accepted,
                 "rolled_back": not accepted,
                 "reference_space_id": self._reference_space_id,
+                "reference_model_fingerprint": self._reference_model_fingerprint,
+                "reference_alignment_hash": self._reference_alignment_hash(
+                    self._active_reference_feature_map
+                ),
             }
             return result
         except Exception:
             self._restore_moe_state(snapshot)
+            self._active_reference_feature_map = previous_map
+            self._active_reference_alignment_info = previous_alignment_info
             raise
 
     def _train_incremental_task_impl(self, task_id, train_loader, extract_loader, class_index,
@@ -997,6 +1298,8 @@ class Runner:
             ))
         router_losses = [metric["loss"] for metric in router_metrics]
         router_drifts = [metric["reference_drift"] for metric in router_metrics]
+        router_alignment_errors = [metric["reference_alignment_error"] for metric in router_metrics]
+        router_alignment_passed = all(metric["alignment_passed"] for metric in router_metrics)
         router_gains = np.asarray(null_losses) - np.asarray(router_losses)
         router_gain = float(np.mean(router_gains))
         router_gain_se = float(
@@ -1007,7 +1310,9 @@ class Runner:
         drift_limit = self._reference_drift_limit()
         print(f"=> [RouterOnly][Task {task_id}] gain={router_gain:.5f} "
               f"se={router_gain_se:.5f} reference_drift_max={router_drift_max:.5f} "
-              f"drift_passed={router_drift_passed}")
+              f"drift_passed={router_drift_passed} "
+              f"alignment_error_max={max(router_alignment_errors, default=0.0):.5f} "
+              f"alignment_passed={router_alignment_passed}")
 
         # Restore the exact pre-candidate state before deciding whether to keep it.
         for block_idx, adapter in self._moe_adapters():
@@ -1025,9 +1330,12 @@ class Runner:
             "reference_drift_max": router_drift_max,
             "reference_drift_limit": drift_limit,
             "drift_passed": bool(router_drift_passed),
+            "reference_alignment_error_max": float(max(router_alignment_errors, default=0.0)),
+            "reference_alignment_limit": self._reference_alignment_limit(),
+            "alignment_passed": bool(router_alignment_passed),
             "accepted": False,
         }]
-        if router_gain > router_gain_se and router_drift_passed:
+        if router_gain > router_gain_se and router_drift_passed and router_alignment_passed:
             history = self._train_router_only(
                 task_id, train_loader, extract_loader, class_index, text,
                 description, enable_visual_calibration,
@@ -1048,10 +1356,12 @@ class Runner:
                     column.load_state_dict(state)
                 adapter.freeze_all()
         else:
-            decisions[0]["reject_reason"] = (
-                "insufficient_validation_gain" if router_gain <= router_gain_se
-                else "reference_drift_limit"
-            )
+            if router_gain <= router_gain_se:
+                decisions[0]["reject_reason"] = "insufficient_validation_gain"
+            elif not router_drift_passed:
+                decisions[0]["reject_reason"] = "reference_drift_limit"
+            else:
+                decisions[0]["reject_reason"] = "reference_alignment_error_limit"
 
         # Descriptor coverage gates candidate layers before predictive validation.
         coverage_features = self.model_without_dp.collect_blockwise_cls_features(extract_loader)
@@ -1090,6 +1400,10 @@ class Runner:
             adapter.remove_newest_expert()
             candidate_losses = [metric["loss"] for metric in candidate_metrics]
             candidate_drifts = [metric["reference_drift"] for metric in candidate_metrics]
+            candidate_alignment_errors = [
+                metric["reference_alignment_error"] for metric in candidate_metrics
+            ]
+            alignment_passed = all(metric["alignment_passed"] for metric in candidate_metrics)
             gains = np.asarray(null_losses) - np.asarray(candidate_losses)
             drift_passed = self._reference_drift_allowed(candidate_drifts)
             decisions.append({
@@ -1104,6 +1418,9 @@ class Runner:
                 "reference_drift_max": float(max(candidate_drifts, default=0.0)),
                 "reference_drift_limit": self._reference_drift_limit(),
                 "drift_passed": bool(drift_passed),
+                "reference_alignment_error_max": float(max(candidate_alignment_errors, default=0.0)),
+                "reference_alignment_limit": self._reference_alignment_limit(),
+                "alignment_passed": bool(alignment_passed),
                 "accepted": False,
             })
             print(f"=> [Candidate][Task {task_id}][B{block_idx}] "
@@ -1115,6 +1432,7 @@ class Runner:
                 if row.get("mode") == "expert_expansion"
                 and row["gain"] > row["gain_se"]
                 and row["drift_passed"]
+                and row["alignment_passed"]
             ],
             key=lambda row: row["gain"],
             reverse=True,
@@ -1201,9 +1519,14 @@ class Runner:
         ids=self.data_manager.class_index_in_task[through_task]
         names=np.array(self.data_manager.class_names)[ids].tolist()
         loader=self.data_manager.get_dataloader(through_task,source="train",mode="test",accumulate_past=False)
-        state=self.model_without_dp.build_task_statistics(names,loader,ids,
-            calibrate_novel_vision_proto=(through_task>0 and bool(self.cfg.TRAINER.BiMC.VISION_CALIBRATION)),
-            encoder_version=None)
+        state = self.model_without_dp.build_task_statistics(
+            names, loader, ids,
+            calibrate_novel_vision_proto=(
+                through_task > 0 and bool(self.cfg.TRAINER.BiMC.VISION_CALIBRATION)
+            ),
+            encoder_version=None,
+            image_feature_map=self._active_reference_feature_map,
+        )
         state["class_ids"] = torch.as_tensor(ids, device=self.device, dtype=torch.long)
         state["creation_session"] = through_task
         state["encoder_version"] = self._current_encoder_version()
@@ -1211,6 +1534,17 @@ class Runner:
         state["model_revision"] = through_task
         state["prototype_space_id"] = self._reference_space_id
         state["reference_session"] = 0
+        state["reference_alignment_hash"] = self._reference_alignment_hash(
+            self._active_reference_feature_map
+        )
+        state["reference_alignment_error"] = float(
+            self._active_reference_alignment_info.get("fit_cosine_error", 0.0)
+        )
+        state["reference_alignment_ridge"] = float(
+            self._active_reference_alignment_info.get("ridge", 0.0)
+        )
+        if self._reference_model_fingerprint is not None:
+            state["reference_model_fingerprint"] = self._reference_model_fingerprint
         state["prototype_refresh_mode"] = "current_session_support_no_replay"
         state["reference_drift"] = float(
             self._loader_reference_drift(loader, through_task, through_task)
@@ -1383,7 +1717,14 @@ class Runner:
             features = F.normalize(
                 self.model_without_dp.extract_img_feature(images).float(), dim=-1
             )
-            for name, prototypes in prototype_banks.items():
+            feature_map = getattr(self, "_active_reference_feature_map", None)
+            if feature_map is not None:
+                features = F.normalize(
+                    features @ feature_map.to(
+                        device=features.device, dtype=features.dtype
+                    ), dim=-1
+                )
+            for name, prototypes in prototype_banks.items()
                 all_logits[name].append(
                     100.0 * features @ F.normalize(prototypes, dim=-1).t()
                 )
