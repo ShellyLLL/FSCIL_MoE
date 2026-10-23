@@ -393,10 +393,19 @@ class VisualMoEAdapter(nn.Module):
         return parameters
 
     def historical_named_parameters(self):
-        newest = self.num_experts - 1
-        prefixes = (f"experts.{newest}.", f"router.columns.{newest}.", f"descriptors.{newest}.")
+        """Yield parameters that belong to already-established sessions."""
+        mutable_prefixes = []
+        if self.num_experts > self.base_expert_count:
+            newest_expert = self.num_experts - 1
+            mutable_prefixes.extend((
+                f"experts.{newest_expert}.",
+                f"router.columns.{newest_expert}.",
+                f"descriptors.{newest_expert}.",
+            ))
+        if self.router_increments:
+            mutable_prefixes.append(f"router_increments.{len(self.router_increments) - 1}.")
         for name, parameter in self.named_parameters():
-            if not name.startswith(prefixes):
+            if not any(name.startswith(prefix) for prefix in mutable_prefixes):
                 yield name, parameter
 
     def export_topology(self):
