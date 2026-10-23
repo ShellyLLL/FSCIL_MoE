@@ -17,7 +17,7 @@ from tqdm import tqdm
 
 from datasets.data_manager import DatasetManager
 from models.bimc import BiMC, build_loo_cache_from_embeddings
-from utils.evaluator import AccuracyEvaluator
+from utils.evaluator import AccuracyEvaluator, compute_continual_metrics
 
 
 def compute_load_balance_loss(moe_aux_list, num_experts):
@@ -1325,23 +1325,23 @@ class Runner:
             self.save_checkpoint(task_id, state_dict_list)
 
         print(f"\nFinal acc: {self.acc_list}")
-        # AA: mean of all-session mean accuracies (percentage points).
-        aa = float(np.mean(self.acc_list)) if self.acc_list else 0.0
-        # PD: average drop on each earlier task from its introduction session
-        # to the final session. The final task is excluded because it has no
-        # subsequent session in which forgetting can occur.
-        if len(self.task_acc_list) > 1:
-            final_task_acc = self.task_acc_list[-1]
-            drops = [
-                float(self.task_acc_list[task_id][task_id]) -
-                float(final_task_acc[task_id])
-                for task_id in range(len(self.task_acc_list) - 1)
-            ]
-            pd = float(np.mean(drops)) if drops else 0.0
-        else:
-            drops, pd = [], 0.0
-        print(f"=> AA (mean session accuracy): {aa:.3f}")
-        print(f"=> PD (mean old-task accuracy drop, pp): {pd:.3f}; per-task={drops}")
+        metrics = compute_continual_metrics(self.acc_list, self.task_acc_list)
+        print(f"=> AA (mean session accuracy, %): {metrics['aa']:.3f}")
+        print(
+            "=> PD (initial overall acc - final overall acc, pp): "
+            f"{metrics['pd']:.3f} "
+            f"(initial={metrics['initial_acc']:.3f}, final={metrics['final_acc']:.3f})"
+        )
+        print(
+            "=> Final Novel average accuracy (%): "
+            f"{metrics['final_novel_avg_acc']:.3f}"
+        )
+        # Keep the former old-task forgetting statistic as a diagnostic only.
+        print(
+            "=> Diagnostic old-task average accuracy drop (pp): "
+            f"{metrics['old_task_avg_drop']:.3f}; "
+            f"per-task={metrics['old_task_drops']}"
+        )
         print("Task-wise acc:")
         for index, task_acc in enumerate(self.task_acc_list):
             print(f"task {index:2d}, acc: {task_acc}")

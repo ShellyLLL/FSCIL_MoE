@@ -2,6 +2,67 @@ import torch
 import numpy as np
 from sklearn.metrics import confusion_matrix
 
+
+def compute_continual_metrics(session_accuracies, task_accuracies=None):
+    """Compute FSCIL summary metrics with an explicit, stable definition.
+
+    Accuracy values are percentages (not fractions). AA is the arithmetic mean
+    of per-session overall accuracies. PD is initial overall accuracy minus
+    final overall accuracy, in percentage points. The former mean old-task drop
+    is retained as a separate diagnostic and must not be reported as PD.
+    """
+    sessions = np.asarray(session_accuracies, dtype=np.float64).reshape(-1)
+    if not np.isfinite(sessions).all():
+        raise ValueError("session_accuracies must contain only finite values.")
+    aa = float(sessions.mean()) if sessions.size else 0.0
+    initial_acc = float(sessions[0]) if sessions.size else 0.0
+    final_acc = float(sessions[-1]) if sessions.size else 0.0
+    pd = initial_acc - final_acc if sessions.size > 1 else 0.0
+
+    task_rows = []
+    if task_accuracies is not None:
+        task_rows = [
+            np.asarray(row, dtype=np.float64).reshape(-1)
+            for row in task_accuracies
+        ]
+        if len(task_rows) != sessions.size:
+            raise ValueError(
+                "task_accuracies must contain one row per session accuracy."
+            )
+        if any(not np.isfinite(row).all() for row in task_rows):
+            raise ValueError("task_accuracies must contain only finite values.")
+        for session_id, row in enumerate(task_rows):
+            if row.size != session_id + 1:
+                raise ValueError(
+                    "Each task-accuracy row must contain one value for every "
+                    "class-incremental task seen by that session."
+                )
+
+    old_task_drops = []
+    final_novel_avg_acc = 0.0
+    if task_rows:
+        final_row = task_rows[-1]
+        final_novel_avg_acc = (
+            float(final_row[1:].mean()) if final_row.size > 1 else 0.0
+        )
+        for task_id in range(len(task_rows) - 1):
+            old_task_drops.append(
+                float(task_rows[task_id][task_id]) - float(final_row[task_id])
+            )
+    old_task_avg_drop = (
+        float(np.mean(old_task_drops)) if old_task_drops else 0.0
+    )
+    return {
+        "aa": aa,
+        "pd": pd,
+        "initial_acc": initial_acc,
+        "final_acc": final_acc,
+        "final_novel_avg_acc": final_novel_avg_acc,
+        "old_task_avg_drop": old_task_avg_drop,
+        "old_task_drops": old_task_drops,
+    }
+
+
 class AccuracyEvaluator:
     
     def __init__(self, class_index_per_task):

@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader, Dataset
 from models.clip.model import VisionTransformer, VisualMoEAdapter
 from models.bimc import BiMC, build_loo_cache_from_embeddings
 from engine.engine import Runner
-from utils.evaluator import AccuracyEvaluator
+from utils.evaluator import AccuracyEvaluator, compute_continual_metrics
 
 
 class TinySupport(Dataset):
@@ -255,6 +255,39 @@ class ExpansionInvariantTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(ValueError, "different or unknown feature-space"):
             runner.merge_dicts([base, novel])
+
+
+
+class ContinualMetricContractTests(unittest.TestCase):
+    def test_pd_is_initial_minus_final_overall_accuracy(self):
+        sessions = [87.71, 70.0, 54.33]
+        task_rows = [
+            [87.71],
+            [70.0, 80.0],
+            [50.0, 66.75, 66.75],
+        ]
+        metrics = compute_continual_metrics(sessions, task_rows)
+        self.assertAlmostEqual(metrics["aa"], (87.71 + 70.0 + 54.33) / 3.0, places=6)
+        self.assertAlmostEqual(metrics["pd"], 33.38, places=6)
+        self.assertAlmostEqual(metrics["initial_acc"], 87.71, places=6)
+        self.assertAlmostEqual(metrics["final_acc"], 54.33, places=6)
+        self.assertAlmostEqual(metrics["final_novel_avg_acc"], 66.75, places=6)
+        # The legacy old-task forgetting statistic remains separate from PD.
+        self.assertAlmostEqual(metrics["old_task_avg_drop"], (37.71 + 13.25) / 2.0, places=6)
+        self.assertNotAlmostEqual(metrics["old_task_avg_drop"], metrics["pd"], places=3)
+
+    def test_metric_contract_rejects_misaligned_session_rows(self):
+        with self.assertRaisesRegex(ValueError, "one row per session"):
+            compute_continual_metrics([80.0, 70.0], [[80.0]])
+
+    def test_metric_contract_rejects_invalid_task_row_width(self):
+        with self.assertRaisesRegex(ValueError, "one value for every"):
+            compute_continual_metrics([80.0, 70.0], [[80.0], [60.0]])
+
+    def test_single_session_pd_is_zero(self):
+        metrics = compute_continual_metrics([81.25], [[81.25]])
+        self.assertEqual(metrics["pd"], 0.0)
+        self.assertEqual(metrics["final_novel_avg_acc"], 0.0)
 
 
 if __name__ == "__main__":
