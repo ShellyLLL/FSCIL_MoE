@@ -1108,7 +1108,7 @@ class Runner:
 
     def _train_router_only(self, task_id, train_loader, extract_loader, class_index,
                            text, description, calibrate):
-        """Adapt router columns only; experts and the pretrained ViT stay frozen."""
+        """Train only a bounded session-local route residual; history stays frozen."""
         adapters = self._moe_adapters()
         parameters = []
         for _, adapter in adapters:
@@ -1262,7 +1262,7 @@ class Runner:
                     for decision in result.get("decisions", []):
                         if decision.get("accepted"):
                             decision["accepted"] = False
-                            decision["postfit_reject_reason"] = "full_support_alignment_error_limit"
+                            decision["postfit_reject_reason"] = "held_out_reference_alignment_error_limit"
                     result["trained"] = False
                     result["router_adapted"] = False
                     result["expanded"] = []
