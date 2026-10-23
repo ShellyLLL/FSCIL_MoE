@@ -1535,6 +1535,8 @@ class Runner:
         best_expansion_gain = float(eligible[0]["gain"])
         if router_candidate_snapshot is not None and router_gain >= best_expansion_gain:
             self._restore_moe_state(router_candidate_snapshot)
+            decisions[0]["accepted"] = True
+            decisions[0]["selected"] = True
             print(f"=> [Accepted][Task {task_id}] router-only candidate outperformed expansion.")
             return {
                 "trained": False, "router_adapted": True,
