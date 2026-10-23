@@ -327,7 +327,12 @@ class Runner:
             digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
 
         for name, value in sorted(visual_state.items()):
-            if ".moe_adapter.router.columns." in name:
+            if (
+                ".moe_adapter.router.columns." in name
+                or ".moe_adapter.router_increments." in name
+            ):
+                # Session-local routing residuals are deliberately outside the
+                # immutable post-base reference model and must not change its ID.
                 continue
             family = None
             for candidate in ("experts", "descriptors"):
