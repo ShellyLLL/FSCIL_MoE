@@ -833,9 +833,26 @@ class Runner:
             class_ids = torch.as_tensor(state.get("class_ids", state.get("class_index")), device=self.device, dtype=torch.long).reshape(-1)
             fused = state.get("fused_proto")
             if fused is None: fused = self.model_without_dp.fuse_prototypes(state)
-            fused = F.normalize(torch.as_tensor(fused, device=self.device).float(), dim=-1)
-            if fused.ndim != 2 or fused.size(0) != class_ids.numel(): raise ValueError("Historical prototypes and ids do not align.")
-            ids.append(class_ids); prototypes.append(fused)
+            fused = torch.as_tensor(fused, device=self.device).float()
+            if fused.ndim != 2 or fused.size(0) != class_ids.numel():
+                raise ValueError("Historical prototypes and ids do not align.")
+            if fused.size(1) != int(self.model_without_dp.clip_model.visual.output_dim):
+                raise ValueError("Historical prototype feature dimension does not match the active reference space.")
+            if not torch.isfinite(fused).all():
+                raise ValueError("Historical prototypes contain non-finite values.")
+            alignment_hash = state.get("reference_alignment_hash")
+            if alignment_hash is not None and (
+                not isinstance(alignment_hash, str) or len(alignment_hash) != 64
+                or any(char not in "0123456789abcdef" for char in alignment_hash.lower())
+            ):
+                raise ValueError("Historical prototype reference-alignment hash is malformed.")
+            alignment_error = state.get("reference_alignment_error")
+            if alignment_error is not None and (
+                not np.isfinite(float(alignment_error))
+                or not self._reference_alignment_allowed([float(alignment_error)])
+            ):
+                raise ValueError("Historical prototype was created with an unaccepted reference alignment.")
+            ids.append(class_ids); prototypes.append(F.normalize(fused, dim=-1))
         ids, prototypes = torch.cat(ids), torch.cat(prototypes)
         if torch.unique(ids).numel() != ids.numel(): raise ValueError("Duplicate historical class ids.")
         order = ids.argsort()
@@ -1228,7 +1245,8 @@ class Runner:
                 heldout_alignment = [
                     float(row["reference_alignment_error_max"])
                     for row in result.get("decisions", [])
-                    if row.get("mode") in ("router_only", "expert_expansion")
+                    if row.get("accepted")
+                    and row.get("mode") in ("router_only", "expert_expansion")
                     and row.get("reference_alignment_error_max") is not None
                 ]
                 if not heldout_alignment or not self._reference_alignment_allowed(heldout_alignment):
@@ -1381,6 +1399,9 @@ class Runner:
             for block_idx, adapter in self._moe_adapters():
                 for column, state in zip(adapter.router.columns, initial_router_states[block_idx]):
                     column.load_state_dict(state)
+                if (adapter.router_increment_birth_sessions
+                        and adapter.router_increment_birth_sessions[-1] == int(task_id)):
+                    adapter.remove_newest_router_increment()
                 adapter.freeze_all()
         else:
             if router_gain <= router_gain_se:
