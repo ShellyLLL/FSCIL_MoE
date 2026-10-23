@@ -842,7 +842,10 @@ class Runner:
             fused = torch.as_tensor(fused, device=self.device).float()
             if fused.ndim != 2 or fused.size(0) != class_ids.numel():
                 raise ValueError("Historical prototypes and ids do not align.")
-            if fused.size(1) != int(self.model_without_dp.clip_model.visual.output_dim):
+            clip_model = getattr(self.model_without_dp, "clip_model", None)
+            visual = getattr(clip_model, "visual", None)
+            expected_dim = getattr(visual, "output_dim", None)
+            if expected_dim is not None and fused.size(1) != int(expected_dim):
                 raise ValueError("Historical prototype feature dimension does not match the active reference space.")
             if not torch.isfinite(fused).all():
                 raise ValueError("Historical prototypes contain non-finite values.")
