@@ -78,6 +78,11 @@ def extend_cfg(cfg):
     # Maximum mean cosine distance from the immutable post-base feature reference.
     # Negative disables the hard guard while retaining the soft penalty.
     cfg.TRAINER.BiMC.INCREMENTAL.MAX_REFERENCE_DRIFT = 0.20
+    # Held-out cosine error limit for mapping current features into the immutable
+    # post-base reference space. Negative values disable the hard acceptance guard.
+    cfg.TRAINER.BiMC.INCREMENTAL.MAX_REFERENCE_ALIGNMENT_ERROR = 0.20
+    # Ridge regularization used when fitting the current-to-reference feature map.
+    cfg.TRAINER.BiMC.INCREMENTAL.REFERENCE_MAP_RIDGE = 1.0
 
     cfg.TRAINER.BiMC.CHECKPOINT = CN()
     cfg.TRAINER.BiMC.CHECKPOINT.ENABLE = True
