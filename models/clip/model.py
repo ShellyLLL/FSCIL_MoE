@@ -221,6 +221,17 @@ class ExpandableRouter(nn.Module):
         bias=(low+high)*0.5; newest.weight.zero_(); newest.bias.fill_(float(bias.item()))
         return float(torch.sigmoid(bias-partition).mean().item())
 
+    @torch.no_grad()
+    def initialize_newest_gate(self, target_mass=0.01):
+        """Initialize the newest incremental expert's independent sigmoid gate."""
+        target_mass = float(target_mass)
+        if not 0.0 < target_mass < 1.0 or len(self.columns) < 2:
+            raise ValueError("Invalid target mass or missing historical columns.")
+        newest = self.columns[-1]
+        newest.weight.zero_()
+        newest.bias.fill_(float(np.log(target_mass / (1.0 - target_mass))))
+        return target_mass
+
     def forward(self, x, num_columns=None):
         if not self.columns: raise RuntimeError("ExpandableRouter requires at least one column.")
         selected=self.columns if num_columns is None else self.columns[:int(num_columns)]
@@ -481,12 +492,13 @@ class VisualMoEAdapter(nn.Module):
         self.freeze_all()
 
     def forward(self, x, max_session=None):
-        """Mix all experts visible in this model path with one normalized router.
+        """Route the base pool jointly and add session-local gated expert residuals.
 
-        Historical experts remain active after freezing. max_session is retained
-        only for base-path distillation/calibration; deployed classification
-        calls this method with max_session=None so every sample is encoded once
-        by the current complete model.
+        New experts are zero-initialized, so appending one leaves the existing
+        function unchanged. Base experts keep their own normalized softmax;
+        each incremental expert uses an independent sigmoid gate. This avoids
+        diluting historical expert weights merely by extending the expert pool.
+        max_session limits both expert births and session-local route increments.
         """
         if x.ndim != 3:
             raise ValueError("VisualMoEAdapter expects [tokens, batch, dim].")
@@ -495,8 +507,6 @@ class VisualMoEAdapter(nn.Module):
                   if max_session is None or birth <= int(max_session)]
         if not active:
             raise RuntimeError("No experts are active for the requested model path.")
-        # SEMA-style routing: all active experts share one Softmax denominator,
-        # including newly added experts.
         logits, _ = self.router(x_norm[0], len(active))
         # Each session contributes only its own bounded residual. Older router
         # columns are never unfrozen or overwritten by later sessions.
@@ -511,7 +521,17 @@ class VisualMoEAdapter(nn.Module):
             elif delta.size(1) > logits.size(1):
                 delta = delta[:, :logits.size(1)]
             logits = logits + delta
-        weights = torch.softmax(logits, dim=-1)
+
+        # Keep the original normalized distribution over base experts. Each
+        # incremental expert contributes a separately gated residual, so adding
+        # a zero-initialized expert cannot perturb the historical function.
+        base_count = min(self.base_expert_count, len(active))
+        base_weights = torch.softmax(logits[:, :base_count], dim=-1)
+        if len(active) > base_count:
+            incremental_gates = torch.sigmoid(logits[:, base_count:])
+            weights = torch.cat((base_weights, incremental_gates), dim=-1)
+        else:
+            weights = base_weights
         residual, norms = torch.zeros_like(x_norm), []
         for column, expert_id in enumerate(active):
             weighted = self.experts[expert_id](x_norm) * weights[:, column].unsqueeze(0).unsqueeze(-1)
