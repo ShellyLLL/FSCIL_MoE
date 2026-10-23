@@ -376,7 +376,7 @@ class Runner:
     @torch.no_grad()
     def _collect_reference_feature_pairs(self, loader, reference_version):
         """Collect current/reference feature pairs in stable support-source order."""
-        current_features, reference_features, source_ids = [], [], []
+        current_features, reference_features, source_ids, support_labels = [], [], [], []
         was_training = self.model.training
         self.model.eval()
         try:
@@ -387,21 +387,32 @@ class Runner:
                     self.model_without_dp.extract_img_feature(images).float(), dim=-1
                 )
                 reference = self._reference_features(images, reference_version)
+                if current.shape != reference.shape:
+                    raise ValueError("Current/reference features must have identical batch shapes.")
                 current_features.append(current.detach())
                 reference_features.append(reference.detach())
                 source_ids.append(ids.detach())
+                support_labels.append(labels.detach())
         finally:
             self.model.train(was_training)
         if not current_features:
             raise ValueError("Cannot fit reference alignment from an empty support loader.")
         ids = torch.cat(source_ids, dim=0)
+        labels = torch.cat(support_labels, dim=0)
         if torch.unique(ids).numel() != ids.numel():
             raise ValueError("Support source ids must be unique when fitting reference alignment.")
-        return torch.cat(current_features, dim=0), torch.cat(reference_features, dim=0), ids
+        if ids.numel() != labels.numel():
+            raise ValueError("Support labels and source ids are not aligned.")
+        return (
+            torch.cat(current_features, dim=0),
+            torch.cat(reference_features, dim=0),
+            ids,
+            labels,
+        )
 
     @torch.no_grad()
     def _fit_reference_feature_map_from_loader(self, loader, reference_version):
-        current, reference, source_ids = self._collect_reference_feature_pairs(
+        current, reference, source_ids, _ = self._collect_reference_feature_pairs(
             loader, reference_version
         )
         feature_map, metrics = fit_reference_feature_map(
@@ -834,20 +845,11 @@ class Runner:
     def _support_bank(self, loader, class_index, text_features, description_proto, version, calibrate=True):
         """Build query-exclusive prototypes after mapping current features to reference space."""
         model = self.model_without_dp
-        current_features, reference_features, source_ids = self._collect_reference_feature_pairs(
-            loader, version
+        current_features, reference_features, source_ids, labels = (
+            self._collect_reference_feature_pairs(loader, version)
         )
         device = torch.device(self.device)
-        labels = []
-        was_training = self.model.training
-        self.model.eval()
-        try:
-            for batch in loader:
-                _, batch_labels = self.parse_batch(batch)
-                labels.append(batch_labels.detach())
-        finally:
-            self.model.train(was_training)
-        labels = torch.cat(labels, dim=0).to(device).long()
+        labels = labels.to(device).long()
         requested = torch.as_tensor(class_index, device=device, dtype=torch.long).reshape(-1)
         classes = torch.unique(requested, sorted=True)
         actual_classes = torch.unique(labels, sorted=True)
@@ -1087,8 +1089,16 @@ class Runner:
         adapters = self._moe_adapters()
         parameters = []
         for _, adapter in adapters:
-            adapter.set_router_trainable()
-            parameters.extend(adapter.router.parameters())
+            # A fresh session-local residual starts at exactly zero. Historical
+            # router columns and prior-session residuals remain frozen.
+            if (not adapter.router_increment_birth_sessions
+                    or adapter.router_increment_birth_sessions[-1] != int(task_id)):
+                adapter.add_router_increment(
+                    task_id,
+                    max_delta=float(_cfg_value(self._visual_moe_cfg(), "ROUTER_INCREMENT_MAX_DELTA", 0.5)),
+                )
+            adapter.set_router_increment_trainable()
+            parameters.extend(adapter.newest_router_increment_parameters())
         if not parameters:
             raise RuntimeError("Router-only adaptation requested without MoE adapters.")
 
@@ -1213,7 +1223,15 @@ class Runner:
                 feature_map, alignment = self._fit_reference_feature_map_from_loader(
                     extract_loader, int(task_id)
                 )
-                if not self._reference_alignment_allowed([alignment["fit_cosine_error"]]):
+                # Full-support fit error is diagnostic, not a generalization test.
+                # Candidate acceptance must be backed by held-out fold alignment.
+                heldout_alignment = [
+                    float(row["reference_alignment_error_max"])
+                    for row in result.get("decisions", [])
+                    if row.get("mode") in ("router_only", "expert_expansion")
+                    and row.get("reference_alignment_error_max") is not None
+                ]
+                if not heldout_alignment or not self._reference_alignment_allowed(heldout_alignment):
                     self._restore_moe_state(snapshot)
                     self._active_reference_feature_map = previous_map
                     self._active_reference_alignment_info = previous_alignment_info
@@ -1224,7 +1242,7 @@ class Runner:
                     result["trained"] = False
                     result["router_adapted"] = False
                     result["expanded"] = []
-                    result["reason"] = "full_support_reference_alignment_error_limit"
+                    result["reason"] = "held_out_reference_alignment_error_limit"
                     accepted = False
                 else:
                     self._active_reference_feature_map = feature_map.detach()
@@ -1296,6 +1314,12 @@ class Runner:
                 previous_version, enable_visual_calibration,
                 previous_version=previous_version, return_metrics=True,
             ))
+            # Each fold must start from the same topology and contain no
+            # trainable/session-local increment left over from the prior fold.
+            for _, adapter in self._moe_adapters():
+                if (adapter.router_increment_birth_sessions
+                        and adapter.router_increment_birth_sessions[-1] == int(task_id)):
+                    adapter.remove_newest_router_increment()
         router_losses = [metric["loss"] for metric in router_metrics]
         router_drifts = [metric["reference_drift"] for metric in router_metrics]
         router_alignment_errors = [metric["reference_alignment_error"] for metric in router_metrics]
