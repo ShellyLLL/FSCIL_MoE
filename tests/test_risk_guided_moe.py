@@ -187,7 +187,7 @@ class ExpansionInvariantTests(unittest.TestCase):
                 labels.append(batch["label"])
             features = torch.cat(current_features, dim=0)
             ids = torch.cat(source_ids, dim=0)
-            return features, features.clone(), ids, torch.cat(labels, dim=0)
+            return features, features.clone(), ids
         runner._collect_reference_feature_pairs = collect_pairs
         runner._reference_map_ridge = lambda: 1.0
         runner._reference_alignment_hash = lambda matrix: "test-map-hash"

@@ -1724,7 +1724,7 @@ class Runner:
                         device=features.device, dtype=features.dtype
                     ), dim=-1
                 )
-            for name, prototypes in prototype_banks.items()
+            for name, prototypes in prototype_banks.items():
                 all_logits[name].append(
                     100.0 * features @ F.normalize(prototypes, dim=-1).t()
                 )
