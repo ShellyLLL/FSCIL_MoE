@@ -228,6 +228,26 @@ class ExpandableRouter(nn.Module):
         return logits,torch.softmax(logits,dim=-1)
 
 
+class RouterIncrement(nn.Module):
+    """Session-local bounded residual over existing router logits."""
+
+    def __init__(self, dim, num_columns, max_delta=0.5):
+        super().__init__()
+        dim, num_columns = int(dim), int(num_columns)
+        max_delta = float(max_delta)
+        if dim < 1 or num_columns < 1:
+            raise ValueError("RouterIncrement requires positive dimensions.")
+        if not np.isfinite(max_delta) or max_delta <= 0.0:
+            raise ValueError("max_delta must be finite and positive.")
+        self.projection = nn.Linear(dim, num_columns)
+        nn.init.zeros_(self.projection.weight)
+        nn.init.zeros_(self.projection.bias)
+        self.max_delta = max_delta
+
+    def forward(self, inputs):
+        return self.max_delta * torch.tanh(self.projection(inputs))
+
+
 class BottleneckExpert(nn.Module):
     def __init__(self, d_model, reduction=4, zero_init_up=False):
         super().__init__()
@@ -260,6 +280,8 @@ class VisualMoEAdapter(nn.Module):
             for _ in range(self.base_expert_count)
         ])
         self.router = ExpandableRouter(self.d_model, self.base_expert_count)
+        self.router_increments = nn.ModuleList()
+        self.router_increment_birth_sessions = []
         self.expert_birth_sessions = [0] * self.base_expert_count
 
     @property
@@ -306,25 +328,63 @@ class VisualMoEAdapter(nn.Module):
                 parameter.requires_grad = True
         self.train()
 
-    def set_router_trainable(self):
-        """Train router columns only while keeping every expert frozen."""
+    def add_router_increment(self, session_id, max_delta=0.5):
+        """Append a zero-initialized, bounded route residual for one session."""
+        session_id = int(session_id)
+        if self.router_increment_birth_sessions and session_id <= self.router_increment_birth_sessions[-1]:
+            raise ValueError("Router increment birth sessions must be strictly increasing.")
+        reference_column = self.router.columns[0]
+        increment = RouterIncrement(
+            self.d_model, self.num_experts, max_delta=max_delta
+        ).to(device=reference_column.weight.device, dtype=reference_column.weight.dtype)
+        self.router_increments.append(increment)
+        self.router_increment_birth_sessions.append(session_id)
+        return len(self.router_increments) - 1
+
+    def set_router_increment_trainable(self):
+        """Train only the newest session-local route residual; freeze all historical columns."""
+        if not self.router_increments:
+            raise RuntimeError("Router-only adaptation requires a new router increment.")
         self.freeze_all()
-        for parameter in self.router.parameters():
+        for parameter in self.router_increments[-1].parameters():
             parameter.requires_grad = True
         self.train()
+
+    def set_router_trainable(self):
+        """Safe compatibility alias: historical router columns are never trainable."""
+        self.set_router_increment_trainable()
+
+    def newest_router_increment_parameters(self):
+        if not self.router_increments:
+            return []
+        return list(self.router_increments[-1].parameters())
 
     def add_expert(self, session_id, reduction=None):
         self.freeze_all()
         reduction = self.default_reduction if reduction is None else int(reduction)
-        self.experts.append(BottleneckExpert(self.d_model, reduction, zero_init_up=True).to(
-            device=self.residual_scale.device, dtype=self.residual_scale.dtype))
+        reference_expert = self.experts[0]
+        reference_column = self.router.columns[0]
+        self.experts.append(BottleneckExpert(
+            self.d_model, reduction, zero_init_up=True
+        ).to(device=reference_expert.c_fc.weight.device,
+             dtype=reference_expert.c_fc.weight.dtype))
         self.descriptors.append(RepresentationDescriptor(
-            self.d_model, self.descriptor_dim, self.descriptor_eps).to(device=self.residual_scale.device))
+            self.d_model, self.descriptor_dim, self.descriptor_eps
+        ).to(device=self.residual_scale.device))
         self.router.add_column()
-        self.router.columns[-1].to(device=self.residual_scale.device, dtype=self.residual_scale.dtype)
+        self.router.columns[-1].to(
+            device=reference_column.weight.device, dtype=reference_column.weight.dtype
+        )
         self.expert_birth_sessions.append(int(session_id))
         self.set_newest_trainable()
         return self.num_experts - 1
+
+    def remove_newest_router_increment(self):
+        if not self.router_increments:
+            raise RuntimeError("Cannot remove a router increment when none exists.")
+        del self.router_increments[-1]
+        self.router_increment_birth_sessions.pop()
+        self.freeze_all()
 
     def newest_parameters(self, include_descriptor=False):
         parameters = list(self.experts[-1].parameters()) + list(self.router.columns[-1].parameters())
@@ -340,10 +400,22 @@ class VisualMoEAdapter(nn.Module):
                 yield name, parameter
 
     def export_topology(self):
-        return {"version": 1, "d_model": self.d_model, "base_expert_count": self.base_expert_count,
-                "experts": [{"reduction": max(1, self.d_model // expert.c_fc.out_features),
-                             "birth_session": int(self.expert_birth_sessions[index])}
-                            for index, expert in enumerate(self.experts)]}
+        return {
+            "version": 2,
+            "d_model": self.d_model,
+            "base_expert_count": self.base_expert_count,
+            "experts": [
+                {"reduction": max(1, self.d_model // expert.c_fc.out_features),
+                 "birth_session": int(self.expert_birth_sessions[index])}
+                for index, expert in enumerate(self.experts)
+            ],
+            "router_increments": [
+                {"num_columns": int(increment.projection.out_features),
+                 "birth_session": int(self.router_increment_birth_sessions[index]),
+                 "max_delta": float(increment.max_delta)}
+                for index, increment in enumerate(self.router_increments)
+            ],
+        }
 
     def rebuild_topology(self, topology):
         if topology is None:
@@ -357,8 +429,15 @@ class VisualMoEAdapter(nn.Module):
         specs = list(topology.get("experts", []))
         if len(specs) < self.base_expert_count:
             raise ValueError("MoE topology has fewer experts than the base pool.")
+
+        # Preserve the checkpoint/model's intended compute dtypes. residual_scale
+        # deliberately remains float32 and must not dictate Linear-layer dtypes.
+        device = self.residual_scale.device
+        expert_dtype = self.experts[0].c_fc.weight.dtype
+        router_dtype = self.router.columns[0].weight.dtype
         self.experts, self.descriptors = nn.ModuleList(), nn.ModuleList()
         self.router, self.expert_birth_sessions = ExpandableRouter(self.d_model), []
+        self.router_increments, self.router_increment_birth_sessions = nn.ModuleList(), []
         for spec in specs:
             reduction = int(spec.get("reduction", self.default_reduction))
             self.experts.append(BottleneckExpert(self.d_model, reduction))
@@ -366,9 +445,17 @@ class VisualMoEAdapter(nn.Module):
                 self.d_model, self.descriptor_dim, self.descriptor_eps))
             self.router.add_column()
             self.expert_birth_sessions.append(int(spec.get("birth_session", 0)))
-        device, dtype = self.residual_scale.device, self.residual_scale.dtype
-        self.experts.to(device=device, dtype=dtype)
-        self.router.to(device=device, dtype=dtype)
+        for spec in topology.get("router_increments", []):
+            increment = RouterIncrement(
+                self.d_model,
+                int(spec.get("num_columns", len(specs))),
+                max_delta=float(spec.get("max_delta", 0.5)),
+            )
+            self.router_increments.append(increment)
+            self.router_increment_birth_sessions.append(int(spec.get("birth_session", 0)))
+        self.experts.to(device=device, dtype=expert_dtype)
+        self.router.to(device=device, dtype=router_dtype)
+        self.router_increments.to(device=device, dtype=router_dtype)
         self.descriptors.to(device=device, dtype=torch.float32)
         self.freeze_all()
 
@@ -401,7 +488,21 @@ class VisualMoEAdapter(nn.Module):
             raise RuntimeError("No experts are active for the requested model path.")
         # SEMA-style routing: all active experts share one Softmax denominator,
         # including newly added experts.
-        logits, weights = self.router(x_norm[0], len(active))
+        logits, _ = self.router(x_norm[0], len(active))
+        # Each session contributes only its own bounded residual. Older router
+        # columns are never unfrozen or overwritten by later sessions.
+        for increment, birth_session in zip(
+            self.router_increments, self.router_increment_birth_sessions
+        ):
+            if max_session is not None and birth_session > int(max_session):
+                continue
+            delta = increment(x_norm[0]).to(dtype=logits.dtype)
+            if delta.size(1) < logits.size(1):
+                delta = F.pad(delta, (0, logits.size(1) - delta.size(1)))
+            elif delta.size(1) > logits.size(1):
+                delta = delta[:, :logits.size(1)]
+            logits = logits + delta
+        weights = torch.softmax(logits, dim=-1)
         residual, norms = torch.zeros_like(x_norm), []
         for column, expert_id in enumerate(active):
             weighted = self.experts[expert_id](x_norm) * weights[:, column].unsqueeze(0).unsqueeze(-1)
