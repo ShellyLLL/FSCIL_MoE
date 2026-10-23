@@ -94,17 +94,46 @@ class ExpansionInvariantTests(unittest.TestCase):
         torch.manual_seed(13)
         source = VisualMoEAdapter(8, num_experts=2, reduction=2).eval()
         source.add_expert(1, reduction=4)
+        source.add_router_increment(2, max_delta=0.25)
         with torch.no_grad():
             source.experts[-1].c_proj.bias.fill_(0.2)
+            source.router_increments[-1].projection.weight.fill_(0.03)
         source.freeze_all()
         inputs = torch.randn(3, 2, 8)
-        expected = [source(inputs, max_session=version)[0] for version in (0, 1)]
+        expected = [source(inputs, max_session=version)[0] for version in (0, 1, 2)]
         restored = VisualMoEAdapter(8, num_experts=2, reduction=2)
         restored.rebuild_topology(source.export_topology())
         restored.load_state_dict(source.state_dict(), strict=True)
         for version, value in enumerate(expected):
             torch.testing.assert_close(restored(inputs, max_session=version)[0],
                                        value, rtol=0, atol=0)
+
+    def test_router_increment_never_rewrites_historical_columns_or_paths(self):
+        torch.manual_seed(23)
+        adapter = VisualMoEAdapter(8, num_experts=2, reduction=2).eval()
+        inputs = torch.randn(5, 3, 8)
+        old_before = adapter(inputs, max_session=0)[0].detach().clone()
+        current_before = adapter(inputs)[0].detach().clone()
+        historical = [
+            parameter.detach().clone()
+            for _, parameter in adapter.historical_named_parameters()
+        ]
+        adapter.add_router_increment(session_id=1, max_delta=0.2)
+        adapter.set_router_increment_trainable()
+        optimizer = torch.optim.SGD(adapter.newest_router_increment_parameters(), lr=0.1)
+        for _ in range(3):
+            optimizer.zero_grad(set_to_none=True)
+            output, _ = adapter(inputs)
+            loss = output.square().mean()
+            loss.backward()
+            optimizer.step()
+        old_after = adapter(inputs, max_session=0)[0].detach()
+        current_after = adapter(inputs)[0].detach()
+        torch.testing.assert_close(old_after, old_before, rtol=0, atol=0)
+        self.assertGreater((current_after - current_before).abs().max().item(), 0.0)
+        for expected, (_, actual) in zip(historical, adapter.historical_named_parameters()):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        self.assertFalse(any(p.requires_grad for p in adapter.router.parameters()))
 
     def test_visual_calibration_uses_current_bimc_prototype(self):
         model=BiMC.__new__(BiMC); torch.nn.Module.__init__(model)
