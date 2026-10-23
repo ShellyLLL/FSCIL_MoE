@@ -1,0 +1,373 @@
+"""Invariants for function-preserving expansion and versioned classifiers."""
+
+import unittest
+import tempfile
+from pathlib import Path
+from types import SimpleNamespace
+
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
+
+from models.clip.model import VisionTransformer, VisualMoEAdapter
+from models.bimc import BiMC, build_loo_cache_from_embeddings, fit_reference_feature_map
+from engine.engine import Runner
+from utils.evaluator import AccuracyEvaluator, compute_continual_metrics
+
+
+class TinySupport(Dataset):
+    def __init__(self, shots=5):
+        self.labels = [2] * shots + [3] * shots
+        self.source_ids = list(range(2 * shots))
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, index):
+        value = F.one_hot(torch.tensor(self.labels[index]), num_classes=4).float()
+        return {"image": value, "label": self.labels[index],
+                "source_id": self.source_ids[index]}
+
+
+class StabilityRiskTests(unittest.TestCase):
+    def test_zero_drift_for_same_version(self):
+        runner = Runner.__new__(Runner)
+        self.assertEqual(float(runner._representation_drift(torch.randn(2, 4), 0, 0)), 0.0)
+
+    def test_drift_is_differentiable(self):
+        class Encoder:
+            def __init__(self):
+                self.delta = torch.nn.Parameter(torch.tensor(0.2))
+
+            def extract_img_feature(self, x, max_session=None):
+                if max_session == 0:
+                    return x.clone()
+                return x + self.delta * torch.roll(x, 1, -1)
+
+            def extract_img_feature_train(self, x, max_session=None):
+                return self.extract_img_feature(x, max_session), []
+
+        runner = Runner.__new__(Runner)
+        runner.model_without_dp = Encoder()
+        loss = runner._representation_drift(torch.eye(3, 4), 1, 0)
+        self.assertGreater(float(loss.item()), 0.0)
+        loss.backward()
+        self.assertTrue(torch.isfinite(runner.model_without_dp.delta.grad))
+
+
+class ExpansionInvariantTests(unittest.TestCase):
+    def test_appending_an_expert_preserves_the_old_function(self):
+        torch.manual_seed(7)
+        adapter = VisualMoEAdapter(8, num_experts=2, reduction=2)
+        adapter.eval()
+        inputs = torch.randn(5, 3, 8)
+        before, _ = adapter(inputs)
+        adapter.add_expert(session_id=1, reduction=2)
+        at_creation, _ = adapter(inputs)
+        torch.testing.assert_close(at_creation, before, rtol=0, atol=0)
+        with torch.no_grad():
+            adapter.experts[-1].c_proj.bias.fill_(0.3)
+        old, _ = adapter(inputs, max_session=0)
+        current, _ = adapter(inputs, max_session=1)
+        torch.testing.assert_close(old, before, rtol=0, atol=0)
+        self.assertGreater((current - old).abs().max().item(), 0)
+        adapter.remove_newest_expert()
+        restored, _ = adapter(inputs)
+        torch.testing.assert_close(restored, before, rtol=0, atol=0)
+
+    def test_later_experts_cannot_change_an_old_visual_encoder(self):
+        torch.manual_seed(11)
+        visual = VisionTransformer(8, 4, 8, 2, 2, 8).eval()
+        visual.transformer.resblocks[-1].moe_adapter = VisualMoEAdapter(
+            8, num_experts=2, reduction=2)
+        images = torch.randn(2, 3, 8, 8)
+        before = visual(images, max_session=0)
+        adapter = visual.transformer.resblocks[-1].moe_adapter
+        adapter.add_expert(1, reduction=2)
+        with torch.no_grad():
+            adapter.experts[-1].c_proj.bias.fill_(0.4)
+        adapter.freeze_all()
+        torch.testing.assert_close(visual(images, max_session=0), before, rtol=0, atol=0)
+        self.assertGreater((visual(images, max_session=1) - before).abs().max().item(), 0)
+
+    def test_topology_and_weights_restore_versioned_predictions(self):
+        torch.manual_seed(13)
+        source = VisualMoEAdapter(8, num_experts=2, reduction=2).eval()
+        source.add_expert(1, reduction=4)
+        source.add_router_increment(2, max_delta=0.25)
+        with torch.no_grad():
+            source.experts[-1].c_proj.bias.fill_(0.2)
+            source.router_increments[-1].projection.weight.fill_(0.03)
+        source.freeze_all()
+        inputs = torch.randn(3, 2, 8)
+        expected = [source(inputs, max_session=version)[0] for version in (0, 1, 2)]
+        restored = VisualMoEAdapter(8, num_experts=2, reduction=2)
+        restored.rebuild_topology(source.export_topology())
+        restored.load_state_dict(source.state_dict(), strict=True)
+        for version, value in enumerate(expected):
+            torch.testing.assert_close(restored(inputs, max_session=version)[0],
+                                       value, rtol=0, atol=0)
+
+    def test_router_increment_never_rewrites_historical_columns_or_paths(self):
+        torch.manual_seed(23)
+        adapter = VisualMoEAdapter(8, num_experts=2, reduction=2).eval()
+        inputs = torch.randn(5, 3, 8)
+        old_before = adapter(inputs, max_session=0)[0].detach().clone()
+        current_before = adapter(inputs)[0].detach().clone()
+        historical = [
+            parameter.detach().clone()
+            for _, parameter in adapter.historical_named_parameters()
+        ]
+        adapter.add_router_increment(session_id=1, max_delta=0.2)
+        adapter.set_router_increment_trainable()
+        optimizer = torch.optim.SGD(adapter.newest_router_increment_parameters(), lr=0.1)
+        for _ in range(3):
+            optimizer.zero_grad(set_to_none=True)
+            output, _ = adapter(inputs)
+            loss = output.square().mean()
+            loss.backward()
+            optimizer.step()
+        old_after = adapter(inputs, max_session=0)[0].detach()
+        current_after = adapter(inputs)[0].detach()
+        torch.testing.assert_close(old_after, old_before, rtol=0, atol=0)
+        self.assertGreater((current_after - current_before).abs().max().item(), 0.0)
+        for expected, (_, actual) in zip(historical, adapter.historical_named_parameters()):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        self.assertFalse(any(p.requires_grad for p in adapter.router.parameters()))
+
+    def test_visual_calibration_uses_current_bimc_prototype(self):
+        model=BiMC.__new__(BiMC); torch.nn.Module.__init__(model)
+        model.cfg=SimpleNamespace(TRAINER=SimpleNamespace(BiMC=SimpleNamespace(LAMBDA_I=0.25,TAU=4)))
+        model.base_vision_prototype=F.normalize(torch.eye(3)[:2],dim=-1)
+        current=F.normalize(torch.tensor([[0.6,0.7,0.4]]),dim=-1)
+        torch.testing.assert_close(model.calibrate_incremental_visual(current),model.soft_calibration(model.base_vision_prototype,current))
+
+    def test_leave_one_out_excludes_the_query_source(self):
+        features = F.normalize(torch.tensor([[1., 0.], [0., 1.],
+                                             [-1., 0.], [0., -1.]]), dim=-1)
+        cache = build_loo_cache_from_embeddings(
+            features, torch.tensor([2, 2, 3, 3]), torch.arange(4))
+        torch.testing.assert_close(cache["loo_visual_prototypes"][0, 0], features[1])
+        self.assertTrue(cache["loo_valid"].all())
+
+    def test_visual_proto_is_not_recovered_from_normalized_fusion(self):
+        model = BiMC.__new__(BiMC)
+        torch.nn.Module.__init__(model)
+        model.device = "cpu"
+        model.template = ["a photo of a {}"]
+        model.cfg = SimpleNamespace(
+            TRAINER=SimpleNamespace(BiMC=SimpleNamespace(
+                TEXT_CALIBRATION=True, LAMBDA_T=0.5,
+                FUSED_CONFLICT_STRENGTH=0.0, FUSED_CONFLICT_MARGIN=0.05)),
+            DATASET=SimpleNamespace(GPT_PATH="unused", BETA=0.3))
+        model.inference_text_feature = lambda *args: (
+            F.normalize(torch.tensor([[0.0, 1.0]]), dim=-1), None)
+        model.inference_all_description_feature = lambda *args: (
+            None, None, F.normalize(torch.tensor([[0.0, 1.0]]), dim=-1))
+        model.inference_all_img_feature = lambda *args, **kwargs: (
+            torch.tensor([[1., 0.]]), torch.tensor([0]), torch.tensor([[1., 0.]]))
+        state = model.build_task_statistics(["class"], None, [0], encoder_version=0)
+        torch.testing.assert_close(state["image_proto"], torch.tensor([[1., 0.]]))
+        self.assertEqual(state["encoder_version"], 0)
+
+    def test_incremental_prototype_is_directly_calibrated_and_has_no_anchor_replay(self):
+        model=BiMC.__new__(BiMC); torch.nn.Module.__init__(model)
+        model.device,model.template="cpu",["a {}"]
+        model.cfg=SimpleNamespace(DATASET=SimpleNamespace(GPT_PATH="unused",BETA=0.3),
+            TRAINER=SimpleNamespace(BiMC=SimpleNamespace(TEXT_CALIBRATION=False,LAMBDA_T=0.0,
+                LAMBDA_I=0.25,TAU=4,FUSED_CONFLICT_STRENGTH=0.0,FUSED_CONFLICT_MARGIN=0.05)))
+        model.base_vision_prototype=torch.tensor([[1.,0.]])
+        model.inference_text_feature=lambda *args:(torch.tensor([[0.,1.]]),None)
+        model.inference_all_description_feature=lambda *args:(None,None,torch.tensor([[0.,1.]]))
+        current=torch.tensor([[0.6,0.8]])
+        model.inference_all_img_feature=lambda *args,**kwargs:(current,torch.tensor([1]),F.normalize(current,dim=-1))
+        state=model.build_task_statistics(["novel"],None,[1],calibrate_novel_vision_proto=True)
+        torch.testing.assert_close(state["image_proto"],model.soft_calibration(model.base_vision_prototype,current))
+        self.assertNotIn("anchor_features",state)
+
+    def test_support_folds_exclude_every_held_out_source(self):
+        runner = Runner.__new__(Runner)
+        dataset = TinySupport()
+        train = DataLoader(dataset, batch_size=4, shuffle=True)
+        extract = DataLoader(dataset, batch_size=4, shuffle=False)
+        folds = runner._support_folds(train, extract)
+        self.assertEqual(len(folds), 5)
+        for fit_train, fit_extract, validation in folds:
+            fitting = set(fit_extract.dataset.indices)
+            held_out = set(validation.dataset.indices)
+            self.assertFalse(fitting & held_out)
+            self.assertEqual(len(held_out), 2)
+            self.assertEqual(len(fit_train.dataset), 8)
+
+    def test_global_support_bank_includes_historical_negative_classes(self):
+        class Model:
+            def build_leave_one_out_prototypes(self,loader,class_index,max_session=None):
+                fs,ys,ss=[],[],[]
+                for batch in loader: fs.append(F.normalize(batch["image"],dim=-1));ys.append(batch["label"]);ss.append(batch["source_id"])
+                return build_loo_cache_from_embeddings(torch.cat(fs),torch.cat(ys),torch.cat(ss),class_index)
+            def calibrate_incremental_visual(self,current): return current
+        runner=Runner.__new__(Runner);runner.device="cpu"
+        def collect_pairs(loader, previous_version):
+            current_features, source_ids = [], []
+            labels = []
+            for batch in loader:
+                current_features.append(F.normalize(batch["image"].float(), dim=-1))
+                source_ids.append(batch["source_id"])
+                labels.append(batch["label"])
+            features = torch.cat(current_features, dim=0)
+            ids = torch.cat(source_ids, dim=0)
+            labels = torch.cat(labels, dim=0)
+            return features, features.clone(), ids, labels
+        runner._collect_reference_feature_pairs = collect_pairs
+        runner._reference_map_ridge = lambda: 1.0
+        runner._reference_alignment_hash = lambda matrix: "test-map-hash"
+        runner.cfg=SimpleNamespace(DATASET=SimpleNamespace(BETA=0.3),TRAINER=SimpleNamespace(BiMC=SimpleNamespace(TEXT_CALIBRATION=False,LAMBDA_T=0.0)))
+        runner.model_without_dp=Model();runner._resume_state_dict_list=[{"class_ids":torch.tensor([0,1]),"fused_proto":torch.eye(4)[:2]}]
+        loader=DataLoader(TinySupport(shots=3),batch_size=4,shuffle=False);text=F.normalize(torch.eye(4)[2:4],dim=-1)
+        bank=runner._support_bank(loader,[2,3],text,text,version=1,calibrate=False)
+        self.assertEqual(bank["classes"].tolist(),[0,1,2,3]);self.assertEqual(tuple(bank["fused_full"].shape),(4,4));self.assertEqual(tuple(bank["fused_loo"].shape),(6,4,4))
+
+    def test_new_router_column_starts_at_calibrated_low_mass(self):
+        torch.manual_seed(9)
+        router = __import__("models.clip.model", fromlist=["ExpandableRouter"]).ExpandableRouter(4, 2)
+        inputs = torch.randn(12, 4)
+        router.add_column()
+        mass = router.initialize_newest_column(inputs, target_mass=0.01)
+        _, weights = router(inputs)
+        self.assertAlmostEqual(mass, 0.01, delta=0.002)
+        self.assertAlmostEqual(float(weights[:, -1].mean()), 0.01, delta=0.002)
+
+    def test_fixed_reference_features_restore_live_router_after_measurement(self):
+        torch.manual_seed(17)
+        adapter = VisualMoEAdapter(4, num_experts=2, reduction=2)
+
+        class Encoder:
+            def __init__(self, moe_adapter):
+                self.adapter = moe_adapter
+
+            def extract_img_feature(self, images, max_session=None):
+                return images + self.adapter.router.columns[0].bias
+
+        runner = Runner.__new__(Runner)
+        runner.model_without_dp = Encoder(adapter)
+        runner._moe_adapters = lambda: [(0, adapter)]
+        reference = [Runner._cpu_copy(column.state_dict())
+                     for column in adapter.router.columns[:adapter.base_expert_count]]
+        runner._base_reference_router_states = {"0": reference}
+        with torch.no_grad():
+            adapter.router.columns[0].bias.add_(2.0)
+        live_bias = adapter.router.columns[0].bias.detach().clone()
+        measured = runner._reference_features(torch.ones(2, 4), previous_version=1)
+        self.assertTrue(torch.isfinite(measured).all())
+        torch.testing.assert_close(adapter.router.columns[0].bias, live_bias)
+
+    def test_held_out_objective_reports_classification_and_reference_drift(self):
+        runner = Runner.__new__(Runner)
+        runner.model = type("EvalModel", (), {"eval": lambda self: None})()
+        runner.cfg = SimpleNamespace(TRAINER=SimpleNamespace(BiMC=SimpleNamespace(
+            INCREMENTAL=SimpleNamespace(LOGIT_SCALE=1.0, STABILITY_WEIGHT=0.4))))
+        runner._support_bank = lambda *args, **kwargs: {}
+        runner.parse_batch = lambda batch: (batch["image"], batch["label"])
+        runner._incremental_logits = lambda images, labels, *args, **kwargs: (
+            torch.tensor([[2.0, 0.0], [0.0, 2.0]], device=labels.device),
+            torch.tensor([0, 1], device=labels.device),
+        )
+        runner._representation_drift = lambda *args, **kwargs: torch.tensor(0.25)
+        loader = DataLoader(TinySupport(shots=1), batch_size=2, shuffle=False)
+        metrics = runner._held_out_loss(
+            loader, loader, [2, 3], None, None, 1, False,
+            previous_version=0, return_metrics=True,
+        )
+        self.assertAlmostEqual(metrics["reference_drift"], 0.25, places=6)
+        self.assertAlmostEqual(
+            metrics["loss"], metrics["classification_loss"] + 0.4 * 0.25, places=6
+        )
+
+    def test_merge_rejects_mixed_prototype_reference_spaces(self):
+        runner = Runner.__new__(Runner)
+        runner.device = "cpu"
+        base = {
+            "class_ids": torch.tensor([0]), "image_proto": torch.tensor([[1.0, 0.0]]),
+            "text_features": torch.tensor([[1.0, 0.0]]),
+            "prototype_space_id": "base_reference_v1",
+        }
+        novel = {
+            "class_ids": torch.tensor([1]), "image_proto": torch.tensor([[0.0, 1.0]]),
+            "text_features": torch.tensor([[0.0, 1.0]]),
+            "prototype_space_id": "unanchored_session_v2",
+        }
+        with self.assertRaisesRegex(ValueError, "different or unknown feature-space"):
+            runner.merge_dicts([base, novel])
+
+
+
+class ContinualMetricContractTests(unittest.TestCase):
+    def test_pd_is_initial_minus_final_overall_accuracy(self):
+        sessions = [87.71, 70.0, 54.33]
+        task_rows = [
+            [87.71],
+            [70.0, 80.0],
+            [50.0, 66.75, 66.75],
+        ]
+        metrics = compute_continual_metrics(sessions, task_rows)
+        self.assertAlmostEqual(metrics["aa"], (87.71 + 70.0 + 54.33) / 3.0, places=6)
+        self.assertAlmostEqual(metrics["pd"], 33.38, places=6)
+        self.assertAlmostEqual(metrics["initial_acc"], 87.71, places=6)
+        self.assertAlmostEqual(metrics["final_acc"], 54.33, places=6)
+        self.assertAlmostEqual(metrics["final_novel_avg_acc"], 66.75, places=6)
+        # The legacy old-task forgetting statistic remains separate from PD.
+        self.assertAlmostEqual(metrics["old_task_avg_drop"], (37.71 + 13.25) / 2.0, places=6)
+        self.assertNotAlmostEqual(metrics["old_task_avg_drop"], metrics["pd"], places=3)
+
+    def test_metric_contract_rejects_misaligned_session_rows(self):
+        with self.assertRaisesRegex(ValueError, "one row per session"):
+            compute_continual_metrics([80.0, 70.0], [[80.0]])
+
+    def test_metric_contract_rejects_invalid_task_row_width(self):
+        with self.assertRaisesRegex(ValueError, "one value for every"):
+            compute_continual_metrics([80.0, 70.0], [[80.0], [60.0]])
+
+    def test_single_session_pd_is_zero(self):
+        metrics = compute_continual_metrics([81.25], [[81.25]])
+        self.assertEqual(metrics["pd"], 0.0)
+        self.assertEqual(metrics["final_novel_avg_acc"], 0.0)
+
+
+
+class ReferenceFeatureMapTests(unittest.TestCase):
+    def test_identity_pairs_produce_identity_map(self):
+        torch.manual_seed(31)
+        features = F.normalize(torch.randn(12, 6), dim=-1)
+        feature_map, metrics = fit_reference_feature_map(features, features, ridge=1.0)
+        torch.testing.assert_close(feature_map, torch.eye(6), rtol=0, atol=1e-6)
+        self.assertAlmostEqual(metrics["fit_cosine_error"], 0.0, places=6)
+        self.assertEqual(metrics["fit_samples"], 12)
+
+    def test_map_reduces_error_for_a_known_feature_shift(self):
+        torch.manual_seed(37)
+        reference = F.normalize(torch.randn(24, 5), dim=-1)
+        transform = torch.tensor([
+            [1.20, 0.08, 0.00, 0.00, 0.00],
+            [0.00, 0.85, 0.05, 0.00, 0.00],
+            [0.00, 0.00, 1.10, 0.04, 0.00],
+            [0.00, 0.00, 0.00, 0.90, 0.03],
+            [0.02, 0.00, 0.00, 0.00, 1.05],
+        ])
+        current = F.normalize(reference @ torch.linalg.inv(transform), dim=-1)
+        before = (1.0 - (current * reference).sum(dim=-1)).mean()
+        feature_map, metrics = fit_reference_feature_map(current, reference, ridge=1e-3)
+        aligned = F.normalize(current @ feature_map, dim=-1)
+        after = (1.0 - (aligned * reference).sum(dim=-1)).mean()
+        self.assertTrue(torch.isfinite(feature_map).all())
+        self.assertLess(float(after), float(before))
+        self.assertAlmostEqual(metrics["fit_cosine_error"], float(after), places=5)
+
+    def test_map_rejects_invalid_pairs_and_regularization(self):
+        with self.assertRaisesRegex(ValueError, "identical"):
+            fit_reference_feature_map(torch.randn(3, 4), torch.randn(3, 5))
+        with self.assertRaisesRegex(ValueError, "positive"):
+            fit_reference_feature_map(torch.randn(3, 4), torch.randn(3, 4), ridge=0.0)
+
+
+if __name__ == "__main__":
+    unittest.main()

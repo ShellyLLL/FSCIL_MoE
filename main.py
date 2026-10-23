@@ -64,14 +64,25 @@ def extend_cfg(cfg):
     cfg.TRAINER.BiMC.VISUAL_MOE.NUM_BASE_EXPERTS = 4
     cfg.TRAINER.BiMC.VISUAL_MOE.BASE_REDUCTION = 4
     cfg.TRAINER.BiMC.VISUAL_MOE.BASE_SCALE_INIT = 0.5
-    cfg.TRAINER.BiMC.VISUAL_MOE.INCREMENTAL_REDUCTION = 8
+    cfg.TRAINER.BiMC.VISUAL_MOE.INCREMENTAL_REDUCTION = 48
     cfg.TRAINER.BiMC.VISUAL_MOE.DESCRIPTOR_DIM = 64
     cfg.TRAINER.BiMC.VISUAL_MOE.DESCRIPTOR_EPS = 1.0e-4
+    # Expansion policy and initial routing prior for dynamically added experts.
     cfg.TRAINER.BiMC.VISUAL_MOE.EXPANSION_Z_THRESHOLD = 1.0
+    cfg.TRAINER.BiMC.VISUAL_MOE.INITIAL_EXPERT_ROUTE_MASS = 0.01
 
     cfg.TRAINER.BiMC.INCREMENTAL = CN()
     cfg.TRAINER.BiMC.INCREMENTAL.EPOCHS = 6
-    cfg.TRAINER.BiMC.INCREMENTAL.LOGIT_SCALE = 25.0
+    cfg.TRAINER.BiMC.INCREMENTAL.LOGIT_SCALE = 100.0
+    cfg.TRAINER.BiMC.INCREMENTAL.STABILITY_WEIGHT = 0.0
+    # Maximum mean cosine distance from the immutable post-base feature reference.
+    # Negative disables the hard guard while retaining the soft penalty.
+    cfg.TRAINER.BiMC.INCREMENTAL.MAX_REFERENCE_DRIFT = 0.20
+    # Held-out cosine error limit for mapping current features into the immutable
+    # post-base reference space. Negative values disable the hard acceptance guard.
+    cfg.TRAINER.BiMC.INCREMENTAL.MAX_REFERENCE_ALIGNMENT_ERROR = 0.20
+    # Ridge regularization used when fitting the current-to-reference feature map.
+    cfg.TRAINER.BiMC.INCREMENTAL.REFERENCE_MAP_RIDGE = 1.0
 
     cfg.TRAINER.BiMC.CHECKPOINT = CN()
     cfg.TRAINER.BiMC.CHECKPOINT.ENABLE = True
@@ -146,4 +157,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

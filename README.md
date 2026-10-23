@@ -49,53 +49,46 @@ python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/t
 ### Dynamic FSCIL MoE runs
 
 The `bimc.yaml` configuration now auto-saves a dataset/seed-specific fixed
-support manifest, alongside session checkpoints, query-exclusive LOO training
-and demand-driven dynamic experts. For reproducible comparisons across model
-variants, explicitly reuse one manifest and run a no-expansion baseline:
+support manifest alongside session checkpoints. Use the same manifest for
+comparisons. The CUB200 run is:
 
 ~~~BASH
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --support_manifest checkpoints/fscil_moe/cub_seed1_support.json --expansion_mode none
+python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --support_manifest checkpoints/fscil_moe/cub_seed1_support.json
 ~~~
 
-The default `auto` mode computes each layer's discriminative coverage deficit:
-only samples with a negative all-seen visual LOO margin and descriptor coverage
-excess contribute expansion evidence. The largest positive eligible layer adds
-one Linear Gate, Expert and Scale. Training uses one softmax over `NULL` and all
-dynamic experts, refreshed query-exclusive visual prototypes each epoch, and only
-visual classification plus historical-path invariance losses. Deployment uses the
-same logits with hard Top-1 routing. A candidate is retained only when its hard
-deployment LOO objective plus historical invariance is lower than the pre-candidate
-objective; otherwise the exact pre-expansion state is restored. Force/session/block
-overrides are intentionally unavailable in the production path.
-The explicit full-auto CUB200 command is:
+At each incremental session, the method first evaluates a **router-only** update
+with experts frozen. Source-disjoint support folds compare candidates using the
+same objective: global-class held-out cross-entropy plus a reference-drift penalty.
+The reference is the immutable post-base MoE function, not the previous session's
+mutable router state. A candidate must improve mean held-out objective by more
+than one standard error and satisfy `MAX_REFERENCE_DRIFT`; a post-fit guard checks
+the update trained on all current-session support examples. If router-only
+adaptation is not supported, descriptor coverage gates temporary expert candidates.
+At most one new expert is retained, and its candidate must pass the same validation
+and drift constraints. Rejected or failed updates restore the exact MoE topology,
+parameters, router state, and descriptor buffers from before the candidate.
+Historical experts stay frozen and continue to participate in the shared Softmax
+router.
+
+Only the **current session's** support prototypes are refreshed after an update;
+historical support images are not replayed. Each prototype state records the model
+revision and fixed target feature-space reference. The fixed-reference constraint
+reduces cross-session embedding drift, but cannot guarantee exact historical-class
+invariance without historical samples. BiMC text/description fusion and base-path
+visual calibration remain enabled. At inference, each test image is encoded once
+by the current model and compared against one global bank of prototypes for all
+seen classes. Report AA and PD over the full sequence; do not assume the added
+constraints improve them without measurement.
+
+The fixed-reference state uses checkpoint schema 11. Incremental checkpoints
+from schema 10 or earlier are rejected because their historical prototypes were
+not maintained under the fixed-reference contract; resume from a base-only
+checkpoint or restart at Session 0. Reuse the same fixed support manifest for all
+ablations.
 
 ~~~BASH
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --expansion_mode auto
+python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --support_manifest checkpoints/fscil_moe/cub_seed1_support.json
 ~~~
-
-For staged development, reuse Session 0 and stop after Task 3 without changing
-the normal full-run default:
-
-~~~BASH
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --resume checkpoints/fscil_moe/session_00.pth --expansion_mode auto --end_session 3
-~~~
-
-Resume from a checkpoint produced by this safety-bounded version with:
-
-~~~BASH
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --resume checkpoints/fscil_moe/session_03.pth
-~~~
-
-Legacy dynamic-expert checkpoint schemas are intentionally rejected when they
-predate the current logit-NULL routing and transactional safety contract.
-
-Each completed session also records per-expert/null routing and a deterministic
-support-proxy leave-one-expert-out diagnostic (`accuracy_gain` and
-`margin_gain`). It masks the selected residual without re-routing to another
-expert, so the reported value is that expert's direct marginal contribution.
-Historical experts additionally receive a support-only forward-interference
-report. Accuracy targets are kept outside runtime; use
-`python tools/report_regression.py --accuracies ...` after a run.
 
 ## Acknowledgment
 
@@ -106,6 +99,4 @@ In this repository, we build our code based on the following excellent open-sour
 - [FeCAM](https://github.com/dipamgoswami/FeCAM)
 - [CuPL](https://github.com/sarahpratt/CuPL)
 - [AdaptCLIPZS](https://github.com/cvl-umass/AdaptCLIPZS)
-
-
 

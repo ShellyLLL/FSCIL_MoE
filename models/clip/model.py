@@ -204,11 +204,59 @@ class ExpandableRouter(nn.Module):
         self.columns.append(column)
         return len(self.columns) - 1
 
-    def forward(self, x):
-        if not self.columns:
-            raise RuntimeError("ExpandableRouter requires at least one column.")
-        logits = torch.cat([column(x) for column in self.columns], dim=-1)
-        return logits, torch.softmax(logits, dim=-1)
+    @torch.no_grad()
+    def initialize_newest_column(self, inputs, target_mass=0.01):
+        """Initialize the new router column to a calibrated mean Softmax mass."""
+        target_mass=float(target_mass)
+        if not 0.0<target_mass<1.0 or len(self.columns)<2: raise ValueError("Invalid target mass or missing historical columns.")
+        newest=self.columns[-1]
+        inputs=torch.as_tensor(inputs,device=newest.weight.device,dtype=newest.weight.dtype)
+        if inputs.ndim!=2 or inputs.size(0)==0 or inputs.size(1)!=self.dim: raise ValueError("Expected non-empty [N, d_model] inputs.")
+        old=torch.cat([col(inputs) for col in self.columns[:-1]],dim=-1).float()
+        partition=torch.logsumexp(old,dim=-1); low,high=partition.min()-20,partition.max()+20
+        for _ in range(64):
+            bias=(low+high)*0.5
+            if torch.sigmoid(bias-partition).mean()<target_mass: low=bias
+            else: high=bias
+        bias=(low+high)*0.5; newest.weight.zero_(); newest.bias.fill_(float(bias.item()))
+        return float(torch.sigmoid(bias-partition).mean().item())
+
+    @torch.no_grad()
+    def initialize_newest_gate(self, target_mass=0.01):
+        """Initialize the newest incremental expert's independent sigmoid gate."""
+        target_mass = float(target_mass)
+        if not 0.0 < target_mass < 1.0 or len(self.columns) < 2:
+            raise ValueError("Invalid target mass or missing historical columns.")
+        newest = self.columns[-1]
+        newest.weight.zero_()
+        newest.bias.fill_(float(np.log(target_mass / (1.0 - target_mass))))
+        return target_mass
+
+    def forward(self, x, num_columns=None):
+        if not self.columns: raise RuntimeError("ExpandableRouter requires at least one column.")
+        selected=self.columns if num_columns is None else self.columns[:int(num_columns)]
+        logits=torch.cat([column(x) for column in selected],dim=-1)
+        return logits,torch.softmax(logits,dim=-1)
+
+
+class RouterIncrement(nn.Module):
+    """Session-local bounded residual over existing router logits."""
+
+    def __init__(self, dim, num_columns, max_delta=0.5):
+        super().__init__()
+        dim, num_columns = int(dim), int(num_columns)
+        max_delta = float(max_delta)
+        if dim < 1 or num_columns < 1:
+            raise ValueError("RouterIncrement requires positive dimensions.")
+        if not np.isfinite(max_delta) or max_delta <= 0.0:
+            raise ValueError("max_delta must be finite and positive.")
+        self.projection = nn.Linear(dim, num_columns)
+        nn.init.zeros_(self.projection.weight)
+        nn.init.zeros_(self.projection.bias)
+        self.max_delta = max_delta
+
+    def forward(self, inputs):
+        return self.max_delta * torch.tanh(self.projection(inputs))
 
 
 class BottleneckExpert(nn.Module):
@@ -243,6 +291,8 @@ class VisualMoEAdapter(nn.Module):
             for _ in range(self.base_expert_count)
         ])
         self.router = ExpandableRouter(self.d_model, self.base_expert_count)
+        self.router_increments = nn.ModuleList()
+        self.router_increment_birth_sessions = []
         self.expert_birth_sessions = [0] * self.base_expert_count
 
     @property
@@ -277,6 +327,7 @@ class VisualMoEAdapter(nn.Module):
         self.eval()
 
     def set_newest_trainable(self, descriptor=False):
+        """Train only the newest expert and its newly added router column."""
         if self.num_experts <= self.base_expert_count:
             raise RuntimeError("there is no incremental expert to train.")
         self.freeze_all()
@@ -288,18 +339,63 @@ class VisualMoEAdapter(nn.Module):
                 parameter.requires_grad = True
         self.train()
 
+    def add_router_increment(self, session_id, max_delta=0.5):
+        """Append a zero-initialized, bounded route residual for one session."""
+        session_id = int(session_id)
+        if self.router_increment_birth_sessions and session_id <= self.router_increment_birth_sessions[-1]:
+            raise ValueError("Router increment birth sessions must be strictly increasing.")
+        reference_column = self.router.columns[0]
+        increment = RouterIncrement(
+            self.d_model, self.num_experts, max_delta=max_delta
+        ).to(device=reference_column.weight.device, dtype=reference_column.weight.dtype)
+        self.router_increments.append(increment)
+        self.router_increment_birth_sessions.append(session_id)
+        return len(self.router_increments) - 1
+
+    def set_router_increment_trainable(self):
+        """Train only the newest session-local route residual; freeze all historical columns."""
+        if not self.router_increments:
+            raise RuntimeError("Router-only adaptation requires a new router increment.")
+        self.freeze_all()
+        for parameter in self.router_increments[-1].parameters():
+            parameter.requires_grad = True
+        self.train()
+
+    def set_router_trainable(self):
+        """Safe compatibility alias: historical router columns are never trainable."""
+        self.set_router_increment_trainable()
+
+    def newest_router_increment_parameters(self):
+        if not self.router_increments:
+            return []
+        return list(self.router_increments[-1].parameters())
+
     def add_expert(self, session_id, reduction=None):
         self.freeze_all()
         reduction = self.default_reduction if reduction is None else int(reduction)
-        self.experts.append(BottleneckExpert(self.d_model, reduction, zero_init_up=True).to(
-            device=self.residual_scale.device, dtype=self.residual_scale.dtype))
+        reference_expert = self.experts[0]
+        reference_column = self.router.columns[0]
+        self.experts.append(BottleneckExpert(
+            self.d_model, reduction, zero_init_up=True
+        ).to(device=reference_expert.c_fc.weight.device,
+             dtype=reference_expert.c_fc.weight.dtype))
         self.descriptors.append(RepresentationDescriptor(
-            self.d_model, self.descriptor_dim, self.descriptor_eps).to(device=self.residual_scale.device))
+            self.d_model, self.descriptor_dim, self.descriptor_eps
+        ).to(device=self.residual_scale.device))
         self.router.add_column()
-        self.router.columns[-1].to(device=self.residual_scale.device, dtype=self.residual_scale.dtype)
+        self.router.columns[-1].to(
+            device=reference_column.weight.device, dtype=reference_column.weight.dtype
+        )
         self.expert_birth_sessions.append(int(session_id))
         self.set_newest_trainable()
         return self.num_experts - 1
+
+    def remove_newest_router_increment(self):
+        if not self.router_increments:
+            raise RuntimeError("Cannot remove a router increment when none exists.")
+        del self.router_increments[-1]
+        self.router_increment_birth_sessions.pop()
+        self.freeze_all()
 
     def newest_parameters(self, include_descriptor=False):
         parameters = list(self.experts[-1].parameters()) + list(self.router.columns[-1].parameters())
@@ -308,17 +404,38 @@ class VisualMoEAdapter(nn.Module):
         return parameters
 
     def historical_named_parameters(self):
-        newest = self.num_experts - 1
-        prefixes = (f"experts.{newest}.", f"router.columns.{newest}.", f"descriptors.{newest}.")
+        """Yield parameters that belong to already-established sessions."""
+        mutable_prefixes = []
+        if self.num_experts > self.base_expert_count:
+            newest_expert = self.num_experts - 1
+            mutable_prefixes.extend((
+                f"experts.{newest_expert}.",
+                f"router.columns.{newest_expert}.",
+                f"descriptors.{newest_expert}.",
+            ))
+        if self.router_increments:
+            mutable_prefixes.append(f"router_increments.{len(self.router_increments) - 1}.")
         for name, parameter in self.named_parameters():
-            if not name.startswith(prefixes):
+            if not any(name.startswith(prefix) for prefix in mutable_prefixes):
                 yield name, parameter
 
     def export_topology(self):
-        return {"version": 1, "d_model": self.d_model, "base_expert_count": self.base_expert_count,
-                "experts": [{"reduction": max(1, self.d_model // expert.c_fc.out_features),
-                             "birth_session": int(self.expert_birth_sessions[index])}
-                            for index, expert in enumerate(self.experts)]}
+        return {
+            "version": 2,
+            "d_model": self.d_model,
+            "base_expert_count": self.base_expert_count,
+            "experts": [
+                {"reduction": max(1, self.d_model // expert.c_fc.out_features),
+                 "birth_session": int(self.expert_birth_sessions[index])}
+                for index, expert in enumerate(self.experts)
+            ],
+            "router_increments": [
+                {"num_columns": int(increment.projection.out_features),
+                 "birth_session": int(self.router_increment_birth_sessions[index]),
+                 "max_delta": float(increment.max_delta)}
+                for index, increment in enumerate(self.router_increments)
+            ],
+        }
 
     def rebuild_topology(self, topology):
         if topology is None:
@@ -332,8 +449,15 @@ class VisualMoEAdapter(nn.Module):
         specs = list(topology.get("experts", []))
         if len(specs) < self.base_expert_count:
             raise ValueError("MoE topology has fewer experts than the base pool.")
+
+        # Preserve the checkpoint/model's intended compute dtypes. residual_scale
+        # deliberately remains float32 and must not dictate Linear-layer dtypes.
+        device = self.residual_scale.device
+        expert_dtype = self.experts[0].c_fc.weight.dtype
+        router_dtype = self.router.columns[0].weight.dtype
         self.experts, self.descriptors = nn.ModuleList(), nn.ModuleList()
         self.router, self.expert_birth_sessions = ExpandableRouter(self.d_model), []
+        self.router_increments, self.router_increment_birth_sessions = nn.ModuleList(), []
         for spec in specs:
             reduction = int(spec.get("reduction", self.default_reduction))
             self.experts.append(BottleneckExpert(self.d_model, reduction))
@@ -341,20 +465,81 @@ class VisualMoEAdapter(nn.Module):
                 self.d_model, self.descriptor_dim, self.descriptor_eps))
             self.router.add_column()
             self.expert_birth_sessions.append(int(spec.get("birth_session", 0)))
-        device, dtype = self.residual_scale.device, self.residual_scale.dtype
-        self.experts.to(device=device, dtype=dtype)
-        self.router.to(device=device, dtype=dtype)
+        for spec in topology.get("router_increments", []):
+            increment = RouterIncrement(
+                self.d_model,
+                int(spec.get("num_columns", len(specs))),
+                max_delta=float(spec.get("max_delta", 0.5)),
+            )
+            self.router_increments.append(increment)
+            self.router_increment_birth_sessions.append(int(spec.get("birth_session", 0)))
+        self.experts.to(device=device, dtype=expert_dtype)
+        self.router.to(device=device, dtype=router_dtype)
+        self.router_increments.to(device=device, dtype=router_dtype)
         self.descriptors.to(device=device, dtype=torch.float32)
         self.freeze_all()
 
-    def forward(self, x):
+    def remove_newest_expert(self):
+        if self.num_experts <= self.base_expert_count:
+            raise RuntimeError("Cannot remove a base expert.")
+        # ModuleList.pop() is unavailable in older PyTorch releases.
+        # Deleting the last index unregisters the temporary modules and
+        # preserves the indices/state_dict keys of historical experts.
+        del self.experts[-1]
+        del self.descriptors[-1]
+        del self.router.columns[-1]
+        self.expert_birth_sessions.pop()
+        self.freeze_all()
+
+    def forward(self, x, max_session=None):
+        """Route the base pool jointly and add session-local gated expert residuals.
+
+        New experts are zero-initialized, so appending one leaves the existing
+        function unchanged. Base experts keep their own normalized softmax;
+        each incremental expert uses an independent sigmoid gate. This avoids
+        diluting historical expert weights merely by extending the expert pool.
+        max_session limits both expert births and session-local route increments.
+        """
         if x.ndim != 3:
             raise ValueError("VisualMoEAdapter expects [tokens, batch, dim].")
         x_norm = self.layer_norm(x)
-        logits, weights = self.router(x_norm[0])
+        active = [index for index, birth in enumerate(self.expert_birth_sessions)
+                  if max_session is None or birth <= int(max_session)]
+        if not active:
+            raise RuntimeError("No experts are active for the requested model path.")
+        logits, _ = self.router(x_norm[0], len(active))
+        # Each session contributes only its own bounded residual. Older router
+        # columns are never unfrozen or overwritten by later sessions.
+        for increment, birth_session in zip(
+            self.router_increments, self.router_increment_birth_sessions
+        ):
+            if max_session is not None and birth_session > int(max_session):
+                continue
+            delta = increment(x_norm[0]).to(dtype=logits.dtype)
+            if delta.size(1) < logits.size(1):
+                delta = F.pad(delta, (0, logits.size(1) - delta.size(1)))
+            elif delta.size(1) > logits.size(1):
+                delta = delta[:, :logits.size(1)]
+            # Session-local route residuals may adapt routing for the current
+            # session, including Router-only sessions with no new experts.
+            # Historical paths remain unchanged because increments born after
+            # max_session are excluded above; the historical router parameters
+            # themselves remain frozen.
+            logits = logits + delta
+
+        # Keep the original normalized distribution over base experts. Each
+        # incremental expert contributes a separately gated residual, so adding
+        # a zero-initialized expert cannot perturb the historical function.
+        base_count = min(self.base_expert_count, len(active))
+        base_weights = torch.softmax(logits[:, :base_count], dim=-1)
+        if len(active) > base_count:
+            incremental_gates = torch.sigmoid(logits[:, base_count:])
+            weights = torch.cat((base_weights, incremental_gates), dim=-1)
+        else:
+            weights = base_weights
         residual, norms = torch.zeros_like(x_norm), []
-        for expert_id, expert in enumerate(self.experts):
-            weighted = expert(x_norm) * weights[:, expert_id].unsqueeze(0).unsqueeze(-1)
+        for column, expert_id in enumerate(active):
+            weighted = self.experts[expert_id](x_norm) * weights[:, column].unsqueeze(0).unsqueeze(-1)
             residual = residual + weighted
             norms.append(weighted.detach().float().pow(2).mean().sqrt())
         residual = self.residual_scale.to(residual.dtype) * residual
@@ -383,12 +568,12 @@ class ResidualAttentionBlock(nn.Module):
         self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
         return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, max_session=None):
         x = x + self.attention(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         moe_aux = None
         if self.moe_adapter is not None:
-            moe_out, moe_aux = self.moe_adapter(x)
+            moe_out, moe_aux = self.moe_adapter(x, max_session=max_session)
             x = x + moe_out
         return x, moe_aux
 
@@ -399,10 +584,10 @@ class Transformer(nn.Module):
         self.layers = layers
         self.resblocks = nn.ModuleList([ResidualAttentionBlock(width, heads, attn_mask) for _ in range(layers)])
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, max_session=None):
         moe_aux_list = []
         for block in self.resblocks:
-            x, aux = block(x)
+            x, aux = block(x, max_session=max_session)
             if aux is not None: moe_aux_list.append(aux)
         return x, moe_aux_list
 
@@ -420,7 +605,8 @@ class VisionTransformer(nn.Module):
         self.ln_post = LayerNorm(width)
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
 
-    def forward(self, x: torch.Tensor, all_layer_outputs=False, return_moe_aux=False):
+    def forward(self, x: torch.Tensor, all_layer_outputs=False, return_moe_aux=False,
+                max_session=None):
         x = self.conv1(x)  
         x = x.reshape(x.shape[0], x.shape[1], -1)  
         x = x.permute(0, 2, 1)  
@@ -430,7 +616,7 @@ class VisionTransformer(nn.Module):
 
         if not all_layer_outputs:
             x = x.permute(1, 0, 2)  
-            x, moe_aux_list = self.transformer(x)
+            x, moe_aux_list = self.transformer(x, max_session=max_session)
             x = x.permute(1, 0, 2)  
             x = self.ln_post(x[:, 0, :])
             if self.proj is not None: x = x @ self.proj
@@ -440,7 +626,7 @@ class VisionTransformer(nn.Module):
             x = x.permute(1, 0, 2)  
             outputs, moe_aux_list = [], []
             for block in self.transformer.resblocks:
-                x, aux = block(x)
+                x, aux = block(x, max_session=max_session)
                 if aux is not None: moe_aux_list.append(aux)
                 cur_output = x.permute(1, 0, 2)
                 cur_output = self.ln_post(cur_output[:, 0, :])
@@ -502,9 +688,13 @@ class CLIP(nn.Module):
     def dtype(self):
         return self.visual.conv1.weight.dtype
 
-    def encode_image(self, image, return_moe_aux=False):
-        if return_moe_aux: return self.visual(image.type(self.dtype), return_moe_aux=True)
-        return self.visual(image.type(self.dtype))
+    def encode_image(self, image, return_moe_aux=False, max_session=None):
+        if not isinstance(self.visual, VisionTransformer):
+            return self.visual(image.type(self.dtype))
+        if return_moe_aux:
+            return self.visual(image.type(self.dtype), return_moe_aux=True,
+                               max_session=max_session)
+        return self.visual(image.type(self.dtype), max_session=max_session)
 
     def encode_text(self, text):
         x = self.token_embedding(text).type(self.dtype)
