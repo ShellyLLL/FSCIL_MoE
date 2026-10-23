@@ -824,10 +824,11 @@ class Runner:
             state_space = state.get(
                 "prototype_space_id", getattr(self, "_reference_space_id", "base_reference_v1")
             )
-            if state_space != self._reference_space_id:
+            active_space = getattr(self, "_reference_space_id", "base_reference_v1")
+            if state_space != active_space:
                 raise ValueError(
                     f"Historical prototype space {state_space!r} does not match "
-                    f"the active reference {self._reference_space_id!r}."
+                    f"the active reference {active_space!r}."
                 )
             active_fingerprint = getattr(self, "_reference_model_fingerprint", None)
             state_fingerprint = state.get("reference_model_fingerprint")
@@ -996,6 +997,16 @@ class Runner:
     @torch.no_grad()
     def _reference_features(self, images, previous_version):
         """Encode with the immutable post-base router state when available."""
+        # Lightweight encoders used in unit tests and integrations may provide
+        # explicit versioned feature extraction without a CLIP/MoE topology.
+        if not hasattr(self, "model_without_dp") or not hasattr(
+            self.model_without_dp, "clip_model"
+        ):
+            extractor = getattr(self.model_without_dp, "extract_img_feature", None)
+            if extractor is None:
+                raise AttributeError("Reference encoder must expose extract_img_feature().")
+            return F.normalize(extractor(images, max_session=previous_version).float(), dim=-1)
+
         adapters = self._moe_adapters()
         base_snapshots = getattr(self, "_base_reference_router_states", None)
         if base_snapshots:
