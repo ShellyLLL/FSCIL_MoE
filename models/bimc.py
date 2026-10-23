@@ -525,7 +525,10 @@ class BiMC(nn.Module):
         reduction=int(getattr(self.cfg.TRAINER.BiMC.VISUAL_MOE,"INCREMENTAL_REDUCTION",8))
         expert_id=adapter.add_expert(session_id=session_id,reduction=reduction)
         if reference_features is not None:
-            adapter.router.initialize_newest_column(torch.as_tensor(reference_features,device=self.device),target_mass=target_route_mass)
+            # Incremental experts use independent sigmoid gates, not the base
+            # router's shared Softmax denominator. Keep the new gate at the
+            # requested low mass without changing historical expert weights.
+            adapter.router.initialize_newest_gate(target_mass=target_route_mass)
         return expert_id
 
     def export_moe_topology(self):
