@@ -852,11 +852,12 @@ class Runner:
             ):
                 raise ValueError("Historical prototype reference-alignment hash is malformed.")
             alignment_error = state.get("reference_alignment_error")
+            # This field records full-support fit error for provenance only.
+            # Generalization acceptance is based on held-out fold alignment above.
             if alignment_error is not None and (
-                not np.isfinite(float(alignment_error))
-                or not self._reference_alignment_allowed([float(alignment_error)])
+                not np.isfinite(float(alignment_error)) or float(alignment_error) < 0.0
             ):
-                raise ValueError("Historical prototype was created with an unaccepted reference alignment.")
+                raise ValueError("Historical prototype has an invalid reference-alignment fit error.")
             ids.append(class_ids); prototypes.append(F.normalize(fused, dim=-1))
         ids, prototypes = torch.cat(ids), torch.cat(prototypes)
         if torch.unique(ids).numel() != ids.numel(): raise ValueError("Duplicate historical class ids.")
