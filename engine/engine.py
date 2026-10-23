@@ -1493,13 +1493,17 @@ class Runner:
                 "encoder_version": previous_version,
             }
 
+        # Refit descriptor statistics on the full support only after CV selection.
+        full_coverage_features = self.model_without_dp.collect_blockwise_cls_features(
+            extract_loader
+        )
         # Rank candidates by cross-validated gain, then guard the full-support fit.
         for candidate in eligible:
             block_idx = int(candidate["block_idx"])
             adapter = self._adapter_by_block(block_idx)
             expert_id = self.model_without_dp.add_expert(
                 block_idx, task_id,
-                reference_features=coverage_features[block_idx]["cls_in"].to(self.device),
+                reference_features=full_coverage_features[block_idx]["cls_in"].to(self.device),
                 target_route_mass=route_mass,
             )
             epochs = self._train_candidate(
@@ -1540,6 +1544,17 @@ class Runner:
                 "encoder_version": task_id,
             }
 
+        if router_candidate_snapshot is not None:
+            self._restore_moe_state(router_candidate_snapshot)
+            decisions[0]["accepted"] = True
+            decisions[0]["fallback_after_expansion_rejection"] = True
+            print(f"=> [Accepted][Task {task_id}] router-only fallback after expansion post-fit rejection.")
+            return {
+                "trained": False, "router_adapted": True,
+                "router_epochs": router_candidate_history,
+                "decisions": decisions, "expanded": [],
+                "encoder_version": previous_version,
+            }
         for _, adapter in self._moe_adapters():
             adapter.freeze_all()
         return {
