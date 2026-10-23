@@ -520,13 +520,12 @@ class VisualMoEAdapter(nn.Module):
                 delta = F.pad(delta, (0, logits.size(1) - delta.size(1)))
             elif delta.size(1) > logits.size(1):
                 delta = delta[:, :logits.size(1)]
-            # Never let a later session's route residual renormalize or modify
-            # the base expert pool. It only calibrates incremental expert gates.
-            if logits.size(1) > self.base_expert_count:
-                logits = torch.cat((
-                    logits[:, :self.base_expert_count],
-                    logits[:, self.base_expert_count:] + delta[:, self.base_expert_count:],
-                ), dim=-1)
+            # Session-local route residuals may adapt routing for the current
+            # session, including Router-only sessions with no new experts.
+            # Historical paths remain unchanged because increments born after
+            # max_session are excluded above; the historical router parameters
+            # themselves remain frozen.
+            logits = logits + delta
 
         # Keep the original normalized distribution over base experts. Each
         # incremental expert contributes a separately gated residual, so adding
