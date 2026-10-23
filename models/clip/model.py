@@ -520,7 +520,13 @@ class VisualMoEAdapter(nn.Module):
                 delta = F.pad(delta, (0, logits.size(1) - delta.size(1)))
             elif delta.size(1) > logits.size(1):
                 delta = delta[:, :logits.size(1)]
-            logits = logits + delta
+            # Never let a later session's route residual renormalize or modify
+            # the base expert pool. It only calibrates incremental expert gates.
+            if logits.size(1) > self.base_expert_count:
+                logits = torch.cat((
+                    logits[:, :self.base_expert_count],
+                    logits[:, self.base_expert_count:] + delta[:, self.base_expert_count:],
+                ), dim=-1)
 
         # Keep the original normalized distribution over base experts. Each
         # incremental expert contributes a separately gated residual, so adding
