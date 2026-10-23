@@ -1335,8 +1335,10 @@ class Runner:
             "alignment_passed": bool(router_alignment_passed),
             "accepted": False,
         }]
+        router_candidate_snapshot = None
+        router_candidate_history = []
         if router_gain > router_gain_se and router_drift_passed and router_alignment_passed:
-            history = self._train_router_only(
+            router_candidate_history = self._train_router_only(
                 task_id, train_loader, extract_loader, class_index, text,
                 description, enable_visual_calibration,
             )
@@ -1345,12 +1347,13 @@ class Runner:
             )
             decisions[0]["postfit_reference_drift"] = float(postfit_drift)
             if self._reference_drift_allowed([postfit_drift]):
+                router_candidate_snapshot = self._snapshot_moe_state()
                 decisions[0]["accepted"] = True
-                print(f"=> [Accepted][Task {task_id}] router-only adaptation; no expert added.")
-                return {"trained": False, "router_adapted": True,
-                        "router_epochs": history, "decisions": decisions, "expanded": [],
-                        "encoder_version": previous_version}
-            decisions[0]["reject_reason"] = "postfit_reference_drift_limit"
+                decisions[0]["candidate_state_saved"] = True
+            else:
+                decisions[0]["reject_reason"] = "postfit_reference_drift_limit"
+            # Always restore the common pre-candidate state before scoring
+            # descriptor coverage or any expert-expansion candidate.
             for block_idx, adapter in self._moe_adapters():
                 for column, state in zip(adapter.router.columns, initial_router_states[block_idx]):
                     column.load_state_dict(state)
@@ -1363,41 +1366,61 @@ class Runner:
             else:
                 decisions[0]["reject_reason"] = "reference_alignment_error_limit"
 
-        # Descriptor coverage gates candidate layers before predictive validation.
-        coverage_features = self.model_without_dp.collect_blockwise_cls_features(extract_loader)
-        expansion_candidates = []
-        for block_idx in self.model_without_dp.expandable_blocks():
-            coverage = self.model_without_dp.plan_layer_expansion(
-                block_idx, extract_loader, class_index, block_features=coverage_features.get(block_idx))
-            decisions.append({"mode":"descriptor_coverage","block_idx":int(block_idx),
-                "expand":bool(coverage.expand),"class_scores":dict(coverage.class_scores),
-                "uncovered_classes":list(coverage.uncovered_classes)})
-            if coverage.expand: expansion_candidates.append(block_idx)
-        if not expansion_candidates:
-            for _, adapter in self._moe_adapters(): adapter.freeze_all()
-            return {"trained":False,"router_adapted":False,"decisions":decisions,"expanded":[],
-                    "encoder_version":previous_version,"reason":"existing descriptors cover support distribution"}
+        # SEMA coverage and descriptor fitting must use fitting folds only.
+        coverage_by_fold = []
+        fold_coverage_decisions = {}
+        for fold_id, (_, fit_extract, _) in enumerate(folds):
+            fold_features = self.model_without_dp.collect_blockwise_cls_features(fit_extract)
+            coverage_by_fold.append(fold_features)
+            for block_idx in self.model_without_dp.expandable_blocks():
+                coverage = self.model_without_dp.plan_layer_expansion(
+                    block_idx, fit_extract, class_index,
+                    block_features=fold_features.get(block_idx),
+                )
+                fold_coverage_decisions.setdefault(block_idx, []).append(coverage)
+        expansion_candidates = [
+            block_idx for block_idx, results in fold_coverage_decisions.items()
+            if all(result.expand for result in results)
+        ]
+        for block_idx, results in fold_coverage_decisions.items():
+            decisions.append({
+                "mode": "descriptor_coverage",
+                "block_idx": int(block_idx),
+                "expand": bool(all(result.expand for result in results)),
+                "fold_expand": [bool(result.expand) for result in results],
+                "class_scores": [
+                    dict(result.class_scores) for result in results
+                ],
+                "uncovered_classes": [
+                    list(result.uncovered_classes) for result in results
+                ],
+            })
         route_mass = float(_cfg_value(self._visual_moe_cfg(),"INITIAL_EXPERT_ROUTE_MASS",0.01))
         for block_idx in expansion_candidates:
             adapter = self._adapter_by_block(block_idx)
-            self.model_without_dp.add_expert(block_idx, task_id,
-                reference_features=coverage_features[block_idx]["cls_in"].to(self.device),
-                target_route_mass=route_mass)
-            initial_expert = copy.deepcopy(adapter.experts[-1].state_dict())
-            initial_router = copy.deepcopy(adapter.router.columns[-1].state_dict())
             candidate_metrics = []
-            for fit_train, fit_extract, validation in folds:
-                adapter.experts[-1].load_state_dict(initial_expert)
-                adapter.router.columns[-1].load_state_dict(initial_router)
-                self._train_candidate(task_id, block_idx, fit_train, fit_extract,
-                                      class_index, text, description,
-                                      enable_visual_calibration)
+            for fold_id, (fit_train, fit_extract, validation) in enumerate(folds):
+                # Each fold gets an expert initialized only from that fold's
+                # fitting sources; no held-out source influences initialization.
+                adapter = self._adapter_by_block(block_idx)
+                fold_features = coverage_by_fold[fold_id]
+                self.model_without_dp.add_expert(
+                    block_idx, task_id,
+                    reference_features=fold_features[block_idx]["cls_in"].to(self.device),
+                    target_route_mass=route_mass,
+                )
+                initial_expert = copy.deepcopy(adapter.experts[-1].state_dict())
+                initial_router = copy.deepcopy(adapter.router.columns[-1].state_dict())
+                self._train_candidate(
+                    task_id, block_idx, fit_train, fit_extract, class_index,
+                    text, description, enable_visual_calibration,
+                )
                 candidate_metrics.append(self._held_out_loss(
                     validation, fit_extract, class_index, text, description,
                     task_id, enable_visual_calibration,
                     previous_version=previous_version, return_metrics=True,
                 ))
-            adapter.remove_newest_expert()
+                adapter.remove_newest_expert()
             candidate_losses = [metric["loss"] for metric in candidate_metrics]
             candidate_drifts = [metric["reference_drift"] for metric in candidate_metrics]
             candidate_alignment_errors = [
@@ -1438,13 +1461,36 @@ class Runner:
             reverse=True,
         )
         if not eligible:
+            if router_candidate_snapshot is not None:
+                self._restore_moe_state(router_candidate_snapshot)
+                decisions[0]["accepted"] = True
+                print(f"=> [Accepted][Task {task_id}] router-only candidate won; no expansion candidate passed.")
+                return {
+                    "trained": False, "router_adapted": True,
+                    "router_epochs": router_candidate_history,
+                    "decisions": decisions, "expanded": [],
+                    "encoder_version": previous_version,
+                }
             for _, adapter in self._moe_adapters():
                 adapter.freeze_all()
             return {
                 "trained": False, "router_adapted": False,
                 "decisions": decisions, "expanded": [],
                 "encoder_version": previous_version,
-                "reason": "no expansion candidate passed gain and reference-drift constraints",
+                "reason": "no router-only or expansion candidate passed gain, drift and alignment constraints",
+            }
+
+        # Compare every eligible expansion against the router-only candidate
+        # on the same cross-validation folds and common null baseline.
+        best_expansion_gain = float(eligible[0]["gain"])
+        if router_candidate_snapshot is not None and router_gain >= best_expansion_gain:
+            self._restore_moe_state(router_candidate_snapshot)
+            print(f"=> [Accepted][Task {task_id}] router-only candidate outperformed expansion.")
+            return {
+                "trained": False, "router_adapted": True,
+                "router_epochs": router_candidate_history,
+                "decisions": decisions, "expanded": [],
+                "encoder_version": previous_version,
             }
 
         # Rank candidates by cross-validated gain, then guard the full-support fit.
