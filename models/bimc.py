@@ -1,12 +1,13 @@
 
 import json
 from dataclasses import dataclass
+from contextlib import contextmanager
 from typing import Dict, List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-import models.clip.clip as clip
+
 
 
 @dataclass
@@ -286,6 +287,7 @@ def loo_fused_prototypes_for_queries(support_cache, query_source_ids, old_state,
 
 
 def load_clip_to_cpu(cfg):
+    import models.clip.clip as clip
     backbone_name = cfg.MODEL.BACKBONE.NAME
     url = clip._MODELS[backbone_name]
     model_path = clip._download(url)
@@ -302,6 +304,10 @@ class BiMC(nn.Module):
     def __init__(self, cfg, template, device):
         super(BiMC, self).__init__()
         self.cfg = cfg
+        if bool(getattr(getattr(cfg.TRAINER.BiMC, "PROTOTYPE_REFINEMENT", None), "ENABLE", False)):
+            raise ValueError("Prototype refinement is incompatible with immutable feature paths.")
+        if float(getattr(cfg.TRAINER.BiMC, "FUSED_CONFLICT_STRENGTH", 0.0)) != 0:
+            raise ValueError("Use unmodified BiMC fusion with immutable feature paths.")
         self.device = device
         print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME})")
         self.template = template
@@ -454,38 +460,92 @@ class BiMC(nn.Module):
         calibrated_text = F.normalize((1.0 - lambda_t) * text + lambda_t * description, dim=-1)
         return F.normalize(self.cfg.DATASET.BETA * calibrated_text + (1.0 - self.cfg.DATASET.BETA) * image, dim=-1)
 
+    def feature_path(self):
+        return {str(i): self.clip_model.visual.transformer.resblocks[i].moe_adapter.num_experts
+                for i in self.expandable_blocks()}
+
+    @contextmanager
+    def use_feature_path(self, path):
+        """Use immutable expert prefixes; restore them even when a forward fails."""
+        adapters = {str(i): self.clip_model.visual.transformer.resblocks[i].moe_adapter
+                    for i in self.expandable_blocks()}
+        if set(path) != set(adapters):
+            raise ValueError("Feature path must specify every MoE block.")
+        previous = {key: adapter.active_expert_count for key, adapter in adapters.items()}
+        try:
+            for key, adapter in adapters.items():
+                count = int(path[key])
+                if not adapter.base_expert_count <= count <= adapter.num_experts:
+                    raise ValueError("Feature path refers to unavailable experts.")
+                adapter.active_expert_count = count
+            yield
+        finally:
+            for key, adapter in adapters.items():
+                adapter.active_expert_count = previous[key]
+
+    def classifier_scores(self, images, state, prototype_key="fused_proto"):
+        """All-class scores, without an oracle task ID or learned task selector."""
+        paths = state["feature_paths"]
+        ids = self._state_class_ids(state, self.device)
+        if len(paths) != ids.numel():
+            raise ValueError("One immutable feature path is required per class.")
+        prototypes = F.normalize(state[prototype_key].to(self.device), dim=-1)
+        groups = {}
+        for column, path in enumerate(paths):
+            key = tuple(sorted(path.items()))
+            groups.setdefault(key, []).append(column)
+        result = prototypes.new_empty((images.size(0), ids.numel()))
+        for key, columns in groups.items():
+            with self.use_feature_path(dict(key)):
+                features = F.normalize(self.clip_model.encode_image(images), dim=-1)
+            result[:, columns] = features @ prototypes[columns].t()
+        return result
+
+    def calibrate_visual(self, prototypes):
+        if not self.cfg.TRAINER.BiMC.VISION_CALIBRATION:
+            return prototypes
+        shape = prototypes.shape
+        return self.soft_calibration(self.base_vision_prototype,
+                                     prototypes.reshape(-1, shape[-1])).reshape(shape)
+
     def expandable_blocks(self):
         return [index for index, block in enumerate(self.clip_model.visual.transformer.resblocks)
                 if getattr(block, "moe_adapter", None) is not None]
 
     @torch.no_grad()
-    def plan_layer_expansion(self, block_idx, loader, class_index, threshold=None):
-        """Decide one layer solely from class-aggregated descriptor coverage."""
-        block_idx = int(block_idx)
-        threshold = float(getattr(
-            self.cfg.TRAINER.BiMC.VISUAL_MOE, "EXPANSION_Z_THRESHOLD", 1.0
-        ) if threshold is None else threshold)
-        features = self.collect_blockwise_cls_features(loader).get(block_idx)
-        if features is None:
-            raise KeyError(f"Block {block_idx} did not produce support features.")
+    def plan_layer_expansion(self, block_idx, loader, class_index, threshold=None, deficits=None):
+        """Descriptor novelty is a proposal signal, gated by all-seen LOO errors."""
+        threshold = float(self.cfg.TRAINER.BiMC.VISUAL_MOE.EXPANSION_Z_THRESHOLD
+                          if threshold is None else threshold)
         adapter = self.clip_model.visual.transformer.resblocks[block_idx].moe_adapter
         adapter.assert_descriptors_ready()
-        values, labels = features["cls_in"].to(self.device), features["labels"].to(self.device)
-        scores = adapter.descriptor_scores(values)
-        class_scores = {
-            int(class_id.item()): float(scores[labels.eq(class_id)].mean(dim=0).min().item())
-            for class_id in torch.unique(labels, sorted=True)
-        }
-        expected = sorted(int(value) for value in class_index)
-        if sorted(class_scores) != expected:
-            raise RuntimeError(f"Block {block_idx} received classes {sorted(class_scores)}, expected {expected}.")
-        uncovered = [class_id for class_id, score in class_scores.items() if score > threshold]
-        for class_id, score in class_scores.items():
-            state = "uncovered" if class_id in uncovered else "covered"
-            print(f"=> [Coverage][B{block_idx}] class={class_id} score={score:.4f} {state}")
-        decision = LayerExpansionDecision(block_idx, bool(uncovered), class_scores, uncovered)
-        print(f"=> [Coverage][B{block_idx}] decision={'EXPAND' if decision.expand else 'REUSE'}")
-        return decision
+        scores, labels, sources = [], None, None
+        by_birth = {}
+        for expert_id, birth in enumerate(adapter.expert_birth_sessions):
+            if birth not in by_birth:
+                path = {str(i): sum(b <= birth for b in
+                        self.clip_model.visual.transformer.resblocks[i].moe_adapter.expert_birth_sessions)
+                        for i in self.expandable_blocks()}
+                with self.use_feature_path(path):
+                    by_birth[birth] = self.collect_blockwise_cls_features(loader)[block_idx]
+            item = by_birth[birth]
+            if sources is not None and (not torch.equal(sources, item["source_ids"])
+                                        or not torch.equal(labels, item["labels"])):
+                raise ValueError("Expansion requires deterministic support loader ordering.")
+            labels, sources = item["labels"], item["source_ids"]
+            scores.append(adapter.descriptors[expert_id].standardized_score(
+                item["cls_in"].to(self.device)).cpu())
+        # Each sample is uncovered only if all historical descriptors reject it.
+        coverage_excess = (torch.stack(scores, dim=1).min(dim=1).values - threshold).clamp_min(0)
+        if deficits is None:
+            raise ValueError("Expansion requires source-aligned classification deficits.")
+        error = torch.tensor([deficits[int(sid)] for sid in sources])
+        evidence = coverage_excess * error
+        class_scores = {int(c): float(evidence[labels.eq(c)].mean()) for c in torch.unique(labels)}
+        if sorted(class_scores) != sorted(int(c) for c in class_index):
+            raise ValueError("Expansion support classes do not match the current session.")
+        uncovered = [c for c, value in class_scores.items() if value > 0]
+        return LayerExpansionDecision(int(block_idx), bool(uncovered), class_scores, uncovered)
 
     def add_expert(self, block_idx, session_id):
         adapter = self.clip_model.visual.transformer.resblocks[int(block_idx)].moe_adapter
@@ -642,6 +702,7 @@ class BiMC(nn.Module):
 
     @torch.no_grad()
     def inference_text_feature(self, class_names, template, cls_begin_index):
+        import models.clip.clip as clip
         clip_weights, all_targets = [], []
         k = cls_begin_index
         for classname in class_names:
@@ -672,6 +733,7 @@ class BiMC(nn.Module):
 
     @torch.no_grad()
     def inference_all_description_feature(self, class_names, gpt_path, cls_begin_index):
+        import models.clip.clip as clip
         description_embeddings, mean_embeddings, all_targets = [], [], []
         with open(gpt_path, "r", encoding="utf-8") as file:
             gpt_prompt_dict = {k.lower().replace("_", " "): v for k, v in json.load(file).items()}
@@ -715,11 +777,6 @@ class BiMC(nn.Module):
         fused_proto = refine_conflict_aware_fused_prototypes(
             raw_fused, torch.as_tensor(class_index), history_fused, history_ids, strength, margin
         )
-        # Re-express refined fusion as a visual prototype so legacy engine
-        # merge/forward paths (which know only image/text/descriptor keys) use it.
-        if self.cfg.DATASET.BETA < 1.0:
-            images_proto = F.normalize((fused_proto - self.cfg.DATASET.BETA * calibrated_text) /
-                                       max(1e-6, 1.0 - self.cfg.DATASET.BETA), dim=-1)
         ids = torch.as_tensor(class_index, device=fused_proto.device, dtype=torch.long)
         if history_fused is None:
             self._fused_history_prototypes, self._fused_history_class_ids = fused_proto.detach(), ids.detach()
@@ -757,3 +814,4 @@ class BiMC(nn.Module):
         # NumPy-backed FSCIL datasets can yield int32 labels on Windows.  Keep
         # targets in PyTorch's required class-index dtype for CE and indexing.
         return batch["image"].to(self.device), batch["label"].to(self.device, dtype=torch.long)
+

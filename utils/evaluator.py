@@ -68,7 +68,7 @@ class AccuracyEvaluator:
         inc_avg_acc = sum(task_accuracies[1:]) / (len(task_accuracies) - 1) if len(task_accuracies) > 1 else 0.0
         harmonic_acc = 2 * base_avg_acc * inc_avg_acc / (base_avg_acc + inc_avg_acc) if inc_avg_acc > 0 else 0.0
         macro_task_acc = float(np.mean(task_accuracies)) if task_accuracies else 0.0
-        return {'mean_acc': round(100 * overall_acc_mean, 2), 
+        return {'mean_acc': 100 * overall_acc_mean,
                 'task_acc': task_accuracies,
                 'harmonic_acc': round(harmonic_acc, 2),
                 'base_avg_acc': round(base_avg_acc, 2),
@@ -213,3 +213,4 @@ class AccuracyEvaluator:
                 confusion_mat[i, j] = task_correct
         
         return confusion_mat
+

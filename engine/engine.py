@@ -17,6 +17,7 @@ from tqdm import tqdm
 from datasets.data_manager import DatasetManager
 from models.bimc import BiMC
 from utils.evaluator import AccuracyEvaluator
+from utils.metrics import session_metrics
 
 
 def compute_load_balance_loss(moe_aux_list, num_experts):
@@ -137,6 +138,12 @@ class Runner:
                 result[key] = torch.cat(chunks, dim=0)[order]
         if "image_proto" not in result or "text_features" not in result:
             raise KeyError("Classifier state is missing image/text prototypes.")
+        paths = []
+        for state, ids in zip(dict_list, per_state_ids):
+            if "feature_path" not in state:
+                raise ValueError("Task state lacks its immutable feature path; retrain Session 0.")
+            paths.extend([dict(state["feature_path"]) for _ in range(ids.numel())])
+        result["feature_paths"] = [paths[i] for i in order.tolist()]
         result["class_index"] = result["class_ids"]
         return result
 
@@ -279,7 +286,7 @@ class Runner:
         missing = [key for key in required if key not in payload]
         if missing:
             raise ValueError(f"Resume checkpoint is missing required fields: {missing}")
-        if int(payload["schema_version"]) != 6:
+        if int(payload["schema_version"]) != 7:
             raise ValueError("Checkpoint topology is incompatible; retrain from Session 0.")
         if not isinstance(payload["model_state"], dict):
             raise TypeError("Resume checkpoint model_state must be a state_dict mapping.")
@@ -316,6 +323,11 @@ class Runner:
         )
         self._resume_state_dict_list = payload.get("task_states", [])
         self.acc_list = payload.get("acc_list", [])
+        if len(self.acc_list) != completed_session + 1:
+            raise ValueError("Checkpoint accuracy history is incomplete.")
+        for state in self._resume_state_dict_list:
+            with self.model_without_dp.use_feature_path(state["feature_path"]):
+                pass
         self.task_acc_list = payload.get("task_acc_list", [])
         self.session_diagnostics = diagnostics
         self._resume_completed_session = completed_session
@@ -331,7 +343,7 @@ class Runner:
         directory.mkdir(parents=True, exist_ok=True)
         topology = self.model_without_dp.export_moe_topology()
         payload = {
-            "schema_version": 6,
+            "schema_version": 7,
             "completed_session": int(completed_session),
             "model_state": self._cpu_copy(self.model_without_dp.state_dict()),
             "moe_topology": topology,
@@ -339,6 +351,7 @@ class Runner:
             "base_vision_prototype": self._cpu_copy(self.model_without_dp.base_vision_prototype),
             "support_manifest": self.data_manager.get_support_manifest(),
             "acc_list": list(self.acc_list),
+            "metrics": session_metrics(self.acc_list),
             "task_acc_list": copy.deepcopy(self.task_acc_list),
             "session_diagnostics": self._cpu_copy(self.session_diagnostics),
             "rng_state": self._rng_state(),
@@ -490,30 +503,56 @@ class Runner:
         return self.model_without_dp.build_leave_one_out_prototypes(extract_loader, class_index)
 
     def _incremental_loo_logits(self, images, labels, source_ids, support_cache, old_state):
-        img_feat, moe_aux = self.model_without_dp.extract_img_feature_train(images)
-        img_feat_norm = F.normalize(img_feat, dim=-1)
-        cache_sources = torch.as_tensor(support_cache["source_ids"]).reshape(-1)
-        query_sources = source_ids.detach().cpu().reshape(-1).to(cache_sources.dtype)
-        matches = query_sources[:, None].eq(cache_sources[None, :])
+        model = self.model_without_dp
+        features, aux = model.extract_img_feature_train(images)
+        features = F.normalize(features, dim=-1)
+        sources = support_cache["source_ids"].cpu()
+        matches = source_ids.cpu().reshape(-1, 1).eq(sources.reshape(1, -1))
         if not matches.any(dim=1).all():
-            missing = query_sources[~matches.any(dim=1)].unique().tolist()
-            raise KeyError(f"query source ids are absent from LOO cache: {missing}")
+            raise KeyError("Query source is absent from the support cache.")
         rows = matches.long().argmax(dim=1)
-        current_visual = support_cache["loo_visual_prototypes"][rows].to(images.device, img_feat_norm.dtype)
-        old_visual = (old_state or {}).get("image_proto")
-        old_visual = (img_feat_norm.new_empty((0, img_feat_norm.size(-1))) if old_visual is None
-                      else F.normalize(torch.as_tensor(old_visual, device=images.device,
-                                                       dtype=img_feat_norm.dtype), dim=-1))
-        banks = torch.cat([old_visual.unsqueeze(0).expand(current_visual.size(0), -1, -1),
-                           current_visual], dim=1)
-        logit_scale = float(_cfg_value(getattr(self.cfg.TRAINER.BiMC, "INCREMENTAL", None),
-                                       "LOGIT_SCALE", 25.0))
-        logits = logit_scale * torch.einsum("bd,bcd->bc", img_feat_norm, F.normalize(banks, dim=-1))
-        old_ids = torch.as_tensor((old_state or {}).get("class_ids", []),
-                                  device=images.device, dtype=torch.long)
-        current_ids = torch.as_tensor(support_cache["classes"], device=images.device, dtype=torch.long)
+        if not support_cache["loo_valid"][rows].all():
+            raise ValueError("Incremental LOO requires at least two distinct sources per class.")
+        visual = support_cache["loo_visual_prototypes"][rows].to(features)
+        visual = model.calibrate_visual(visual)
+        text = support_cache["calibrated_text"].to(features)
+        beta = self.cfg.DATASET.BETA
+        fused = F.normalize(beta * text.unsqueeze(0) + (1.0 - beta) * visual, dim=-1)
+        current_logits = torch.einsum("bd,bcd->bc", features, fused)
+        with torch.no_grad():
+            old_logits = (model.classifier_scores(images, old_state) if old_state is not None
+                          else features.new_empty((features.size(0), 0)))
+        scale = float(self.cfg.TRAINER.BiMC.INCREMENTAL.LOGIT_SCALE)
+        logits = scale * torch.cat([old_logits, current_logits], dim=1)
+        old_ids = model._state_class_ids(old_state, images.device)
+        current_ids = support_cache["classes"].to(images.device)
         targets = self._targets_to_columns(labels, {"class_ids": torch.cat([old_ids, current_ids])})
-        return logits, targets, moe_aux
+        return logits, targets, aux
+
+    def _current_support_cache(self, loader, class_index, calibrated_text):
+        cache = self._build_incremental_loo_cache(loader, class_index)
+        if not cache["loo_valid"].all():
+            raise ValueError("Expansion requires at least two distinct support sources per class.")
+        cache["calibrated_text"] = calibrated_text.detach()
+        return cache
+
+    @torch.no_grad()
+    def _support_objective(self, loader, cache, old_state):
+        self.model.eval()
+        loss, count, correct, deficit = 0.0, 0, 0, {}
+        for batch in loader:
+            images, labels = self.parse_batch(batch)
+            sources = self._batch_source_ids(batch, labels.numel(), labels.device)
+            logits, targets, _ = self._incremental_loo_logits(images, labels, sources, cache, old_state)
+            loss += float(F.cross_entropy(logits, targets, reduction="sum"))
+            correct += int(logits.argmax(1).eq(targets).sum())
+            count += labels.numel()
+            other = logits.clone()
+            other.scatter_(1, targets[:, None], -torch.inf)
+            margins = logits.gather(1, targets[:, None]).squeeze(1) - other.max(1).values
+            for source, margin in zip(sources.tolist(), margins.tolist()):
+                deficit[int(source)] = max(0.0, -margin)
+        return {"loss": loss / count, "accuracy": correct / count, "deficit": deficit}
 
     @staticmethod
     def _historical_snapshot(adapter):
@@ -549,7 +588,8 @@ class Runner:
         )
         adapter.assert_descriptors_ready()
 
-    def train_expanded_module(self, task_id, block_idx, train_loader, support_cache, old_state):
+    def train_expanded_module(self, task_id, block_idx, train_loader, extract_loader,
+                              class_index, calibrated_text, old_state):
         adapter = self._adapter_by_block(block_idx)
         for _, item in self._moe_adapters():
             item.freeze_all()
@@ -564,6 +604,8 @@ class Runner:
         epochs = int(_cfg_value(self.cfg.TRAINER.BiMC.INCREMENTAL, "EPOCHS", 6))
         logs = []
         for epoch in range(epochs):
+            # Stop-gradient support bank refreshed in the current representation.
+            support_cache = self._current_support_cache(extract_loader, class_index, calibrated_text)
             self.model.train()
             total_loss, total_correct, total_count = 0.0, 0, 0
             for batch in train_loader:
@@ -606,49 +648,72 @@ class Runner:
     def train_incremental_task(self, task_id, train_loader, extract_loader, class_index,
                                current_class_name, prev_state_dict_list,
                                enable_visual_calibration):
-        del current_class_name, enable_visual_calibration
+        del enable_visual_calibration
+        model = self.model_without_dp
+        for _, adapter in self._moe_adapters():
+            adapter.freeze_all()
+        if self._visual_moe_cfg().EXPANSION_MODE == "none":
+            return {"trained": False, "decisions": [], "expanded": []}
         old_state = self.merge_dicts(prev_state_dict_list) if prev_state_dict_list else None
-        decisions, expanded = [], []
-        for _, adapter in self._moe_adapters():
+        text, _ = model.inference_text_feature(current_class_name, model.template, class_index[0])
+        _, _, description = model.inference_all_description_feature(
+            current_class_name, self.cfg.DATASET.GPT_PATH, class_index[0])
+        # DataManager uses ascending global class IDs; explicitly align LOO rows.
+        order = torch.as_tensor(class_index, device=text.device).argsort()
+        weight = self.cfg.TRAINER.BiMC.LAMBDA_T if self.cfg.TRAINER.BiMC.TEXT_CALIBRATION else 0.0
+        calibrated_text = F.normalize((1-weight)*text + weight*description, dim=-1)[order]
+        cache = self._current_support_cache(extract_loader, class_index, calibrated_text)
+        before_score = self._support_objective(extract_loader, cache, old_state)
+        decisions = [model.plan_layer_expansion(i, extract_loader, class_index,
+                                               deficits=before_score["deficit"])
+                     for i in model.expandable_blocks()]
+        eligible = [d for d in decisions if d.expand]
+        summary = [dict(block_idx=d.block_idx, expand=d.expand,
+                        class_scores=d.class_scores, uncovered_classes=d.uncovered_classes)
+                   for d in decisions]
+        if not eligible:
+            return {"trained": False, "decisions": summary, "expanded": []}
+        # One candidate per session is an explicit capacity budget, not an accuracy target.
+        decision = max(eligible, key=lambda d: max(d.class_scores.values()))
+        block_idx = decision.block_idx
+        adapter = self._adapter_by_block(block_idx)
+        historical = self._historical_snapshot(adapter)
+        topology = adapter.export_topology()
+        rng = self._rng_state()
+        accepted = False
+        try:
+            expert_id = model.add_expert(block_idx, task_id)
+            logs = self.train_expanded_module(task_id, block_idx, train_loader, extract_loader,
+                                              class_index, calibrated_text, old_state)
             adapter.freeze_all()
-        for block_idx in sorted(self.model_without_dp.expandable_blocks()):
-            decision = self.model_without_dp.plan_layer_expansion(
-                block_idx, extract_loader, class_index
-            )
-            decisions.append({
-                "block_idx": decision.block_idx, "expand": decision.expand,
-                "class_scores": decision.class_scores,
-                "uncovered_classes": decision.uncovered_classes,
-            })
-            if not decision.expand:
-                continue
-            support_cache = self._build_incremental_loo_cache(extract_loader, class_index)
-            adapter = self._adapter_by_block(block_idx)
-            historical = self._historical_snapshot(adapter)
-            before = adapter.num_experts
-            expert_id = self.model_without_dp.add_expert(block_idx, task_id)
-            print(
-                f"=> [Expand][Task {task_id}][B{block_idx}] new_expert={expert_id} "
-                f"num_experts: {before} -> {adapter.num_experts}"
-            )
-            logs = self.train_expanded_module(
-                task_id, block_idx, train_loader, support_cache, old_state
-            )
-            self.train_descriptor_for_expert(block_idx, extract_loader)
-            unchanged, changed = self._historical_state_unchanged(adapter, historical)
-            if not unchanged:
-                raise RuntimeError(f"historical parameter changed at B{block_idx}: {changed}")
-            adapter.freeze_all()
-            print(
-                f"=> [FreezeCheck][Task {task_id}][B{block_idx}] "
-                "historical_experts_unchanged=True "
-                "historical_router_columns_unchanged=True "
-                "historical_descriptors_unchanged=True"
-            )
-            expanded.append({"block_idx": block_idx, "expert_id": expert_id, "epochs": logs})
-        for _, adapter in self._moe_adapters():
-            adapter.freeze_all()
-        return {"trained": bool(expanded), "decisions": decisions, "expanded": expanded}
+            fresh_cache = self._current_support_cache(extract_loader, class_index, calibrated_text)
+            after_score = self._support_objective(extract_loader, fresh_cache, old_state)
+            # This is a support fit diagnostic, NOT held-out generalization evidence.
+            accepted = (np.isfinite(after_score["loss"])
+                        and after_score["loss"] < before_score["loss"]
+                        and after_score["accuracy"] >= before_score["accuracy"])
+            if accepted:
+                self.train_descriptor_for_expert(block_idx, extract_loader)
+                unchanged, changed = self._historical_state_unchanged(adapter, historical)
+                if not unchanged:
+                    accepted = False
+                    raise RuntimeError(f"Historical parameter changed at B{block_idx}: {changed}")
+        except BaseException:
+            accepted = False
+            raise
+        finally:
+            if not accepted:
+                adapter.rebuild_topology(topology)
+                adapter.load_state_dict(historical, strict=True)
+                self._restore_rng_state(rng)
+            for _, item in self._moe_adapters():
+                item.freeze_all()
+        print(f"=> [Candidate] B{block_idx} accepted={accepted} "
+              f"support_LOO_CE={before_score['loss']:.6f}->{after_score['loss']:.6f}")
+        return {"trained": accepted, "decisions": summary,
+                "expanded": ([{"block_idx": block_idx, "expert_id": expert_id, "epochs": logs}]
+                             if accepted else []),
+                "candidate": {"accepted": accepted, "before": before_score, "after": after_score}}
 
     def _build_and_refine_task_state(self, current_class_name, extract_loader, class_index,
                                      old_state, enable_visual_calibration):
@@ -700,6 +765,7 @@ class Runner:
                     task_stat["class_ids"] = torch.as_tensor(class_index, device=self.device, dtype=torch.long)
                 state_dict_list.append(task_stat)
                 state_dict_list[-1]["creation_session"] = int(task_id)
+                state_dict_list[-1]["feature_path"] = self.model_without_dp.feature_path()
             else:
                 old_state = self.merge_dicts(state_dict_list)
                 enable_visual_calibration = bool(self.cfg.TRAINER.BiMC.VISION_CALIBRATION)
@@ -716,6 +782,7 @@ class Runner:
                 )
                 state_dict_list.append(task_stat)
                 state_dict_list[-1]["creation_session"] = int(task_id)
+                state_dict_list[-1]["feature_path"] = self.model_without_dp.feature_path()
 
             merged_state = self.merge_dicts(state_dict_list)
             if use_moe:
@@ -735,7 +802,7 @@ class Runner:
                 f"Base: {acc['base_avg_acc']:.2f}, Novel: {acc['inc_avg_acc']:.2f}, "
                 f"H: {acc['harmonic_acc']:.2f}"
             )
-            self.acc_list.append(round(acc["mean_acc"], 3))
+            self.acc_list.append(acc["mean_acc"])
             self.task_acc_list.append(acc["task_acc"])
             self.session_diagnostics.append({
                 "session": int(task_id),
@@ -753,13 +820,16 @@ class Runner:
             self.save_checkpoint(task_id, state_dict_list)
 
         print(f"\nFinal acc: {self.acc_list}")
+        metrics = session_metrics(self.acc_list)
+        scope = "full" if end_task == self.data_manager.num_tasks - 1 else "partial"
+        print(f"=> [{scope}] AA={metrics['AA']:.4f}, PD={metrics['PD']:.4f} percentage points")
         print("Task-wise acc:")
         for index, task_acc in enumerate(self.task_acc_list):
             print(f"task {index:2d}, acc: {task_acc}")
 
     @torch.no_grad()
     def inference_task_bilevel(self, task_id, state_dict):
-        """Evaluate visual/text/BiMC/refined banks from one image forward pass."""
+        """Evaluate all banks, sharing image forwards among identical feature paths."""
         beta = self.cfg.DATASET.BETA
         lambda_t = self.cfg.TRAINER.BiMC.LAMBDA_T if self.cfg.TRAINER.BiMC.TEXT_CALIBRATION else 0.0
         image_proto = F.normalize(state_dict["image_proto"].to(self.device), dim=-1)
@@ -782,9 +852,19 @@ class Runner:
         all_targets = []
         for batch in tqdm(test_loader, desc=f"Eval Task {task_id}"):
             data, targets = self.parse_batch(batch)
-            image_features = F.normalize(self.model_without_dp.extract_img_feature(data), dim=-1)
-            for name, prototypes in prototype_banks.items():
-                all_logits[name].append(100.0 * image_features @ prototypes.t())
+            # Reuse each historical-path forward across all diagnostic banks.
+            groups = {}
+            for column, path in enumerate(state_dict["feature_paths"]):
+                groups.setdefault(tuple(sorted(path.items())), []).append(column)
+            batch_logits = {name: image_proto.new_empty((data.size(0), image_proto.size(0)))
+                            for name in prototype_banks}
+            for key, columns in groups.items():
+                with self.model_without_dp.use_feature_path(dict(key)):
+                    features = F.normalize(self.model_without_dp.extract_img_feature(data), dim=-1)
+                for name, prototypes in prototype_banks.items():
+                    batch_logits[name][:, columns] = 100.0 * features @ prototypes[columns].t()
+            for name in prototype_banks:
+                all_logits[name].append(batch_logits[name])
             all_targets.append(targets)
         logits_by_variant = {name: torch.cat(values, dim=0) for name, values in all_logits.items()}
         targets = torch.cat(all_targets, dim=0)
@@ -817,3 +897,4 @@ class Runner:
 
     def parse_batch(self, batch):
         return batch["image"].to(self.device), batch["label"].to(self.device, dtype=torch.long)
+

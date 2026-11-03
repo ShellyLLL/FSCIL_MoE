@@ -68,6 +68,7 @@ def extend_cfg(cfg):
     cfg.TRAINER.BiMC.VISUAL_MOE.DESCRIPTOR_DIM = 64
     cfg.TRAINER.BiMC.VISUAL_MOE.DESCRIPTOR_EPS = 1.0e-4
     cfg.TRAINER.BiMC.VISUAL_MOE.EXPANSION_Z_THRESHOLD = 1.0
+    cfg.TRAINER.BiMC.VISUAL_MOE.EXPANSION_MODE = "auto"
 
     cfg.TRAINER.BiMC.INCREMENTAL = CN()
     cfg.TRAINER.BiMC.INCREMENTAL.EPOCHS = 6
@@ -124,12 +125,15 @@ def main():
     parser = argparse.ArgumentParser(description="Run the pipeline")
     parser.add_argument('--data_cfg', type=str, required=True, help="Path to the data configuration file")
     parser.add_argument('--train_cfg', type=str, required=True, help="Path to the training configuration file")
+    parser.add_argument('--expansion_mode', choices=['auto', 'none'], default=None)
     parser.add_argument('--resume', type=str, default='', help='Session checkpoint to resume from')
     parser.add_argument('--support_manifest', type=str, default='', help='Optional fixed support manifest JSON')
     parser.add_argument('--end_session', type=int, default=-1, help='Stop after this FSCIL session')
     parser.add_argument('opts', nargs=argparse.REMAINDER, help='Additional KEY VALUE YACS overrides')
     args = parser.parse_args()
     overrides = list(args.opts)
+    if args.expansion_mode is not None:
+        overrides += ["TRAINER.BiMC.VISUAL_MOE.EXPANSION_MODE", args.expansion_mode]
     if args.resume:
         overrides += ['TRAINER.BiMC.CHECKPOINT.RESUME', args.resume]
     if args.support_manifest:
@@ -146,4 +150,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 

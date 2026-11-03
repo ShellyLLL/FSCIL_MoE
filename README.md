@@ -1,6 +1,6 @@
 # BiMC
 
-This is the official implementation of paper **Enhancing Few-Shot Class-Incremental Learning via Training-Free Bi-Level Modality Calibration (CVPR 2025)**.
+This repository is a research fork based on the implementation of **Enhancing Few-Shot Class-Incremental Learning via Training-Free Bi-Level Modality Calibration (CVPR 2025)**.
 
 ## Abstract
 
@@ -22,80 +22,72 @@ Please follow [CEC](https://github.com/icoz69/CEC-CVPR2021) to download *mini*-I
 - `regex==2023.10.3`
 - `scikit-learn==1.3.2`
 
-## Experiments
+## FSCIL MoE implementation
 
-First, remember to modify the data path `ROOT` in the `dataset` configuration file.
+This fork extends BiMC with frozen-backbone visual MoE adapters and demand-driven
+expansion. It is a research candidate, not a verified improvement over BiMC.
+Read [the design, proof scope, limitations and experiment protocol](docs/fscil_design.md)
+before comparing results. The original BiMC implementation is available at
+https://github.com/yychen016/BiMC.
 
-~~~BASH
-# CIFAR BIMC
-python main.py --data_cfg ./configs/datasets/cifar100.yaml --train_cfg ./configs/trainers/bimc.yaml
+Update `DATASET.ROOT` in the dataset YAML first. The repository's description JSONs
+and pretrained CLIP weights are also required for real experiments.
 
-# CIFAR BIMC_Ensemble
-python main.py --data_cfg ./configs/datasets/cifar100.yaml --train_cfg ./configs/trainers/bimc_ensemble.yaml
+```bash
+python main.py --data_cfg configs/datasets/cub200.yaml --train_cfg configs/trainers/bimc.yaml --expansion_mode auto
+```
 
-# MiniImagenet BIMC
-python main.py --data_cfg ./configs/datasets/miniimagenet.yaml --train_cfg ./configs/trainers/bimc.yaml
+For a paired comparison, reuse the same Session 0 checkpoint and support manifest,
+with separate output directories so runs do not overwrite one another:
 
-# MiniImagenet BIMC_Ensemble
-python main.py --data_cfg ./configs/datasets/miniimagenet.yaml --train_cfg ./configs/trainers/bimc_ensemble.yaml
+```bash
+python main.py --data_cfg configs/datasets/cub200.yaml --train_cfg configs/trainers/bimc.yaml --resume checkpoints/fscil_moe/session_00.pth --expansion_mode none TRAINER.BiMC.CHECKPOINT.DIR checkpoints/no_expansion
+python main.py --data_cfg configs/datasets/cub200.yaml --train_cfg configs/trainers/bimc.yaml --resume checkpoints/fscil_moe/session_00.pth --expansion_mode auto TRAINER.BiMC.CHECKPOINT.DIR checkpoints/auto_expansion
+```
 
-# CUB200 BIMC
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml
+`--support_manifest PATH` selects an explicit support manifest. The checkpoint
+also contains the fixed manifest. `--end_session 3` supports a partial development
+run; its AA/PD must not be reported as the complete benchmark result.
 
-# CUB200 BIMC_Ensemble
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc_ensemble.yaml
-~~~
+### Implemented contract
 
-### Dynamic FSCIL MoE runs
+- Base training freezes CLIP and fits only the adapters; all historical parameters
+  remain frozen during subsequent expansion.
+- Every class keeps the expert-prefix path used to build its prototype. Inference
+  scores **all** seen classes using their respective paths, without query task IDs.
+  This preserves old score functions, not old accuracy against newly added classes.
+- Soft routing is used in both training and inference. There is no NULL gate or
+  hard Top-1 deployment path. Different feature paths require additional forwards.
+- Descriptor coverage is evaluated in each descriptor's birth path. Expansion also
+  requires a negative all-seen, source-exclusive BiMC classification margin.
+  At most one candidate layer is trained per session.
+- Incremental training uses visual/text calibration and fusion consistent with
+  deployment, with refreshed stop-gradient support prototypes each epoch.
+- Candidate retention requires lower deterministic support LOO CE without lower
+  support accuracy. This is a fit diagnostic, **not held-out generalization evidence**.
+  Rejection or exceptions restore the prior topology, weights and candidate RNG.
+- Visual and fused prototypes are stored separately. Legacy prototype refinement
+  and conflict repulsion are unsupported under the multi-path protocol.
+- Checkpoint schema **7** stores feature paths, topology, prototypes, manifest,
+  diagnostics, RNG and unrounded accuracies. Older schemas require retraining.
+- AA includes Session 0; PD is `A_0 - A_B` in percentage points. No achieved
+  AA/PD improvement is claimed without real-data experiments.
 
-The `bimc.yaml` configuration now auto-saves a dataset/seed-specific fixed
-support manifest, alongside session checkpoints, query-exclusive LOO training
-and demand-driven dynamic experts. For reproducible comparisons across model
-variants, explicitly reuse one manifest and run a no-expansion baseline:
+The old `bimc_ensemble.yaml` is an unsupported legacy configuration; its keys are
+not implemented by this runner. Use `bimc.yaml`. For a frozen-CLIP baseline, append
+`TRAINER.BiMC.VISUAL_MOE.ENABLE False` to the command and use a separate output directory.
 
-~~~BASH
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --support_manifest checkpoints/fscil_moe/cub_seed1_support.json --expansion_mode none
-~~~
+### Numerical and integration tests
 
-The default `auto` mode computes each layer's discriminative coverage deficit:
-only samples with a negative all-seen visual LOO margin and descriptor coverage
-excess contribute expansion evidence. The largest positive eligible layer adds
-one Linear Gate, Expert and Scale. Training uses one softmax over `NULL` and all
-dynamic experts, refreshed query-exclusive visual prototypes each epoch, and only
-visual classification plus historical-path invariance losses. Deployment uses the
-same logits with hard Top-1 routing. A candidate is retained only when its hard
-deployment LOO objective plus historical invariance is lower than the pre-candidate
-objective; otherwise the exact pre-expansion state is restored. Force/session/block
-overrides are intentionally unavailable in the production path.
-The explicit full-auto CUB200 command is:
+```bash
+python -m pip install pytest
+python -m pytest -q
+```
 
-~~~BASH
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --expansion_mode auto
-~~~
-
-For staged development, reuse Session 0 and stop after Task 3 without changing
-the normal full-run default:
-
-~~~BASH
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --resume checkpoints/fscil_moe/session_00.pth --expansion_mode auto --end_session 3
-~~~
-
-Resume from a checkpoint produced by this safety-bounded version with:
-
-~~~BASH
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --resume checkpoints/fscil_moe/session_03.pth
-~~~
-
-Legacy dynamic-expert checkpoint schemas are intentionally rejected when they
-predate the current logit-NULL routing and transactional safety contract.
-
-Each completed session also records per-expert/null routing and a deterministic
-support-proxy leave-one-expert-out diagnostic (`accuracy_gain` and
-`margin_gain`). It masks the selected residual without re-routing to another
-expert, so the reported value is that expert's direct marginal contribution.
-Historical experts additionally receive a support-only forward-interference
-report. Accuracy targets are kept outside runtime; use
-`python tools/report_regression.py --accuracies ...` after a run.
+The tests use a tiny real ViT and synthetic data; no tokenizer, CLIP download or
+benchmark dataset is required. They cover old-score invariance, prototype
+consistency, rollback, checkpoint recovery, and a three-session continuous versus
+resumed run. This is not a benchmark performance evaluation.
 
 ## Acknowledgment
 
@@ -106,6 +98,7 @@ In this repository, we build our code based on the following excellent open-sour
 - [FeCAM](https://github.com/dipamgoswami/FeCAM)
 - [CuPL](https://github.com/sarahpratt/CuPL)
 - [AdaptCLIPZS](https://github.com/cvl-umass/AdaptCLIPZS)
+
 
 
 

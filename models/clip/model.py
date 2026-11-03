@@ -204,10 +204,11 @@ class ExpandableRouter(nn.Module):
         self.columns.append(column)
         return len(self.columns) - 1
 
-    def forward(self, x):
-        if not self.columns:
+    def forward(self, x, active_count=None):
+        columns = self.columns if active_count is None else self.columns[:active_count]
+        if not columns:
             raise RuntimeError("ExpandableRouter requires at least one column.")
-        logits = torch.cat([column(x) for column in self.columns], dim=-1)
+        logits = torch.cat([column(x) for column in columns], dim=-1)
         return logits, torch.softmax(logits, dim=-1)
 
 
@@ -244,6 +245,7 @@ class VisualMoEAdapter(nn.Module):
         ])
         self.router = ExpandableRouter(self.d_model, self.base_expert_count)
         self.expert_birth_sessions = [0] * self.base_expert_count
+        self.active_expert_count = None
 
     @property
     def num_experts(self):
@@ -351,9 +353,12 @@ class VisualMoEAdapter(nn.Module):
         if x.ndim != 3:
             raise ValueError("VisualMoEAdapter expects [tokens, batch, dim].")
         x_norm = self.layer_norm(x)
-        logits, weights = self.router(x_norm[0])
+        count = self.num_experts if self.active_expert_count is None else self.active_expert_count
+        if not self.base_expert_count <= count <= self.num_experts:
+            raise ValueError("Invalid historical expert prefix.")
+        logits, weights = self.router(x_norm[0], active_count=count)
         residual, norms = torch.zeros_like(x_norm), []
-        for expert_id, expert in enumerate(self.experts):
+        for expert_id, expert in enumerate(self.experts[:count]):
             weighted = expert(x_norm) * weights[:, expert_id].unsqueeze(0).unsqueeze(-1)
             residual = residual + weighted
             norms.append(weighted.detach().float().pow(2).mean().sqrt())
@@ -605,3 +610,4 @@ def build_model(state_dict: dict, cfg=None):
             )
         convert_weights(model)
     return model.eval()
+
