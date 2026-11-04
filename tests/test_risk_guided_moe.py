@@ -424,7 +424,7 @@ class ExpansionInvariantTests(unittest.TestCase):
         F.cross_entropy(logits, targets).backward()
         self.assertIsNotNone(runner._adapter_by_block(0).experts[-1].c_proj.weight.grad)
         runner._adapter_by_block(0).remove_newest_expert()
-        runner._held_out_loss = lambda *args: 0.0 if args[5] == 0 else 1.0
+        runner._held_out_loss = lambda *args, **kwargs: 0.0 if args[5] == 0 else 1.0
         result = runner.train_incremental_task(
             1, training, extraction, [2, 3], ["two", "three"], True)
         self.assertEqual(len(result["decisions"]), 1)
@@ -433,7 +433,7 @@ class ExpansionInvariantTests(unittest.TestCase):
 
         # Exercise the acceptance and full-support retraining path independently
         # of this synthetic support set's actual predictive quality.
-        runner._held_out_loss = lambda *args: 1.0 if args[5] == 0 else 0.0
+        runner._held_out_loss = lambda *args, **kwargs: 1.0 if args[5] == 0 else 0.0
         accepted = runner.train_incremental_task(
             1, training, extraction, [2, 3], ["two", "three"], True)
         self.assertTrue(accepted["trained"])

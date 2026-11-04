@@ -104,6 +104,21 @@ def extend_cfg(cfg):
     cfg.TRAINER.BiMC.PROTOTYPE_REFINEMENT.OLD_PROTECT_MARGIN = 0.70
     cfg.TRAINER.BiMC.FUSED_CONFLICT_STRENGTH = 0.0
     cfg.TRAINER.BiMC.FUSED_CONFLICT_MARGIN = 0.05
+    cfg.TRAINER.BiMC.GLOBAL_MOE = CN()
+    g = cfg.TRAINER.BiMC.GLOBAL_MOE
+    g.ENABLE = False  # legacy configurations remain reproducible
+    g.EXPAND = True
+    g.EPOCHS = 30
+    g.LR = 3e-4
+    g.WEIGHT_DECAY = 1e-4
+    g.BATCH_SIZE = 256
+    g.FOLDS = 5
+    g.RANK = 16
+    g.MAX_EXPERTS = 10
+    g.RESIDUAL_WEIGHT = 0.1
+    g.MIN_GAIN = 0.0
+    g.OLD_RISK_TOLERANCE = 0.0
+    g.PARAMETER_COST = 0.01
     cfg.TRAINER.BiMC.END_SESSION = -1
 
 def setup_cfg(dataset_cfg_file, method_cfg_file, opts=None):
@@ -140,7 +155,10 @@ def main():
     set_seed(cfg.SEED)
     set_gpu(cfg.DEVICE.GPU_ID)
     
-    from engine.engine import Runner
+    if cfg.TRAINER.BiMC.GLOBAL_MOE.ENABLE:
+        from engine.global_runner import GlobalRiskRunner as Runner
+    else:
+        from engine.engine import Runner
     engine = Runner(cfg)
     engine.run()
 

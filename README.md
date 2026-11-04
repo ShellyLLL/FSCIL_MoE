@@ -46,47 +46,48 @@ python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/t
 python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc_ensemble.yaml
 ~~~
 
-### Dynamic FSCIL MoE runs
+### Global-risk FSCIL MoE (new default)
 
-The `bimc.yaml` configuration now auto-saves a dataset/seed-specific fixed
-support manifest alongside session checkpoints. Use the same manifest for
-comparisons. The CUB200 run is:
+`configs/trainers/bimc.yaml` now selects a fixed-feature parallel MoE with
+all-seen-class training and inference. The S0 encoder is frozen; new routers
+and optional low-rank experts learn against both new support and historical
+cached features. Old class scoring functions are immutable. No task gate or
+test task identity is used. This is **feature replay**, not a no-memory method.
+See [the design, selection protocol, limitations, and ablations](docs/global_risk_moe.md).
 
-~~~BASH
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --support_manifest checkpoints/fscil_moe/cub_seed1_support.json
-~~~
+Start a fresh CUB run:
 
-At each incremental session, each eligible block receives a temporary candidate
-expert. Five support folds compare its held-out, task-local fused classifier
-loss with the unchanged encoder; at most one candidate is retained if its
-gain exceeds one standard error. Training refreshes source-exclusive visual
-prototypes, updates only the new expert and router column, and freezes them
-afterward. Historical class weights and encoders retain their creation versions.
-The frozen base encoder supplies common-space task evidence. Its task offsets
-jointly minimize class-balanced task loss using source-exclusive support
-features from every observed class. Expert logits only rank classes within
-each task; no task identity is supplied at inference.
+```bash
+python main.py --data_cfg configs/datasets/cub200.yaml --train_cfg configs/trainers/bimc.yaml --support_manifest checkpoints/cub_seed1_support.json
+```
 
-For staged development, reuse Session 0 and stop after Task 3 without changing
-the normal full-run default:
+Reuse an existing base-only checkpoint (schema 7/8/9), preserving its original
+output directory and re-evaluating S0:
 
-~~~BASH
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --resume checkpoints/fscil_moe/session_00.pth --end_session 3
-~~~
+```bash
+python main.py --data_cfg configs/datasets/cub200.yaml --train_cfg configs/trainers/bimc.yaml --resume checkpoints/fscil_risk_stable/session_00.pth --end_session 3
+```
 
-Resume from a checkpoint produced by this version (schema 9) with:
+Continue the new schema-10 run with the same training/calibration settings:
 
-~~~BASH
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --resume checkpoints/fscil_moe/session_03.pth
-~~~
+```bash
+python main.py --data_cfg configs/datasets/cub200.yaml --train_cfg configs/trainers/bimc.yaml --resume checkpoints/fscil_global_risk/session_03.pth
+```
 
-Base-only schema 7/8 checkpoints can be reused. Earlier incremental
-checkpoints cannot be resumed because their experts were optimized for a
-different classifier objective. Compare the complete 11-session accuracy list
-with the target using the same fixed support manifest; the support-only gate
-diagnostics are not a substitute for test accuracy. `TaskDiagnostic` reports
-the actual task selection rate and an oracle-task within-class upper bound;
-the latter uses test labels only for analysis, never for predictions.
+The original configuration remains available as `configs/trainers/bimc_legacy.yaml`.
+Use separate output directories and the same support manifest for comparisons.
+To run the frozen-feature classifier without incremental experts, start from
+S0 with `TRAINER.BiMC.GLOBAL_MOE.EXPAND False` and a separate checkpoint directory;
+changing this setting midway through a schema-10 run is rejected.
+
+Candidate decisions log identity/reuse/expand risk, historical-class regret,
+parameter cost and accepted expert count. AA and PD use unrounded accuracies.
+Defaults require base-class validation before performance claims; the included
+CPU tests establish implementation invariants, not CUB accuracy improvements.
+
+```bash
+python -m pytest -q
+```
 
 ## Acknowledgment
 

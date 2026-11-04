@@ -54,7 +54,7 @@ TRAINER:
 
     CHECKPOINT:
       ENABLE: True
-      DIR: "checkpoints/fscil_risk_stable"
+      DIR: "checkpoints/fscil_global_risk"
       RESUME: ""
       SAVE_EVERY_SESSION: True
 
@@ -84,3 +84,19 @@ TRAINER:
 
     FUSED_CONFLICT_STRENGTH: 0.0
     FUSED_CONFLICT_MARGIN: 0.05
+
+    # Fixed-feature replay and one global classifier, without a task gate.
+    GLOBAL_MOE:
+      ENABLE: True
+      EXPAND: True
+      EPOCHS: 30
+      LR: 3.0e-4
+      WEIGHT_DECAY: 1.0e-4
+      BATCH_SIZE: 256
+      FOLDS: 5
+      RANK: 16
+      MAX_EXPERTS: 10
+      RESIDUAL_WEIGHT: 0.1
+      MIN_GAIN: 0.0
+      OLD_RISK_TOLERANCE: 0.0
+      PARAMETER_COST: 0.01
