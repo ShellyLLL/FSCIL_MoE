@@ -73,6 +73,17 @@ def extend_cfg(cfg):
     cfg.TRAINER.BiMC.INCREMENTAL.LOGIT_SCALE = 100.0
     cfg.TRAINER.BiMC.INCREMENTAL.STABILITY_WEIGHT = 0.0
 
+    cfg.TRAINER.BiMC.APC = CN()
+    cfg.TRAINER.BiMC.APC.ENABLE = True
+    cfg.TRAINER.BiMC.APC.ALPHA = 0.05
+    cfg.TRAINER.BiMC.APC.CALIBRATION_TRIALS = 256
+    cfg.TRAINER.BiMC.APC.SEED = -1
+
+    cfg.TRAINER.BiMC.PROTECTION = CN()
+    cfg.TRAINER.BiMC.PROTECTION.ALIGN_WEIGHT = 0.1
+    cfg.TRAINER.BiMC.PROTECTION.GATE_WEIGHT = 1.0
+    cfg.TRAINER.BiMC.PROTECTION.RESIDUAL_WEIGHT = 1.0
+
     cfg.TRAINER.BiMC.CHECKPOINT = CN()
     cfg.TRAINER.BiMC.CHECKPOINT.ENABLE = True
     cfg.TRAINER.BiMC.CHECKPOINT.DIR = 'checkpoints/fscil_moe'
@@ -140,8 +151,8 @@ def main():
     set_seed(cfg.SEED)
     set_gpu(cfg.DEVICE.GPU_ID)
     
-    from engine.engine import Runner
-    engine = Runner(cfg)
+    from engine.apc_runner import APCRunner
+    engine = APCRunner(cfg)
     engine.run()
 
 if __name__ == '__main__':

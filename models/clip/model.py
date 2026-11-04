@@ -308,6 +308,20 @@ class VisualMoEAdapter(nn.Module):
             parameters += list(self.descriptors[-1].parameters())
         return parameters
 
+    def newest_contribution(self, normalized_cls_features):
+        """Effective newest-expert gate and residual on frozen historical anchors."""
+        if self.num_experts <= self.base_expert_count:
+            raise RuntimeError("there is no incremental expert to protect.")
+        x = torch.as_tensor(normalized_cls_features, device=self.residual_scale.device,
+                            dtype=self.residual_scale.dtype)
+        active = list(range(self.base_expert_count, self.num_experts))
+        gates = torch.cat([torch.sigmoid(self.router.columns[i](x)) for i in active], dim=-1)
+        denominator = 1.0 + gates.sum(dim=-1, keepdim=True)
+        col = active.index(self.num_experts - 1)
+        effective = gates[:, col] / denominator.squeeze(-1)
+        contribution = self.experts[-1](x) * effective.unsqueeze(-1)
+        return effective, contribution * self.residual_scale.to(contribution.dtype)
+
     def historical_named_parameters(self):
         newest = self.num_experts - 1
         prefixes = (f"experts.{newest}.", f"router.columns.{newest}.", f"descriptors.{newest}.")
@@ -370,8 +384,12 @@ class VisualMoEAdapter(nn.Module):
                   if index >= self.base_expert_count and
                   (max_session is None or birth <= max_session)]
         gate_logits = [self.router.columns[index](x_norm[0]) for index in active]
-        weights = (torch.cat([base_weights] + [torch.sigmoid(value) for value in gate_logits], dim=-1)
-                   if gate_logits else base_weights)
+        if gate_logits:
+            gates = torch.cat([torch.sigmoid(value) for value in gate_logits], dim=-1)
+            incremental_weights = gates / (1.0 + gates.sum(dim=-1, keepdim=True))
+            weights = torch.cat([base_weights, incremental_weights], dim=-1)
+        else:
+            weights = base_weights
         logits = torch.cat([base_logits] + gate_logits, dim=-1) if gate_logits else base_logits
         residual, norms = torch.zeros_like(x_norm), []
         for column, expert_id in enumerate(list(range(self.base_expert_count)) + active):
