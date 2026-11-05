@@ -151,7 +151,9 @@ class APCRunner(Runner):
                     < baseline_old_gate_recall):
                 # Hard non-regression constraint: an expert cannot be accepted
                 # by trading away historical task selection.
-                return float("inf")
+                return 1.0e6 + 100.0 * max(
+                    0.0, baseline_old_gate_recall - gate_diagnostics["old_loo_task_recall"]
+                )
             # Keep the anchor task-selection objective inside candidate
             # verification, rather than accepting an expert on within-task CE
             # while silently degrading the historical task gate.
