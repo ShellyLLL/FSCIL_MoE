@@ -665,7 +665,7 @@ class Runner:
         return (1.0 - (current * previous).sum(dim=-1)).mean().clamp_min(0.0)
 
     def _train_candidate(self, task_id, block_idx, train_loader, extract_loader,
-                         class_index, text, description, calibrate):
+                         class_index, text, description, calibrate, encoder_version):
         adapter = self._adapter_by_block(block_idx)
         adapter.set_newest_trainable()
         optim_cfg = self.cfg.TRAINER.BiMC.OPTIM
@@ -679,7 +679,7 @@ class Runner:
         history = []
         for epoch in range(int(self.cfg.TRAINER.BiMC.INCREMENTAL.EPOCHS)):
             bank = self._support_bank(extract_loader, class_index, text, description,
-                                      task_id, calibrate)
+                                      encoder_version, calibrate)
             self.model.train()
             total_loss, count = 0.0, 0
             for batch in train_loader:
@@ -687,13 +687,13 @@ class Runner:
                 source_ids = self._batch_source_ids(batch, labels.numel(), labels.device)
                 optimizer.zero_grad(set_to_none=True)
                 logits, targets = self._incremental_logits(
-                    images, labels, source_ids, bank, task_id, scale)
+                    images, labels, source_ids, bank, encoder_version, scale)
                 loss = F.cross_entropy(logits, targets)
                 stability_weight = float(getattr(self.cfg.TRAINER.BiMC.INCREMENTAL,
                                                  "STABILITY_WEIGHT", 0.0))
                 if stability_weight > 0.0:
                     loss = loss + stability_weight * self._representation_drift(
-                        images, task_id, self._candidate_previous_version)
+                        images, encoder_version, self._candidate_previous_version)
                 if not bool(torch.isfinite(loss).item()):
                     raise FloatingPointError("Non-finite fused incremental loss.")
                 loss.backward()
