@@ -243,7 +243,8 @@ class APCRunner(Runner):
                 features, old_ids, class_ids, self.apc_state
             )
             eligible = {int(row["block_idx"]) for row in remaining if row["expand"]}
-            candidate_blocks = [block for block in candidate_blocks if block in eligible]
+            already_expanded = {int(row["block_idx"]) for row in expanded}
+            candidate_blocks = sorted(eligible - already_expanded)
 
         for _, adapter in self._moe_adapters():
             adapter.freeze_all()
