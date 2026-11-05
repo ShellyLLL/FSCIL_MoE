@@ -48,9 +48,18 @@ TRAINER:
     INCREMENTAL:
       EPOCHS: 6
       LOGIT_SCALE: 100.0
-      # Regularize the change in current-support image features relative to the
-      # frozen previous model. Also included in candidate held-out selection.
-      STABILITY_WEIGHT: 0.1
+      STABILITY_WEIGHT: 0.0
+
+    APC:
+      ENABLE: True
+      ALPHA: 0.05
+      CALIBRATION_TRIALS: 256
+      SEED: -1
+
+    PROTECTION:
+      ALIGN_WEIGHT: 0.1
+      GATE_WEIGHT: 1.0
+      RESIDUAL_WEIGHT: 1.0
 
     CHECKPOINT:
       ENABLE: True

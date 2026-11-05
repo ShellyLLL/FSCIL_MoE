@@ -713,14 +713,27 @@ class BiMC(nn.Module):
         cls_begin_index = class_index[0]
         text_features, _ = self.inference_text_feature(class_names, self.template, cls_begin_index)
         _, _, description_proto = self.inference_all_description_feature(class_names, self.cfg.DATASET.GPT_PATH, cls_begin_index)
-        images_features, anchor_labels, images_proto = self.inference_all_img_feature(
+        images_features, anchor_labels, _ = self.inference_all_img_feature(
             loader, max_session=encoder_version)
+        class_ids = torch.as_tensor(class_index, device=images_features.device, dtype=torch.long)
+
+        def ordered_prototypes(features, labels):
+            rows = []
+            for class_id in class_ids:
+                mask = labels.eq(class_id)
+                if not mask.any():
+                    raise ValueError(f"Visual support is missing global class {int(class_id)}.")
+                rows.append(features[mask].mean(dim=0))
+            return F.normalize(torch.stack(rows), dim=-1)
+
+        images_proto = ordered_prototypes(images_features, anchor_labels)
         anchor_features = images_features
         anchor_proto = images_proto
         if cls_begin_index != 0:
             if encoder_version != 0:
-                anchor_features, anchor_labels, anchor_proto = self.inference_all_img_feature(
+                anchor_features, anchor_labels, _ = self.inference_all_img_feature(
                     loader, max_session=0)
+                anchor_proto = ordered_prototypes(anchor_features, anchor_labels)
             if calibrate_novel_vision_proto:
                 images_proto = self.calibrate_incremental_visual(images_proto, anchor_proto)
                 anchor_proto = self.soft_calibration(self.base_vision_prototype, anchor_proto)

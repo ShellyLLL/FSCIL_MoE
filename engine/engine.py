@@ -54,6 +54,7 @@ class Runner:
         self.acc_list, self.task_acc_list = [], []
         self.session_diagnostics = []
         self.task_gate_biases = []
+        self.apc_state = None
         self.evaluator = AccuracyEvaluator(self.data_manager.class_index_in_task)
         self._resume_completed_session = -1
         self._resume_state_dict_list = []
@@ -289,7 +290,8 @@ class Runner:
         if missing:
             raise ValueError(f"Resume checkpoint is missing required fields: {missing}")
         schema = int(payload["schema_version"])
-        if schema == 6 and int(payload["completed_session"]) == 0:
+        completed_session = int(payload["completed_session"])
+        if schema == 6 and completed_session == 0:
             # The base mixture is unchanged; only its erroneously reconstructed
             # visual prototype needs replacing with the saved true base mean.
             base_proto = payload.get("base_vision_prototype")
@@ -298,11 +300,12 @@ class Runner:
             payload["task_states"][0] = dict(payload["task_states"][0])
             payload["task_states"][0]["image_proto"] = base_proto
             payload["task_states"][0]["encoder_version"] = 0
-        elif schema not in (7, 8, 9):
+        elif schema not in (7, 8, 9, 10):
             raise ValueError("Checkpoint topology is incompatible; resume from Session 0.")
-        if schema in (7, 8) and int(payload["completed_session"]) != 0:
-            raise ValueError("The calibrated gate and task-local objective need a base-only "
-                             "checkpoint or a schema 9 checkpoint.")
+        if schema in (6, 7, 8, 9) and completed_session != 0:
+            raise ValueError("Legacy incremental checkpoints use a different classifier protocol; resume from Session 0.")
+        if schema == 10 and not isinstance(payload.get("apc_state"), dict):
+            raise ValueError("Schema 10 checkpoint is missing APC calibration state.")
         if not isinstance(payload["model_state"], dict):
             raise TypeError("Resume checkpoint model_state must be a state_dict mapping.")
         if not isinstance(payload["task_states"], list):
@@ -310,7 +313,6 @@ class Runner:
         diagnostics = payload.get("session_diagnostics", [])
         if not isinstance(diagnostics, list):
             raise TypeError("Resume checkpoint session_diagnostics must be a list.")
-        completed_session = int(payload["completed_session"])
         if completed_session != len(payload["task_states"]) - 1:
             raise ValueError(
                 "Resume checkpoint has inconsistent completed_session/task_states length: "
@@ -332,6 +334,7 @@ class Runner:
         if manifest is None:
             raise ValueError("Resume checkpoint support_manifest must not be null.")
         self.data_manager.load_support_manifest(manifest)
+        self.apc_state = self._cpu_copy(payload.get("apc_state")) if schema == 10 else None
         base_proto = payload.get("base_vision_prototype")
         self.model_without_dp.base_vision_prototype = (
             None if base_proto is None else base_proto.to(self.device)
@@ -350,8 +353,8 @@ class Runner:
                                                torch.as_tensor(sources, dtype=torch.long).cpu())
             base_state["creation_session"] = 0
         self._resume_state_dict_list = payload.get("task_states", [])
-        self.task_gate_biases = ([0.0] if schema in (6, 7, 8) else
-                                 list(payload["task_gate_biases"]))
+        self.task_gate_biases = ([0.0] * (completed_session + 1) if schema == 10 else
+                                  ([0.0] if schema in (6, 7, 8) else list(payload["task_gate_biases"])))
         if len(self.task_gate_biases) != completed_session + 1:
             raise ValueError("Checkpoint task gate biases do not match completed sessions.")
         self.acc_list = payload.get("acc_list", [])
@@ -370,8 +373,9 @@ class Runner:
         directory.mkdir(parents=True, exist_ok=True)
         topology = self.model_without_dp.export_moe_topology()
         payload = {
-            "schema_version": 9,
+            "schema_version": 10,
             "completed_session": int(completed_session),
+            "apc_state": self._cpu_copy(self.apc_state or {}),
             "model_state": self._cpu_copy(self.model_without_dp.state_dict()),
             "moe_topology": topology,
             "task_states": self._cpu_copy(state_dict_list),
@@ -519,9 +523,9 @@ class Runner:
                 )
             )
 
+        # APC replaces reconstruction-descriptor training as the expansion controller.
         for _, adapter in self._moe_adapters():
             adapter.freeze_all()
-        self._train_base_descriptors(extract_loader)
 
     # ------------------------------------------------------------------
     # Support-risk-guided expansion
@@ -541,6 +545,13 @@ class Runner:
         if not torch.equal(current["source_ids"], reference["source_ids"]):
             raise RuntimeError("Current and reference support source orders differ.")
         labels, classes = current["labels"], current["classes"]
+        requested = torch.as_tensor(class_index, dtype=torch.long).reshape(-1)
+        matches = classes.reshape(-1, 1).eq(requested.reshape(1, -1))
+        if not matches.sum(dim=1).eq(1).all():
+            raise ValueError("Support bank classes do not map one-to-one to requested global IDs.")
+        order = matches.long().argmax(dim=1)
+        text_features = text_features[order.to(text_features.device)]
+        description_proto = description_proto[order.to(description_proto.device)]
         current_features, reference_features = current["features"], reference["features"]
         visual_full = F.normalize(torch.stack([
             current_features[labels.eq(cls)].mean(0) for cls in classes
@@ -559,6 +570,7 @@ class Runner:
         text = F.normalize((1.0 - lambda_t) * text_features
                            + lambda_t * description_proto, dim=-1)
         beta = float(self.cfg.DATASET.BETA)
+        current["text_proto"] = text.to(self.device)
         current["visual_full"] = visual_full.to(self.device)
         current["visual_loo"] = visual_loo.to(self.device)
         current["fused_full"] = F.normalize(beta * text + (1.0 - beta) * current["visual_full"], dim=-1)
