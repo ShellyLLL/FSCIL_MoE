@@ -1,55 +1,61 @@
-# Multi-layer APC-controlled dynamic MoE for FSCIL
+# Unified version-consistent APC and dynamic MoE architecture
 
-## Shared encoder and historical versions
+## Status and scope
 
-The method has one frozen pretrained CLIP ViT backbone. It does not create a separate ViT per session. Each configured Transformer block owns a VisualMoEAdapter with a shared base expert pool and append-only incremental experts.
+This branch is an architecture refactor, not a performance claim. A full CUB200 experiment is gated on passing the unit, integration, checkpoint round-trip, and multi-session acceptance tests. No AA or PD improvement is claimed until those experiments are run.
 
-A prototype stores the session version at which it was created. At inference, each class column is scored using the same expert activation boundary that produced that class prototype. The implementation uses the existing `max_session` argument to activate only experts whose birth session is not later than the requested version. This is versioned execution of one shared backbone, not multiple independent encoders.
+The frozen CLIP ViT backbone, visual MoE adapters, zero-up incremental expert initialization, historical expert freezing, and BiMC visual/text calibration are retained.
 
-## Multi-layer expansion controller
+## One version definition
 
-Every configured MoE block is independently calibrated during Session 0. The controller stores two empirical base-episode distributions per block:
+An encoder version is a monotonically increasing **MoE topology version**, not a session number. A session may commit more than one expert; every committed topology transition receives a new version. Expert metadata therefore stores both:
 
-1. Maximum novel-to-old prototype cosine similarity (prototype-confusion risk).
-2. Source-exclusive K-shot novel-query prototype classification loss (existing-expert adaptation capacity).
+- `birth_session`: which FSCIL session introduced the expert (audit metadata).
+- `birth_version`: the topology version at which the expert becomes active (execution semantics).
 
-During an incremental session, features are re-extracted for all fixed seen-class support examples under the current deployed topology. Each layer is a candidate if either its confusion risk or its adaptation loss exceeds its own calibrated threshold. This is a candidate-generation rule, not permission to deploy an expert.
+A class prototype stores its `encoder_version`. Its image feature and its classifier prototype are always evaluated with the same version. Legacy topology manifests without `birth_version` are migrated in expert order to unique versions.
 
-The APC calibration is an empirical reference distribution, not a formal guarantee under distribution shift. The Bonferroni-adjusted upper quantile controls the calibration family across layers and the two monitored metrics.
+## APC representation
 
-## New-expert gain verification and multi-layer selection
+APC uses the post-residual Transformer block hidden state: the exact CLS state passed to the next Transformer block. The Adapter's normalized input and adapter-local output remain separately exposed for diagnostics, but are not substituted for the actual block output. APC calibration schema is version 3 because the representation definition changed.
 
-Candidate layers are evaluated with source-disjoint folds from the current session's fixed K-shot support set. For each candidate layer:
+## Candidate validation and deployment classifier
 
-- Append a zero-up expert and a new router column.
-- Train only that expert and router column; all historical experts, router columns and ViT parameters remain frozen.
-- Reset candidate parameters between folds.
-- Compare held-out novel-class prototype loss against the no-new-expert baseline on the same folds.
-- Accept a layer only when its paired mean loss reduction exceeds its estimated standard error (one-standard-error rule).
+A candidate is no longer accepted from novel-only class loss. Each source-disjoint fold builds the current task's support prototypes under the tested topology, merges them with immutable historical task states, and evaluates the same retained classifier used at deployment:
 
-Selection is greedy and marginal. After a layer is accepted and trained on all current support examples, the full seen-class support set is re-encoded. The remaining downstream layers are re-evaluated because an earlier-layer expert changes their input distribution. The process repeats until no remaining candidate provides a supported gain. A session can therefore add no experts, one expert, or experts in multiple configured blocks. The method does not hard-code the earliest MoE block.
+1. Each global class column is scored using that class's creation topology version.
+2. Task evidence is computed in the frozen base anchor space.
+3. Task offsets are fitted from source-exclusive support anchors for the tested candidate/null state.
+4. Within-task class evidence is combined with task evidence using the deployment scoring rule.
+5. The held-out novel query is evaluated against **all seen classes**, not only the current session's classes.
+6. The objective also includes class-balanced source-exclusive anchor task-gate loss, so a candidate cannot be selected solely for improving new-class discrimination while ignoring the historical task gate.
 
-The final layer set is selected sequentially, not by exhaustive global subset optimization. The one-standard-error rule is a conservative finite-support heuristic; full CUB200 runs and repeated seeds are required before making performance claims.
+The candidate and null model use paired source folds and identical scoring semantics. Candidate parameters are reset between folds. A candidate must exceed the paired one-standard-error threshold. Greedy selection is marginal: after a committed layer changes the topology, APC is recalibrated and all remaining layer representations are recomputed.
 
-## Historical knowledge and classifier
+## Historical knowledge and state
 
-The pretrained ViT and historical experts remain frozen. The new expert is zero-up initialized, so adding it initially preserves the previous function. The parent Runner's versioned classifier is used by APCRunner: each class column is scored with its creation-session encoder version; task-level evidence is calibrated using source-exclusive historical anchors; within-task class logits are retained from the versioned classifier.
+Historical experts and router columns are frozen. Historical class prototypes remain immutable and retain their creation topology version. Task-gate calibration uses source-exclusive anchors. Checkpoints persist topology metadata, task states, gate offsets, APC calibration, support manifest, diagnostics and RNG state. The current checkpoint schema is 11; schema 10 and 11 APC payloads are recognized, but APC v2 calibration is intentionally rejected by the v3 controller and must be recalibrated from Session 0.
 
-This avoids comparing a query embedding from the latest expert topology directly with a prototype created by an older topology. It does not mean that multiple ViT backbones are stored.
+## Efficiency accounting
 
-## Modality calibration and support protocol
+Every candidate trial records validation/search time. Every committed expert records training time and incremental parameter count. Session diagnostics also retain expert counts, routing summaries and deployment evaluation time. These are required alongside AA and PD; expert expansion efficiency is not inferred from accuracy alone.
 
-Visual calibration transports the paired support shift from the base visual space. Text calibration fuses class-name and description features. The classifier then fuses calibrated visual and text prototypes. The support manifest fixes the K-shot sources across training, calibration and evaluation.
+## Required acceptance gates before CUB200
 
-## Checkpoints and compatibility
+- Adapter input, adapter-local output, and actual post-residual block output have distinct definitions and tests.
+- Expert birth versions are monotonic and topology save/load round-trips exactly.
+- Historical class logits are invariant under the addition of a later-version expert when evaluated at their creation version.
+- Candidate/null validation uses the exact global versioned classifier and source-exclusive support prototypes.
+- Task-gate offsets and all prototype/version metadata survive checkpoint round-trip with identical logits.
+- Multi-layer expansion commits zero, one, or multiple experts without duplicate versions or stale downstream APC features.
+- Tests cover candidate rollback, frozen historical parameters, source leakage, and checkpoint recovery.
+- Metrics report class-balanced AA, task-balanced AA, PD, expert counts, incremental parameter growth, candidate search time, training time, and inference latency.
 
-Checkpoints persist the model weights, dynamic MoE topology, per-task prototype states, APC calibration state, support manifest, diagnostics and RNG state. APC calibration schema version 1 used a single stable block and is not compatible with the multi-layer version 2 controller. A legacy incremental checkpoint must not be silently resumed as a multi-layer experiment; restart from Session 0 with the new branch. A Session-0 checkpoint can be recalibrated for all configured blocks.
-
-## Run and validation
+## Run
 
 ```bash
 python -m pytest -q
 python main.py --data_cfg configs/datasets/cub200.yaml --train_cfg configs/trainers/bimc.yaml
 ```
 
-No claim of higher AA or lower PD is made until the full CUB200 experiment completes. Report per-session Acc, class-balanced and task-balanced AA separately, PD/forgetting, per-block expert counts, risk, adaptation loss, paired validation gains, and routing utilization.
+The command above is not an authorization to launch the full experiment. First satisfy all acceptance gates in automated tests and a small multi-session integration run.
