@@ -21,7 +21,7 @@ class AdaptationAwarePrototypeController:
     source-disjoint validation before changing the deployed topology.
     """
 
-    VERSION = 2
+    VERSION = 3
 
     def __init__(self, alpha=0.05, calibration_trials=256, seed=1,
                  logit_scale=20.0):
