@@ -1,37 +1,55 @@
-# APC-controlled dynamic MoE for FSCIL
+# Multi-layer APC-controlled dynamic MoE for FSCIL
 
-## Architecture
+## Shared encoder and historical versions
 
-1. **Frozen visual encoder.** The pretrained CLIP visual backbone and text encoder remain frozen. Base adapters are trained in Session 0 and then frozen.
-2. **Expandable MoE adapter.** Shared base experts use Softmax routing. Incremental Sigmoid gates form a separate bounded residual branch with total gate mass strictly below one; zero-up initialization preserves the old function at expert creation.
-3. **Adaptation-aware prototype confusion controller (APC).** APC calibrates a K-shot pairwise prototype-similarity distribution on base pseudo-incremental episodes. It expands when maximum new-to-old similarity in the current adapted representation exceeds an empirical, session-size-adjusted threshold.
-4. **Dynamic routing and activation/freezing.** Only the newly appended expert and its router column are trainable. ViT, shared experts, old incremental experts and old router columns remain frozen.
-5. **Incremental learning and old-knowledge protection.** Source-exclusive all-seen-class prototype CE is combined with visual-text alignment and penalties on the newest expert's effective gate and residual at stored old-class anchors. Failed fitting rolls back the new expert.
-6. **Dual-level modality-calibrated classifier.** BiMC visual prototype calibration and text-name/description calibration are followed by visual-text fusion and one global all-seen-class prototype classifier. Task identity is not used at inference.
+The method has one frozen pretrained CLIP ViT backbone. It does not create a separate ViT per session. Each configured Transformer block owns a VisualMoEAdapter with a shared base expert pool and append-only incremental experts.
 
-## Stable APC comparison locus
+A prototype stores the session version at which it was created. At inference, each class column is scored using the same expert activation boundary that produced that class prototype. The implementation uses the existing `max_session` argument to activate only experts whose birth session is not later than the requested version. This is versioned execution of one shared backbone, not multiple independent encoders.
 
-An adapter at an earlier transformer block changes inputs to every later block. Historical downstream block-input prototypes therefore cannot be compared directly with current downstream features without replaying historical images or retaining full token-level activations.
+## Multi-layer expansion controller
 
-To avoid comparing incompatible feature spaces, APC growth is restricted to the **earliest configured MoE block**. Its input is invariant because no preceding MoE adapter exists. The system stores pre-adapter CLS features for each support source, reapplies the current adapter pool to old and new anchors, and computes confusion risk in the same adapted space. Other configured blocks retain shared base experts but do not receive incremental experts in this implementation.
+Every configured MoE block is independently calibrated during Session 0. The controller stores two empirical base-episode distributions per block:
 
-This is a deliberate correctness boundary. Independently expanding downstream blocks requires token-level historical feature replay or another mathematically consistent representation transport.
+1. Maximum novel-to-old prototype cosine similarity (prototype-confusion risk).
+2. Source-exclusive K-shot novel-query prototype classification loss (existing-expert adaptation capacity).
 
-## Calibration and limitations
+During an incremental session, features are re-extracted for all fixed seen-class support examples under the current deployed topology. Each layer is a candidate if either its confusion risk or its adaptation loss exceeds its own calibrated threshold. This is a candidate-generation rule, not permission to deploy an expert.
 
-APC uses deterministic pseudo-episodes from base classes, with K distinct source IDs per pseudo-class. Its empirical threshold is a family-size-adjusted upper quantile. Similarity pairs are dependent and future session distributions may shift; this is an empirical decision rule, not a formal false-expansion guarantee. Defaults require base validation before performance claims.
+The APC calibration is an empirical reference distribution, not a formal guarantee under distribution shift. The Bonferroni-adjusted upper quantile controls the calibration family across layers and the two monitored metrics.
 
-The old-class protection term constrains the new expert on stored historical CLS anchors. It reduces interference but does not prove every old test image is invariant. This is feature replay, not exemplar-free learning.
+## New-expert gain verification and multi-layer selection
 
-## Checkpoints
+Candidate layers are evaluated with source-disjoint folds from the current session's fixed K-shot support set. For each candidate layer:
 
-New checkpoints use schema 10 and persist APC calibration, dynamic MoE topology, task prototype states, stable-block feature anchors, support manifest, RNG state and diagnostics. Schema 6–9 base-only checkpoints can be imported and recalibrated. Legacy incremental checkpoints are rejected because they use a different classifier objective.
+- Append a zero-up expert and a new router column.
+- Train only that expert and router column; all historical experts, router columns and ViT parameters remain frozen.
+- Reset candidate parameters between folds.
+- Compare held-out novel-class prototype loss against the no-new-expert baseline on the same folds.
+- Accept a layer only when its paired mean loss reduction exceeds its estimated standard error (one-standard-error rule).
 
-## Run
+Selection is greedy and marginal. After a layer is accepted and trained on all current support examples, the full seen-class support set is re-encoded. The remaining downstream layers are re-evaluated because an earlier-layer expert changes their input distribution. The process repeats until no remaining candidate provides a supported gain. A session can therefore add no experts, one expert, or experts in multiple configured blocks. The method does not hard-code the earliest MoE block.
+
+The final layer set is selected sequentially, not by exhaustive global subset optimization. The one-standard-error rule is a conservative finite-support heuristic; full CUB200 runs and repeated seeds are required before making performance claims.
+
+## Historical knowledge and classifier
+
+The pretrained ViT and historical experts remain frozen. The new expert is zero-up initialized, so adding it initially preserves the previous function. The parent Runner's versioned classifier is used by APCRunner: each class column is scored with its creation-session encoder version; task-level evidence is calibrated using source-exclusive historical anchors; within-task class logits are retained from the versioned classifier.
+
+This avoids comparing a query embedding from the latest expert topology directly with a prototype created by an older topology. It does not mean that multiple ViT backbones are stored.
+
+## Modality calibration and support protocol
+
+Visual calibration transports the paired support shift from the base visual space. Text calibration fuses class-name and description features. The classifier then fuses calibrated visual and text prototypes. The support manifest fixes the K-shot sources across training, calibration and evaluation.
+
+## Checkpoints and compatibility
+
+Checkpoints persist the model weights, dynamic MoE topology, per-task prototype states, APC calibration state, support manifest, diagnostics and RNG state. APC calibration schema version 1 used a single stable block and is not compatible with the multi-layer version 2 controller. A legacy incremental checkpoint must not be silently resumed as a multi-layer experiment; restart from Session 0 with the new branch. A Session-0 checkpoint can be recalibrated for all configured blocks.
+
+## Run and validation
 
 ```bash
-python main.py --data_cfg configs/datasets/cub200.yaml --train_cfg configs/trainers/bimc.yaml
 python -m pytest -q
+python main.py --data_cfg configs/datasets/cub200.yaml --train_cfg configs/trainers/bimc.yaml
 ```
 
-No claim of improved AA or reduced PD is made until full dataset runs complete on the target environment.
+No claim of higher AA or lower PD is made until the full CUB200 experiment completes. Report per-session Acc, class-balanced and task-balanced AA separately, PD/forgetting, per-block expert counts, risk, adaptation loss, paired validation gains, and routing utilization.
