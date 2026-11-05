@@ -405,6 +405,7 @@ def make_runner(checkpoint_dir, resume=""):
     cfg = make_cfg(checkpoint_dir, resume)
     data = SyntheticDataManager()
     model = TinyVersionedModel(blocks=2)
+    model._test_cfg = cfg
     runner = SyntheticAPCRunner.__new__(SyntheticAPCRunner)
     runner.cfg = cfg
     runner.data_manager = data
