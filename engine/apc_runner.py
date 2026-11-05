@@ -123,7 +123,38 @@ class APCRunner(Runner):
             new_state["creation_session"] = int(task_id)
             states = [*self._resume_state_dict_list, new_state]
             merged = self.merge_dicts(states)
-            self._calibrate_task_gate(task_id, states)
+            gate_diagnostics = self._calibrate_task_gate(task_id, states)
+            # Keep the anchor task-selection objective inside candidate
+            # verification, rather than accepting an expert on within-task CE
+            # while silently degrading the historical task gate.
+            gate_evidence, gate_targets, gate_weights = [], [], []
+            for state in states:
+                anchor_features = state["anchor_features"].to(self.device).float()
+                anchor_labels = state["anchor_labels"].to(self.device)
+                evidence = self._anchor_task_scores(
+                    anchor_features, merged, self._anchor_leave_one_out(state), anchor_labels
+                )
+                gate_evidence.append(evidence)
+                gate_targets.append(torch.full(
+                    (len(anchor_labels),), int(state["creation_session"]),
+                    device=self.device, dtype=torch.long
+                ))
+                class_columns = self._targets_to_columns(anchor_labels, merged)
+                class_counts = torch.bincount(
+                    class_columns, minlength=len(merged["class_ids"])
+                )
+                gate_weights.append(class_counts[class_columns].reciprocal().double())
+            gate_logits = torch.cat(gate_evidence) + torch.as_tensor(
+                self.task_gate_biases, device=self.device, dtype=torch.float64
+            )
+            gate_targets = torch.cat(gate_targets)
+            gate_weights = torch.cat(gate_weights)
+            gate_loss = (
+                F.cross_entropy(gate_logits, gate_targets, reduction="none") * gate_weights
+            ).sum() / gate_weights.sum()
+            gate_weight = float(getattr(
+                self.cfg.TRAINER.BiMC.PROTECTION, "GATE_WEIGHT", 1.0
+            ))
             total, count = 0.0, 0
             scale = float(self.cfg.TRAINER.BiMC.INCREMENTAL.LOGIT_SCALE)
             for batch in validation_loader:
@@ -141,7 +172,7 @@ class APCRunner(Runner):
                 loss = F.cross_entropy(deployed_logits.float(), targets, reduction="sum")
                 total += float(loss.item())
                 count += labels.numel()
-            return total / max(count, 1)
+            return total / max(count, 1) + gate_weight * float(gate_loss.item())
         finally:
             self.task_gate_biases = previous_biases
             model._fused_history_prototypes = old_history
