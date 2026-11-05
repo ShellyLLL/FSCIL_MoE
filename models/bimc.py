@@ -362,7 +362,7 @@ class BiMC(nn.Module):
         return self
 
     @torch.no_grad()
-    def collect_blockwise_cls_features(self, loader):
+    def collect_blockwise_cls_features(self, loader, max_version=None):
         """Collect current-path Adapter-LayerNorm CLS features and labels."""
         block_features, fallback_source_id = {}, 0
         moe_blocks = [idx for idx, block in enumerate(self.clip_model.visual.transformer.resblocks)
@@ -380,7 +380,7 @@ class BiMC(nn.Module):
                 fallback_source_id += labels.numel()
                 if source_ids.numel() != labels.numel():
                     raise ValueError("support source ids must align with labels.")
-                _, aux_list = self.clip_model.encode_image(images, return_moe_aux=True)
+                _, aux_list = self.clip_model.encode_image(images, return_moe_aux=True, max_version=max_version)
                 if len(aux_list) != len(moe_blocks):
                     raise RuntimeError("MoE auxiliary outputs do not match inserted blocks.")
                 for block_idx, aux in zip(moe_blocks, aux_list):
@@ -388,13 +388,17 @@ class BiMC(nn.Module):
                     if cls_in is None or cls_in.ndim != 2:
                         raise RuntimeError(f"Block {block_idx} has invalid CLS features.")
                     item = block_features.setdefault(block_idx, {
-                        "cls_in": [], "cls_out": [], "patch_mean_in": [], "labels": [], "source_ids": []
+                        "cls_in": [], "cls_out": [], "block_out": [], "patch_mean_in": [], "labels": [], "source_ids": []
                     })
                     item["cls_in"].append(cls_in.detach().cpu())
                     cls_out = aux.get("cls_out")
                     if cls_out is None or cls_out.shape != cls_in.shape:
                         raise RuntimeError(f"Block {block_idx} has invalid adapted CLS features.")
                     item["cls_out"].append(cls_out.detach().cpu())
+                    block_out = aux.get("block_out")
+                    if block_out is None or block_out.shape != cls_in.shape:
+                        raise RuntimeError(f"Block {block_idx} has invalid post-residual block output.")
+                    item["block_out"].append(block_out.detach().cpu())
                     if aux.get("patch_mean_in") is not None:
                         item["patch_mean_in"].append(aux["patch_mean_in"].detach().cpu())
                     item["labels"].append(labels.detach().cpu())
@@ -403,6 +407,7 @@ class BiMC(nn.Module):
             self.train(was_training)
         for item in block_features.values():
             item["cls_in"], item["cls_out"] = torch.cat(item["cls_in"]), torch.cat(item["cls_out"])
+            item["block_out"] = torch.cat(item["block_out"])
             item["labels"] = torch.cat(item["labels"])
             item["source_ids"] = torch.cat(item["source_ids"])
             item["patch_mean_in"] = (torch.cat(item["patch_mean_in"]) if item["patch_mean_in"]
@@ -410,7 +415,11 @@ class BiMC(nn.Module):
         return block_features
 
     @torch.no_grad()
-    def build_leave_one_out_prototypes(self, loader, class_index=None, max_session=None):
+    def build_leave_one_out_prototypes(self, loader, class_index=None, max_version=None, max_session=None):
+        if max_session is not None:
+            if max_version is not None:
+                raise ValueError("Specify max_version, not both max_version and legacy max_session.")
+            max_version = max_session
         """Collect a support cache with stable source ids and per-query LOO means.
 
         ``loo_visual_prototypes[i, j]`` is class ``j``'s support mean after
@@ -430,7 +439,7 @@ class BiMC(nn.Module):
                     raise ValueError("support source ids must align with labels.")
                 next_id += y.numel()
                 features.append(F.normalize(self.clip_model.encode_image(
-                    images, max_session=max_session), dim=-1).detach().cpu())
+                    images, max_version=max_version), dim=-1).detach().cpu())
                 labels.append(y.detach().cpu())
                 source_ids.append(sid.detach().cpu())
         finally:
@@ -664,12 +673,16 @@ class BiMC(nn.Module):
         return F.normalize(torch.stack(clip_weights, dim=0), dim=-1), torch.cat(all_targets, dim=0)
 
     @torch.no_grad()
-    def inference_all_img_feature(self, loader, max_session=None):
+    def inference_all_img_feature(self, loader, max_version=None, max_session=None):
+        if max_session is not None:
+            if max_version is not None:
+                raise ValueError("Specify max_version, not both max_version and legacy max_session.")
+            max_version = max_session
         all_features, all_labels = [], []
         for batch in loader:
             images, labels = self.parse_batch(batch)
             features = F.normalize(self.clip_model.encode_image(
-                images, max_session=max_session), dim=-1)
+                images, max_version=max_version), dim=-1)
             all_features.append(features)
             all_labels.append(labels)
 
@@ -797,8 +810,12 @@ class BiMC(nn.Module):
         return 100.0 * img_feat @ fused_proto.t()
 
     @torch.no_grad()
-    def extract_img_feature(self, images, max_session=None):
-        return self.clip_model.encode_image(images.to(self.device), max_session=max_session)
+    def extract_img_feature(self, images, max_version=None, max_session=None):
+        if max_session is not None:
+            if max_version is not None:
+                raise ValueError("Specify max_version, not both max_version and legacy max_session.")
+            max_version = max_session
+        return self.clip_model.encode_image(images.to(self.device), max_version=max_version)
 
     def parse_batch(self, batch):
         # NumPy-backed FSCIL datasets can yield int32 labels on Windows.  Keep
