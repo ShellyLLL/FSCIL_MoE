@@ -83,6 +83,8 @@ def extend_cfg(cfg):
     cfg.TRAINER.BiMC.PROTECTION.ALIGN_WEIGHT = 0.1
     cfg.TRAINER.BiMC.PROTECTION.GATE_WEIGHT = 1.0
     cfg.TRAINER.BiMC.PROTECTION.RESIDUAL_WEIGHT = 1.0
+    # Maximum tolerated drop in historical task-selection recall during candidate acceptance.
+    cfg.TRAINER.BiMC.PROTECTION.OLD_TASK_RECALL_TOLERANCE = 0.02
 
     cfg.TRAINER.BiMC.CHECKPOINT = CN()
     cfg.TRAINER.BiMC.CHECKPOINT.ENABLE = True
