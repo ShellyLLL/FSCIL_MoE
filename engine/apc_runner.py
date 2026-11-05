@@ -142,6 +142,13 @@ class APCRunner(Runner):
             )
 
         text, description = self._text_prototypes(class_names, class_ids)
+        historical_loader = self.data_manager.get_dataloader(
+            task_id - 1, source="train", mode="test", accumulate_past=True
+        )
+        # Recalibrate every layer under the current topology. An accepted
+        # upstream expert changes downstream feature distributions, so the
+        # base-only thresholds must not be reused blindly.
+        self._calibrate_apc(historical_loader)
         all_seen_loader = self._all_seen_feature_loader(task_id)
         self.model.eval()
         features = self.model_without_dp.collect_blockwise_cls_features(all_seen_loader)
@@ -229,6 +236,7 @@ class APCRunner(Runner):
             # Earlier-layer expansion changes downstream inputs. Recompute
             # every layer's current and historical support features before
             # the next APC decision; never reuse stale downstream activations.
+            self._calibrate_apc(historical_loader)
             all_seen_loader = self._all_seen_feature_loader(task_id)
             features = self.model_without_dp.collect_blockwise_cls_features(all_seen_loader)
             remaining = self.apc_controller.decide(
