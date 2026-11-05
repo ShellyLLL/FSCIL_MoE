@@ -40,6 +40,25 @@ Historical experts and router columns are frozen. Historical class prototypes re
 
 Every candidate trial records validation/search time. Every committed expert records training time and incremental parameter count. Session diagnostics also retain expert counts, routing summaries and deployment evaluation time. These are required alongside AA and PD; expert expansion efficiency is not inferred from accuracy alone.
 
+## Synthetic multi-session integration coverage
+
+`tests/test_apc_multisession_integration.py` drives the production `APCRunner.run()`
+through Session 0, Session 1 and Session 2 using deterministic in-memory data and
+the production `VisualMoEAdapter`, candidate-fold trainer, APC controller,
+versioned global classifier, anchor task gate, topology exporter/rebuilder and
+checkpoint serializer/restorer. Only the image/text backbone and data source are
+replaced with small deterministic fixtures; the expansion and classifier
+control flow remains production code.
+
+The integration test verifies that real candidates are trained and committed,
+multiple layers can receive distinct topology versions in one session, old
+version-0 class scores remain invariant after later experts are introduced,
+historical parameters are frozen, and a newly constructed runner restores the
+full checkpoint with identical topology, model tensors, class/version/task
+metadata, task-gate offsets, versioned logits, retained logits, AA and PD
+diagnostics. The synthetic fixture is a software integration test, not a
+benchmark and not evidence of CUB200 accuracy improvement.
+
 ## Required acceptance gates before CUB200
 
 - Adapter input, adapter-local output, and actual post-residual block output have distinct definitions and tests.
