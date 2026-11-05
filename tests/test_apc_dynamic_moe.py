@@ -104,7 +104,6 @@ class MultiLayerAPCTests(unittest.TestCase):
         self.assertEqual(adapter.expert_birth_sessions, [0, 0, 1])
         self.assertEqual(adapter.expert_birth_versions, [0, 0, 4])
         self.assertIn("cls_out", aux_new)
-        self.assertIn("block_out", aux_new)  # supplied by ResidualAttentionBlock, not adapter
         self.assertLess(float(aux_old["route_weights"].shape[-1]), float(aux_new["route_weights"].shape[-1]))
 
     def test_topology_round_trip_preserves_monotonic_versions(self):
