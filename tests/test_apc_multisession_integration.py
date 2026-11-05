@@ -163,8 +163,12 @@ class TinyVersionedModel(nn.Module):
         return x, aux_list
 
     @torch.no_grad()
-    def extract_img_feature(self, images, max_session=None):
-        return self.extract_img_feature_train(images, max_session)[0]
+    def extract_img_feature(self, images, max_version=None, max_session=None):
+        if max_session is not None:
+            if max_version is not None:
+                raise ValueError("Specify max_version or max_session, not both.")
+            max_version = max_session
+        return self.extract_img_feature_train(images, max_version)[0]
 
     @torch.no_grad()
     def collect_blockwise_cls_features(self, loader, max_version=None):
