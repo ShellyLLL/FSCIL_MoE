@@ -750,7 +750,8 @@ class Runner:
         decisions = []
         for block_idx in self.model_without_dp.expandable_blocks():
             adapter = self._adapter_by_block(block_idx)
-            self.model_without_dp.add_expert(block_idx, task_id)
+            candidate_version = previous_version + 1
+            self.model_without_dp.add_expert(block_idx, task_id, candidate_version)
             initial_expert = copy.deepcopy(adapter.experts[-1].state_dict())
             initial_router = copy.deepcopy(adapter.router.columns[-1].state_dict())
             candidate_losses = []
@@ -759,10 +760,10 @@ class Runner:
                 adapter.router.columns[-1].load_state_dict(initial_router)
                 self._train_candidate(task_id, block_idx, fit_train, fit_extract,
                                       class_index, text, description,
-                                      enable_visual_calibration)
+                                      enable_visual_calibration, candidate_version)
                 candidate_losses.append(self._held_out_loss(
                     validation, fit_extract, class_index, text, description,
-                    task_id, enable_visual_calibration, previous_version=previous_version))
+                    candidate_version, enable_visual_calibration, previous_version=previous_version))
             adapter.remove_newest_expert()
             gains = np.asarray(null_losses) - np.asarray(candidate_losses)
             decisions.append({"block_idx": block_idx, "null_loss": float(np.mean(null_losses)),
@@ -778,15 +779,16 @@ class Runner:
                     "encoder_version": previous_version}
         block_idx = best["block_idx"]
         adapter = self._adapter_by_block(block_idx)
-        expert_id = self.model_without_dp.add_expert(block_idx, task_id)
+        candidate_version = self._current_encoder_version() + 1
+        expert_id = self.model_without_dp.add_expert(block_idx, task_id, candidate_version)
         epochs = self._train_candidate(task_id, block_idx, train_loader, extract_loader,
                                        class_index, text, description,
-                                       enable_visual_calibration)
+                                       enable_visual_calibration, candidate_version)
         print(f"=> [Accepted][Task {task_id}][B{block_idx}] expert={expert_id} "
               f"validation_gain={best['gain']:.5f}")
         return {"trained": True, "decisions": decisions,
                 "expanded": [{"block_idx": block_idx, "expert_id": expert_id,
-                              "epochs": epochs}], "encoder_version": task_id}
+                              "epochs": epochs}], "encoder_version": candidate_version}
 
     def _build_and_refine_task_state(self, current_class_name, extract_loader, class_index,
                                      old_state, enable_visual_calibration, encoder_version):
