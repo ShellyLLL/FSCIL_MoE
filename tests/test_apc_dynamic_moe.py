@@ -34,7 +34,7 @@ class MultiLayerAPCTests(unittest.TestCase):
         }
         controller = AdaptationAwarePrototypeController(.05, 64, 3)
         state = controller.calibrate(features, n_new_classes=2, k_shot=5)
-        self.assertEqual(state["version"], 2)
+        self.assertEqual(state["version"], 3)
         self.assertEqual(sorted(map(int, state["blocks"])), [8, 9, 10, 11])
         for block in (8, 9, 10, 11):
             self.assertIn("risk_threshold", state["blocks"][str(block)])
