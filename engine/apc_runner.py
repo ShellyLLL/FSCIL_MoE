@@ -428,7 +428,11 @@ class APCRunner(Runner):
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             elapsed = time.perf_counter() - start_time
-            result["AA"] = float(result["macro_task_acc"])
+            result["class_balanced_AA"] = float(result["mean_acc"])
+            result["task_balanced_AA"] = float(result["macro_task_acc"])
+            # Keep AA explicit and reproducible: task-balanced macro accuracy
+            # is the primary FSCIL AA, while class-balanced AA is reported too.
+            result["AA"] = result["task_balanced_AA"]
             result["PD"] = self._average_forgetting(task_id, result["task_acc"])
             self.acc_list.append(float(result["mean_acc"]))
             self.task_acc_list.append(list(result["task_acc"]))
