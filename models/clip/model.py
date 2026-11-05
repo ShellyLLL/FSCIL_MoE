@@ -245,6 +245,7 @@ class VisualMoEAdapter(nn.Module):
         ])
         self.router = ExpandableRouter(self.d_model, self.base_expert_count)
         self.expert_birth_sessions = [0] * self.base_expert_count
+        self.expert_birth_versions = [0] * self.base_expert_count
 
     @property
     def num_experts(self):
@@ -289,7 +290,7 @@ class VisualMoEAdapter(nn.Module):
                 parameter.requires_grad = True
         self.train()
 
-    def add_expert(self, session_id, reduction=None):
+    def add_expert(self, session_id, reduction=None, version_id=None):
         self.freeze_all()
         reduction = self.default_reduction if reduction is None else int(reduction)
         self.experts.append(BottleneckExpert(self.d_model, reduction, zero_init_up=True).to(
@@ -299,6 +300,11 @@ class VisualMoEAdapter(nn.Module):
         self.router.add_column()
         self.router.columns[-1].to(device=self.residual_scale.device, dtype=self.residual_scale.dtype)
         self.expert_birth_sessions.append(int(session_id))
+        next_version = (max(self.expert_birth_versions, default=0) + 1
+                        if version_id is None else int(version_id))
+        if next_version <= max(self.expert_birth_versions, default=0):
+            raise ValueError("A new expert must create a strictly newer encoder topology version.")
+        self.expert_birth_versions.append(next_version)
         self.set_newest_trainable()
         return self.num_experts - 1
 
@@ -332,7 +338,8 @@ class VisualMoEAdapter(nn.Module):
     def export_topology(self):
         return {"version": 1, "d_model": self.d_model, "base_expert_count": self.base_expert_count,
                 "experts": [{"reduction": max(1, self.d_model // expert.c_fc.out_features),
-                             "birth_session": int(self.expert_birth_sessions[index])}
+                             "birth_session": int(self.expert_birth_sessions[index]),
+                             "birth_version": int(self.expert_birth_versions[index])}
                             for index, expert in enumerate(self.experts)]}
 
     def rebuild_topology(self, topology):
@@ -349,6 +356,7 @@ class VisualMoEAdapter(nn.Module):
             raise ValueError("MoE topology has fewer experts than the base pool.")
         self.experts, self.descriptors = nn.ModuleList(), nn.ModuleList()
         self.router, self.expert_birth_sessions = ExpandableRouter(self.d_model), []
+        self.expert_birth_versions = []
         for spec in specs:
             reduction = int(spec.get("reduction", self.default_reduction))
             self.experts.append(BottleneckExpert(self.d_model, reduction))
@@ -356,6 +364,7 @@ class VisualMoEAdapter(nn.Module):
                 self.d_model, self.descriptor_dim, self.descriptor_eps))
             self.router.add_column()
             self.expert_birth_sessions.append(int(spec.get("birth_session", 0)))
+            self.expert_birth_versions.append(int(spec.get("birth_version", spec.get("birth_session", 0))))
         device, dtype = self.residual_scale.device, self.residual_scale.dtype
         self.experts.to(device=device, dtype=dtype)
         self.router.to(device=device, dtype=dtype)
@@ -372,17 +381,21 @@ class VisualMoEAdapter(nn.Module):
         del self.descriptors[-1]
         del self.router.columns[-1]
         self.expert_birth_sessions.pop()
+        self.expert_birth_versions.pop()
         self.freeze_all()
 
-    def forward(self, x, max_session=None):
+    def forward(self, x, max_version=None, max_session=None):
+        if max_session is not None:
+            if max_version is not None:
+                raise ValueError("Specify max_version, not both max_version and legacy max_session.")
+            max_version = max_session
         if x.ndim != 3:
             raise ValueError("VisualMoEAdapter expects [tokens, batch, dim].")
         x_norm = self.layer_norm(x)
         # The base mixture is never renormalised when incremental experts arrive.
         base_logits, base_weights = self.router(x_norm[0], self.base_expert_count)
-        active = [index for index, birth in enumerate(self.expert_birth_sessions)
-                  if index >= self.base_expert_count and
-                  (max_session is None or birth <= max_session)]
+        active = [index for index in range(self.base_expert_count, self.num_experts)
+                  if max_version is None or self.expert_birth_versions[index] <= max_version]
         gate_logits = [self.router.columns[index](x_norm[0]) for index in active]
         if gate_logits:
             gates = torch.cat([torch.sigmoid(value) for value in gate_logits], dim=-1)
@@ -400,7 +413,7 @@ class VisualMoEAdapter(nn.Module):
         adapted = x_norm + residual
         return residual, {"logits": logits, "route_weights": weights,
                           "top_k_indices": weights.argmax(dim=-1, keepdim=True),
-                          "cls_in": x_norm[0], "cls_out": adapted[0],
+                          "cls_in": x_norm[0], "adapter_output_cls": adapted[0], "cls_out": adapted[0],
                           "patch_mean_in": x_norm[1:].mean(dim=0),
                           "expert_residual_norms": torch.stack(norms),
                           "token_residual": residual.detach()}
@@ -424,13 +437,19 @@ class ResidualAttentionBlock(nn.Module):
         self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
         return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
 
-    def forward(self, x: torch.Tensor, max_session=None):
+    def forward(self, x: torch.Tensor, max_version=None, max_session=None):
+        if max_session is not None:
+            if max_version is not None:
+                raise ValueError("Specify max_version, not both max_version and legacy max_session.")
+            max_version = max_session
         x = x + self.attention(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         moe_aux = None
         if self.moe_adapter is not None:
-            moe_out, moe_aux = self.moe_adapter(x, max_session=max_session)
+            moe_out, moe_aux = self.moe_adapter(x, max_version=max_version)
             x = x + moe_out
+            # This is the actual hidden state passed to the next Transformer block.
+            moe_aux["block_out"] = x[0]
         return x, moe_aux
 
 class Transformer(nn.Module):
@@ -440,10 +459,14 @@ class Transformer(nn.Module):
         self.layers = layers
         self.resblocks = nn.ModuleList([ResidualAttentionBlock(width, heads, attn_mask) for _ in range(layers)])
 
-    def forward(self, x: torch.Tensor, max_session=None):
+    def forward(self, x: torch.Tensor, max_version=None, max_session=None):
+        if max_session is not None:
+            if max_version is not None:
+                raise ValueError("Specify max_version, not both max_version and legacy max_session.")
+            max_version = max_session
         moe_aux_list = []
         for block in self.resblocks:
-            x, aux = block(x, max_session=max_session)
+            x, aux = block(x, max_version=max_version)
             if aux is not None: moe_aux_list.append(aux)
         return x, moe_aux_list
 
@@ -462,7 +485,11 @@ class VisionTransformer(nn.Module):
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
 
     def forward(self, x: torch.Tensor, all_layer_outputs=False, return_moe_aux=False,
-                max_session=None):
+                max_version=None, max_session=None):
+        if max_session is not None:
+            if max_version is not None:
+                raise ValueError("Specify max_version, not both max_version and legacy max_session.")
+            max_version = max_session
         x = self.conv1(x)  
         x = x.reshape(x.shape[0], x.shape[1], -1)  
         x = x.permute(0, 2, 1)  
@@ -472,7 +499,7 @@ class VisionTransformer(nn.Module):
 
         if not all_layer_outputs:
             x = x.permute(1, 0, 2)  
-            x, moe_aux_list = self.transformer(x, max_session=max_session)
+            x, moe_aux_list = self.transformer(x, max_version=max_version)
             x = x.permute(1, 0, 2)  
             x = self.ln_post(x[:, 0, :])
             if self.proj is not None: x = x @ self.proj
@@ -482,7 +509,7 @@ class VisionTransformer(nn.Module):
             x = x.permute(1, 0, 2)  
             outputs, moe_aux_list = [], []
             for block in self.transformer.resblocks:
-                x, aux = block(x, max_session=max_session)
+                x, aux = block(x, max_version=max_version)
                 if aux is not None: moe_aux_list.append(aux)
                 cur_output = x.permute(1, 0, 2)
                 cur_output = self.ln_post(cur_output[:, 0, :])
@@ -544,13 +571,17 @@ class CLIP(nn.Module):
     def dtype(self):
         return self.visual.conv1.weight.dtype
 
-    def encode_image(self, image, return_moe_aux=False, max_session=None):
+    def encode_image(self, image, return_moe_aux=False, max_version=None, max_session=None):
+        if max_session is not None:
+            if max_version is not None:
+                raise ValueError("Specify max_version, not both max_version and legacy max_session.")
+            max_version = max_session
         if not isinstance(self.visual, VisionTransformer):
             return self.visual(image.type(self.dtype))
         if return_moe_aux:
             return self.visual(image.type(self.dtype), return_moe_aux=True,
-                               max_session=max_session)
-        return self.visual(image.type(self.dtype), max_session=max_session)
+                               max_version=max_version)
+        return self.visual(image.type(self.dtype), max_version=max_version)
 
     def encode_text(self, text):
         x = self.token_embedding(text).type(self.dtype)
