@@ -300,7 +300,7 @@ class Runner:
             payload["task_states"][0] = dict(payload["task_states"][0])
             payload["task_states"][0]["image_proto"] = base_proto
             payload["task_states"][0]["encoder_version"] = 0
-        elif schema not in (7, 8, 9, 10):
+        elif schema not in (7, 8, 9, 10, 11):
             raise ValueError("Checkpoint topology is incompatible; resume from Session 0.")
         if schema in (6, 7, 8, 9) and completed_session != 0:
             raise ValueError("Legacy incremental checkpoints use a different classifier protocol; resume from Session 0.")
