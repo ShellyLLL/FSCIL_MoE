@@ -388,9 +388,13 @@ class BiMC(nn.Module):
                     if cls_in is None or cls_in.ndim != 2:
                         raise RuntimeError(f"Block {block_idx} has invalid CLS features.")
                     item = block_features.setdefault(block_idx, {
-                        "cls_in": [], "patch_mean_in": [], "labels": [], "source_ids": []
+                        "cls_in": [], "cls_out": [], "patch_mean_in": [], "labels": [], "source_ids": []
                     })
                     item["cls_in"].append(cls_in.detach().cpu())
+                    cls_out = aux.get("cls_out")
+                    if cls_out is None or cls_out.shape != cls_in.shape:
+                        raise RuntimeError(f"Block {block_idx} has invalid adapted CLS features.")
+                    item["cls_out"].append(cls_out.detach().cpu())
                     if aux.get("patch_mean_in") is not None:
                         item["patch_mean_in"].append(aux["patch_mean_in"].detach().cpu())
                     item["labels"].append(labels.detach().cpu())
@@ -398,7 +402,8 @@ class BiMC(nn.Module):
         finally:
             self.train(was_training)
         for item in block_features.values():
-            item["cls_in"], item["labels"] = torch.cat(item["cls_in"]), torch.cat(item["labels"])
+            item["cls_in"], item["cls_out"] = torch.cat(item["cls_in"]), torch.cat(item["cls_out"])
+            item["labels"] = torch.cat(item["labels"])
             item["source_ids"] = torch.cat(item["source_ids"])
             item["patch_mean_in"] = (torch.cat(item["patch_mean_in"]) if item["patch_mean_in"]
                                      else item["cls_in"].new_empty(0, item["cls_in"].size(-1)))
