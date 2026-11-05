@@ -46,47 +46,25 @@ python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/t
 python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc_ensemble.yaml
 ~~~
 
-### Dynamic FSCIL MoE runs
+### Unified dynamic FSCIL MoE development
 
-The `bimc.yaml` configuration now auto-saves a dataset/seed-specific fixed
-support manifest alongside session checkpoints. Use the same manifest for
-comparisons. The CUB200 run is:
+The active architecture work is on branch `codex/fscil-unified-expansion-architecture`.
+It separates the session that creates an expert from the monotonic topology version
+at which that expert becomes active. APC calibration uses the actual post-residual
+Transformer block CLS state. Candidate/null comparisons use the full global,
+versioned class bank and the deployment task-gating rule, not a novel-only classifier.
 
-~~~BASH
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --support_manifest checkpoints/fscil_moe/cub_seed1_support.json
-~~~
+The branch is under architecture validation. **Do not launch the full CUB200
+experiment until the acceptance tests documented in
+`docs/apc_dynamic_moe.md` pass**, including versioned checkpoint round-trip,
+source-disjoint global-classifier verification, multi-layer expansion, and
+historical task-gate retention. No AA or PD improvement is claimed yet.
 
-At each incremental session, each eligible block receives a temporary candidate
-expert. Five support folds compare its held-out, task-local fused classifier
-loss with the unchanged encoder; at most one candidate is retained if its
-gain exceeds one standard error. Training refreshes source-exclusive visual
-prototypes, updates only the new expert and router column, and freezes them
-afterward. Historical class weights and encoders retain their creation versions.
-The frozen base encoder supplies common-space task evidence. Its task offsets
-jointly minimize class-balanced task loss using source-exclusive support
-features from every observed class. Expert logits only rank classes within
-each task; no task identity is supplied at inference.
-
-For staged development, reuse Session 0 and stop after Task 3 without changing
-the normal full-run default:
-
-~~~BASH
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --resume checkpoints/fscil_moe/session_00.pth --end_session 3
-~~~
-
-Resume from a checkpoint produced by this version (schema 9) with:
-
-~~~BASH
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --resume checkpoints/fscil_moe/session_03.pth
-~~~
-
-Base-only schema 7/8 checkpoints can be reused. Earlier incremental
-checkpoints cannot be resumed because their experts were optimized for a
-different classifier objective. Compare the complete 11-session accuracy list
-with the target using the same fixed support manifest; the support-only gate
-diagnostics are not a substitute for test accuracy. `TaskDiagnostic` reports
-the actual task selection rate and an oracle-task within-class upper bound;
-the latter uses test labels only for analysis, never for predictions.
+After those gates pass, use a fixed support manifest for every baseline and
+ablation. Report class-balanced AA, task-balanced AA, PD, per-block expert
+counts, added parameters, candidate validation/search time, training time,
+and inference latency. Expert expansion efficiency must be reported alongside
+accuracy; it cannot be inferred from AA alone.
 
 ## Acknowledgment
 
