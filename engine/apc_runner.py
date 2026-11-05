@@ -76,7 +76,7 @@ class APCRunner(Runner):
               sorted(int(key) for key in self.apc_state["blocks"]))
 
     def _ensure_apc_ready(self, completed_session):
-        if not self._moe_adapters():
+        if not self._moe_adapters() or completed_session < 0:
             return
         if self.apc_state and int(self.apc_state.get("version", -1)) == self.apc_controller.VERSION:
             return
