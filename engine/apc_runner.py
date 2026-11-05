@@ -266,7 +266,9 @@ class APCRunner(Runner):
                 bool(calibrate_visual)
             )
             trials = []
+            round_started = time.perf_counter()
             for block_idx in list(candidate_blocks):
+                trial_started = time.perf_counter()
                 adapter = self._adapter_by_block(block_idx)
                 candidate_version = previous_version + 1
                 self.model_without_dp.add_expert(block_idx, task_id, candidate_version)
@@ -286,12 +288,14 @@ class APCRunner(Runner):
                         "fold_gains": fold_gains,
                         "null_loss": float(null_losses.mean()),
                         "candidate_loss": float(candidate_losses.mean()),
+                        "validation_seconds": float(time.perf_counter() - trial_started),
                     })
                 finally:
                     adapter.remove_newest_expert()
 
             best = max(trials, key=lambda row: row["gain"], default=None)
-            accepted_diagnostics.append({"round": len(expanded) + 1, "trials": trials})
+            accepted_diagnostics.append({"round": len(expanded) + 1, "trials": trials,
+                                         "round_seconds": float(time.perf_counter() - round_started)})
             if best is None or best["gain"] <= best["gain_se"]:
                 print(
                     f"=> [ExpansionStop][Session {task_id}] "
@@ -303,6 +307,7 @@ class APCRunner(Runner):
             adapter = self._adapter_by_block(block_idx)
             candidate_version = self._current_encoder_version() + 1
             expert_id = self.model_without_dp.add_expert(block_idx, task_id, candidate_version)
+            training_started = time.perf_counter()
             training_history = self._train_candidate(
                 task_id, block_idx, train_loader, extract_loader, class_ids,
                 text, description, bool(calibrate_visual), candidate_version
@@ -312,6 +317,10 @@ class APCRunner(Runner):
                 "expert_id": expert_id,
                 "validation_gain": best["gain"],
                 "validation_gain_se": best["gain_se"],
+                "training_seconds": float(time.perf_counter() - training_started),
+                "incremental_parameters": int(sum(
+                    parameter.numel() for parameter in adapter.newest_parameters()
+                )),
                 "training": training_history,
             })
             candidate_blocks.remove(block_idx)
