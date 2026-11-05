@@ -39,7 +39,7 @@ class APCRunner(Runner):
             raise ValueError("Historical and current feature maps must contain identical MoE blocks.")
         for block in sorted(old):
             item = {}
-            for key in ("cls_in", "cls_out", "labels", "source_ids"):
+            for key in ("cls_in", "cls_out", "block_out", "labels", "source_ids"):
                 left = torch.as_tensor(old[block][key]).detach().cpu()
                 right = torch.as_tensor(new[block][key]).detach().cpu()
                 if left.ndim != right.ndim or left.shape[1:] != right.shape[1:]:
@@ -67,8 +67,8 @@ class APCRunner(Runner):
         if not features:
             raise RuntimeError("No configured MoE block produced base calibration features.")
         for block, item in features.items():
-            if "cls_out" not in item:
-                raise RuntimeError(f"MoE block {block} does not expose adapted CLS features.")
+            if "block_out" not in item:
+                raise RuntimeError(f"MoE block {block} does not expose the actual post-residual Transformer block output.")
         self.apc_state = self.apc_controller.calibrate(
             features, self.cfg.DATASET.NUM_INC_CLS, self.cfg.DATASET.NUM_INC_SHOT
         )
@@ -102,7 +102,7 @@ class APCRunner(Runner):
 
     def _candidate_fold_losses(self, task_id, block_idx, folds, class_ids,
                                text, description, calibrate, initial_expert,
-                               initial_router, previous_version):
+                               initial_router, previous_version, candidate_version):
         adapter = self._adapter_by_block(block_idx)
         values = []
         for fit_train, fit_extract, validation in folds:
@@ -110,9 +110,9 @@ class APCRunner(Runner):
             adapter.router.columns[-1].load_state_dict(copy.deepcopy(initial_router))
             self._train_candidate(
                 task_id, block_idx, fit_train, fit_extract, class_ids,
-                text, description, calibrate
+                text, description, calibrate, candidate_version
             )
-            version = self._current_encoder_version()
+            version = candidate_version
             values.append(self._held_out_loss(
                 validation, fit_extract, class_ids, text, description,
                 version, calibrate, previous_version=previous_version
@@ -180,14 +180,15 @@ class APCRunner(Runner):
             trials = []
             for block_idx in list(candidate_blocks):
                 adapter = self._adapter_by_block(block_idx)
-                self.model_without_dp.add_expert(block_idx, task_id)
+                candidate_version = previous_version + 1
+                self.model_without_dp.add_expert(block_idx, task_id, candidate_version)
                 initial_expert = copy.deepcopy(adapter.experts[-1].state_dict())
                 initial_router = copy.deepcopy(adapter.router.columns[-1].state_dict())
                 try:
                     candidate_losses = self._candidate_fold_losses(
                         task_id, block_idx, folds, class_ids, text, description,
                         bool(calibrate_visual), initial_expert, initial_router,
-                        previous_version
+                        previous_version, candidate_version
                     )
                     gain, gain_se, fold_gains = self._paired_gain(null_losses, candidate_losses)
                     trials.append({
@@ -212,10 +213,11 @@ class APCRunner(Runner):
 
             block_idx = int(best["block_idx"])
             adapter = self._adapter_by_block(block_idx)
-            expert_id = self.model_without_dp.add_expert(block_idx, task_id)
+            candidate_version = self._current_encoder_version() + 1
+            expert_id = self.model_without_dp.add_expert(block_idx, task_id, candidate_version)
             training_history = self._train_candidate(
                 task_id, block_idx, train_loader, extract_loader, class_ids,
-                text, description, bool(calibrate_visual)
+                text, description, bool(calibrate_visual), candidate_version
             )
             expanded.append({
                 "block_idx": block_idx,
@@ -253,7 +255,7 @@ class APCRunner(Runner):
             "decisions": decisions,
             "candidate_rounds": accepted_diagnostics,
             "expanded": expanded,
-            "encoder_version": task_id if expanded else self._current_encoder_version(),
+            "encoder_version": self._current_encoder_version(),
         }
 
     def run(self):
