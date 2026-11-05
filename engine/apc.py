@@ -135,7 +135,7 @@ class AdaptationAwarePrototypeController:
         alpha_per_metric = self.alpha / (2.0 * len(block_ids))
         for block in block_ids:
             item = features_by_block[block]
-            x, labels, sources = self._aggregate_sources(item, "cls_out")
+            x, labels, sources = self._aggregate_sources(item, "block_out")
             classes = torch.unique(labels, sorted=True).numpy()
             if len(classes) < 2:
                 raise ValueError(f"Block {block} calibration needs at least two classes.")
@@ -210,7 +210,7 @@ class AdaptationAwarePrototypeController:
             block = int(key)
             if block not in features_by_block:
                 raise KeyError(f"APC current features are missing MoE block {block}.")
-            x, labels, sources = self._aggregate_sources(features_by_block[block], "cls_out")
+            x, labels, sources = self._aggregate_sources(features_by_block[block], "block_out")
             observed = torch.unique(labels, sorted=True)
             if not torch.equal(observed, expected):
                 raise ValueError(
