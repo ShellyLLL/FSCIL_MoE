@@ -62,29 +62,70 @@ class APCRunner(Runner):
             counts.append(len(selected))
         return torch.cat(rows,0),counts
 
+    @staticmethod
+    def _merge_block_input_anchors(states,key):
+        """Merge per-class historical CLS anchors in global class-ID order.
+
+        Class IDs, counts and cached anchors are bookkeeping/replay metadata.
+        Normalize all three to CPU before concatenation and slicing, regardless
+        of the device on which a task checkpoint was originally serialized.
+        """
+        ids_by_state=[]
+        class_chunks=[]
+        counts_by_class=[]
+        feature_dim=None
+
+        for state in states:
+            ids=torch.as_tensor(state["class_ids"],dtype=torch.long).detach().cpu().reshape(-1)
+            anchors=torch.as_tensor(
+                state["block_input_anchors"][key],dtype=torch.float32
+            ).detach().cpu()
+            counts=torch.as_tensor(
+                state["block_input_counts"][key],dtype=torch.long
+            ).detach().cpu().reshape(-1)
+
+            if anchors.ndim!=2:
+                raise ValueError("Stable-block CLS anchors must be a two-dimensional tensor.")
+            if feature_dim is None:
+                feature_dim=anchors.size(1)
+            elif anchors.size(1)!=feature_dim:
+                raise ValueError("Stable-block CLS anchor feature dimensions differ.")
+            if ids.numel()==0 or counts.numel()!=ids.numel() or torch.any(counts<=0):
+                raise ValueError("Every class must have a positive, aligned anchor count.")
+            if int(counts.sum().item())!=anchors.size(0):
+                raise ValueError("Stable-block anchor counts do not match anchor rows.")
+
+            ids_by_state.append(ids)
+            offset=0
+            for count in counts.tolist():
+                class_chunks.append(anchors[offset:offset+count])
+                counts_by_class.append(int(count))
+                offset+=count
+
+        if not ids_by_state:
+            raise ValueError("Cannot merge an empty stable-block anchor bank.")
+        all_ids=torch.cat(ids_by_state,dim=0)
+        if torch.unique(all_ids).numel()!=all_ids.numel():
+            raise ValueError("Duplicate class ids in stable-block anchor bank.")
+        if len(class_chunks)!=all_ids.numel():
+            raise ValueError("Stable-block anchor chunks do not align with class IDs.")
+
+        order=all_ids.argsort()
+        ordered_anchors=torch.cat([class_chunks[i] for i in order.tolist()],dim=0)
+        ordered_counts=torch.tensor(
+            [counts_by_class[i] for i in order.tolist()],dtype=torch.long
+        )
+        return all_ids[order],ordered_anchors,ordered_counts
+
     def merge_dicts(self,states):
         merged=super().merge_dicts(states)
         if not any("block_input_anchors" in s for s in states): return merged
         if not all("block_input_anchors" in s and "block_input_counts" in s for s in states):
             raise ValueError("Every seen class must carry stable-block input anchors.")
         key=str(self.apc_state["stable_block"])
-        ids=[torch.as_tensor(s["class_ids"],dtype=torch.long).reshape(-1) for s in states]
-        all_ids=torch.cat(ids)
-        if torch.unique(all_ids).numel()!=all_ids.numel(): raise ValueError("Duplicate class ids in anchor bank.")
-        order=all_ids.argsort()
-        chunks=[]; counts=[]
-        for s,cls in zip(states,ids):
-            x=torch.as_tensor(s["block_input_anchors"][key]).float()
-            c=torch.as_tensor(s["block_input_counts"][key]).long().reshape(-1)
-            if len(c)!=len(cls) or int(c.sum())!=len(x): raise ValueError("Stable-block anchor counts mismatch.")
-            chunks.append(x); counts.extend(c.tolist())
-        # states and rows are each class-contiguous; reorder class chunks globally.
-        class_chunks=[]; offset=0
-        for c in counts:
-            class_chunks.append(torch.cat(chunks) [offset:offset+c])
-            offset+=c
-        merged["block_input_anchors"]={key:torch.cat([class_chunks[i] for i in order.tolist()],0)}
-        merged["block_input_counts"]={key:[counts[i] for i in order.tolist()]}
+        _,anchors,counts=self._merge_block_input_anchors(states,key)
+        merged["block_input_anchors"]={key:anchors}
+        merged["block_input_counts"]={key:counts}
         return merged
 
     def _ensure_apc_ready(self,states):

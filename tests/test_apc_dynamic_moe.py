@@ -6,6 +6,28 @@ from models.clip.model import VisualMoEAdapter
 
 
 class APCTests(unittest.TestCase):
+    def test_merge_block_input_anchors_normalizes_devices_and_sorts_classes(self):
+        device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        states=[
+            {
+                "class_ids":torch.tensor([3],device=device),
+                "block_input_counts":{"2":torch.tensor([2],device="cpu")},
+                "block_input_anchors":{"2":torch.tensor([[30.],[31.]],device=device)},
+            },
+            {
+                "class_ids":torch.tensor([1,2],device="cpu"),
+                "block_input_counts":{"2":torch.tensor([1,2],device=device)},
+                "block_input_anchors":{"2":torch.tensor([[10.],[20.],[21.]],device="cpu")},
+            },
+        ]
+        ids,anchors,counts=APCRunner._merge_block_input_anchors(states,"2")
+        self.assertEqual(ids.device.type,"cpu")
+        self.assertEqual(anchors.device.type,"cpu")
+        self.assertEqual(counts.device.type,"cpu")
+        torch.testing.assert_close(ids,torch.tensor([1,2,3]))
+        torch.testing.assert_close(counts,torch.tensor([1,2,2]))
+        torch.testing.assert_close(anchors,torch.tensor([[10.],[20.],[21.],[30.],[31.]]))
+
     def test_historical_class_metadata_is_normalized_to_cpu(self):
         source_device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
         class_ids=torch.tensor([2,5,9],device=source_device)
