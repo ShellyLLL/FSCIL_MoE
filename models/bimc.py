@@ -502,10 +502,10 @@ class BiMC(nn.Module):
         print(f"=> [Coverage][B{block_idx}] decision={'EXPAND' if decision.expand else 'REUSE'}")
         return decision
 
-    def add_expert(self, block_idx, session_id):
+    def add_expert(self, block_idx, session_id, version_id=None):
         adapter = self.clip_model.visual.transformer.resblocks[int(block_idx)].moe_adapter
         reduction = int(getattr(self.cfg.TRAINER.BiMC.VISUAL_MOE, "INCREMENTAL_REDUCTION", 8))
-        return adapter.add_expert(session_id=session_id, reduction=reduction)
+        return adapter.add_expert(session_id=session_id, reduction=reduction, version_id=version_id)
 
     def export_moe_topology(self):
         return {str(index): block.moe_adapter.export_topology()
