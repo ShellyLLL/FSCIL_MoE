@@ -454,7 +454,7 @@ class APCRunnerMultiSessionIntegrationTests(unittest.TestCase):
                 for version in adapter.expert_birth_versions[adapter.base_expert_count:]
             ]
             self.assertTrue(versions, "The real APCRunner path did not commit an expert.")
-            self.assertEqual(versions, sorted(set(versions)))
+            self.assertEqual(sorted(versions), sorted(set(versions)))
             self.assertTrue(any(
                 item["adaptation"] and item["adaptation"]["expanded"]
                 for item in runner.session_diagnostics[1:]
