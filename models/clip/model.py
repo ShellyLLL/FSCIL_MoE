@@ -363,8 +363,17 @@ class VisualMoEAdapter(nn.Module):
             self.descriptors.append(RepresentationDescriptor(
                 self.d_model, self.descriptor_dim, self.descriptor_eps))
             self.router.add_column()
-            self.expert_birth_sessions.append(int(spec.get("birth_session", 0)))
-            self.expert_birth_versions.append(int(spec.get("birth_version", spec.get("birth_session", 0))))
+            birth_session = int(spec.get("birth_session", 0))
+            self.expert_birth_sessions.append(birth_session)
+            # Legacy topology files stored only session IDs. Multiple layers
+            # may be expanded in one session, so reconstruct a unique ordered
+            # topology version rather than assigning duplicate session IDs.
+            fallback_version = (0 if len(self.expert_birth_versions) < self.base_expert_count
+                                else max(self.expert_birth_versions, default=0) + 1)
+            birth_version = int(spec.get("birth_version", fallback_version))
+            if self.expert_birth_versions and birth_version < max(self.expert_birth_versions):
+                raise ValueError("MoE topology versions must be monotonically non-decreasing.")
+            self.expert_birth_versions.append(birth_version)
         device, dtype = self.residual_scale.device, self.residual_scale.dtype
         self.experts.to(device=device, dtype=dtype)
         self.router.to(device=device, dtype=dtype)
