@@ -338,10 +338,19 @@ class APCRunner(Runner):
             candidate_version = self._current_encoder_version() + 1
             expert_id = self.model_without_dp.add_expert(block_idx, task_id, candidate_version)
             training_started = time.perf_counter()
-            training_history = self._train_candidate(
-                task_id, block_idx, train_loader, extract_loader, class_ids,
-                text, description, bool(calibrate_visual), candidate_version
-            )
+            try:
+                training_history = self._train_candidate(
+                    task_id, block_idx, train_loader, extract_loader, class_ids,
+                    text, description, bool(calibrate_visual), candidate_version
+                )
+            except Exception:
+                # A topology version is committed only after its full-support
+                # retraining succeeds. Failed materialization must leave no
+                # partially trained expert or router column in the live model.
+                adapter.remove_newest_expert()
+                for _, current_adapter in self._moe_adapters():
+                    current_adapter.freeze_all()
+                raise
             expanded.append({
                 "block_idx": block_idx,
                 "expert_id": expert_id,
