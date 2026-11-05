@@ -1,10 +1,23 @@
 import unittest
 import torch
 from engine.apc import AdaptationAwarePrototypeController
+from engine.apc_runner import APCRunner
 from models.clip.model import VisualMoEAdapter
 
 
 class APCTests(unittest.TestCase):
+    def test_historical_class_metadata_is_normalized_to_cpu(self):
+        source_device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        class_ids=torch.tensor([2,5,9],device=source_device)
+        class_counts=torch.tensor([3,1,2],device="cpu")
+        ids,counts,labels=APCRunner._cpu_class_metadata(class_ids,class_counts)
+        self.assertEqual(ids.device.type,"cpu")
+        self.assertEqual(counts.device.type,"cpu")
+        self.assertEqual(labels.device.type,"cpu")
+        torch.testing.assert_close(ids,torch.tensor([2,5,9]))
+        torch.testing.assert_close(counts,torch.tensor([3,1,2]))
+        torch.testing.assert_close(labels,torch.tensor([2,2,2,5,9,9]))
+
     def test_reproducible_calibration_and_family_size(self):
         g=torch.Generator().manual_seed(11); y=torch.arange(8).repeat_interleave(6)
         x=torch.eye(8)[y]+.02*torch.randn(48,8,generator=g)

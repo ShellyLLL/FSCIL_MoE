@@ -34,6 +34,21 @@ class APCRunner(Runner):
         return F.normalize((x+adapter.residual_scale.to(x.dtype)*residual).float(),dim=-1)
 
     @staticmethod
+    def _cpu_class_metadata(class_ids,class_counts):
+        """Normalize historical class IDs/counts to CPU before label expansion.
+
+        These values are bookkeeping metadata used with CPU-cached anchor
+        features; keep them on CPU even when checkpoint class_ids were saved
+        from CUDA.
+        """
+        ids=torch.as_tensor(class_ids,dtype=torch.long).detach().cpu().reshape(-1)
+        counts=torch.as_tensor(class_counts,dtype=torch.long).detach().cpu().reshape(-1)
+        if ids.numel()==0 or counts.numel()!=ids.numel() or torch.any(counts<=0):
+            raise ValueError("Historical class IDs and positive anchor counts must align.")
+        labels=torch.repeat_interleave(ids,counts)
+        return ids,counts,labels
+
+    @staticmethod
     def _class_input_bank(item,class_ids):
         x=torch.as_tensor(item["cls_in"]).float().cpu()
         y=torch.as_tensor(item["labels"]).long().cpu()
@@ -102,15 +117,16 @@ class APCRunner(Runner):
         # both current and historical inputs through the exact existing expert
         # pool before calculating residual prototype confusion.
         current["cls_in"]=self._adapt_cls_anchors(adapter,current["cls_in"]).cpu()
-        old_input=torch.as_tensor(old_state["block_input_anchors"][str(stable)]).to(self.device)
-        old_counts=torch.as_tensor(old_state["block_input_counts"][str(stable)]).long()
-        old_ids=torch.as_tensor(old_state["class_ids"]).long()
-        if len(old_input)!=int(old_counts.sum()) or len(old_counts)!=len(old_ids):
+        old_input=torch.as_tensor(
+            old_state["block_input_anchors"][str(stable)],
+            device=self.device,dtype=torch.float32)
+        old_ids,old_counts,old_labels=self._cpu_class_metadata(
+            old_state["class_ids"],old_state["block_input_counts"][str(stable)])
+        if len(old_input)!=int(old_counts.sum()):
             raise ValueError("Historical stable-block feature memory is inconsistent.")
-        old_labels=torch.repeat_interleave(old_ids,old_counts)
         old_transformed=self._adapt_cls_anchors(adapter,old_input)
         old_proto=AdaptationAwarePrototypeController.prototypes(
-            {"cls_in":old_transformed.cpu(),"labels":old_labels,"source_ids":torch.arange(len(old_labels))},
+            {"cls_in":old_transformed.detach().cpu(),"labels":old_labels,"source_ids":torch.arange(len(old_labels),dtype=torch.long)},
             old_ids)
         decisions=self.apc_controller.decide(
             {stable:current},{str(stable):old_proto.cpu()},old_ids,class_ids,self.apc_state)
