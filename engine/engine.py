@@ -304,7 +304,7 @@ class Runner:
             raise ValueError("Checkpoint topology is incompatible; resume from Session 0.")
         if schema in (6, 7, 8, 9) and completed_session != 0:
             raise ValueError("Legacy incremental checkpoints use a different classifier protocol; resume from Session 0.")
-        if schema == 10 and not isinstance(payload.get("apc_state"), dict):
+        if schema in (10, 11) and not isinstance(payload.get("apc_state"), dict):
             raise ValueError("Schema 10 checkpoint is missing APC calibration state.")
         if not isinstance(payload["model_state"], dict):
             raise TypeError("Resume checkpoint model_state must be a state_dict mapping.")
@@ -334,7 +334,7 @@ class Runner:
         if manifest is None:
             raise ValueError("Resume checkpoint support_manifest must not be null.")
         self.data_manager.load_support_manifest(manifest)
-        self.apc_state = self._cpu_copy(payload.get("apc_state")) if schema == 10 else None
+        self.apc_state = self._cpu_copy(payload.get("apc_state")) if schema in (10, 11) else None
         base_proto = payload.get("base_vision_prototype")
         self.model_without_dp.base_vision_prototype = (
             None if base_proto is None else base_proto.to(self.device)
@@ -353,8 +353,9 @@ class Runner:
                                                torch.as_tensor(sources, dtype=torch.long).cpu())
             base_state["creation_session"] = 0
         self._resume_state_dict_list = payload.get("task_states", [])
-        self.task_gate_biases = ([0.0] * (completed_session + 1) if schema == 10 else
-                                  ([0.0] if schema in (6, 7, 8) else list(payload["task_gate_biases"])))
+        self.task_gate_biases = list(payload.get("task_gate_biases", [0.0] * (completed_session + 1)))
+        if schema >= 10 and len(self.task_gate_biases) != completed_session + 1:
+            raise ValueError("Checkpoint task gate biases do not match completed sessions.")
         if len(self.task_gate_biases) != completed_session + 1:
             raise ValueError("Checkpoint task gate biases do not match completed sessions.")
         self.acc_list = payload.get("acc_list", [])
@@ -373,7 +374,7 @@ class Runner:
         directory.mkdir(parents=True, exist_ok=True)
         topology = self.model_without_dp.export_moe_topology()
         payload = {
-            "schema_version": 10,
+            "schema_version": 11,
             "completed_session": int(completed_session),
             "apc_state": self._cpu_copy(self.apc_state or {}),
             "model_state": self._cpu_copy(self.model_without_dp.state_dict()),
@@ -531,8 +532,9 @@ class Runner:
     # Support-risk-guided expansion
     # ------------------------------------------------------------------
     def _current_encoder_version(self):
-        return max((birth for _, adapter in self._moe_adapters()
-                    for birth in adapter.expert_birth_sessions), default=0)
+        """Monotonic topology version; distinct from the session that created an expert."""
+        return max((version for _, adapter in self._moe_adapters()
+                    for version in adapter.expert_birth_versions), default=0)
 
     @torch.no_grad()
     def _support_bank(self, loader, class_index, text_features, description_proto,
