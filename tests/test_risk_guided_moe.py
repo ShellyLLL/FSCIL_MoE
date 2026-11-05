@@ -340,7 +340,7 @@ class ExpansionInvariantTests(unittest.TestCase):
                                        torch.eye(2))
             runner.save_checkpoint(0, runner._resume_state_dict_list)
             upgraded = torch.load(Path(directory) / "session_00.pth", weights_only=False)
-            self.assertEqual(upgraded["schema_version"], 9)
+            self.assertEqual(upgraded["schema_version"], 11)
             self.assertEqual(upgraded["task_gate_biases"], [0.0])
 
     def test_candidate_training_uses_fused_leave_one_out_scores(self):
@@ -395,9 +395,9 @@ class ExpansionInvariantTests(unittest.TestCase):
             def expandable_blocks(self):
                 return [0]
 
-            def add_expert(self, block_idx, session_id):
+            def add_expert(self, block_idx, session_id, version_id=None):
                 return self.clip_model.visual.transformer.resblocks[block_idx].moe_adapter.add_expert(
-                    session_id, reduction=2)
+                    session_id, reduction=2, version_id=version_id)
 
         cfg = SimpleNamespace(
             DATASET=SimpleNamespace(BETA=0.3, GPT_PATH="unused"),
