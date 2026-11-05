@@ -121,9 +121,37 @@ class APCRunner(Runner):
                 class_index, device=self.device, dtype=torch.long
             )
             new_state["creation_session"] = int(task_id)
-            states = [*self._resume_state_dict_list, new_state]
+            old_states = list(self._resume_state_dict_list)
+            old_merged = self.merge_dicts(old_states)
+            old_gate_correct, old_gate_total = 0, 0
+            for old_state in old_states:
+                old_features = old_state["anchor_features"].to(self.device).float()
+                old_labels = old_state["anchor_labels"].to(self.device)
+                old_evidence = self._anchor_task_scores(
+                    old_features, old_merged, self._anchor_leave_one_out(old_state), old_labels
+                )
+                old_logits = old_evidence + torch.as_tensor(
+                    previous_biases, device=self.device, dtype=old_evidence.dtype
+                )
+                old_targets = torch.full(
+                    (len(old_labels),), int(old_state["creation_session"]),
+                    device=self.device, dtype=torch.long
+                )
+                old_gate_correct += int(old_logits.argmax(dim=1).eq(old_targets).sum().item())
+                old_gate_total += len(old_labels)
+            baseline_old_gate_recall = old_gate_correct / max(1, old_gate_total)
+
+            states = [*old_states, new_state]
             merged = self.merge_dicts(states)
             gate_diagnostics = self._calibrate_task_gate(task_id, states)
+            tolerance = float(getattr(
+                self.cfg.TRAINER.BiMC.PROTECTION, "OLD_TASK_RECALL_TOLERANCE", 0.02
+            ))
+            if (gate_diagnostics["old_loo_task_recall"] + tolerance
+                    < baseline_old_gate_recall):
+                # Hard non-regression constraint: an expert cannot be accepted
+                # by trading away historical task selection.
+                return float("inf")
             # Keep the anchor task-selection objective inside candidate
             # verification, rather than accepting an expert on within-task CE
             # while silently degrading the historical task gate.
