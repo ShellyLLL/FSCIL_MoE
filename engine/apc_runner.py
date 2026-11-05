@@ -90,6 +90,63 @@ class APCRunner(Runner):
         )
         self._calibrate_apc(base_loader)
 
+    @torch.no_grad()
+    def _held_out_loss(self, validation_loader, support_loader, class_index, text,
+                       description, version, calibrate, previous_version=None):
+        """Evaluate the exact deployed, versioned global classifier on held-out queries.
+
+        Historical classes keep their immutable creation-version prototypes.
+        The candidate session gets prototypes from the candidate topology, while
+        task offsets are re-fitted from source-exclusive anchors for this exact
+        candidate/null state. No validation query contributes to its prototype.
+        """
+        task_id = len(self._resume_state_dict_list)
+        if task_id < 1:
+            raise RuntimeError("Global candidate verification requires a completed base classifier.")
+        class_names = np.asarray(self.data_manager.class_names)[
+            torch.as_tensor(class_index).cpu().numpy()
+        ].tolist()
+        model = self.model_without_dp
+        old_history = getattr(model, "_fused_history_prototypes", None)
+        old_history_ids = getattr(model, "_fused_history_class_ids", None)
+        previous_biases = list(self.task_gate_biases)
+        try:
+            model.eval()
+            new_state = model.build_task_statistics(
+                class_names, support_loader, class_index,
+                calibrate_novel_vision_proto=calibrate,
+                encoder_version=int(version),
+            )
+            new_state["class_ids"] = torch.as_tensor(
+                class_index, device=self.device, dtype=torch.long
+            )
+            new_state["creation_session"] = int(task_id)
+            states = [*self._resume_state_dict_list, new_state]
+            merged = self.merge_dicts(states)
+            self._calibrate_task_gate(task_id, states)
+            total, count = 0.0, 0
+            scale = float(self.cfg.TRAINER.BiMC.INCREMENTAL.LOGIT_SCALE)
+            for batch in validation_loader:
+                images, labels = self.parse_batch(batch)
+                # The versioned class logits and base-anchor task evidence are
+                # combined by the same retained-score rule used at deployment.
+                class_logits = self._versioned_scores(
+                    images, merged["fused_proto"], merged["encoder_versions"], scale
+                )
+                base_features = F.normalize(
+                    model.extract_img_feature(images, max_version=0).float(), dim=-1
+                )
+                deployed_logits = self._retained_scores(base_features, merged, class_logits)
+                targets = self._targets_to_columns(labels, merged)
+                loss = F.cross_entropy(deployed_logits.float(), targets, reduction="sum")
+                total += float(loss.item())
+                count += labels.numel()
+            return total / max(count, 1)
+        finally:
+            self.task_gate_biases = previous_biases
+            model._fused_history_prototypes = old_history
+            model._fused_history_class_ids = old_history_ids
+
     def _evaluate_null_losses(self, folds, class_ids, text, description,
                               version, calibrate):
         values = []
