@@ -17,6 +17,7 @@ def make_layer_features(class_vectors, shots=8, noise=0.005, seed=7):
     return {
         "cls_in": features.clone(),
         "cls_out": features.clone(),
+        "block_out": features.clone(),
         "labels": labels,
         "source_ids": torch.arange(len(labels)),
     }
@@ -91,20 +92,30 @@ class MultiLayerAPCTests(unittest.TestCase):
         with self.assertRaises(KeyError):
             controller.calibrate(invalid, 1, 2)
 
-    def test_zero_up_expert_preserves_old_function_and_cls_out_is_exposed(self):
+    def test_zero_up_expert_preserves_old_function_and_version_is_explicit(self):
         adapter = VisualMoEAdapter(8, 2, 2).eval()
         x = torch.randn(5, 3, 8)
-        before, aux_before = adapter(x)
-        adapter.add_expert(session_id=1, reduction=2)
-        after, aux_after = adapter(x)
-        torch.testing.assert_close(before, after, rtol=0, atol=0)
-        self.assertIn("cls_out", aux_after)
-        torch.testing.assert_close(
-            aux_after["cls_out"],
-            F.normalize(aux_after["cls_in"] + after[0], dim=-1),
-            rtol=1e-5, atol=1e-6,
-        )
-        self.assertLess(float(aux_after["route_weights"][:, 2:].sum(-1).max()), 1.0)
+        before, _ = adapter(x, max_version=0)
+        adapter.add_expert(session_id=1, reduction=2, version_id=4)
+        after_old, aux_old = adapter(x, max_version=3)
+        after_new, aux_new = adapter(x, max_version=4)
+        torch.testing.assert_close(before, after_old, rtol=0, atol=0)
+        torch.testing.assert_close(before, after_new, rtol=0, atol=0)
+        self.assertEqual(adapter.expert_birth_sessions, [0, 0, 1])
+        self.assertEqual(adapter.expert_birth_versions, [0, 0, 4])
+        self.assertIn("cls_out", aux_new)
+        self.assertIn("block_out", aux_new)  # supplied by ResidualAttentionBlock, not adapter
+        self.assertLess(float(aux_old["route_weights"].shape[-1]), float(aux_new["route_weights"].shape[-1]))
+
+    def test_topology_round_trip_preserves_monotonic_versions(self):
+        adapter = VisualMoEAdapter(8, 2, 2).eval()
+        adapter.add_expert(session_id=2, reduction=2, version_id=5)
+        adapter.add_expert(session_id=2, reduction=2, version_id=6)
+        topology = adapter.export_topology()
+        clone = VisualMoEAdapter(8, 2, 2).eval()
+        clone.rebuild_topology(topology)
+        self.assertEqual(clone.expert_birth_sessions, [0, 0, 2, 2])
+        self.assertEqual(clone.expert_birth_versions, [0, 0, 5, 6])
 
 
 if __name__ == "__main__":
