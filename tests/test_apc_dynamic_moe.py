@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 
 from engine.apc import AdaptationAwarePrototypeController
-from models.clip.model import VisualMoEAdapter
+from models.clip.model import ResidualAttentionBlock, VisualMoEAdapter
 
 
 def make_layer_features(class_vectors, shots=8, noise=0.005, seed=7):
@@ -105,6 +105,14 @@ class MultiLayerAPCTests(unittest.TestCase):
         self.assertEqual(adapter.expert_birth_versions, [0, 0, 4])
         self.assertIn("cls_out", aux_new)
         self.assertLess(float(aux_old["route_weights"].shape[-1]), float(aux_new["route_weights"].shape[-1]))
+
+    def test_apc_block_feature_is_actual_post_residual_transformer_state(self):
+        block = ResidualAttentionBlock(8, 2).eval()
+        block.moe_adapter = VisualMoEAdapter(8, 2, 2).eval()
+        x = torch.randn(5, 3, 8)
+        output, aux = block(x, max_version=0)
+        torch.testing.assert_close(aux["block_out"], output[0], rtol=0, atol=0)
+        self.assertFalse(torch.equal(aux["block_out"], aux["adapter_output_cls"]))
 
     def test_topology_round_trip_preserves_monotonic_versions(self):
         adapter = VisualMoEAdapter(8, 2, 2).eval()
