@@ -230,11 +230,18 @@ class VisualMoEAdapter(nn.Module):
     """Unified expert pool, descriptors and expandable soft router."""
 
     def __init__(self, d_model, num_experts=4, reduction=4, residual_scale_init=1.0,
-                 descriptor_dim=64, descriptor_eps=1e-4):
+                 descriptor_dim=64, descriptor_eps=1e-4,
+                 base_top_k=2, incremental_top_k=2):
         super().__init__()
         self.d_model, self.base_expert_count = int(d_model), int(num_experts)
         self.default_reduction, self.descriptor_dim = int(reduction), int(descriptor_dim)
         self.descriptor_eps = float(descriptor_eps)
+        self.base_top_k = int(base_top_k)
+        self.incremental_top_k = int(incremental_top_k)
+        if not 1 <= self.base_top_k <= self.base_expert_count:
+            raise ValueError("base_top_k must be within the base expert pool.")
+        if self.incremental_top_k < 1:
+            raise ValueError("incremental_top_k must be positive.")
         self.layer_norm = LayerNorm(self.d_model)
         self.residual_scale = nn.Parameter(torch.ones(1) * float(residual_scale_init))
         self.experts = nn.ModuleList([BottleneckExpert(self.d_model, reduction)
@@ -314,17 +321,54 @@ class VisualMoEAdapter(nn.Module):
             parameters += list(self.descriptors[-1].parameters())
         return parameters
 
-    def newest_contribution(self, normalized_cls_features):
-        """Effective newest-expert gate and residual on frozen historical anchors."""
+    @staticmethod
+    def _topk_mask(logits, top_k, force_column=None):
+        if logits.ndim != 2 or logits.size(-1) == 0:
+            raise ValueError("Router logits must be a non-empty [batch, experts] tensor.")
+        k = min(max(1, int(top_k)), logits.size(-1))
+        indices = logits.topk(k, dim=-1).indices
+        if force_column is not None:
+            force_column = int(force_column)
+            if not 0 <= force_column < logits.size(-1):
+                raise ValueError("Forced router column is outside the active expert pool.")
+            missing = ~indices.eq(force_column).any(dim=-1)
+            if bool(missing.any().item()):
+                indices = indices.clone()
+                indices[missing, -1] = force_column
+        mask = torch.zeros_like(logits, dtype=torch.bool).scatter_(1, indices, True)
+        return mask, indices
+
+    def _incremental_routing(self, x, max_version=None, force_newest=False):
+        active = [index for index in range(self.base_expert_count, self.num_experts)
+                  if max_version is None or self.expert_birth_versions[index] <= max_version]
+        if not active:
+            empty = x.new_zeros((x.size(0), 0))
+            return active, empty, empty, torch.zeros_like(empty, dtype=torch.bool), empty.long()
+        logits = torch.cat([self.router.columns[index](x) for index in active], dim=-1)
+        force_column = len(active) - 1 if force_newest and active[-1] == self.num_experts - 1 else None
+        selected, indices = self._topk_mask(logits, self.incremental_top_k, force_column)
+        gates = torch.sigmoid(logits) * selected.to(logits.dtype)
+        weights = gates / (1.0 + gates.sum(dim=-1, keepdim=True))
+        return active, logits, weights, selected, indices
+
+    def newest_gate(self, normalized_cls_features):
+        """Raw independent sigmoid gate used by the historical-class suppression loss."""
+        if self.num_experts <= self.base_expert_count:
+            raise RuntimeError("there is no incremental expert to inspect.")
+        x = torch.as_tensor(normalized_cls_features, device=self.residual_scale.device,
+                            dtype=self.residual_scale.dtype)
+        return torch.sigmoid(self.router.columns[-1](x)).squeeze(-1)
+
+    def newest_contribution(self, normalized_cls_features, max_version=None):
+        """Return the newest expert's actual sparse route weight and residual."""
         if self.num_experts <= self.base_expert_count:
             raise RuntimeError("there is no incremental expert to protect.")
         x = torch.as_tensor(normalized_cls_features, device=self.residual_scale.device,
                             dtype=self.residual_scale.dtype)
-        active = list(range(self.base_expert_count, self.num_experts))
-        gates = torch.cat([torch.sigmoid(self.router.columns[i](x)) for i in active], dim=-1)
-        denominator = 1.0 + gates.sum(dim=-1, keepdim=True)
-        col = active.index(self.num_experts - 1)
-        effective = gates[:, col] / denominator.squeeze(-1)
+        active, _, weights, _, _ = self._incremental_routing(x, max_version, False)
+        if self.num_experts - 1 not in active:
+            return x.new_zeros(x.size(0)), x.new_zeros(x.shape)
+        effective = weights[:, active.index(self.num_experts - 1)]
         contribution = self.experts[-1](x) * effective.unsqueeze(-1)
         return effective, contribution * self.residual_scale.to(contribution.dtype)
 
@@ -336,7 +380,8 @@ class VisualMoEAdapter(nn.Module):
                 yield name, parameter
 
     def export_topology(self):
-        return {"version": 1, "d_model": self.d_model, "base_expert_count": self.base_expert_count,
+        return {"version": 2, "d_model": self.d_model, "base_expert_count": self.base_expert_count,
+                "base_top_k": self.base_top_k, "incremental_top_k": self.incremental_top_k,
                 "experts": [{"reduction": max(1, self.d_model // expert.c_fc.out_features),
                              "birth_session": int(self.expert_birth_sessions[index]),
                              "birth_version": int(self.expert_birth_versions[index])}
@@ -351,6 +396,10 @@ class VisualMoEAdapter(nn.Module):
             raise ValueError("MoE topology d_model mismatch.")
         if int(topology.get("base_expert_count", self.base_expert_count)) != self.base_expert_count:
             raise ValueError("MoE topology base expert count mismatch.")
+        if int(topology.get("base_top_k", self.base_top_k)) != self.base_top_k:
+            raise ValueError("MoE topology base Top-K does not match the active configuration.")
+        if int(topology.get("incremental_top_k", self.incremental_top_k)) != self.incremental_top_k:
+            raise ValueError("MoE topology incremental Top-K does not match the active configuration.")
         specs = list(topology.get("experts", []))
         if len(specs) < self.base_expert_count:
             raise ValueError("MoE topology has fewer experts than the base pool.")
@@ -371,8 +420,11 @@ class VisualMoEAdapter(nn.Module):
             fallback_version = (0 if len(self.expert_birth_versions) < self.base_expert_count
                                 else max(self.expert_birth_versions, default=0) + 1)
             birth_version = int(spec.get("birth_version", fallback_version))
-            if self.expert_birth_versions and birth_version < max(self.expert_birth_versions):
-                raise ValueError("MoE topology versions must be monotonically non-decreasing.")
+            if len(self.expert_birth_versions) < self.base_expert_count:
+                if birth_version != 0:
+                    raise ValueError("Base experts must belong to topology version zero.")
+            elif birth_version <= max(self.expert_birth_versions, default=0):
+                raise ValueError("Incremental expert topology versions must be strictly increasing.")
             self.expert_birth_versions.append(birth_version)
         device, dtype = self.residual_scale.device, self.residual_scale.dtype
         self.experts.to(device=device, dtype=dtype)
@@ -401,32 +453,69 @@ class VisualMoEAdapter(nn.Module):
         if x.ndim != 3:
             raise ValueError("VisualMoEAdapter expects [tokens, batch, dim].")
         x_norm = self.layer_norm(x)
-        # The base mixture is never renormalised when incremental experts arrive.
-        base_logits, base_weights = self.router(x_norm[0], self.base_expert_count)
-        active = [index for index in range(self.base_expert_count, self.num_experts)
-                  if max_version is None or self.expert_birth_versions[index] <= max_version]
-        gate_logits = [self.router.columns[index](x_norm[0]) for index in active]
-        if gate_logits:
-            gates = torch.cat([torch.sigmoid(value) for value in gate_logits], dim=-1)
-            incremental_weights = gates / (1.0 + gates.sum(dim=-1, keepdim=True))
-            weights = torch.cat([base_weights, incremental_weights], dim=-1)
-        else:
-            weights = base_weights
-        logits = torch.cat([base_logits] + gate_logits, dim=-1) if gate_logits else base_logits
-        residual, norms = torch.zeros_like(x_norm), []
-        for column, expert_id in enumerate(list(range(self.base_expert_count)) + active):
-            weighted = self.experts[expert_id](x_norm) * weights[:, column].unsqueeze(0).unsqueeze(-1)
-            residual = residual + weighted
+        base_logits, _ = self.router(x_norm[0], self.base_expert_count)
+        base_selected, base_indices = self._topk_mask(base_logits, self.base_top_k)
+        base_weights = torch.softmax(base_logits.masked_fill(~base_selected, float("-inf")), dim=-1)
+
+        force_newest = self.training and any(
+            parameter.requires_grad for parameter in self.newest_parameters()
+        )
+        active, incremental_logits, incremental_weights, incremental_selected, incremental_indices = (
+            self._incremental_routing(x_norm[0], max_version, force_newest)
+        )
+        weights = torch.cat([base_weights, incremental_weights], dim=-1)
+        selected_mask = torch.cat([base_selected, incremental_selected], dim=-1)
+        logits = (torch.cat([base_logits, incremental_logits], dim=-1)
+                  if active else base_logits)
+        top_k_indices = (torch.cat([base_indices, incremental_indices + self.base_expert_count], dim=-1)
+                         if active else base_indices)
+
+        # Execute only experts selected by at least one sample in this batch.
+        # Unselected experts are not evaluated and receive no activation/gradient.
+        residual = torch.zeros_like(x_norm)
+        norms = []
+        active_columns = {expert_id: self.base_expert_count + offset
+                          for offset, expert_id in enumerate(active)}
+        for expert_id in range(self.num_experts):
+            if expert_id < self.base_expert_count:
+                column = expert_id
+            elif expert_id in active_columns:
+                column = active_columns[expert_id]
+            else:
+                norms.append(x_norm.new_zeros((), dtype=torch.float32))
+                continue
+            sample_indices = torch.nonzero(weights[:, column] > 0, as_tuple=False).flatten()
+            if sample_indices.numel() == 0:
+                norms.append(x_norm.new_zeros((), dtype=torch.float32))
+                continue
+            expert_input = x_norm.index_select(1, sample_indices)
+            expert_output = self.experts[expert_id](expert_input)
+            sample_weights = weights.index_select(0, sample_indices)[:, column].view(1, -1, 1)
+            weighted = expert_output * sample_weights
+            residual = residual.index_add(1, sample_indices, weighted)
             norms.append(weighted.detach().float().pow(2).mean().sqrt())
+
         residual = self.residual_scale.to(residual.dtype) * residual
         adapted = x_norm + residual
-        return residual, {"logits": logits, "route_weights": weights,
-                          "top_k_indices": weights.argmax(dim=-1, keepdim=True),
-                          "cls_in": x_norm[0], "adapter_output_cls": adapted[0], "cls_out": adapted[0],
-                          "patch_mean_in": x_norm[1:].mean(dim=0),
-                          "expert_residual_norms": torch.stack(norms),
-                          "token_residual": residual.detach()}
-
+        return residual, {
+            "logits": logits,
+            "route_weights": weights,
+            "selected_mask": selected_mask,
+            "base_route_weights": base_weights,
+            "base_selected_mask": base_selected,
+            "incremental_route_weights": incremental_weights,
+            "incremental_selected_mask": incremental_selected,
+            "base_top_k_indices": base_indices,
+            "incremental_top_k_indices": incremental_indices,
+            "top_k_indices": top_k_indices,
+            "adapter_input_cls": x[0],
+            "cls_in": x_norm[0],
+            "adapter_output_cls": adapted[0],
+            "cls_out": adapted[0],
+            "patch_mean_in": x_norm[1:].mean(dim=0),
+            "expert_residual_norms": torch.stack(norms),
+            "token_residual": residual.detach(),
+        }
 
 class ResidualAttentionBlock(nn.Module):
     def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None):
@@ -676,6 +765,8 @@ def build_model(state_dict: dict, cfg=None):
             "BASE_SCALE_INIT",
             getattr(moe_cfg, "RESIDUAL_SCALE_INIT", 1.0),
         )
+        base_top_k = getattr(moe_cfg, "BASE_TOP_K", 2)
+        incremental_top_k = getattr(moe_cfg, "INCREMENTAL_TOP_K", 2)
         descriptor_dim = getattr(moe_cfg, "DESCRIPTOR_DIM", 64)
         descriptor_eps = getattr(moe_cfg, "DESCRIPTOR_EPS", 1e-4)
         for idx in moe_cfg.INSERT_BLOCKS:
@@ -688,6 +779,8 @@ def build_model(state_dict: dict, cfg=None):
                 residual_scale_init=base_scale_init,
                 descriptor_dim=descriptor_dim,
                 descriptor_eps=descriptor_eps,
+                base_top_k=base_top_k,
+                incremental_top_k=incremental_top_k,
             )
         convert_weights(model)
     return model.eval()

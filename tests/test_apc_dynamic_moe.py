@@ -125,6 +125,50 @@ class MultiLayerAPCTests(unittest.TestCase):
         self.assertEqual(clone.expert_birth_versions, [0, 0, 5, 6])
 
 
+    def test_topk_router_executes_only_sparse_expert_routes(self):
+        torch.manual_seed(19)
+        adapter = VisualMoEAdapter(
+            8, num_experts=4, reduction=2, base_top_k=2, incremental_top_k=1
+        ).eval()
+        x = torch.randn(5, 3, 8)
+        base_output, base_aux = adapter(x, max_version=0)
+        self.assertTrue(base_aux["base_selected_mask"].sum(dim=1).eq(2).all())
+        self.assertTrue(base_aux["base_route_weights"].ne(0).sum(dim=1).eq(2).all())
+        self.assertEqual(base_aux["incremental_route_weights"].size(1), 0)
+
+        adapter.add_expert(session_id=1, reduction=2, version_id=1)
+        adapter.add_expert(session_id=2, reduction=2, version_id=2)
+        current_output, current_aux = adapter(x, max_version=2)
+        self.assertTrue(current_aux["base_selected_mask"].sum(dim=1).eq(2).all())
+        self.assertTrue(current_aux["incremental_selected_mask"].sum(dim=1).eq(1).all())
+        torch.testing.assert_close(
+            base_aux["base_route_weights"], current_aux["base_route_weights"],
+            rtol=0, atol=0,
+        )
+        torch.testing.assert_close(
+            base_output, adapter(x, max_version=0)[0], rtol=0, atol=0
+        )
+        self.assertEqual(current_aux["route_weights"].size(1), 6)
+
+    def test_training_router_forces_newest_expert_into_topk(self):
+        torch.manual_seed(23)
+        adapter = VisualMoEAdapter(
+            8, num_experts=2, reduction=2, base_top_k=1, incremental_top_k=1
+        )
+        adapter.add_expert(session_id=1, reduction=2, version_id=1)
+        adapter.add_expert(session_id=2, reduction=2, version_id=2)
+        with torch.no_grad():
+            adapter.router.columns[-2].bias.fill_(10.0)
+            adapter.router.columns[-1].bias.zero_()
+        adapter.train()
+        x = torch.randn(5, 2, 8)
+        output, aux = adapter(x, max_version=2)
+        self.assertTrue(aux["incremental_selected_mask"][:, -1].all())
+        output.square().mean().backward()
+        newest_grad = adapter.experts[-1].c_proj.weight.grad
+        self.assertIsNotNone(newest_grad)
+        self.assertGreater(float(newest_grad.abs().sum()), 0.0)
+
     def test_topology_bound_calibration_rejects_stale_topology(self):
         centers = torch.eye(8)
         features = {8: make_layer_features(centers[:6], seed=8)}

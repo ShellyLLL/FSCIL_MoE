@@ -21,14 +21,24 @@ from utils.evaluator import AccuracyEvaluator
 
 
 def compute_load_balance_loss(moe_aux_list, num_experts):
-    """Base-session load balance over the unified soft router."""
+    """Switch-style importance/load balance over the sparse base-expert router."""
     if not moe_aux_list:
         return torch.tensor(0.0)
     losses = []
     for aux in moe_aux_list:
-        weights = aux["route_weights"].float()
-        top1 = F.one_hot(weights.argmax(dim=-1), num_classes=num_experts).float()
-        losses.append(num_experts * torch.sum(weights.mean(dim=0) * top1.mean(dim=0)))
+        weights = aux.get("base_route_weights", aux["route_weights"][:, :num_experts]).float()
+        selected = aux.get("base_selected_mask")
+        if selected is None:
+            selected = F.one_hot(weights.argmax(dim=-1), num_classes=num_experts).bool()
+        else:
+            selected = selected.bool()
+        if weights.ndim != 2 or weights.size(1) != num_experts or selected.shape != weights.shape:
+            raise ValueError("Sparse router balance tensors do not match the base expert pool.")
+        batch_size = max(1, weights.size(0))
+        selected_per_example = selected.sum(dim=1).float().mean().clamp_min(1.0)
+        importance = weights.mean(dim=0)
+        load = selected.float().sum(dim=0) / (batch_size * selected_per_example)
+        losses.append(num_experts * torch.sum(importance * load))
     return torch.stack(losses).mean()
 
 
