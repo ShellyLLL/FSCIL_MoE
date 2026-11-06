@@ -34,7 +34,7 @@ class MultiLayerAPCTests(unittest.TestCase):
         }
         controller = AdaptationAwarePrototypeController(.05, 64, 3)
         state = controller.calibrate(features, n_new_classes=2, k_shot=5)
-        self.assertEqual(state["version"], 3)
+        self.assertEqual(state["version"], 4)
         self.assertEqual(sorted(map(int, state["blocks"])), [8, 9, 10, 11])
         for block in (8, 9, 10, 11):
             self.assertIn("risk_threshold", state["blocks"][str(block)])
@@ -123,6 +123,28 @@ class MultiLayerAPCTests(unittest.TestCase):
         clone.rebuild_topology(topology)
         self.assertEqual(clone.expert_birth_sessions, [0, 0, 2, 2])
         self.assertEqual(clone.expert_birth_versions, [0, 0, 5, 6])
+
+
+    def test_topology_bound_calibration_rejects_stale_topology(self):
+        centers = torch.eye(8)
+        features = {8: make_layer_features(centers, seed=8)}
+        controller = AdaptationAwarePrototypeController(.05, 32, 3)
+        state = controller.calibrate(
+            features, n_new_classes=2, k_shot=5,
+            topology_version=3, topology_signature="topology-A",
+            support_manifest_hash="manifest-A",
+        )
+        current = {8: make_layer_features(centers, seed=19)}
+        with self.assertRaisesRegex(ValueError, "different MoE topology"):
+            controller.decide(
+                current, torch.arange(6), torch.tensor([6, 7]), state,
+                topology_version=3, topology_signature="topology-B",
+            )
+        with self.assertRaisesRegex(ValueError, "different topology version"):
+            controller.decide(
+                current, torch.arange(6), torch.tensor([6, 7]), state,
+                topology_version=4, topology_signature="topology-A",
+            )
 
 
 if __name__ == "__main__":

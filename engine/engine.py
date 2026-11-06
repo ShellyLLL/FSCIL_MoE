@@ -626,26 +626,51 @@ class Runner:
 
     def _support_folds(self, train_loader, extract_loader):
         train_data, extract_data = train_loader.dataset, extract_loader.dataset
-        if not np.array_equal(train_data.source_ids, extract_data.source_ids):
-            raise RuntimeError("Train and extraction loaders must share source order.")
-        labels = np.asarray(extract_data.labels)
-        groups = [np.flatnonzero(labels == cls) for cls in np.unique(labels)]
-        folds = min(len(group) for group in groups)
-        # A held-out query and a source-exclusive training prototype require
-        # at least three distinct sources per class.
+        train_sources = np.asarray(train_data.source_ids)
+        extract_sources = np.asarray(extract_data.source_ids)
+        train_labels = np.asarray(train_data.labels)
+        extract_labels = np.asarray(extract_data.labels)
+        if (not np.array_equal(train_sources, extract_sources)
+                or not np.array_equal(train_labels, extract_labels)):
+            raise RuntimeError("Train and extraction loaders must share source/label order.")
+        if train_sources.shape != train_labels.shape:
+            raise RuntimeError("Support source IDs and labels must align.")
+        for source_id in np.unique(train_sources):
+            if len(np.unique(train_labels[train_sources == source_id])) != 1:
+                raise RuntimeError("One support source ID cannot belong to multiple classes.")
+        class_sources = {
+            int(cls): np.unique(train_sources[train_labels == cls])
+            for cls in np.unique(train_labels)
+        }
+        folds = min(len(values) for values in class_sources.values())
+        # Hold out complete source groups (including all augmentations/views),
+        # leaving at least two independent sources to form each query's own-class
+        # prototype and a third source for an independent validation query.
         if folds < 3:
             return []
         result = []
         for fold in range(folds):
-            held_out = sorted(int(group[fold]) for group in groups)
-            fitting = sorted(set(range(len(labels))) - set(held_out))
+            held_sources = {cls: values[fold] for cls, values in class_sources.items()}
+            held_out = np.flatnonzero(np.asarray([
+                held_sources[int(label)] == source
+                for label, source in zip(extract_labels, extract_sources)
+            ])).tolist()
+            fitting = sorted(set(range(len(extract_labels))) - set(held_out))
+            if not held_out or not fitting:
+                raise RuntimeError("Source-grouped support fold is empty.")
+
             def loader(dataset, indices, shuffle):
-                return DataLoader(Subset(dataset, indices), batch_size=train_loader.batch_size,
-                                  shuffle=shuffle, num_workers=train_loader.num_workers,
-                                  drop_last=False, pin_memory=True)
-            result.append((loader(train_data, fitting, True),
-                           loader(extract_data, fitting, False),
-                           loader(extract_data, held_out, False)))
+                return DataLoader(
+                    Subset(dataset, indices), batch_size=train_loader.batch_size,
+                    shuffle=shuffle, num_workers=train_loader.num_workers,
+                    drop_last=False, pin_memory=True,
+                )
+
+            result.append((
+                loader(train_data, fitting, True),
+                loader(extract_data, fitting, False),
+                loader(extract_data, held_out, False),
+            ))
         return result
 
     def _representation_drift(self, images, current_version, previous_version):

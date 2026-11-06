@@ -17,7 +17,7 @@ A class prototype stores its `encoder_version`. Its image feature and its classi
 
 ## APC representation
 
-APC uses the post-residual Transformer block hidden state: the exact CLS state passed to the next Transformer block. The Adapter's normalized input and adapter-local output remain separately exposed for diagnostics, but are not substituted for the actual block output. APC calibration schema is version 3 because the representation definition changed.
+APC uses the post-residual Transformer block hidden state: the exact CLS state passed to the next Transformer block. The Adapter's normalized input and adapter-local output remain separately exposed for diagnostics, but are not substituted for the actual block output. APC calibration schema is version 4. Its calibration state is bound to the exact MoE topology signature/version, historical global class IDs, and support-manifest hash; stale calibration is rebuilt before a decision.
 
 ## Candidate validation and deployment classifier
 
@@ -30,11 +30,11 @@ A candidate is no longer accepted from novel-only class loss. Each source-disjoi
 5. The held-out novel query is evaluated against **all seen classes**, not only the current session's classes.
 6. The objective also includes class-balanced source-exclusive anchor task-gate loss, so a candidate cannot be selected solely for improving new-class discrimination while ignoring the historical task gate.
 
-The candidate and null model use paired source folds and identical scoring semantics. Candidate parameters are reset between folds. A candidate must exceed the paired one-standard-error threshold. Greedy selection is marginal: after a committed layer changes the topology, APC is recalibrated and all remaining layer representations are recomputed.
+The candidate and null model use paired, source-grouped folds and identical scoring semantics. Every view of a source is held out together, and a source ID is forbidden from crossing class labels. Candidate parameters are reset between folds. The best candidate must exceed a family-wise paired threshold (Bonferroni-adjusted normal critical value) for the number of candidates tested in that round. The best-performing fold's trained expert/router state initializes full-support retraining, rather than restarting from an unrelated random initialization. Greedy selection is marginal: after a committed layer changes the topology, APC is recalibrated and all remaining layer representations are recomputed.
 
 ## Historical knowledge and state
 
-Historical experts and router columns are frozen. Historical class prototypes remain immutable and retain their creation topology version. Task-gate calibration uses source-exclusive anchors. Checkpoints persist topology metadata, task states, gate offsets, APC calibration, support manifest, diagnostics and RNG state. The current checkpoint schema is 11; schema 10 and 11 APC payloads are recognized, but APC v2 calibration is intentionally rejected by the v3 controller and must be recalibrated from Session 0.
+Historical experts and router columns are frozen. Historical class prototypes remain immutable and retain their creation topology version. Task-gate calibration uses source-exclusive anchors. Checkpoints persist topology metadata, task states, gate offsets, APC calibration, support manifest, diagnostics and RNG state. The current checkpoint schema is 11; schema 10 and 11 APC payloads are recognized, but APC v2/v3 calibration is never reused by the v4 controller. It is recalibrated from the historical support manifest at the completed session, without requiring the entire FSCIL stream to restart.
 
 ## Efficiency accounting
 
@@ -64,7 +64,10 @@ benchmark and not evidence of CUB200 accuracy improvement.
 - Adapter input, adapter-local output, and actual post-residual block output have distinct definitions and tests.
 - Expert birth versions are monotonic and topology save/load round-trips exactly.
 - Historical class logits are invariant under the addition of a later-version expert when evaluated at their creation version.
-- Candidate/null validation uses the exact global versioned classifier and source-exclusive support prototypes.
+- Candidate/null validation uses the exact global versioned BiMC classifier, all currently accumulated historical task states, and source-exclusive support prototypes.
+- APC state is rejected when its topology signature/version or historical class set is stale.
+- Cross-validation holds out complete source groups, not individual rows/views.
+- Candidate selection controls family-wise false expansion across layers and reuses the selected trained fold state for final support retraining.
 - Task-gate offsets and all prototype/version metadata survive checkpoint round-trip with identical logits.
 - Multi-layer expansion commits zero, one, or multiple experts without duplicate versions or stale downstream APC features.
 - Tests cover candidate rollback, frozen historical parameters, source leakage, and checkpoint recovery.

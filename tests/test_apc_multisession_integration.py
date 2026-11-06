@@ -469,7 +469,7 @@ class APCRunnerMultiSessionIntegrationTests(unittest.TestCase):
             self.assertEqual(payload["completed_session"], 2)
             self.assertEqual(len(payload["task_states"]), 3)
             self.assertEqual(len(payload["task_gate_biases"]), 3)
-            self.assertEqual(payload["apc_state"]["version"], 3)
+            self.assertEqual(payload["apc_state"]["version"], 4)
 
             resumed = make_runner(directory, resume=str(checkpoint))
             resumed._load_resume_checkpoint_if_requested()
@@ -521,6 +521,39 @@ class APCRunnerMultiSessionIntegrationTests(unittest.TestCase):
                 self.assertEqual(left["expert_counts"], right["expert_counts"])
                 self.assertEqual(left["classifier"]["AA"], right["classifier"]["AA"])
                 self.assertEqual(left["classifier"]["PD"], right["classifier"]["PD"])
+
+    def test_support_folds_hold_out_complete_source_groups(self):
+        class MultiViewSupport(Dataset):
+            def __init__(self):
+                base = SyntheticSupport([0, 1], shots=5, seed=37)
+                self.labels = np.repeat(base.labels, 2)
+                self.source_ids = np.repeat(base.source_ids, 2)
+                self.images = base.images.repeat_interleave(2, dim=0)
+
+            def __len__(self):
+                return len(self.labels)
+
+            def __getitem__(self, index):
+                return {
+                    "image": self.images[index].clone(),
+                    "label": int(self.labels[index]),
+                    "source_id": int(self.source_ids[index]),
+                }
+
+        with tempfile.TemporaryDirectory() as directory:
+            runner = make_runner(directory)
+            dataset = MultiViewSupport()
+            train = DataLoader(dataset, batch_size=8, shuffle=True)
+            extract = DataLoader(dataset, batch_size=8, shuffle=False)
+            folds = runner._support_folds(train, extract)
+            self.assertEqual(len(folds), 5)
+            for fit_train, fit_extract, validation in folds:
+                fit_sources = set(fit_extract.dataset.dataset.source_ids[
+                    fit_extract.dataset.indices].tolist())
+                held_sources = set(validation.dataset.dataset.source_ids[
+                    validation.dataset.indices].tolist())
+                self.assertEqual(len(held_sources), 2)
+                self.assertFalse(fit_sources & held_sources)
 
     def test_versioned_global_classifier_preserves_old_columns_after_two_expansions(self):
         with tempfile.TemporaryDirectory() as directory:

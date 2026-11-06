@@ -1,6 +1,9 @@
 """Multi-layer APC-controlled dynamic MoE FSCIL runner."""
 import copy
+import hashlib
+import json
 import time
+from statistics import NormalDist
 
 import numpy as np
 import torch
@@ -61,16 +64,26 @@ class APCRunner(Runner):
             task_id, source="train", mode="test", accumulate_past=True
         )
 
-    def _calibrate_apc(self, base_loader):
+    def _topology_identity(self):
+        topology = self.model_without_dp.export_moe_topology()
+        payload = json.dumps(topology, sort_keys=True, separators=(",", ":"))
+        signature = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        return self._current_encoder_version(), signature
+
+    def _calibrate_apc(self, historical_loader):
         self.model.eval()
-        features = self.model_without_dp.collect_blockwise_cls_features(base_loader)
+        features = self.model_without_dp.collect_blockwise_cls_features(historical_loader)
+        topology_version, topology_signature = self._topology_identity()
         if not features:
             raise RuntimeError("No configured MoE block produced base calibration features.")
         for block, item in features.items():
             if "block_out" not in item:
                 raise RuntimeError(f"MoE block {block} does not expose the actual post-residual Transformer block output.")
         self.apc_state = self.apc_controller.calibrate(
-            features, self.cfg.DATASET.NUM_INC_CLS, self.cfg.DATASET.NUM_INC_SHOT
+            features, self.cfg.DATASET.NUM_INC_CLS, self.cfg.DATASET.NUM_INC_SHOT,
+            topology_version=topology_version,
+            topology_signature=topology_signature,
+            support_manifest_hash=self._support_manifest_hash(),
         )
         print("=> [APC] calibrated blocks:",
               sorted(int(key) for key in self.apc_state["blocks"]))
@@ -78,21 +91,24 @@ class APCRunner(Runner):
     def _ensure_apc_ready(self, completed_session):
         if not self._moe_adapters() or completed_session < 0:
             return
-        if self.apc_state and int(self.apc_state.get("version", -1)) == self.apc_controller.VERSION:
-            return
-        if completed_session > 0:
-            raise RuntimeError(
-                "This checkpoint contains a legacy single-layer APC topology. "
-                "Start a fresh Session-0 run for the multi-layer expansion protocol."
-            )
-        base_loader = self.data_manager.get_dataloader(
-            0, source="train", mode="test", accumulate_past=False
+        if (self.apc_state
+                and int(self.apc_state.get("version", -1)) == self.apc_controller.VERSION):
+            topology_version, topology_signature = self._topology_identity()
+            if (int(self.apc_state.get("topology_version", -1)) == topology_version
+                    and str(self.apc_state.get("topology_signature", "")) == topology_signature):
+                return
+        # APC v2/v3 checkpoints and states calibrated before the last topology
+        # transition are not silently reused. Rebuild the statistical reference
+        # from the exact historical support manifest and current topology.
+        historical_loader = self.data_manager.get_dataloader(
+            completed_session, source="train", mode="test", accumulate_past=True
         )
-        self._calibrate_apc(base_loader)
+        self._calibrate_apc(historical_loader)
 
     @torch.no_grad()
     def _held_out_loss(self, validation_loader, support_loader, class_index, text,
-                       description, version, calibrate, previous_version=None):
+                       description, version, calibrate, history_states,
+                       previous_version=None):
         """Evaluate the exact deployed, versioned global classifier on held-out queries.
 
         Historical classes keep their immutable creation-version prototypes.
@@ -100,7 +116,7 @@ class APCRunner(Runner):
         task offsets are re-fitted from source-exclusive anchors for this exact
         candidate/null state. No validation query contributes to its prototype.
         """
-        task_id = len(self._resume_state_dict_list)
+        task_id = len(history_states)
         if task_id < 1:
             raise RuntimeError("Global candidate verification requires a completed base classifier.")
         class_names = np.asarray(self.data_manager.class_names)[
@@ -121,7 +137,7 @@ class APCRunner(Runner):
                 class_index, device=self.device, dtype=torch.long
             )
             new_state["creation_session"] = int(task_id)
-            old_states = list(self._resume_state_dict_list)
+            old_states = list(history_states)
             old_merged = self.merge_dicts(old_states)
             old_gate_correct, old_gate_total = 0, 0
             for old_state in old_states:
@@ -209,20 +225,22 @@ class APCRunner(Runner):
             model._fused_history_class_ids = old_history_ids
 
     def _evaluate_null_losses(self, folds, class_ids, text, description,
-                              version, calibrate):
+                              version, calibrate, history_states):
         values = []
         for _, fit_extract, validation in folds:
             values.append(self._held_out_loss(
                 validation, fit_extract, class_ids, text, description,
-                version, calibrate, previous_version=None
+                version, calibrate, history_states, previous_version=None
             ))
         return np.asarray(values, dtype=np.float64)
 
     def _candidate_fold_losses(self, task_id, block_idx, folds, class_ids,
                                text, description, calibrate, initial_expert,
-                               initial_router, previous_version, candidate_version):
+                               initial_router, previous_version, candidate_version,
+                               history_states):
         adapter = self._adapter_by_block(block_idx)
-        values = []
+        values, best_state, best_loss = [], None, float("inf")
+        self._candidate_previous_version = int(previous_version)
         for fit_train, fit_extract, validation in folds:
             adapter.experts[-1].load_state_dict(copy.deepcopy(initial_expert))
             adapter.router.columns[-1].load_state_dict(copy.deepcopy(initial_router))
@@ -231,11 +249,20 @@ class APCRunner(Runner):
                 text, description, calibrate, candidate_version
             )
             version = candidate_version
-            values.append(self._held_out_loss(
+            value = self._held_out_loss(
                 validation, fit_extract, class_ids, text, description,
-                version, calibrate, previous_version=previous_version
-            ))
-        return np.asarray(values, dtype=np.float64)
+                version, calibrate, history_states, previous_version=previous_version
+            )
+            values.append(value)
+            if value < best_loss:
+                best_loss = float(value)
+                best_state = {
+                    "expert": copy.deepcopy(adapter.experts[-1].state_dict()),
+                    "router": copy.deepcopy(adapter.router.columns[-1].state_dict()),
+                }
+        if best_state is None:
+            raise RuntimeError("Candidate cross-validation did not produce a trained state.")
+        return np.asarray(values, dtype=np.float64), best_state
 
     @staticmethod
     def _paired_gain(null_losses, candidate_losses):
@@ -249,7 +276,8 @@ class APCRunner(Runner):
         return mean, standard_error, gains.tolist()
 
     def train_incremental_task(self, task_id, train_loader, extract_loader,
-                               class_ids, class_names, calibrate_visual):
+                               class_ids, class_names, calibrate_visual,
+                               history_states):
         if self.apc_state is None:
             raise RuntimeError("APC must be calibrated on the base session.")
         folds = self._support_folds(train_loader, extract_loader)
@@ -274,8 +302,11 @@ class APCRunner(Runner):
             torch.as_tensor(classes, dtype=torch.long)
             for classes in self.data_manager.class_index_in_task[:task_id]
         ])
+        topology_version, topology_signature = self._topology_identity()
         decisions = self.apc_controller.decide(
-            features, old_ids, class_ids, self.apc_state
+            features, old_ids, class_ids, self.apc_state,
+            topology_version=topology_version,
+            topology_signature=topology_signature,
         )
         candidate_blocks = [
             int(row["block_idx"]) for row in decisions if bool(row["expand"])
@@ -293,7 +324,7 @@ class APCRunner(Runner):
             previous_version = self._current_encoder_version()
             null_losses = self._evaluate_null_losses(
                 folds, class_ids, text, description, previous_version,
-                bool(calibrate_visual)
+                bool(calibrate_visual), history_states
             )
             trials = []
             round_started = time.perf_counter()
@@ -305,10 +336,10 @@ class APCRunner(Runner):
                 initial_expert = copy.deepcopy(adapter.experts[-1].state_dict())
                 initial_router = copy.deepcopy(adapter.router.columns[-1].state_dict())
                 try:
-                    candidate_losses = self._candidate_fold_losses(
+                    candidate_losses, selected_state = self._candidate_fold_losses(
                         task_id, block_idx, folds, class_ids, text, description,
                         bool(calibrate_visual), initial_expert, initial_router,
-                        previous_version, candidate_version
+                        previous_version, candidate_version, history_states
                     )
                     gain, gain_se, fold_gains = self._paired_gain(null_losses, candidate_losses)
                     trials.append({
@@ -318,18 +349,37 @@ class APCRunner(Runner):
                         "fold_gains": fold_gains,
                         "null_loss": float(null_losses.mean()),
                         "candidate_loss": float(candidate_losses.mean()),
+                        "selected_state": selected_state,
                         "validation_seconds": float(time.perf_counter() - trial_started),
                     })
                 finally:
                     adapter.remove_newest_expert()
 
             best = max(trials, key=lambda row: row["gain"], default=None)
-            accepted_diagnostics.append({"round": len(expanded) + 1, "trials": trials,
-                                         "round_seconds": float(time.perf_counter() - round_started)})
-            if best is None or best["gain"] <= best["gain_se"]:
+            best_state = None if best is None else best["selected_state"]
+            for trial in trials:
+                trial.pop("selected_state", None)
+            alpha = float(self.cfg.TRAINER.BiMC.APC.ALPHA)
+            family_size = max(1, len(trials))
+            critical_z = NormalDist().inv_cdf(1.0 - alpha / family_size)
+            acceptance_threshold = (
+                float("inf") if best is None
+                else critical_z * float(best["gain_se"])
+            )
+            accepted_diagnostics.append({
+                "round": len(expanded) + 1,
+                "trials": trials,
+                "family_size": family_size,
+                "familywise_alpha": alpha,
+                "critical_z": critical_z,
+                "acceptance_threshold": acceptance_threshold,
+                "round_seconds": float(time.perf_counter() - round_started),
+            })
+            if best is None or best["gain"] <= acceptance_threshold:
                 print(
                     f"=> [ExpansionStop][Session {task_id}] "
-                    "no candidate exceeds paired one-standard-error threshold."
+                    f"no candidate exceeds family-wise paired threshold "
+                    f"(z={critical_z:.3f})."
                 )
                 break
 
@@ -337,6 +387,9 @@ class APCRunner(Runner):
             adapter = self._adapter_by_block(block_idx)
             candidate_version = self._current_encoder_version() + 1
             expert_id = self.model_without_dp.add_expert(block_idx, task_id, candidate_version)
+            adapter.experts[-1].load_state_dict(best_state["expert"])
+            adapter.router.columns[-1].load_state_dict(best_state["router"])
+            self._candidate_previous_version = candidate_version - 1
             training_started = time.perf_counter()
             try:
                 training_history = self._train_candidate(
@@ -377,8 +430,11 @@ class APCRunner(Runner):
             self._calibrate_apc(historical_loader)
             all_seen_loader = self._all_seen_feature_loader(task_id)
             features = self.model_without_dp.collect_blockwise_cls_features(all_seen_loader)
+            topology_version, topology_signature = self._topology_identity()
             remaining = self.apc_controller.decide(
-                features, old_ids, class_ids, self.apc_state
+                features, old_ids, class_ids, self.apc_state,
+                topology_version=topology_version,
+                topology_signature=topology_signature,
             )
             eligible = {int(row["block_idx"]) for row in remaining if row["expand"]}
             already_expanded = {int(row["block_idx"]) for row in expanded}
@@ -445,7 +501,7 @@ class APCRunner(Runner):
             else:
                 adaptation = self.train_incremental_task(
                     task_id, train_loader, extract_loader, class_ids, class_names,
-                    bool(self.cfg.TRAINER.BiMC.VISION_CALIBRATION)
+                    bool(self.cfg.TRAINER.BiMC.VISION_CALIBRATION), states
                 )
                 self.model.eval()
                 encoder_version = int(adaptation["encoder_version"])
