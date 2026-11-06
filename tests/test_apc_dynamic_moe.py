@@ -29,8 +29,8 @@ class MultiLayerAPCTests(unittest.TestCase):
         features = {
             8: make_layer_features(centers[:6], seed=8),
             9: make_layer_features(centers.roll(1, dims=1)[:6], seed=9),
-            10: make_layer_features(centers.roll(2, dims=1), seed=10),
-            11: make_layer_features(centers.roll(3, dims=1), seed=11),
+            10: make_layer_features(centers.roll(2, dims=1)[:6], seed=10),
+            11: make_layer_features(centers.roll(3, dims=1)[:6], seed=11),
         }
         controller = AdaptationAwarePrototypeController(.05, 64, 3)
         state = controller.calibrate(features, n_new_classes=2, k_shot=5)
