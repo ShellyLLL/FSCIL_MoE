@@ -730,6 +730,22 @@ class Runner:
                 logits, targets = self._incremental_logits(
                     images, labels, source_ids, bank, encoder_version, scale)
                 loss = F.cross_entropy(logits, targets)
+                # Protect historical class anchors without updating or replay-training
+                # their experts: only the current expert/router receives this penalty.
+                old_anchor_map = getattr(self, "_candidate_old_gate_anchors", {})
+                old_anchor = old_anchor_map.get(int(block_idx))
+                gate_weight = float(getattr(self.cfg.TRAINER.BiMC.PROTECTION,
+                                             "OLD_GATE_WEIGHT", 0.0))
+                residual_weight = float(getattr(self.cfg.TRAINER.BiMC.PROTECTION,
+                                                 "OLD_RESIDUAL_WEIGHT", 0.0))
+                if old_anchor is not None and (gate_weight > 0.0 or residual_weight > 0.0):
+                    old_anchor = old_anchor.to(device=self.device, dtype=images.dtype).detach()
+                    old_gate = adapter.newest_gate(old_anchor)
+                    old_residual = adapter.experts[-1](old_anchor) * old_gate.unsqueeze(-1)
+                    if gate_weight > 0.0:
+                        loss = loss + gate_weight * old_gate.square().mean()
+                    if residual_weight > 0.0:
+                        loss = loss + residual_weight * old_residual.float().square().mean()
                 stability_weight = float(getattr(self.cfg.TRAINER.BiMC.INCREMENTAL,
                                                  "STABILITY_WEIGHT", 0.0))
                 if stability_weight > 0.0:

@@ -241,6 +241,20 @@ class APCRunner(Runner):
         adapter = self._adapter_by_block(block_idx)
         values, best_state, best_loss = [], None, float("inf")
         self._candidate_previous_version = int(previous_version)
+        # Extract old-class inputs at this block using the frozen pre-candidate
+        # topology. They are immutable anchors for the new router's suppression loss.
+        historical_loader = getattr(self, "_candidate_historical_loader", None)
+        if historical_loader is not None:
+            self.model.eval()
+            old_features = self.model_without_dp.collect_blockwise_cls_features(
+                historical_loader, max_version=int(previous_version)
+            )
+            self._candidate_old_gate_anchors = {
+                int(block): item["cls_in"].to(self.device).detach()
+                for block, item in old_features.items()
+            }
+        else:
+            self._candidate_old_gate_anchors = {}
         for fit_train, fit_extract, validation in folds:
             adapter.experts[-1].load_state_dict(copy.deepcopy(initial_expert))
             adapter.router.columns[-1].load_state_dict(copy.deepcopy(initial_router))
@@ -295,6 +309,7 @@ class APCRunner(Runner):
         # upstream expert changes downstream feature distributions, so the
         # base-only thresholds must not be reused blindly.
         self._calibrate_apc(historical_loader)
+        self._candidate_historical_loader = historical_loader
         all_seen_loader = self._all_seen_feature_loader(task_id)
         self.model.eval()
         features = self.model_without_dp.collect_blockwise_cls_features(all_seen_loader)
@@ -391,6 +406,14 @@ class APCRunner(Runner):
             adapter.experts[-1].load_state_dict(best_state["expert"])
             adapter.router.columns[-1].load_state_dict(best_state["router"])
             self._candidate_previous_version = candidate_version - 1
+            self.model.eval()
+            old_features = self.model_without_dp.collect_blockwise_cls_features(
+                historical_loader, max_version=candidate_version - 1
+            )
+            self._candidate_old_gate_anchors = {
+                int(block): item["cls_in"].to(self.device).detach()
+                for block, item in old_features.items()
+            }
             training_started = time.perf_counter()
             try:
                 training_history = self._train_candidate(
@@ -444,6 +467,8 @@ class APCRunner(Runner):
 
         for _, adapter in self._moe_adapters():
             adapter.freeze_all()
+        self._candidate_old_gate_anchors = {}
+        self._candidate_historical_loader = None
         return {
             "trained": bool(expanded),
             "decisions": decisions,

@@ -90,6 +90,26 @@ class ExpansionInvariantTests(unittest.TestCase):
         torch.testing.assert_close(visual(images, max_session=0), before, rtol=0, atol=0)
         self.assertGreater((visual(images, max_session=1) - before).abs().max().item(), 0)
 
+    def test_newest_router_gate_is_differentiable_for_old_anchor_suppression(self):
+        adapter = VisualMoEAdapter(
+            8, num_experts=2, reduction=2, incremental_top_k=1
+        )
+        adapter.add_expert(session_id=1, reduction=2, version_id=1)
+        adapter.set_newest_trainable()
+        old_anchor = torch.randn(6, 8)
+        gate = adapter.newest_gate(old_anchor)
+        residual = adapter.experts[-1](old_anchor) * gate.unsqueeze(-1)
+        penalty = gate.square().mean() + residual.square().mean()
+        penalty.backward()
+        self.assertIsNotNone(adapter.router.columns[-1].weight.grad)
+        self.assertGreater(float(adapter.router.columns[-1].weight.grad.abs().sum()), 0.0)
+        self.assertIsNotNone(adapter.experts[-1].c_proj.weight.grad)
+        self.assertTrue(all(
+            not parameter.requires_grad
+            for expert in adapter.experts[:-1]
+            for parameter in expert.parameters()
+        ))
+
     def test_topology_and_weights_restore_versioned_predictions(self):
         torch.manual_seed(13)
         source = VisualMoEAdapter(8, num_experts=2, reduction=2).eval()
