@@ -27,8 +27,8 @@ class MultiLayerAPCTests(unittest.TestCase):
     def test_calibration_covers_every_inserted_moe_block(self):
         centers = torch.eye(8)
         features = {
-            8: make_layer_features(centers, seed=8),
-            9: make_layer_features(centers.roll(1, dims=1), seed=9),
+            8: make_layer_features(centers[:6], seed=8),
+            9: make_layer_features(centers.roll(1, dims=1)[:6], seed=9),
             10: make_layer_features(centers.roll(2, dims=1), seed=10),
             11: make_layer_features(centers.roll(3, dims=1), seed=11),
         }
@@ -43,8 +43,8 @@ class MultiLayerAPCTests(unittest.TestCase):
     def test_decision_reports_risk_and_existing_expert_capacity_per_layer(self):
         centers = torch.eye(8)
         base = {
-            8: make_layer_features(centers, seed=8),
-            9: make_layer_features(centers.roll(1, dims=1), seed=9),
+            8: make_layer_features(centers[:6], seed=8),
+            9: make_layer_features(centers.roll(1, dims=1)[:6], seed=9),
         }
         controller = AdaptationAwarePrototypeController(.05, 128, 3)
         state = controller.calibrate(base, n_new_classes=2, k_shot=5)
@@ -65,8 +65,8 @@ class MultiLayerAPCTests(unittest.TestCase):
     def test_confusion_and_low_adaptation_trigger_candidate(self):
         centers = torch.eye(8)
         base = {
-            4: make_layer_features(centers, seed=1),
-            5: make_layer_features(centers.roll(1, dims=1), seed=2),
+            4: make_layer_features(centers[:6], seed=1),
+            5: make_layer_features(centers.roll(1, dims=1)[:6], seed=2),
         }
         controller = AdaptationAwarePrototypeController(.05, 128, 9)
         state = controller.calibrate(base, n_new_classes=2, k_shot=5)
@@ -127,7 +127,7 @@ class MultiLayerAPCTests(unittest.TestCase):
 
     def test_topology_bound_calibration_rejects_stale_topology(self):
         centers = torch.eye(8)
-        features = {8: make_layer_features(centers, seed=8)}
+        features = {8: make_layer_features(centers[:6], seed=8)}
         controller = AdaptationAwarePrototypeController(.05, 32, 3)
         state = controller.calibrate(
             features, n_new_classes=2, k_shot=5,
