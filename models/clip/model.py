@@ -355,16 +355,16 @@ class VisualMoEAdapter(nn.Module):
         """Raw independent sigmoid gate used by the historical-class suppression loss."""
         if self.num_experts <= self.base_expert_count:
             raise RuntimeError("there is no incremental expert to inspect.")
-        x = torch.as_tensor(normalized_cls_features, device=self.residual_scale.device,
-                            dtype=self.residual_scale.dtype)
+        weight = self.router.columns[-1].weight
+        x = torch.as_tensor(normalized_cls_features, device=weight.device, dtype=weight.dtype)
         return torch.sigmoid(self.router.columns[-1](x)).squeeze(-1)
 
     def newest_contribution(self, normalized_cls_features, max_version=None):
         """Return the newest expert's actual sparse route weight and residual."""
         if self.num_experts <= self.base_expert_count:
             raise RuntimeError("there is no incremental expert to protect.")
-        x = torch.as_tensor(normalized_cls_features, device=self.residual_scale.device,
-                            dtype=self.residual_scale.dtype)
+        weight = self.router.columns[-1].weight
+        x = torch.as_tensor(normalized_cls_features, device=weight.device, dtype=weight.dtype)
         active, _, weights, _, _ = self._incremental_routing(x, max_version, False)
         if self.num_experts - 1 not in active:
             return x.new_zeros(x.size(0)), x.new_zeros(x.shape)
