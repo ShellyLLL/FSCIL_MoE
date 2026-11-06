@@ -139,11 +139,13 @@ class MultiLayerAPCTests(unittest.TestCase):
             controller.decide(
                 current, torch.arange(6), torch.tensor([6, 7]), state,
                 topology_version=3, topology_signature="topology-B",
+                support_manifest_hash="manifest-A",
             )
         with self.assertRaisesRegex(ValueError, "different topology version"):
             controller.decide(
                 current, torch.arange(6), torch.tensor([6, 7]), state,
                 topology_version=4, topology_signature="topology-A",
+                support_manifest_hash="manifest-A",
             )
 
 

@@ -307,6 +307,7 @@ class APCRunner(Runner):
             features, old_ids, class_ids, self.apc_state,
             topology_version=topology_version,
             topology_signature=topology_signature,
+            support_manifest_hash=self._support_manifest_hash(),
         )
         candidate_blocks = [
             int(row["block_idx"]) for row in decisions if bool(row["expand"])
@@ -435,6 +436,7 @@ class APCRunner(Runner):
                 features, old_ids, class_ids, self.apc_state,
                 topology_version=topology_version,
                 topology_signature=topology_signature,
+                support_manifest_hash=self._support_manifest_hash(),
             )
             eligible = {int(row["block_idx"]) for row in remaining if row["expand"]}
             already_expanded = {int(row["block_idx"]) for row in expanded}

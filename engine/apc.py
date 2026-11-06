@@ -251,7 +251,8 @@ class AdaptationAwarePrototypeController:
         }
 
     def decide(self, features_by_block, old_ids, new_ids, state,
-               topology_version=None, topology_signature=None):
+               topology_version=None, topology_signature=None,
+               support_manifest_hash=None):
         if not isinstance(state, dict) or int(state.get("version", -1)) != self.VERSION:
             raise ValueError(
                 "APC state is missing or uses an incompatible calibration version."
@@ -266,6 +267,13 @@ class AdaptationAwarePrototypeController:
                 raise ValueError("APC calibration belongs to a different topology version.")
             if str(topology_signature) != stored_signature:
                 raise ValueError("APC calibration belongs to a different MoE topology.")
+
+        stored_manifest = str(state.get("support_manifest_hash", ""))
+        if stored_manifest:
+            if support_manifest_hash is None:
+                raise ValueError("Topology-bound APC decisions require the support-manifest hash.")
+            if str(support_manifest_hash) != stored_manifest:
+                raise ValueError("APC calibration belongs to a different support manifest.")
 
         old = torch.as_tensor(old_ids, dtype=torch.long).cpu().reshape(-1)
         new = torch.as_tensor(new_ids, dtype=torch.long).cpu().reshape(-1)
