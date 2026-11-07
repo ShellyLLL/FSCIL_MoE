@@ -124,6 +124,9 @@ class Runner:
     @torch.no_grad()
     def _class_prototypes(self, features, labels, class_ids, exclude_sources=None, query_sources=None):
         class_ids = torch.as_tensor(class_ids, device=features.device, dtype=torch.long)
+        sources = None if exclude_sources is None else torch.as_tensor(
+            exclude_sources, device=features.device
+        ).reshape(-1)
         if query_sources is None:
             result = []
             for cls in class_ids:
