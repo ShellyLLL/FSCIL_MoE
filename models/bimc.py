@@ -24,6 +24,11 @@ class BiMC(nn.Module):
     def __init__(self, cfg, template, device):
         super().__init__()
         self.cfg, self.device, self.template = cfg, device, template
+        bimc_cfg = cfg.TRAINER.BiMC
+        if not bool(getattr(bimc_cfg, "FREEZE_TEXT_ENCODER", True)):
+            raise ValueError("Unified FSCIL architecture requires FREEZE_TEXT_ENCODER=True.")
+        if not bool(getattr(bimc_cfg, "FREEZE_VISUAL_BACKBONE", True)):
+            raise ValueError("Unified FSCIL architecture requires FREEZE_VISUAL_BACKBONE=True.")
         self.clip_model = load_clip_to_cpu(cfg)
         if cfg.TRAINER.BiMC.PREC in ("fp32", "amp"):
             self.clip_model.float()

@@ -151,6 +151,21 @@ class UnifiedMoETests(unittest.TestCase):
             for parameter in router.parameters()
         ))
 
+    def test_base_and_incremental_route_pools_have_distinct_normalization_contracts(self):
+        adapter = VisualMoEAdapter(8, num_experts=2, reduction=2)
+        adapter.add_expert(session_id=1, reduction=2)
+        with torch.no_grad():
+            adapter.incremental_routers[-1].weight.zero_()
+            adapter.incremental_routers[-1].bias.fill_(1.0)
+        _, aux = adapter(torch.randn(4, 3, 8), torch.randn(3, 8))
+        torch.testing.assert_close(
+            aux["base_route_weights"].sum(-1), torch.ones(3), atol=1e-6, rtol=0
+        )
+        self.assertTrue(torch.all(aux["incremental_gates"] > 0.5))
+        self.assertFalse(torch.allclose(
+            aux["incremental_gates"].sum(-1), torch.ones(3)
+        ))
+
     def test_router_requires_frozen_reference_feature(self):
         adapter = VisualMoEAdapter(8, num_experts=2, reduction=2)
         with self.assertRaises(ValueError):

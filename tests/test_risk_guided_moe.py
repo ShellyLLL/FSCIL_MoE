@@ -173,6 +173,23 @@ class PrototypeAndStateTests(unittest.TestCase):
         dataset = SimpleNamespace(labels=[0, 1], source_ids=[10, 20])
         self.assertEqual(runner._support_folds(dataset), [])
 
+    def test_apc_candidate_set_must_match_every_held_out_fold(self):
+        runner = Runner.__new__(Runner)
+        runner.cfg = SimpleNamespace(
+            TRAINER=SimpleNamespace(BiMC=SimpleNamespace(
+                APC=SimpleNamespace(ENABLE=True, SIGNIFICANCE=0.05)
+            ))
+        )
+        # Candidate topology differs by fold. The full-data proposal must not
+        # be authorized by risk gains measured for different fold topologies.
+        fold_sets = [[1, 2], [1], [1, 2]]
+        final_set = {1, 2}
+        unstable = [
+            index for index, candidates in enumerate(fold_sets)
+            if set(candidates) != final_set
+        ]
+        self.assertEqual(unstable, [1])
+
     def test_source_grouped_folds_keep_every_source_wholly_in_one_partition(self):
         dataset = SimpleNamespace(
             labels=[0, 0, 0, 0, 1, 1, 1, 1],

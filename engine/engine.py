@@ -893,6 +893,24 @@ class Runner:
             row["block"] for row in self._candidate_layers(full_state, old_states)
             if row["candidate"]
         )
+        # The exact layer set that will be trained must be the layer set whose
+        # held-out risk was measured in every fold. Otherwise the CV gains
+        # estimate a different architecture and cannot authorize deployment.
+        final_candidate_set = set(final_candidates)
+        unstable_folds = [
+            index for index, candidates in enumerate(fold_candidate_sets)
+            if set(candidates) != final_candidate_set
+        ]
+        if unstable_folds:
+            return {
+                "expanded": [], "candidate_layers": final_candidates,
+                "reason": "APC candidate topology is not stable across source-held-out folds",
+                "validation_status": "candidate_set_unstable",
+                "unstable_fold_indices": unstable_folds,
+                "fold_candidate_layers": fold_candidate_sets,
+                "final_candidate_layers": final_candidates,
+                "logs": [],
+            }
         gains = np.asarray(fold_gains, dtype=np.float64)
         mean_gain = float(gains.mean()) if len(gains) else 0.0
         if len(gains) > 1:
