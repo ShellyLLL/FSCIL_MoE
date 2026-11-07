@@ -109,6 +109,9 @@ class UnifiedMoETests(unittest.TestCase):
             for expert in adapter.experts[2:]:
                 expert.c_proj.weight.normal_()
                 expert.c_proj.bias.normal_()
+            for router in adapter.incremental_routers:
+                router.weight.zero_()
+                router.bias.fill_(2.0)
         residual, aux = adapter(tokens, reference)
         base_weights = aux["base_route_weights"]
         gates = aux["incremental_gates"]
