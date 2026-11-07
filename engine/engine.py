@@ -54,7 +54,10 @@ class Runner:
             for i, class_id in enumerate(torch.as_tensor(state["class_ids"]).tolist()):
                 rows.append((int(class_id), state, i))
         rows.sort(key=lambda row: row[0])
-        ids = torch.tensor([r[0] for r in rows], dtype=torch.long, device=device)
+        ordered_ids = [r[0] for r in rows]
+        if len(set(ordered_ids)) != len(ordered_ids):
+            raise ValueError("Global prototype bank contains duplicate class IDs.")
+        ids = torch.tensor(ordered_ids, dtype=torch.long, device=device)
         for state_key in ("image_proto", "text_features", "description_proto", "fused_proto"):
             values = [torch.as_tensor(state[state_key])[i] for _, state, i in rows]
             if not values:
