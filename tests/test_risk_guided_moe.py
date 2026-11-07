@@ -1,5 +1,7 @@
 """Regression tests for one current encoder and one all-class BiMC prototype bank."""
 import unittest
+import torch.nn as nn
+import torch.optim as optim
 from types import SimpleNamespace
 import torch
 import torch.nn.functional as F
@@ -8,7 +10,108 @@ from models.clip.model import VisualMoEAdapter
 from models.bimc import BiMC
 
 
+class _AdapterModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.adapter = VisualMoEAdapter(8, num_experts=2, reduction=2)
+
+    def adapters(self):
+        return [(0, self.adapter)]
+
+    def rebuild_moe_topology(self, topology):
+        self.adapter.rebuild_topology(topology["0"])
+
+    def export_moe_topology(self):
+        return {"0": self.adapter.export_topology()}
+
+
+class _FeatureAuditModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.eye(2), requires_grad=False)
+
+    def parse_batch(self, batch):
+        return batch["image"], batch["label"]
+
+    def extract_img_feature(self, images):
+        return images @ self.weight
+
+
 class PrototypeAndStateTests(unittest.TestCase):
+    def test_freeze_audit_and_optimizer_scope_are_exact(self):
+        runner = Runner.__new__(Runner)
+        runner.model = _AdapterModel()
+        runner.model.adapter.add_expert(session_id=1, reduction=2)
+        expected = runner.model.adapter.newest_parameters()
+        runner._assert_trainable_scope(expected, "test")
+        optimizer = optim.AdamW(expected, lr=1e-3)
+        runner._assert_optimizer_scope(optimizer, expected, "test")
+        frozen = runner._snapshot_frozen_parameters(expected)
+        x, reference = torch.randn(5, 3, 8), torch.randn(3, 8)
+        optimizer.zero_grad(set_to_none=True)
+        residual, _ = runner.model.adapter(x, reference)
+        residual.square().mean().backward()
+        runner._assert_gradient_scope(expected, "test")
+        optimizer.step()
+        runner.model.adapter.freeze_all()
+        runner._assert_all_parameters_frozen("test")
+        runner._assert_frozen_unchanged(frozen, "test")
+
+    def test_checkpoint_rollback_restores_exact_topology_and_weights(self):
+        runner = Runner.__new__(Runner)
+        runner.model = _AdapterModel()
+        before_topology = runner.model.export_moe_topology()
+        before_state = {
+            key: value.detach().cpu().clone()
+            for key, value in runner.model.state_dict().items()
+        }
+        runner.model.adapter.add_expert(session_id=1, reduction=2)
+        with torch.no_grad():
+            runner.model.adapter.experts[-1].c_proj.bias.fill_(3.0)
+        runner._restore_candidate_snapshot(before_topology, before_state)
+        self.assertEqual(runner.model.adapter.num_experts, 2)
+        self.assertTrue(all(not p.requires_grad for p in runner.model.parameters()))
+        for key, value in before_state.items():
+            torch.testing.assert_close(runner.model.state_dict()[key].cpu(), value)
+
+    def test_historical_feature_audit_detects_end_to_end_embedding_regression(self):
+        runner = Runner.__new__(Runner)
+        runner.device = "cpu"
+        runner.model = _FeatureAuditModel()
+        with torch.no_grad():
+            runner.model.weight.copy_(torch.tensor([[0., 1.], [1., 0.]]))
+        batches = [{
+            "image": torch.eye(2),
+            "label": torch.tensor([0, 1]),
+            "source_id": torch.tensor([100, 101]),
+        }]
+        targets = {
+            100: (0, torch.tensor([1., 0.])),
+            101: (1, torch.tensor([0., 1.])),
+        }
+        bank = {
+            "class_ids": torch.tensor([0, 1]),
+            "fused_proto": torch.eye(2),
+        }
+        audit = runner._evaluate_old_feature_preservation(batches, targets, bank)
+        self.assertEqual(audit["count"], 2)
+        self.assertEqual(audit["baseline_correct"], 2)
+        self.assertEqual(audit["candidate_correct"], 0)
+        self.assertEqual(audit["lost_previously_correct"], 2)
+        self.assertAlmostEqual(audit["mean_cosine_similarity"], 0.0, places=6)
+
+    def test_historical_feature_targets_require_complete_session_metadata(self):
+        runner = Runner.__new__(Runner)
+        state = {
+            "support_features": torch.eye(2),
+            "support_labels": torch.tensor([0, 1]),
+            "support_source_ids": torch.tensor([20, 21]),
+        }
+        targets = runner._historical_feature_targets([state])
+        self.assertEqual(set(targets), {20, 21})
+        with self.assertRaisesRegex(RuntimeError, "schema 23"):
+            runner._historical_feature_targets([{"class_ids": torch.tensor([0])}])
+
     def test_visual_text_intra_modal_and_inter_modal_calibration(self):
         runner = Runner.__new__(Runner)
         cfg = SimpleNamespace(
