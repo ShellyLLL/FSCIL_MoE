@@ -522,6 +522,9 @@ class Runner:
         if configured >= 0:
             end = min(end, configured)
         for task_id in range(self.start_session, end+1):
+            # Session 0 does not run incremental expansion, but the common
+            # reporting path below still records the (empty) expansion result.
+            adaptation = {"expanded": []}
             classes = self.data_manager.class_index_in_task[task_id]
             names = np.asarray(self.data_manager.class_names)[classes].tolist()
             train = self.data_manager.get_dataloader(task_id, "train", mode="train", accumulate_past=False)
