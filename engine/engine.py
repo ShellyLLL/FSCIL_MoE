@@ -630,4 +630,12 @@ class Runner:
             self.acc_list.append(metrics["mean_acc"])
             self.task_acc_list.append(task_acc)
             self._save_checkpoint(task_id)
-            print(f"=> Session {task_id}: Acc={metrics['mean_acc']:.3f}, AA={metrics['macro_task_acc']:.3f}, PD={pd:.3f}, expanded={adaptation.get('expanded', [])}")
+            print(
+                f"=> Session {task_id}: Acc={metrics['mean_acc']:.3f}, "
+                f"AA={metrics['macro_task_acc']:.3f}, PD={pd:.3f}, "
+                f"expanded={adaptation.get('expanded', [])}, "
+                f"candidates={adaptation.get('candidate_layers', [])}, "
+                f"risk_gain={adaptation.get('mean_risk_gain', adaptation.get('candidate_gain', float('nan'))):.5f}, "
+                f"required_gain={adaptation.get('required_risk_gain', adaptation.get('required_gain', float('nan'))):.5f}, "
+                f"reason={adaptation.get('reason', 'base session')}"
+            )
