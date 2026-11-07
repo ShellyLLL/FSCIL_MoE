@@ -323,7 +323,7 @@ class Runner:
                         chosen = current_support[mask]
                         if not chosen.numel():
                             raise ValueError("Incremental classification needs at least two sources per class.")
-                        class_rows.append(F.normalize(chosen.mean(0), dim=-1))
+                        class_rows.append(BiMC.mean_normalized_features(chosen, dim=0))
                     proto_rows.append(torch.stack(class_rows))
                 visual_loo = torch.stack(proto_rows)
                 if self.cfg.TRAINER.BiMC.VISION_CALIBRATION:
