@@ -378,10 +378,17 @@ class Runner:
                 continue
             gain = baseline - values
             candidates_scores.append((float(gain.mean()), float(gain.std(ddof=1)/np.sqrt(len(gain))) if len(gain)>1 else float("inf"), subset, values))
-        candidates_scores.sort(key=lambda x: (x[0], -len(x[2])), reverse=True)
         if not candidates_scores:
             return {"expanded": [], "candidate_layers": candidates, "logs": []}
-        gain, se, selected, foldscores = candidates_scores[0]
+        best_mean = max(row[0] for row in candidates_scores)
+        best_row = max(candidates_scores, key=lambda row: row[0])
+        one_se_floor = best_mean - best_row[1]
+        # Among statistically indistinguishable candidates, prefer fewer added
+        # layers/parameters; do not maximize a noisy fold mean at any cost.
+        eligible = [row for row in candidates_scores if row[0] >= one_se_floor]
+        gain, se, selected, foldscores = min(
+            eligible, key=lambda row: (len(row[2]), -row[0])
+        )
         family_alpha = float(self.cfg.TRAINER.BiMC.APC.ALPHA)
         critical = NormalDist().inv_cdf(1.0 - family_alpha / max(1, len(candidates_scores)))
         required_gain = critical * se
