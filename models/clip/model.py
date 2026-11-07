@@ -157,11 +157,14 @@ class VisualMoEAdapter(nn.Module):
     the enhanced hidden sequence. The two routing pools are never jointly
     normalized and no Top-K selection is applied.
     """
-    def __init__(self, d_model, num_experts=4, reduction=4):
+    def __init__(self, d_model, num_experts=4, reduction=4, incremental_reduction=None):
         super().__init__()
         self.d_model = int(d_model)
         self.base_expert_count = int(num_experts)
         self.default_reduction = int(reduction)
+        self.incremental_reduction = int(
+            self.default_reduction if incremental_reduction is None else incremental_reduction
+        )
         if self.base_expert_count < 1:
             raise ValueError("At least one base expert is required.")
         self.layer_norm = nn.LayerNorm(self.d_model, elementwise_affine=False)
@@ -204,7 +207,7 @@ class VisualMoEAdapter(nn.Module):
 
     def add_expert(self, session_id, reduction=None):
         self.freeze_all()
-        reduction = self.default_reduction if reduction is None else int(reduction)
+        reduction = self.incremental_reduction if reduction is None else int(reduction)
         reference = next(self.base_router.parameters())
         expert = BottleneckExpert(self.d_model, reduction, zero_init_up=True)
         router = nn.Linear(self.d_model, 1)
@@ -237,6 +240,7 @@ class VisualMoEAdapter(nn.Module):
             "version": 3,
             "d_model": self.d_model,
             "base_expert_count": self.base_expert_count,
+            "incremental_reduction": self.incremental_reduction,
             "experts": [
                 {
                     "reduction": max(1, self.d_model // expert.c_fc.out_features),
@@ -251,6 +255,7 @@ class VisualMoEAdapter(nn.Module):
             topology = {
                 "d_model": self.d_model,
                 "base_expert_count": self.base_expert_count,
+                "incremental_reduction": self.incremental_reduction,
                 "experts": [
                     {"reduction": self.default_reduction, "birth_session": 0}
                     for _ in range(self.base_expert_count)
@@ -260,6 +265,9 @@ class VisualMoEAdapter(nn.Module):
             raise ValueError("MoE topology d_model mismatch.")
         if int(topology.get("base_expert_count", self.base_expert_count)) != self.base_expert_count:
             raise ValueError("MoE topology base expert count mismatch.")
+        self.incremental_reduction = int(topology.get(
+            "incremental_reduction", self.incremental_reduction
+        ))
         specs = list(topology.get("experts", []))
         if len(specs) < self.base_expert_count:
             raise ValueError("MoE topology has fewer experts than the base pool.")
@@ -588,6 +596,7 @@ def build_model(state_dict: dict, cfg=None):
         d_model = model.visual.transformer.width
         num_base_experts = int(getattr(moe_cfg, "NUM_BASE_EXPERTS", 4))
         base_reduction = int(getattr(moe_cfg, "BASE_REDUCTION", 4))
+        incremental_reduction = int(getattr(moe_cfg, "INCREMENTAL_REDUCTION", base_reduction))
         for idx in moe_cfg.INSERT_BLOCKS:
             if idx < 0:
                 idx = len(model.visual.transformer.resblocks) + idx
@@ -598,6 +607,7 @@ def build_model(state_dict: dict, cfg=None):
                 d_model=d_model,
                 num_experts=num_base_experts,
                 reduction=base_reduction,
+                incremental_reduction=incremental_reduction,
             )
         convert_weights(model)
     return model.eval()
