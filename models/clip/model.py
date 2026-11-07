@@ -134,89 +134,13 @@ class QuickGELU(nn.Module):
         return x * torch.sigmoid(1.702 * x)
 
 
-class RepresentationDescriptor(nn.Module):
-    """FP32 reconstruction descriptor for one expert's local input distribution."""
-
-    def __init__(self, d_model, descriptor_dim=64, eps=1e-4):
-        super().__init__()
-        self.d_model, self.eps = int(d_model), float(eps)
-        self.descriptor_dim = max(1, min(int(descriptor_dim), self.d_model))
-        self.encoder = nn.Linear(self.d_model, self.descriptor_dim)
-        self.activation = QuickGELU()
-        self.decoder = nn.Linear(self.descriptor_dim, self.d_model)
-        self.register_buffer("mean", torch.tensor(0.0, dtype=torch.float32))
-        self.register_buffer("std", torch.tensor(1.0, dtype=torch.float32))
-        self.register_buffer("fit_sample_count", torch.tensor(0, dtype=torch.long))
-        self.register_buffer("calibration_sample_count", torch.tensor(0, dtype=torch.long))
-
-    def _reconstruct_fp32(self, x):
-        encoded = F.linear(x.float(), self.encoder.weight.float(), self.encoder.bias.float())
-        return F.linear(self.activation(encoded), self.decoder.weight.float(), self.decoder.bias.float())
-
-    def forward(self, x):
-        return self._reconstruct_fp32(x).to(dtype=x.dtype)
-
-    def reconstruction_error(self, x):
-        values = x.detach().float()
-        return (self._reconstruct_fp32(values) - values).pow(2).mean(dim=-1)
-
-    @torch.no_grad()
-    def update_stats(self, errors, responsibilities=None, fit_sample_count=None):
-        errors = torch.as_tensor(errors, device=self.mean.device, dtype=torch.float32).reshape(-1)
-        finite = torch.isfinite(errors)
-        errors = errors[finite]
-        if errors.numel() == 0:
-            raise ValueError("descriptor calibration requires finite errors.")
-        weights = torch.ones_like(errors) if responsibilities is None else torch.as_tensor(
-            responsibilities, device=self.mean.device, dtype=torch.float32
-        ).reshape(-1)[finite].clamp_min(0)
-        mass = weights.sum()
-        if not bool(mass.gt(0).item()):
-            raise ValueError("descriptor responsibilities require positive mass.")
-        mean = (weights * errors).sum() / mass
-        variance = (weights * (errors - mean).square()).sum() / mass
-        self.mean.copy_(mean)
-        self.std.copy_(variance.sqrt().clamp_min(max(self.eps, abs(float(mean.item())) * self.eps)))
-        self.fit_sample_count.fill_(errors.numel() if fit_sample_count is None else int(fit_sample_count))
-        self.calibration_sample_count.fill_(errors.numel())
-        return self.mean, self.std
-
-    def standardized_score(self, x):
-        return (self.reconstruction_error(x) - self.mean) / self.std.clamp_min(self.eps)
-
-    def is_ready(self):
-        return int(self.fit_sample_count.item()) > 0 and int(self.calibration_sample_count.item()) > 0
-
-
-class ExpandableRouter(nn.Module):
-    """Soft router with independently freezable output columns."""
-
-    def __init__(self, dim, num_columns=0):
-        super().__init__()
-        self.dim, self.columns = int(dim), nn.ModuleList()
-        for _ in range(int(num_columns)):
-            self.add_column()
-
-    def add_column(self):
-        column = nn.Linear(self.dim, 1)
-        nn.init.normal_(column.weight, std=0.02)
-        nn.init.zeros_(column.bias)
-        self.columns.append(column)
-        return len(self.columns) - 1
-
-    def forward(self, x, num_columns=None):
-        if not self.columns:
-            raise RuntimeError("ExpandableRouter requires at least one column.")
-        selected = self.columns if num_columns is None else self.columns[:int(num_columns)]
-        logits = torch.cat([column(x) for column in selected], dim=-1)
-        return logits, torch.softmax(logits, dim=-1)
-
-
 class BottleneckExpert(nn.Module):
+    """A residual bottleneck expert. Zero-up initialization preserves the old function."""
     def __init__(self, d_model, reduction=4, zero_init_up=False):
         super().__init__()
         hidden_dim = max(1, int(d_model) // max(1, int(reduction)))
-        self.c_fc, self.gelu = nn.Linear(d_model, hidden_dim), QuickGELU()
+        self.c_fc = nn.Linear(d_model, hidden_dim)
+        self.gelu = QuickGELU()
         self.c_proj = nn.Linear(hidden_dim, d_model)
         if zero_init_up:
             nn.init.zeros_(self.c_proj.weight)
@@ -227,57 +151,31 @@ class BottleneckExpert(nn.Module):
 
 
 class VisualMoEAdapter(nn.Module):
-    """Unified expert pool, descriptors and expandable soft router."""
+    """Base experts use one Softmax pool; every incremental expert has an independent Sigmoid gate.
 
-    def __init__(self, d_model, num_experts=4, reduction=4, residual_scale_init=1.0,
-                 descriptor_dim=64, descriptor_eps=1e-4,
-                 base_top_k=2, incremental_top_k=2):
+    Routers consume the frozen-backbone reference CLS feature. Experts transform
+    the enhanced hidden sequence. The two routing pools are never jointly
+    normalized and no Top-K selection is applied.
+    """
+    def __init__(self, d_model, num_experts=4, reduction=4):
         super().__init__()
-        self.d_model, self.base_expert_count = int(d_model), int(num_experts)
-        self.default_reduction, self.descriptor_dim = int(reduction), int(descriptor_dim)
-        self.descriptor_eps = float(descriptor_eps)
-        self.base_top_k = int(base_top_k)
-        self.incremental_top_k = int(incremental_top_k)
-        if not 1 <= self.base_top_k <= self.base_expert_count:
-            raise ValueError("base_top_k must be within the base expert pool.")
-        if self.incremental_top_k < 1:
-            raise ValueError("incremental_top_k must be positive.")
-        self.layer_norm = LayerNorm(self.d_model)
-        self.residual_scale = nn.Parameter(torch.ones(1) * float(residual_scale_init))
-        self.experts = nn.ModuleList([BottleneckExpert(self.d_model, reduction)
-                                      for _ in range(self.base_expert_count)])
-        self.descriptors = nn.ModuleList([
-            RepresentationDescriptor(self.d_model, descriptor_dim, descriptor_eps)
+        self.d_model = int(d_model)
+        self.base_expert_count = int(num_experts)
+        self.default_reduction = int(reduction)
+        if self.base_expert_count < 1:
+            raise ValueError("At least one base expert is required.")
+        self.layer_norm = nn.LayerNorm(self.d_model, elementwise_affine=False)
+        self.experts = nn.ModuleList([
+            BottleneckExpert(self.d_model, self.default_reduction, zero_init_up=True)
             for _ in range(self.base_expert_count)
         ])
-        self.router = ExpandableRouter(self.d_model, self.base_expert_count)
+        self.base_router = nn.Linear(self.d_model, self.base_expert_count)
+        self.incremental_routers = nn.ModuleList()
         self.expert_birth_sessions = [0] * self.base_expert_count
-        self.expert_birth_versions = [0] * self.base_expert_count
 
     @property
     def num_experts(self):
         return len(self.experts)
-
-    def num_incremental_experts(self):
-        return max(0, self.num_experts - self.base_expert_count)
-
-    def assert_descriptors_ready(self):
-        if len(self.descriptors) != self.num_experts:
-            raise RuntimeError("every deployed expert must own one descriptor.")
-        missing = [i for i, descriptor in enumerate(self.descriptors) if not descriptor.is_ready()]
-        if missing:
-            raise RuntimeError(f"deployed experts have uncalibrated descriptors: {missing}")
-
-    def descriptor_scores(self, x, require_ready=True):
-        if require_ready:
-            self.assert_descriptors_ready()
-        return torch.stack([descriptor.standardized_score(x) for descriptor in self.descriptors], dim=-1)
-
-    @torch.no_grad()
-    def update_descriptor_stats(self, errors, expert_id, responsibilities=None, fit_sample_count=None):
-        return self.descriptors[int(expert_id)].update_stats(
-            errors, responsibilities=responsibilities, fit_sample_count=fit_sample_count
-        )
 
     def freeze_all(self):
         for parameter in self.parameters():
@@ -285,237 +183,156 @@ class VisualMoEAdapter(nn.Module):
             parameter.grad = None
         self.eval()
 
-    def set_newest_trainable(self, descriptor=False):
-        if self.num_experts <= self.base_expert_count:
-            raise RuntimeError("there is no incremental expert to train.")
+    def set_base_trainable(self):
         self.freeze_all()
-        for module in (self.experts[-1], self.router.columns[-1]):
-            for parameter in module.parameters():
-                parameter.requires_grad = True
-        if descriptor:
-            for parameter in self.descriptors[-1].parameters():
+        for parameter in self.base_router.parameters():
+            parameter.requires_grad = True
+        for expert in self.experts[:self.base_expert_count]:
+            for parameter in expert.parameters():
                 parameter.requires_grad = True
         self.train()
 
-    def add_expert(self, session_id, reduction=None, version_id=None):
+    def set_newest_trainable(self):
+        if self.num_experts <= self.base_expert_count:
+            raise RuntimeError("There is no incremental expert to train.")
+        self.freeze_all()
+        for parameter in self.experts[-1].parameters():
+            parameter.requires_grad = True
+        for parameter in self.incremental_routers[-1].parameters():
+            parameter.requires_grad = True
+        self.train()
+
+    def add_expert(self, session_id, reduction=None):
         self.freeze_all()
         reduction = self.default_reduction if reduction is None else int(reduction)
-        self.experts.append(BottleneckExpert(self.d_model, reduction, zero_init_up=True).to(
-            device=self.residual_scale.device, dtype=self.residual_scale.dtype))
-        self.descriptors.append(RepresentationDescriptor(
-            self.d_model, self.descriptor_dim, self.descriptor_eps).to(device=self.residual_scale.device))
-        self.router.add_column()
-        self.router.columns[-1].to(device=self.residual_scale.device, dtype=self.residual_scale.dtype)
+        reference = next(self.base_router.parameters())
+        expert = BottleneckExpert(self.d_model, reduction, zero_init_up=True)
+        router = nn.Linear(self.d_model, 1)
+        # A low initial gate keeps the newly added residual conservative;
+        # the classification and old-gate objectives subsequently learn it.
+        nn.init.normal_(router.weight, std=0.01)
+        nn.init.constant_(router.bias, -1.0)
+        expert.to(device=reference.device, dtype=reference.dtype)
+        router.to(device=reference.device, dtype=reference.dtype)
+        self.experts.append(expert)
+        self.incremental_routers.append(router)
         self.expert_birth_sessions.append(int(session_id))
-        next_version = (max(self.expert_birth_versions, default=0) + 1
-                        if version_id is None else int(version_id))
-        if next_version <= max(self.expert_birth_versions, default=0):
-            raise ValueError("A new expert must create a strictly newer encoder topology version.")
-        self.expert_birth_versions.append(next_version)
         self.set_newest_trainable()
         return self.num_experts - 1
 
-    def newest_parameters(self, include_descriptor=False):
-        parameters = list(self.experts[-1].parameters()) + list(self.router.columns[-1].parameters())
-        if include_descriptor:
-            parameters += list(self.descriptors[-1].parameters())
-        return parameters
-
-    @staticmethod
-    def _topk_mask(logits, top_k, force_column=None):
-        if logits.ndim != 2 or logits.size(-1) == 0:
-            raise ValueError("Router logits must be a non-empty [batch, experts] tensor.")
-        k = min(max(1, int(top_k)), logits.size(-1))
-        indices = logits.topk(k, dim=-1).indices
-        if force_column is not None:
-            force_column = int(force_column)
-            if not 0 <= force_column < logits.size(-1):
-                raise ValueError("Forced router column is outside the active expert pool.")
-            missing = ~indices.eq(force_column).any(dim=-1)
-            if bool(missing.any().item()):
-                indices = indices.clone()
-                indices[missing, -1] = force_column
-        mask = torch.zeros_like(logits, dtype=torch.bool).scatter_(1, indices, True)
-        return mask, indices
-
-    def _incremental_routing(self, x, max_version=None, force_newest=False):
-        active = [index for index in range(self.base_expert_count, self.num_experts)
-                  if max_version is None or self.expert_birth_versions[index] <= max_version]
-        if not active:
-            empty = x.new_zeros((x.size(0), 0))
-            return active, empty, empty, torch.zeros_like(empty, dtype=torch.bool), empty.long()
-        logits = torch.cat([self.router.columns[index](x) for index in active], dim=-1)
-        force_column = len(active) - 1 if force_newest and active[-1] == self.num_experts - 1 else None
-        selected, indices = self._topk_mask(logits, self.incremental_top_k, force_column)
-        gates = torch.sigmoid(logits) * selected.to(logits.dtype)
-        weights = gates / (1.0 + gates.sum(dim=-1, keepdim=True))
-        return active, logits, weights, selected, indices
-
-    def newest_gate(self, normalized_cls_features):
-        """Raw independent sigmoid gate used by the historical-class suppression loss."""
+    def newest_parameters(self):
         if self.num_experts <= self.base_expert_count:
-            raise RuntimeError("there is no incremental expert to inspect.")
-        weight = self.router.columns[-1].weight
-        x = torch.as_tensor(normalized_cls_features, device=weight.device, dtype=weight.dtype)
-        return torch.sigmoid(self.router.columns[-1](x)).squeeze(-1)
+            return []
+        return list(self.experts[-1].parameters()) + list(self.incremental_routers[-1].parameters())
 
-    def newest_contribution(self, normalized_cls_features, max_version=None):
-        """Return the newest expert's actual sparse route weight and residual."""
+    def newest_gate(self, raw_reference_cls):
         if self.num_experts <= self.base_expert_count:
-            raise RuntimeError("there is no incremental expert to protect.")
-        weight = self.router.columns[-1].weight
-        x = torch.as_tensor(normalized_cls_features, device=weight.device, dtype=weight.dtype)
-        active, _, weights, _, _ = self._incremental_routing(x, max_version, False)
-        if self.num_experts - 1 not in active:
-            return x.new_zeros(x.size(0)), x.new_zeros(x.shape)
-        effective = weights[:, active.index(self.num_experts - 1)]
-        contribution = self.experts[-1](x) * effective.unsqueeze(-1)
-        return effective, contribution * self.residual_scale.to(contribution.dtype)
-
-    def historical_named_parameters(self):
-        newest = self.num_experts - 1
-        prefixes = (f"experts.{newest}.", f"router.columns.{newest}.", f"descriptors.{newest}.")
-        for name, parameter in self.named_parameters():
-            if not name.startswith(prefixes):
-                yield name, parameter
+            raise RuntimeError("There is no incremental expert to inspect.")
+        router = self.incremental_routers[-1]
+        values = torch.as_tensor(raw_reference_cls, device=router.weight.device, dtype=router.weight.dtype)
+        return torch.sigmoid(router(values)).squeeze(-1)
 
     def export_topology(self):
-        return {"version": 2, "d_model": self.d_model, "base_expert_count": self.base_expert_count,
-                "base_top_k": self.base_top_k, "incremental_top_k": self.incremental_top_k,
-                "experts": [{"reduction": max(1, self.d_model // expert.c_fc.out_features),
-                             "birth_session": int(self.expert_birth_sessions[index]),
-                             "birth_version": int(self.expert_birth_versions[index])}
-                            for index, expert in enumerate(self.experts)]}
+        return {
+            "version": 3,
+            "d_model": self.d_model,
+            "base_expert_count": self.base_expert_count,
+            "experts": [
+                {
+                    "reduction": max(1, self.d_model // expert.c_fc.out_features),
+                    "birth_session": int(self.expert_birth_sessions[index]),
+                }
+                for index, expert in enumerate(self.experts)
+            ],
+        }
 
     def rebuild_topology(self, topology):
         if topology is None:
-            topology = {"d_model": self.d_model, "base_expert_count": self.base_expert_count,
-                        "experts": [{"reduction": self.default_reduction, "birth_session": 0}
-                                    for _ in range(self.base_expert_count)]}
+            topology = {
+                "d_model": self.d_model,
+                "base_expert_count": self.base_expert_count,
+                "experts": [
+                    {"reduction": self.default_reduction, "birth_session": 0}
+                    for _ in range(self.base_expert_count)
+                ],
+            }
         if int(topology.get("d_model", self.d_model)) != self.d_model:
             raise ValueError("MoE topology d_model mismatch.")
         if int(topology.get("base_expert_count", self.base_expert_count)) != self.base_expert_count:
             raise ValueError("MoE topology base expert count mismatch.")
-        if int(topology.get("base_top_k", self.base_top_k)) != self.base_top_k:
-            raise ValueError("MoE topology base Top-K does not match the active configuration.")
-        if int(topology.get("incremental_top_k", self.incremental_top_k)) != self.incremental_top_k:
-            raise ValueError("MoE topology incremental Top-K does not match the active configuration.")
         specs = list(topology.get("experts", []))
         if len(specs) < self.base_expert_count:
             raise ValueError("MoE topology has fewer experts than the base pool.")
-        self.experts, self.descriptors = nn.ModuleList(), nn.ModuleList()
-        self.router, self.expert_birth_sessions = ExpandableRouter(self.d_model), []
-        self.expert_birth_versions = []
-        for spec in specs:
+        if len(specs[:self.base_expert_count]) != self.base_expert_count:
+            raise ValueError("MoE topology base expert count is inconsistent.")
+        reference = next(self.base_router.parameters())
+        self.experts = nn.ModuleList()
+        self.incremental_routers = nn.ModuleList()
+        self.expert_birth_sessions = []
+        for index, spec in enumerate(specs):
             reduction = int(spec.get("reduction", self.default_reduction))
-            self.experts.append(BottleneckExpert(self.d_model, reduction))
-            self.descriptors.append(RepresentationDescriptor(
-                self.d_model, self.descriptor_dim, self.descriptor_eps))
-            self.router.add_column()
-            birth_session = int(spec.get("birth_session", 0))
-            self.expert_birth_sessions.append(birth_session)
-            # Legacy topology files stored only session IDs. Multiple layers
-            # may be expanded in one session, so reconstruct a unique ordered
-            # topology version rather than assigning duplicate session IDs.
-            fallback_version = (0 if len(self.expert_birth_versions) < self.base_expert_count
-                                else max(self.expert_birth_versions, default=0) + 1)
-            birth_version = int(spec.get("birth_version", fallback_version))
-            if len(self.expert_birth_versions) < self.base_expert_count:
-                if birth_version != 0:
-                    raise ValueError("Base experts must belong to topology version zero.")
-            elif birth_version <= max(self.expert_birth_versions, default=0):
-                raise ValueError("Incremental expert topology versions must be strictly increasing.")
-            self.expert_birth_versions.append(birth_version)
-        device, dtype = self.residual_scale.device, self.residual_scale.dtype
-        self.experts.to(device=device, dtype=dtype)
-        self.router.to(device=device, dtype=dtype)
-        self.descriptors.to(device=device, dtype=torch.float32)
+            expert = BottleneckExpert(
+                self.d_model, reduction,
+                zero_init_up=(index >= self.base_expert_count),
+            ).to(device=reference.device, dtype=reference.dtype)
+            self.experts.append(expert)
+            self.expert_birth_sessions.append(int(spec.get("birth_session", 0)))
+            if index >= self.base_expert_count:
+                router = nn.Linear(self.d_model, 1).to(
+                    device=reference.device, dtype=reference.dtype
+                )
+                self.incremental_routers.append(router)
         self.freeze_all()
 
     def remove_newest_expert(self):
         if self.num_experts <= self.base_expert_count:
             raise RuntimeError("Cannot remove a base expert.")
-        # ModuleList.pop() is unavailable in older PyTorch releases.
-        # Deleting the last index unregisters the temporary modules and
-        # preserves the indices/state_dict keys of historical experts.
         del self.experts[-1]
-        del self.descriptors[-1]
-        del self.router.columns[-1]
+        del self.incremental_routers[-1]
         self.expert_birth_sessions.pop()
-        self.expert_birth_versions.pop()
         self.freeze_all()
 
-    def forward(self, x, max_version=None, max_session=None):
-        if max_session is not None:
-            if max_version is not None:
-                raise ValueError("Specify max_version, not both max_version and legacy max_session.")
-            max_version = max_session
+    def forward(self, x, raw_reference_cls):
         if x.ndim != 3:
             raise ValueError("VisualMoEAdapter expects [tokens, batch, dim].")
-        x_norm = self.layer_norm(x)
-        base_logits, _ = self.router(x_norm[0], self.base_expert_count)
-        base_selected, base_indices = self._topk_mask(base_logits, self.base_top_k)
-        base_weights = torch.softmax(base_logits.masked_fill(~base_selected, float("-inf")), dim=-1)
+        if raw_reference_cls.ndim != 2 or raw_reference_cls.shape != (x.size(1), self.d_model):
+            raise ValueError("raw_reference_cls must have shape [batch, d_model].")
+        expert_input = self.layer_norm(x)
+        route_input = raw_reference_cls.to(dtype=expert_input.dtype)
+        base_weights = torch.softmax(self.base_router(route_input), dim=-1)
+        residual = torch.zeros_like(expert_input)
+        base_norms = []
+        for expert_id in range(self.base_expert_count):
+            component = self.experts[expert_id](expert_input)
+            weight = base_weights[:, expert_id].view(1, -1, 1)
+            weighted = component * weight
+            residual = residual + weighted
+            base_norms.append(weighted.detach().float().pow(2).mean().sqrt())
 
-        force_newest = self.training and any(
-            parameter.requires_grad for parameter in self.newest_parameters()
+        incremental_gates = []
+        incremental_norms = []
+        for offset, router in enumerate(self.incremental_routers):
+            gate = torch.sigmoid(router(route_input)).squeeze(-1)
+            incremental_gates.append(gate)
+            component = self.experts[self.base_expert_count + offset](expert_input)
+            weighted = component * gate.view(1, -1, 1)
+            residual = residual + weighted
+            incremental_norms.append(weighted.detach().float().pow(2).mean().sqrt())
+
+        gates = (
+            torch.stack(incremental_gates, dim=-1)
+            if incremental_gates else route_input.new_empty((route_input.size(0), 0))
         )
-        active, incremental_logits, incremental_weights, incremental_selected, incremental_indices = (
-            self._incremental_routing(x_norm[0], max_version, force_newest)
-        )
-        weights = torch.cat([base_weights, incremental_weights], dim=-1)
-        selected_mask = torch.cat([base_selected, incremental_selected], dim=-1)
-        logits = (torch.cat([base_logits, incremental_logits], dim=-1)
-                  if active else base_logits)
-        top_k_indices = (torch.cat([base_indices, incremental_indices + self.base_expert_count], dim=-1)
-                         if active else base_indices)
-
-        # Execute only experts selected by at least one sample in this batch.
-        # Unselected experts are not evaluated and receive no activation/gradient.
-        residual = torch.zeros_like(x_norm)
-        norms = []
-        active_columns = {expert_id: self.base_expert_count + offset
-                          for offset, expert_id in enumerate(active)}
-        for expert_id in range(self.num_experts):
-            if expert_id < self.base_expert_count:
-                column = expert_id
-            elif expert_id in active_columns:
-                column = active_columns[expert_id]
-            else:
-                norms.append(x_norm.new_zeros((), dtype=torch.float32))
-                continue
-            sample_indices = torch.nonzero(weights[:, column] > 0, as_tuple=False).flatten()
-            if sample_indices.numel() == 0:
-                norms.append(x_norm.new_zeros((), dtype=torch.float32))
-                continue
-            expert_input = x_norm.index_select(1, sample_indices)
-            expert_output = self.experts[expert_id](expert_input)
-            sample_weights = weights.index_select(0, sample_indices)[:, column].view(1, -1, 1)
-            weighted = expert_output * sample_weights
-            residual = residual.index_add(1, sample_indices, weighted)
-            norms.append(weighted.detach().float().pow(2).mean().sqrt())
-
-        residual = self.residual_scale.to(residual.dtype) * residual
-        adapted = x_norm + residual
         return residual, {
-            "logits": logits,
-            "route_weights": weights,
-            "selected_mask": selected_mask,
-            "base_route_weights": base_weights,
-            "base_selected_mask": base_selected,
-            "incremental_route_weights": incremental_weights,
-            "incremental_selected_mask": incremental_selected,
-            "base_top_k_indices": base_indices,
-            "incremental_top_k_indices": incremental_indices,
-            "top_k_indices": top_k_indices,
+            "raw_reference_cls": raw_reference_cls.detach(),
             "adapter_input_cls": x[0],
-            "cls_in": x_norm[0],
-            "adapter_output_cls": adapted[0],
-            "cls_out": adapted[0],
-            "patch_mean_in": x_norm[1:].mean(dim=0),
-            "expert_residual_norms": torch.stack(norms),
-            "token_residual": residual.detach(),
+            "adapter_normalized_cls": expert_input[0],
+            "adapter_output_cls": (expert_input + residual)[0],
+            "base_route_weights": base_weights,
+            "incremental_gates": gates,
+            "expert_residual_norms": torch.stack(base_norms + incremental_norms),
         }
+
 
 class ResidualAttentionBlock(nn.Module):
     def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None):
@@ -535,38 +352,52 @@ class ResidualAttentionBlock(nn.Module):
         self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
         return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
 
-    def forward(self, x: torch.Tensor, max_version=None, max_session=None):
-        if max_session is not None:
-            if max_version is not None:
-                raise ValueError("Specify max_version, not both max_version and legacy max_session.")
-            max_version = max_session
+    def forward_base(self, x: torch.Tensor):
         x = x + self.attention(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
-        moe_aux = None
+        return x + self.mlp(self.ln_2(x))
+
+    def forward(self, x: torch.Tensor, raw_reference_cls=None):
+        x = self.forward_base(x)
+        aux = None
         if self.moe_adapter is not None:
-            moe_out, moe_aux = self.moe_adapter(x, max_version=max_version)
-            x = x + moe_out
-            # This is the actual hidden state passed to the next Transformer block.
-            moe_aux["block_out"] = x[0]
-        return x, moe_aux
+            if raw_reference_cls is None:
+                raise ValueError("An adapter block requires its frozen-backbone reference CLS feature.")
+            residual, aux = self.moe_adapter(x, raw_reference_cls)
+            x = x + residual
+            aux["block_out"] = x[0]
+        return x, aux
+
 
 class Transformer(nn.Module):
     def __init__(self, width: int, layers: int, heads: int, attn_mask: torch.Tensor = None):
         super().__init__()
         self.width = width
         self.layers = layers
-        self.resblocks = nn.ModuleList([ResidualAttentionBlock(width, heads, attn_mask) for _ in range(layers)])
+        self.resblocks = nn.ModuleList([
+            ResidualAttentionBlock(width, heads, attn_mask) for _ in range(layers)
+        ])
 
-    def forward(self, x: torch.Tensor, max_version=None, max_session=None):
-        if max_session is not None:
-            if max_version is not None:
-                raise ValueError("Specify max_version, not both max_version and legacy max_session.")
-            max_version = max_session
-        moe_aux_list = []
+    def forward(self, x: torch.Tensor, return_layer_outputs=False):
+        # Reference stream is the exact frozen ViT path. Before the first
+        # adapter, the enhanced stream is identical and can share this tensor.
+        reference = x.detach()
+        hidden = None
+        has_adapter = False
+        moe_aux_list, layer_outputs = [], []
         for block in self.resblocks:
-            x, aux = block(x, max_version=max_version)
-            if aux is not None: moe_aux_list.append(aux)
-        return x, moe_aux_list
+            with torch.no_grad():
+                reference = block.forward_base(reference)
+            hidden = block.forward_base(hidden) if has_adapter else reference
+            if block.moe_adapter is not None:
+                residual, aux = block.moe_adapter(hidden, reference[0])
+                hidden = hidden + residual
+                aux["block_out"] = hidden[0]
+                moe_aux_list.append(aux)
+                has_adapter = True
+            if return_layer_outputs:
+                layer_outputs.append(hidden)
+        return hidden, moe_aux_list, layer_outputs
+
 
 class VisionTransformer(nn.Module):
     def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int):
@@ -584,37 +415,41 @@ class VisionTransformer(nn.Module):
 
     def forward(self, x: torch.Tensor, all_layer_outputs=False, return_moe_aux=False,
                 max_version=None, max_session=None):
-        if max_session is not None:
-            if max_version is not None:
-                raise ValueError("Specify max_version, not both max_version and legacy max_session.")
-            max_version = max_session
-        x = self.conv1(x)  
-        x = x.reshape(x.shape[0], x.shape[1], -1)  
-        x = x.permute(0, 2, 1)  
-        x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1) 
+        if max_version is not None or max_session is not None:
+            raise ValueError("Versioned encoder execution is not part of the unified FSCIL model.")
+        x = self.conv1(x)
+        x = x.reshape(x.shape[0], x.shape[1], -1)
+        x = x.permute(0, 2, 1)
+        x = torch.cat([
+            self.class_embedding.to(x.dtype)
+            + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device),
+            x,
+        ], dim=1)
         x = x + self.positional_embedding.to(x.dtype)
-        x = self.ln_pre(x)
-
-        if not all_layer_outputs:
-            x = x.permute(1, 0, 2)  
-            x, moe_aux_list = self.transformer(x, max_version=max_version)
-            x = x.permute(1, 0, 2)  
-            x = self.ln_post(x[:, 0, :])
-            if self.proj is not None: x = x @ self.proj
-            if return_moe_aux: return x, moe_aux_list
-            return x
-        else:
-            x = x.permute(1, 0, 2)  
-            outputs, moe_aux_list = [], []
-            for block in self.transformer.resblocks:
-                x, aux = block(x, max_version=max_version)
-                if aux is not None: moe_aux_list.append(aux)
-                cur_output = x.permute(1, 0, 2)
-                cur_output = self.ln_post(cur_output[:, 0, :])
-                if self.proj is not None: cur_output = cur_output @ self.proj
-                outputs.append(cur_output)
-            if return_moe_aux: return outputs, moe_aux_list
+        x = self.ln_pre(x).permute(1, 0, 2)
+        hidden, moe_aux_list, layer_outputs = self.transformer(
+            x, return_layer_outputs=all_layer_outputs
+        )
+        if all_layer_outputs:
+            outputs = []
+            for layer_hidden in layer_outputs:
+                value = layer_hidden.permute(1, 0, 2)
+                value = self.ln_post(value[:, 0, :])
+                if self.proj is not None:
+                    value = value @ self.proj
+                outputs.append(value)
+            if return_moe_aux:
+                return outputs, moe_aux_list
             return outputs
+        value = hidden.permute(1, 0, 2)
+        value = self.ln_post(value[:, 0, :])
+        if self.proj is not None:
+            value = value @ self.proj
+        if return_moe_aux:
+            return value, moe_aux_list
+        return value
+
+
 
 class CLIP(nn.Module):
     def __init__(self, embed_dim: int, image_resolution: int, vision_layers: Union[Tuple[int, int, int, int], int], vision_width: int, vision_patch_size: int, context_length: int, vocab_size: int, transformer_width: int, transformer_heads: int, transformer_layers: int):
@@ -670,16 +505,16 @@ class CLIP(nn.Module):
         return self.visual.conv1.weight.dtype
 
     def encode_image(self, image, return_moe_aux=False, max_version=None, max_session=None):
-        if max_session is not None:
-            if max_version is not None:
-                raise ValueError("Specify max_version, not both max_version and legacy max_session.")
-            max_version = max_session
+        if max_version is not None or max_session is not None:
+            raise ValueError("Versioned encoder execution is not part of the unified FSCIL model.")
         if not isinstance(self.visual, VisionTransformer):
+            if return_moe_aux:
+                raise ValueError("MoE auxiliary outputs are available only for ViT backbones.")
             return self.visual(image.type(self.dtype))
-        if return_moe_aux:
-            return self.visual(image.type(self.dtype), return_moe_aux=True,
-                               max_version=max_version)
-        return self.visual(image.type(self.dtype), max_version=max_version)
+        return self.visual(
+            image.type(self.dtype),
+            return_moe_aux=return_moe_aux,
+        )
 
     def encode_text(self, text):
         x = self.token_embedding(text).type(self.dtype)
@@ -750,37 +585,19 @@ def build_model(state_dict: dict, cfg=None):
     if cfg is not None and hasattr(cfg, 'TRAINER') and cfg.TRAINER.BiMC.VISUAL_MOE.ENABLE:
         moe_cfg = cfg.TRAINER.BiMC.VISUAL_MOE
         d_model = model.visual.transformer.width
-        num_base_experts = getattr(
-            moe_cfg,
-            "NUM_BASE_EXPERTS",
-            getattr(moe_cfg, "NUM_EXPERTS", 4),
-        )
-        base_reduction = getattr(
-            moe_cfg,
-            "BASE_REDUCTION",
-            getattr(moe_cfg, "BOTTLENECK_RATIO", 4),
-        )
-        base_scale_init = getattr(
-            moe_cfg,
-            "BASE_SCALE_INIT",
-            getattr(moe_cfg, "RESIDUAL_SCALE_INIT", 1.0),
-        )
-        base_top_k = getattr(moe_cfg, "BASE_TOP_K", 2)
-        incremental_top_k = getattr(moe_cfg, "INCREMENTAL_TOP_K", 2)
-        descriptor_dim = getattr(moe_cfg, "DESCRIPTOR_DIM", 64)
-        descriptor_eps = getattr(moe_cfg, "DESCRIPTOR_EPS", 1e-4)
+        num_base_experts = int(getattr(moe_cfg, "NUM_BASE_EXPERTS", 4))
+        base_reduction = int(getattr(moe_cfg, "BASE_REDUCTION", 4))
         for idx in moe_cfg.INSERT_BLOCKS:
-            if idx < 0: idx = len(model.visual.transformer.resblocks) + idx
+            if idx < 0:
+                idx = len(model.visual.transformer.resblocks) + idx
             block = model.visual.transformer.resblocks[idx]
+            if block.moe_adapter is not None:
+                raise RuntimeError(f"MoE adapter already exists at visual block {idx}.")
             block.moe_adapter = VisualMoEAdapter(
                 d_model=d_model,
                 num_experts=num_base_experts,
                 reduction=base_reduction,
-                residual_scale_init=base_scale_init,
-                descriptor_dim=descriptor_dim,
-                descriptor_eps=descriptor_eps,
-                base_top_k=base_top_k,
-                incremental_top_k=incremental_top_k,
             )
         convert_weights(model)
     return model.eval()
+
