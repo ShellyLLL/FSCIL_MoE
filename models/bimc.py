@@ -79,9 +79,11 @@ class BiMC(nn.Module):
                 raise RuntimeError("MoE block auxiliary output count mismatch.")
             for (block, _), aux in zip(self.adapters(), aux_list):
                 item = collected.setdefault(block, {
-                    "raw_reference_cls": [], "block_out": [], "labels": [], "source_ids": []
+                    "raw_reference_cls": [], "adapter_input_cls": [],
+                    "block_out": [], "labels": [], "source_ids": []
                 })
                 item["raw_reference_cls"].append(aux["raw_reference_cls"].detach().cpu())
+                item["adapter_input_cls"].append(aux["adapter_input_cls"].detach().cpu())
                 item["block_out"].append(aux["block_out"].detach().cpu())
                 item["labels"].append(labels.detach().cpu())
                 item["source_ids"].append(source.detach().cpu())

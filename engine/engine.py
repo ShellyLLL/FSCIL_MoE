@@ -217,9 +217,10 @@ class Runner:
         desc_list, desc = self.model.inference_all_description_feature(names, self.cfg.DATASET.GPT_PATH)
         fused = self._fuse(visual, text, desc)
         raw_layers = self.model.collect_blockwise_cls_features(loader)
-        raw_prototypes = {}
+        raw_prototypes, adapter_input_anchors = {}, {}
         for block, item in raw_layers.items():
             vals, ys = item["raw_reference_cls"], item["labels"]
+            adapter_input_anchors[int(block)] = item["adapter_input_cls"].float().cpu()
             rows = []
             for cls in class_ids:
                 v = vals[ys.eq(int(cls))]
@@ -235,6 +236,9 @@ class Runner:
             "description_features": [x.detach().cpu() for x in desc_list],
             "fused_proto": fused.detach().cpu(),
             "raw_layer_prototypes": raw_prototypes,
+            # Historical adapter-input CLS anchors permit auditing the actual
+            # residual emitted by a newly inserted expert without retaining images.
+            "adapter_input_anchors": adapter_input_anchors,
             "creation_session": len(old_states),
         }
 
@@ -247,6 +251,18 @@ class Runner:
             ids.extend(torch.as_tensor(state["class_ids"]).tolist())
             protos.extend(torch.as_tensor(raw).unbind(0))
         return torch.tensor(ids, dtype=torch.long), torch.stack(protos).to(self.device)
+
+    def _adapter_input_history(self, states, block):
+        values = []
+        for state in states:
+            anchors = state.get("adapter_input_anchors", {}).get(int(block))
+            if anchors is None or anchors.numel() == 0:
+                raise RuntimeError(
+                    f"Historical adapter-input anchors missing for MoE block {block}; "
+                    "the checkpoint cannot certify actual expert residual protection."
+                )
+            values.append(torch.as_tensor(anchors).float())
+        return torch.cat(values, dim=0).to(self.device)
 
     def _calibrate_apc(self, base_state):
         thresholds = {}
@@ -300,6 +316,10 @@ class Runner:
             b: F.normalize(self._raw_history(old_states, b)[1].float(), dim=-1)
             for b in selected_blocks
         }
+        history_inputs = {
+            b: self._adapter_input_history(old_states, b)
+            for b in selected_blocks
+        }
         logs = []
         for epoch in range(epochs):
             self.model.train()
@@ -340,12 +360,28 @@ class Runner:
                 targets = self._columns(labels, target_ids)
                 loss = F.cross_entropy(logits, targets)
                 # Suppress each new expert on stored old-class raw reference prototypes.
-                gate_terms = []
+                protection_terms, gate_audit, residual_audit = [], {}, {}
                 for block in selected_blocks:
                     adapter = dict(self._adapters())[block]
-                    gate_terms.append(adapter.newest_gate(history_raw[block]).square().mean())
-                if gate_terms:
-                    loss = loss + float(self.cfg.TRAINER.BiMC.PROTECTION.OLD_GATE_WEIGHT) * torch.stack(gate_terms).mean()
+                    gates = adapter.newest_gate(history_raw[block])
+                    # Evaluate the actual newly emitted expert residual on
+                    # stored historical adapter inputs, not only its gate.
+                    expert_input = adapter.layer_norm(
+                        history_inputs[block].to(dtype=next(adapter.experts[-1].parameters()).dtype)
+                    )
+                    residual = adapter.experts[-1](expert_input) * gates.unsqueeze(-1)
+                    relative_residual = residual.float().norm(dim=-1) / (
+                        history_inputs[block].float().norm(dim=-1).clamp_min(1e-12)
+                    )
+                    protection_terms.append(gates.square().mean())
+                    protection_terms.append(relative_residual.square().mean())
+                    gate_audit[int(block)] = float(gates.detach().max().item())
+                    residual_audit[int(block)] = {
+                        "mean_relative_residual": float(relative_residual.detach().mean().item()),
+                        "max_relative_residual": float(relative_residual.detach().max().item()),
+                    }
+                if protection_terms:
+                    loss = loss + float(self.cfg.TRAINER.BiMC.PROTECTION.OLD_GATE_WEIGHT) * torch.stack(protection_terms).mean()
                 if not torch.isfinite(loss):
                     raise FloatingPointError("Non-finite all-class incremental loss.")
                 loss.backward()
@@ -362,6 +398,7 @@ class Runner:
             gates = adapter.newest_gate(history_raw[block]).detach()
             gate_audit[int(block)] = float(gates.max().item())
         self._last_old_gate_audit = gate_audit
+        self._last_old_residual_audit = residual_audit
         if any(value > max_old_gate for value in gate_audit.values()):
             raise OldGateConstraintError(
                 "New-expert gate exceeds MAX_OLD_GATE on stored historical "
@@ -760,6 +797,7 @@ class Runner:
                 "mean_risk_gain": adaptation.get("mean_risk_gain"),
                 "required_risk_gain": adaptation.get("required_risk_gain"),
                 "old_gate_audit": getattr(self, "_last_old_gate_audit", {}),
+                "old_residual_audit": getattr(self, "_last_old_residual_audit", {}),
                 "expert_topology": self.model.export_moe_topology(),
                 "mean_acc": float(metrics["mean_acc"]),
                 "macro_task_acc": float(metrics["macro_task_acc"]),
