@@ -105,6 +105,10 @@ class UnifiedMoETests(unittest.TestCase):
         adapter.add_expert(session_id=2, reduction=2)
         reference = torch.randn(6, 8)
         tokens = torch.randn(4, 6, 8)
+        with torch.no_grad():
+            for expert in adapter.experts[2:]:
+                expert.c_proj.weight.normal_()
+                expert.c_proj.bias.normal_()
         residual, aux = adapter(tokens, reference)
         base_weights = aux["base_route_weights"]
         gates = aux["incremental_gates"]
@@ -129,8 +133,16 @@ class UnifiedMoETests(unittest.TestCase):
         second_router = {id(p) for p in adapter.incremental_routers[-1].parameters()}
         self.assertFalse(first_expert & second_expert)
         self.assertFalse(first_router & second_router)
-        self.assertTrue(all(not p.requires_grad for p in adapter.experts[:-1]))
-        self.assertTrue(all(not p.requires_grad for p in adapter.incremental_routers[:-1]))
+        self.assertTrue(all(
+            not parameter.requires_grad
+            for expert in adapter.experts[:-1]
+            for parameter in expert.parameters()
+        ))
+        self.assertTrue(all(
+            not parameter.requires_grad
+            for router in adapter.incremental_routers[:-1]
+            for parameter in router.parameters()
+        ))
 
     def test_router_requires_frozen_reference_feature(self):
         adapter = VisualMoEAdapter(8, num_experts=2, reduction=2)
