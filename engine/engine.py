@@ -333,95 +333,157 @@ class Runner:
 
     def _select_and_train_expansion(self, task_id, train_loader, extract_loader,
                                     old_states, class_ids, class_names):
+        """Evaluate one predeclared APC expansion policy with source-held-out CV.
+
+        Each fold proposes layers from its fitting sources only, jointly trains
+        all proposed layers, and evaluates the resulting all-seen-class risk on
+        that fold's untouched sources. We do not intersect fold proposals or
+        select a winning subset on the same validation folds.
+        """
         if not self.apc_state:
             raise RuntimeError("Base APC thresholds are not initialized.")
         folds = self._support_folds(train_loader.dataset)
         if not folds:
-            raise RuntimeError("Source-exclusive expansion validation requires at least 3 shots per class.")
+            raise RuntimeError(
+                "Source-exclusive expansion validation requires at least 3 shots per class."
+            )
         text, desc, _ = self._text(class_ids)
-        # Propose layers separately inside each source-held-out training fold.
-        # A validation source is never used to decide which layers are eligible
-        # in the fold where that source is evaluated.
         fold_candidate_sets = []
-        for fit_idx, _ in folds:
+        fold_baseline_losses = []
+        fold_expanded_losses = []
+        fold_gains = []
+
+        for fit_idx, val_idx in folds:
+            fit_train = self._loader(
+                train_loader.dataset, fit_idx, train_loader.batch_size, True
+            )
             fit_extract = self._loader(
                 extract_loader.dataset, fit_idx, extract_loader.batch_size, False
             )
+            val_loader = self._loader(
+                extract_loader.dataset, val_idx, extract_loader.batch_size, False
+            )
+
+            # APC proposal is derived only from this fold's fitting sources.
             fold_state = self._build_state(class_ids, fit_extract, old_states, False)
-            fold_candidates = {
+            fold_candidates = sorted(
                 row["block"] for row in self._candidate_layers(fold_state, old_states)
                 if row["candidate"]
-            }
+            )
             fold_candidate_sets.append(fold_candidates)
-        candidates = sorted(set.intersection(*fold_candidate_sets)) if fold_candidate_sets else []
-        if not candidates:
-            return {"expanded": [], "candidate_layers": [], "fold_candidate_layers": fold_candidate_sets, "logs": []}
-        subsets = [tuple(candidates[i] for i in range(len(candidates)) if mask & (1 << i))
-                   for mask in range(1 << len(candidates))]
-        # Evaluate the no-expansion baseline and every candidate subset on
-        # identical source-grouped folds. Each subset is jointly trained.
-        scores = []
-        for subset in subsets:
-            fold_scores = []
-            for fit_idx, val_idx in folds:
-                fit_train = self._loader(train_loader.dataset, fit_idx, train_loader.batch_size, True)
-                fit_extract = self._loader(extract_loader.dataset, fit_idx, extract_loader.batch_size, False)
-                val = self._loader(extract_loader.dataset, val_idx, extract_loader.batch_size, False)
-                before = self.model.export_moe_topology()
-                before_state = {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}
-                try:
-                    if subset:
-                        self._candidate_train(task_id, subset, fit_train, fit_extract,
-                                              old_states, class_ids, text, desc)
-                    fold_scores.append(self._evaluate_candidate(
-                        val, fit_extract, old_states, class_ids, text, desc
-                    ))
-                finally:
-                    self.model.rebuild_moe_topology(before)
-                    self.model.load_state_dict(before_state, strict=True)
-                    for _, adapter in self._adapters():
-                        adapter.freeze_all()
-            scores.append((subset, np.asarray(fold_scores, dtype=np.float64)))
-        baseline = next(values for subset, values in scores if not subset)
-        candidates_scores = []
-        for subset, values in scores:
-            if not subset:
-                continue
-            gain = baseline - values
-            candidates_scores.append((float(gain.mean()), float(gain.std(ddof=1)/np.sqrt(len(gain))) if len(gain)>1 else float("inf"), subset, values))
-        if not candidates_scores:
-            return {"expanded": [], "candidate_layers": candidates, "logs": []}
-        best_mean = max(row[0] for row in candidates_scores)
-        best_row = max(candidates_scores, key=lambda row: row[0])
-        one_se_floor = best_mean - best_row[1]
-        # Among statistically indistinguishable candidates, prefer fewer added
-        # layers/parameters; do not maximize a noisy fold mean at any cost.
-        eligible = [row for row in candidates_scores if row[0] >= one_se_floor]
-        gain, se, selected, foldscores = min(
-            eligible, key=lambda row: (len(row[2]), -row[0])
+
+            topology_before = self.model.export_moe_topology()
+            state_before = {
+                key: value.detach().cpu().clone()
+                for key, value in self.model.state_dict().items()
+            }
+            try:
+                baseline_loss = self._evaluate_candidate(
+                    val_loader, fit_extract, old_states, class_ids, text, desc
+                )
+                if fold_candidates:
+                    self._candidate_train(
+                        task_id, fold_candidates, fit_train, fit_extract,
+                        old_states, class_ids, text, desc
+                    )
+                    expanded_loss = self._evaluate_candidate(
+                        val_loader, fit_extract, old_states, class_ids, text, desc
+                    )
+                else:
+                    # The policy predicts no expansion in this fold.
+                    expanded_loss = baseline_loss
+                gain = float(baseline_loss - expanded_loss)
+                fold_baseline_losses.append(float(baseline_loss))
+                fold_expanded_losses.append(float(expanded_loss))
+                fold_gains.append(gain)
+            finally:
+                self.model.rebuild_moe_topology(topology_before)
+                self.model.load_state_dict(state_before, strict=True)
+                for _, adapter in self._adapters():
+                    adapter.freeze_all()
+
+        # Re-apply the same fixed APC proposal rule to all current support
+        # sources for the final fit. Validation folds estimate the policy;
+        # they do not choose individual layers or subsets.
+        full_state = self._build_state(class_ids, extract_loader, old_states, False)
+        final_candidates = sorted(
+            row["block"] for row in self._candidate_layers(full_state, old_states)
+            if row["candidate"]
         )
-        family_alpha = float(self.cfg.TRAINER.BiMC.APC.ALPHA)
-        critical = NormalDist().inv_cdf(1.0 - family_alpha / max(1, len(candidates_scores)))
-        required_gain = critical * se
-        if gain <= required_gain:
-            return {"expanded": [], "candidate_layers": candidates,
-                    "candidate_gain": gain, "candidate_se": se,
-                    "familywise_critical_z": critical, "required_gain": required_gain, "logs": []}
+
+        gains = np.asarray(fold_gains, dtype=np.float64)
+        mean_gain = float(gains.mean()) if len(gains) else 0.0
+        if len(gains) > 1:
+            # Corrected resampled-t uncertainty accounts conservatively for
+            # overlap between fitting folds (test/train ratio = 1/(K-1)).
+            sample_variance = float(gains.var(ddof=1))
+            test_train_ratio = 1.0 / max(1, len(gains) - 1)
+            corrected_se = float(np.sqrt((1.0 / len(gains) + test_train_ratio)
+                                         * sample_variance))
+            from scipy.stats import t as student_t
+            significance = float(
+                _get(self.cfg.TRAINER.BiMC.APC, "SIGNIFICANCE", 0.05)
+            )
+            critical = float(student_t.ppf(1.0 - significance, df=len(gains) - 1))
+            required_gain = critical * corrected_se
+        else:
+            corrected_se = float("inf")
+            critical = float("inf")
+            required_gain = float("inf")
+
+        diagnostics = {
+            "fold_candidate_layers": fold_candidate_sets,
+            "fold_baseline_nll": fold_baseline_losses,
+            "fold_expanded_nll": fold_expanded_losses,
+            "fold_risk_gains": fold_gains,
+            "mean_risk_gain": mean_gain,
+            "corrected_standard_error": corrected_se,
+            "critical_value": critical,
+            "required_risk_gain": required_gain,
+            "final_candidate_layers": final_candidates,
+        }
+
+        if not any(fold_candidate_sets):
+            return {
+                "expanded": [], "candidate_layers": final_candidates,
+                "reason": "APC proposed no layer in any fitting fold",
+                **diagnostics, "logs": [],
+            }
+        if not final_candidates:
+            return {
+                "expanded": [], "candidate_layers": [],
+                "reason": "APC proposed no layer on the full support set",
+                **diagnostics, "logs": [],
+            }
+        if not np.isfinite(mean_gain) or mean_gain <= required_gain:
+            return {
+                "expanded": [], "candidate_layers": final_candidates,
+                "reason": "Held-out full-class risk improvement did not clear the uncertainty bound",
+                **diagnostics, "logs": [],
+            }
+
         topology_before = self.model.export_moe_topology()
-        state_before = {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}
+        state_before = {
+            key: value.detach().cpu().clone()
+            for key, value in self.model.state_dict().items()
+        }
         try:
-            logs = self._candidate_train(task_id, selected, train_loader, extract_loader,
-                                         old_states, class_ids, text, desc)
+            logs = self._candidate_train(
+                task_id, final_candidates, train_loader, extract_loader,
+                old_states, class_ids, text, desc
+            )
         except Exception:
             self.model.rebuild_moe_topology(topology_before)
             self.model.load_state_dict(state_before, strict=True)
             for _, adapter in self._adapters():
                 adapter.freeze_all()
             raise
-        return {"expanded": list(selected), "candidate_layers": candidates,
-                "candidate_gain": gain, "candidate_se": se,
-                "familywise_critical_z": critical, "required_gain": required_gain,
-                "logs": logs}
+        return {
+            "expanded": list(final_candidates),
+            "candidate_layers": final_candidates,
+            "reason": "Held-out full-class risk improvement accepted",
+            **diagnostics, "logs": logs,
+        }
 
     def _base_train(self, state, train_loader, extract_loader):
         for _, adapter in self._adapters():
