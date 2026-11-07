@@ -218,7 +218,10 @@ class Runner:
     def _historical_feature_targets(self, old_states):
         targets = {}
         for state in old_states:
-            required = ("support_features", "support_labels", "support_source_ids")
+            required = (
+                "support_features", "support_labels", "support_source_ids",
+                "feature_anchor_session",
+            )
             if any(key not in state for key in required):
                 raise RuntimeError(
                     "Historical feature targets are missing. Restart from Session 0 "
@@ -235,7 +238,12 @@ class Runner:
                 source_id = int(source)
                 if source_id in targets:
                     raise ValueError(f"Historical support source {source_id} appears more than once.")
-                targets[source_id] = (int(label), F.normalize(feature.float(), dim=-1))
+                if int(state["feature_anchor_session"]) != int(state.get("creation_session", -1)):
+                raise RuntimeError(
+                    "Historical feature anchor session metadata is inconsistent; "
+                    "restart from Session 0 with checkpoint schema 24."
+                )
+            targets[source_id] = (int(label), F.normalize(feature.float(), dim=-1))
         if not targets:
             raise ValueError("Historical support feature target bank is empty.")
         return targets
@@ -440,6 +448,8 @@ class Runner:
             "support_features": feat.detach().cpu(),
             "support_labels": labels.detach().cpu(),
             "support_source_ids": sources.detach().cpu(),
+            "feature_anchor_session": len(old_states),
+            "current_support_features": feat.detach().cpu(),
             "raw_layer_prototypes": raw_prototypes,
             # Historical adapter-input CLS anchors permit auditing the actual
             # residual emitted by a newly inserted expert without retaining images.
@@ -482,6 +492,22 @@ class Runner:
             values.append(torch.as_tensor(anchors).float())
         return torch.cat(values, dim=0).to(self.device)
 
+    @staticmethod
+    def _update_current_feature_cache(state, features, labels, sources, indices):
+        """Refresh diagnostics/cache without mutating immutable class-birth targets."""
+        indices = torch.as_tensor(indices, dtype=torch.long, device=features.device)
+        current_features = features.index_select(0, indices).detach().cpu()
+        current_labels = labels.index_select(0, indices).detach().cpu()
+        current_sources = sources.index_select(0, indices).detach().cpu()
+        birth_labels = torch.as_tensor(state["support_labels"]).long().cpu()
+        birth_sources = torch.as_tensor(state["support_source_ids"]).long().cpu()
+        if not torch.equal(current_labels, birth_labels):
+            raise RuntimeError("Historical support labels changed after their feature-anchor session.")
+        if not torch.equal(current_sources, birth_sources):
+            raise RuntimeError("Historical support source ordering changed after feature anchoring.")
+        # support_features remains immutable and is the teacher target for all future sessions.
+        state["current_support_features"] = current_features
+
     @torch.no_grad()
     def _refresh_historical_support_features(self, task_id):
         """Refresh every stored support target/anchor in the current encoder space."""
@@ -508,9 +534,9 @@ class Runner:
                 [index_by_source[int(source)] for source in ordered_sources],
                 device=features.device, dtype=torch.long,
             )
-            state["support_features"] = features.index_select(0, indices).detach().cpu()
-            state["support_labels"] = labels.index_select(0, indices).detach().cpu()
-            state["support_source_ids"] = sources.index_select(0, indices).detach().cpu()
+            self._update_current_feature_cache(
+                state, features, labels, sources, indices
+            )
 
         raw_layers = self.model.collect_blockwise_cls_features(loader)
         for block, item in raw_layers.items():
@@ -1024,7 +1050,7 @@ class Runner:
         path = Path(_get(cfg, "DIR", "checkpoints/fscil_moe"))
         path.mkdir(parents=True, exist_ok=True)
         payload = {
-            "schema_version": 23,
+            "schema_version": 24,
             "completed_session": int(completed_session),
             "model_state": {k:v.detach().cpu() for k,v in self.model.state_dict().items()},
             "moe_topology": self.model.export_moe_topology(),
@@ -1053,8 +1079,8 @@ class Runner:
         if not resume:
             return
         payload = torch.load(resume, map_location="cpu", weights_only=False)
-        if int(payload.get("schema_version", -1)) != 23:
-            raise ValueError("This unified architecture requires checkpoint schema 23 with historical feature anchors; restart from Session 0.")
+        if int(payload.get("schema_version", -1)) != 24:
+            raise ValueError("This unified architecture requires checkpoint schema 24 with immutable class-birth feature anchors; restart from Session 0.")
         self.model.rebuild_moe_topology(payload["moe_topology"])
         self.model.load_state_dict(payload["model_state"], strict=True)
         self.states = payload["states"]

@@ -100,16 +100,39 @@ class PrototypeAndStateTests(unittest.TestCase):
         self.assertEqual(audit["lost_previously_correct"], 2)
         self.assertAlmostEqual(audit["mean_cosine_similarity"], 0.0, places=6)
 
+    def test_current_feature_refresh_never_overwrites_class_birth_teacher(self):
+        runner = Runner.__new__(Runner)
+        birth = torch.tensor([[1., 0.], [0., 1.]])
+        state = {
+            "support_features": birth.clone(),
+            "support_labels": torch.tensor([0, 1]),
+            "support_source_ids": torch.tensor([20, 21]),
+            "feature_anchor_session": 0,
+            "creation_session": 0,
+        }
+        current = torch.tensor([[0.8, 0.6], [0.6, 0.8]])
+        labels = torch.tensor([0, 1])
+        sources = torch.tensor([20, 21])
+        Runner._update_current_feature_cache(
+            state, current, labels, sources, torch.tensor([0, 1])
+        )
+        torch.testing.assert_close(state["support_features"], birth)
+        torch.testing.assert_close(state["current_support_features"], current)
+        targets = runner._historical_feature_targets([state])
+        torch.testing.assert_close(targets[20][1], birth[0])
+
     def test_historical_feature_targets_require_complete_session_metadata(self):
         runner = Runner.__new__(Runner)
         state = {
             "support_features": torch.eye(2),
             "support_labels": torch.tensor([0, 1]),
             "support_source_ids": torch.tensor([20, 21]),
+            "feature_anchor_session": 0,
+            "creation_session": 0,
         }
         targets = runner._historical_feature_targets([state])
         self.assertEqual(set(targets), {20, 21})
-        with self.assertRaisesRegex(RuntimeError, "schema 23"):
+        with self.assertRaisesRegex(RuntimeError, "schema 24"):
             runner._historical_feature_targets([{"class_ids": torch.tensor([0])}])
 
     def test_visual_text_intra_modal_and_inter_modal_calibration(self):
