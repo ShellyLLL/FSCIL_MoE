@@ -4,6 +4,7 @@ import json
 import os
 import random
 import time
+from statistics import NormalDist
 from pathlib import Path
 import numpy as np
 import torch
@@ -353,7 +354,7 @@ class Runner:
                 fit_extract = self._loader(extract_loader.dataset, fit_idx, extract_loader.batch_size, False)
                 val = self._loader(extract_loader.dataset, val_idx, extract_loader.batch_size, False)
                 before = self.model.export_moe_topology()
-                before_state = copy.deepcopy(self.model.state_dict())
+                before_state = {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}
                 try:
                     if subset:
                         self._candidate_train(task_id, subset, fit_train, fit_extract,
@@ -378,13 +379,28 @@ class Runner:
         if not candidates_scores:
             return {"expanded": [], "candidate_layers": candidates, "logs": []}
         gain, se, selected, foldscores = candidates_scores[0]
-        if gain <= se:
+        family_alpha = float(self.cfg.TRAINER.BiMC.APC.ALPHA)
+        critical = NormalDist().inv_cdf(1.0 - family_alpha / max(1, len(candidates_scores)))
+        required_gain = critical * se
+        if gain <= required_gain:
             return {"expanded": [], "candidate_layers": candidates,
-                    "candidate_gain": gain, "candidate_se": se, "logs": []}
-        logs = self._candidate_train(task_id, selected, train_loader, extract_loader,
-                                     old_states, class_ids, text, desc)
+                    "candidate_gain": gain, "candidate_se": se,
+                    "familywise_critical_z": critical, "required_gain": required_gain, "logs": []}
+        topology_before = self.model.export_moe_topology()
+        state_before = {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}
+        try:
+            logs = self._candidate_train(task_id, selected, train_loader, extract_loader,
+                                         old_states, class_ids, text, desc)
+        except Exception:
+            self.model.rebuild_moe_topology(topology_before)
+            self.model.load_state_dict(state_before, strict=True)
+            for _, adapter in self._adapters():
+                adapter.freeze_all()
+            raise
         return {"expanded": list(selected), "candidate_layers": candidates,
-                "candidate_gain": gain, "candidate_se": se, "logs": logs}
+                "candidate_gain": gain, "candidate_se": se,
+                "familywise_critical_z": critical, "required_gain": required_gain,
+                "logs": logs}
 
     def _base_train(self, state, train_loader, extract_loader):
         for _, adapter in self._adapters():
@@ -444,14 +460,18 @@ class Runner:
             "acc_list": self.acc_list,
             "task_acc_list": self.task_acc_list,
             "support_manifest": self.data_manager.get_support_manifest(),
-            "rng": {"python": random.getstate(), "numpy": np.random.get_state(), "torch": torch.get_rng_state()},
+            "rng": {"python": random.getstate(), "numpy": np.random.get_state(),
+                    "torch": torch.get_rng_state(),
+                    "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None},
         }
         target = path / f"session_{completed_session:02d}.pth"
         temp = target.with_suffix(".tmp")
         torch.save(payload, temp)
         os.replace(temp, target)
         latest = path / "latest.pth"
-        torch.save(payload, latest)
+        latest_tmp = latest.with_suffix(".tmp")
+        torch.save(payload, latest_tmp)
+        os.replace(latest_tmp, latest)
 
     def _load_checkpoint(self):
         resume = _get(self.cfg.TRAINER.BiMC.CHECKPOINT, "RESUME", "")
@@ -471,6 +491,8 @@ class Runner:
         random.setstate(payload["rng"]["python"])
         np.random.set_state(payload["rng"]["numpy"])
         torch.set_rng_state(payload["rng"]["torch"])
+        if torch.cuda.is_available() and payload["rng"].get("cuda") is not None:
+            torch.cuda.set_rng_state_all(payload["rng"]["cuda"])
 
     def run(self):
         self.evaluator = AccuracyEvaluator(self.data_manager.class_index_in_task)
