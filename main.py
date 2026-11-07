@@ -71,6 +71,7 @@ def extend_cfg(cfg):
     cfg.TRAINER.BiMC.APC = CN()
     cfg.TRAINER.BiMC.APC.ENABLE = True
     cfg.TRAINER.BiMC.APC.ALPHA = 0.05
+    cfg.TRAINER.BiMC.APC.SIGNIFICANCE = 0.05
 
     cfg.TRAINER.BiMC.PROTECTION = CN()
     cfg.TRAINER.BiMC.PROTECTION.OLD_GATE_WEIGHT = 0.1
