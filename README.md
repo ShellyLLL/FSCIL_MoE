@@ -46,26 +46,20 @@ python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/t
 python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc_ensemble.yaml
 ~~~
 
-### Unified dynamic FSCIL MoE development
+### Unified dynamic FSCIL MoE architecture
 
-The active architecture work is on branch `codex/fscil-unified-expansion-architecture`.
-It separates the session that creates an expert from the monotonic topology version
-at which that expert becomes active. APC calibration uses the actual post-residual
-Transformer block CLS state. Candidate/null comparisons use the full global,
-versioned class bank and the deployment task-gating rule, not a novel-only classifier.
+The active implementation is on `codex/fscil-unified-expansion-architecture`.
 
-The branch is under architecture validation. **Do not launch the full CUB200
-experiment until the acceptance tests documented in
-`docs/apc_dynamic_moe.md` pass**, including versioned checkpoint round-trip,
-source-disjoint global-classifier verification, multi-layer expansion, and
-historical task-gate retention. No AA or PD improvement is claimed yet.
+The classifier uses one current visual encoder and one all-seen-class cosine prototype bank. Visual intra-modal calibration, text intra-modal calibration, and inter-modal fusion produce one fused prototype per seen class. Inference is a single cosine similarity calculation over every seen class. This implementation does **not** use category-masked BiMC†, MGC, CMNN, per-class encoder versions, or task gates.
 
-After those gates pass, use a fixed support manifest for every baseline and
-ablation. Report class-balanced AA, task-balanced AA, PD, per-block expert
-counts, added parameters, candidate validation/search time, training time,
-and inference latency. Expert expansion efficiency must be reported alongside
-accuracy; it cannot be inferred from AA alone.
+The visual MoE uses two streams over the frozen CLIP ViT:
+- A frozen reference stream supplies the raw CLS feature for APC and every expert router.
+- An enhanced stream applies residual experts and supplies the final image feature.
 
+Base experts share a Softmax router. Every incremental expert has an independent Sigmoid router. The pools are not jointly normalized and do not use Top-K. Incremental training freezes the backbone, base experts/router and historical experts/routers; only newly added experts and their own routers are trainable. APC proposes candidate layers from fixed base raw-prototype thresholds; joint layer subsets are then compared with the no-expansion model using source-grouped validation and the same all-class classifier.
+
+**Architecture acceptance is not yet declared.** Run `python -m pytest -q` and inspect the GitHub Actions result before starting the full CUB200 experiment. No AA/PD improvement is claimed until controlled experiments complete.
+  
 ## Acknowledgment
 
 In this repository, we build our code based on the following excellent open-source projects. We sincerely thank all the authors for sharing their great work:
