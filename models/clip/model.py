@@ -166,7 +166,7 @@ class VisualMoEAdapter(nn.Module):
             raise ValueError("At least one base expert is required.")
         self.layer_norm = nn.LayerNorm(self.d_model, elementwise_affine=False)
         self.experts = nn.ModuleList([
-            BottleneckExpert(self.d_model, self.default_reduction, zero_init_up=True)
+            BottleneckExpert(self.d_model, self.default_reduction, zero_init_up=False)
             for _ in range(self.base_expert_count)
         ])
         self.base_router = nn.Linear(self.d_model, self.base_expert_count)
