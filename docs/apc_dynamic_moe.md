@@ -72,7 +72,7 @@ Base-session raw reference prototypes are stored for each inserted block. A fixe
 
 APC only proposes candidate layers. It does not commit expansion based on prototype similarity alone.
 
-For each source-grouped fold, APC proposals are computed from that fold's fitting sources only; the intersection of fold-level proposals forms the candidate set, so a held-out source cannot nominate its own expansion layer. The runner evaluates the no-expansion model and every non-empty subset of that candidate set. Each subset is jointly trained, then evaluated on the same source-grouped held-out folds using the one all-seen-class cosine classifier. Every fold starts from an exact snapshot of the pre-candidate topology and weights. A subset is selected only when its paired mean NLL improvement exceeds one standard error. The selected subset is then jointly trained on all current support data.
+For each source-grouped fold, APC proposals are computed from that fold's fitting sources only. The fold's own proposed layers are jointly trained and evaluated on its untouched held-out sources against the no-expansion baseline using the same all-seen-class cosine classifier. We do not intersect fold proposals, enumerate every layer subset, or select a winning subset on the same validation folds. A corrected resampled one-sided t bound is applied to the paired risk gains to account conservatively for overlapping fitting folds. If accepted, the fixed APC rule is applied once to all current support sources and all resulting candidate layers are jointly trained. Per-fold candidates, baseline/expanded NLL, risk gains, uncertainty bound, and rejection reason are logged.
 
 ## 4. Training and activation/freeze policy
 
