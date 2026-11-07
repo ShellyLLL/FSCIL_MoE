@@ -124,9 +124,42 @@ class BiMC(nn.Module):
         lam = float(self.cfg.TRAINER.BiMC.LAMBDA_I)
         return F.normalize((1.0 - lam) * current + lam * inherited, dim=-1)
 
+    @torch.no_grad()
+    def set_base_visual_prototype(self, prototypes):
+        """Install the immutable base-session visual calibration anchor."""
+        value = torch.as_tensor(
+            prototypes, device=self.device, dtype=torch.float32
+        ).detach()
+        if value.ndim != 2 or value.shape[0] == 0:
+            raise ValueError("Base visual prototypes must be a non-empty [classes, dim] tensor.")
+        if not torch.isfinite(value).all():
+            raise FloatingPointError("Base visual prototypes contain non-finite values.")
+        norms = value.norm(dim=-1)
+        if torch.any(norms <= 1e-12):
+            raise ValueError("Base visual prototypes contain zero-norm rows.")
+        value = F.normalize(value, dim=-1).detach().clone()
+        if self.base_vision_prototype is not None:
+            existing = self.base_vision_prototype.to(device=value.device, dtype=value.dtype)
+            if existing.shape != value.shape or not torch.allclose(
+                existing, value, rtol=0.0, atol=1e-6
+            ):
+                raise RuntimeError(
+                    "Base visual calibration anchor is immutable once initialized."
+                )
+        self.base_vision_prototype = value
+
     def calibrate_incremental_visual(self, current, reference=None):
         if self.base_vision_prototype is None:
-            raise RuntimeError("Base visual prototypes must exist before incremental calibration.")
+            raise RuntimeError(
+                "Base visual calibration anchor is missing. Initialize it from "
+                "Session 0 image_proto or restore it from the checkpoint before "
+                "incremental visual calibration."
+            )
+        current = torch.as_tensor(current, device=self.device, dtype=torch.float32)
+        if current.ndim != 2 or current.shape[-1] != self.base_vision_prototype.shape[-1]:
+            raise ValueError(
+                "Incremental visual prototypes must be [novel_classes, base_embedding_dim]."
+            )
         return self.soft_calibration(self.base_vision_prototype, current)
 
     @torch.no_grad()
