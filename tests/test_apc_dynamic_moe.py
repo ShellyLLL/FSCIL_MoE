@@ -98,6 +98,40 @@ class UnifiedMoETests(unittest.TestCase):
         self.assertTrue(torch.isfinite(residual).all())
         self.assertTrue(torch.all(residual.norm(dim=-1) > 0))
 
+    def test_incremental_router_pool_is_independent_and_each_gate_has_own_gradient(self):
+        torch.manual_seed(31)
+        adapter = VisualMoEAdapter(8, num_experts=2, reduction=2)
+        adapter.add_expert(session_id=1, reduction=2)
+        adapter.add_expert(session_id=2, reduction=2)
+        reference = torch.randn(6, 8)
+        tokens = torch.randn(4, 6, 8)
+        residual, aux = adapter(tokens, reference)
+        base_weights = aux["base_route_weights"]
+        gates = aux["incremental_gates"]
+        torch.testing.assert_close(base_weights.sum(-1), torch.ones(6))
+        self.assertEqual(tuple(gates.shape), (6, 2))
+        self.assertTrue(torch.all((gates > 0) & (gates < 1)))
+        self.assertTrue(torch.any(gates.sum(-1) > 1.0))
+        residual.square().mean().backward()
+        for router in adapter.incremental_routers:
+            self.assertIsNotNone(router.weight.grad)
+            self.assertTrue(torch.isfinite(router.weight.grad).all())
+        self.assertTrue(all(p.grad is None for p in adapter.base_router.parameters()))
+
+    def test_incremental_router_and_expert_have_no_cross_session_parameter_sharing(self):
+        adapter = VisualMoEAdapter(8, num_experts=2, reduction=2)
+        adapter.add_expert(session_id=1, reduction=2)
+        first_expert = {id(p) for p in adapter.experts[-1].parameters()}
+        first_router = {id(p) for p in adapter.incremental_routers[-1].parameters()}
+        adapter.freeze_all()
+        adapter.add_expert(session_id=2, reduction=2)
+        second_expert = {id(p) for p in adapter.experts[-1].parameters()}
+        second_router = {id(p) for p in adapter.incremental_routers[-1].parameters()}
+        self.assertFalse(first_expert & second_expert)
+        self.assertFalse(first_router & second_router)
+        self.assertTrue(all(not p.requires_grad for p in adapter.experts[:-1]))
+        self.assertTrue(all(not p.requires_grad for p in adapter.incremental_routers[:-1]))
+
     def test_router_requires_frozen_reference_feature(self):
         adapter = VisualMoEAdapter(8, num_experts=2, reduction=2)
         with self.assertRaises(ValueError):
