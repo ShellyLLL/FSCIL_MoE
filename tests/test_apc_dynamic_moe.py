@@ -1,8 +1,9 @@
 """Tests for the unified raw-reference APC and independent expert gates."""
+import copy
 import unittest
 import torch
 import torch.nn.functional as F
-from models.clip.model import VisualMoEAdapter
+from models.clip.model import Transformer, VisualMoEAdapter
 
 
 class UnifiedMoETests(unittest.TestCase):
@@ -46,6 +47,24 @@ class UnifiedMoETests(unittest.TestCase):
         self.assertTrue(all(not p.requires_grad for p in adapter.experts[:-1].parameters()))
         self.assertTrue(all(not p.requires_grad for p in adapter.base_router.parameters()))
 
+    def test_reference_stream_is_independent_of_earlier_adapters(self):
+        torch.manual_seed(19)
+        reference_model = Transformer(width=8, layers=2, heads=2).eval()
+        enhanced_model = copy.deepcopy(reference_model)
+        enhanced_model.resblocks[0].moe_adapter = VisualMoEAdapter(8, 2, 2)
+        enhanced_model.resblocks[1].moe_adapter = VisualMoEAdapter(8, 2, 2)
+        enhanced_model.eval()
+        x = torch.randn(5, 3, 8)
+        reference = x
+        expected = []
+        with torch.no_grad():
+            for block in reference_model.resblocks:
+                reference = block.forward_base(reference)
+                expected.append(reference[0].clone())
+        _, aux, _ = enhanced_model(x)
+        self.assertEqual(len(aux), 2)
+        torch.testing.assert_close(aux[0]["raw_reference_cls"], expected[0])
+        torch.testing.assert_close(aux[1]["raw_reference_cls"], expected[1])
     def test_router_requires_frozen_reference_feature(self):
         adapter = VisualMoEAdapter(8, num_experts=2, reduction=2)
         with self.assertRaises(ValueError):
