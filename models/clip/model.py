@@ -158,7 +158,7 @@ class VisualMoEAdapter(nn.Module):
     Experts transform the enhanced hidden sequence. The two routing pools are
     never jointly normalized and no Top-K selection is applied.
     """
-    INITIAL_INCREMENTAL_GATE = 0.1
+    INITIAL_INCREMENTAL_GATE = 0.01
 
     def __init__(self, d_model, num_experts=4, reduction=4, incremental_reduction=None):
         super().__init__()
