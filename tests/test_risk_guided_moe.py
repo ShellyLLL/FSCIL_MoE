@@ -11,10 +11,13 @@ from models.bimc import BiMC
 class PrototypeAndStateTests(unittest.TestCase):
     def test_visual_text_intra_modal_and_inter_modal_calibration(self):
         runner = Runner.__new__(Runner)
-        runner.cfg = SimpleNamespace(
+        cfg = SimpleNamespace(
             TRAINER=SimpleNamespace(BiMC=SimpleNamespace(TEXT_CALIBRATION=True, LAMBDA_T=0.5)),
             DATASET=SimpleNamespace(BETA=0.3),
         )
+        model = BiMC.__new__(BiMC)
+        model.cfg = cfg
+        runner.model = model
         visual = F.normalize(torch.tensor([[1., 0., 0.], [0., 1., 0.]]), dim=-1)
         text = F.normalize(torch.tensor([[0., 0., 1.], [0., 1., 0.]]), dim=-1)
         desc = F.normalize(torch.tensor([[0., 0.5, 0.5], [0.5, 0.5, 0.]]), dim=-1)
@@ -140,7 +143,7 @@ class PrototypeAndStateTests(unittest.TestCase):
         )
         torch.testing.assert_close(prototypes[1, 1], features[2])
         torch.testing.assert_close(
-            prototypes[1, 0], F.normalize(features[:2].mean(0), dim=-1)
+            prototypes[1, 0], features[:2].mean(0)
         )
 
 
