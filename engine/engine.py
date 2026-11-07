@@ -504,6 +504,11 @@ class Runner:
         self.model.rebuild_moe_topology(payload["moe_topology"])
         self.model.load_state_dict(payload["model_state"], strict=True)
         self.states = payload["states"]
+        if not self.states:
+            raise ValueError("Unified checkpoint has no base-session prototype state.")
+        # Restore the exact post-base-training anchor used by every later
+        # incremental visual calibration step.
+        self.model.set_base_visual_prototype(self.states[0]["image_proto"])
         self.apc_state = payload["apc_state"]
         self.acc_list = payload["acc_list"]
         self.task_acc_list = payload["task_acc_list"]
@@ -533,7 +538,11 @@ class Runner:
                 state = self._build_state(classes, extract, [], False)
                 if self._adapters():
                     self._base_train(state, train, extract)
+                    # Rebuild prototypes after base expert training. This is
+                    # the final base feature space and therefore the only
+                    # valid anchor for all incremental visual calibration.
                     state = self._build_state(classes, extract, [], False)
+                self.model.set_base_visual_prototype(state["image_proto"])
                 self.states.append(state)
                 if self._adapters():
                     self._calibrate_apc(state)
