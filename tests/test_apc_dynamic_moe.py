@@ -98,7 +98,7 @@ class UnifiedMoETests(unittest.TestCase):
         self.assertTrue(torch.isfinite(residual).all())
         self.assertTrue(torch.all(residual.norm(dim=-1) > 0))
 
-    def test_incremental_router_pool_is_independent_and_each_gate_has_own_gradient(self):
+    def test_incremental_router_pool_is_independent_and_only_newest_gate_trains(self):
         torch.manual_seed(31)
         adapter = VisualMoEAdapter(8, num_experts=2, reduction=2)
         adapter.add_expert(session_id=1, reduction=2)
@@ -120,9 +120,13 @@ class UnifiedMoETests(unittest.TestCase):
         self.assertTrue(torch.all((gates > 0) & (gates < 1)))
         self.assertTrue(torch.any(gates.sum(-1) > 1.0))
         residual.square().mean().backward()
-        for router in adapter.incremental_routers:
-            self.assertIsNotNone(router.weight.grad)
-            self.assertTrue(torch.isfinite(router.weight.grad).all())
+        self.assertIsNotNone(adapter.incremental_routers[-1].weight.grad)
+        self.assertTrue(torch.isfinite(adapter.incremental_routers[-1].weight.grad).all())
+        self.assertTrue(all(
+            parameter.grad is None
+            for router in adapter.incremental_routers[:-1]
+            for parameter in router.parameters()
+        ))
         self.assertTrue(all(p.grad is None for p in adapter.base_router.parameters()))
 
     def test_incremental_router_and_expert_have_no_cross_session_parameter_sharing(self):
