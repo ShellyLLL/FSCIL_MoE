@@ -217,10 +217,11 @@ class Runner:
         desc_list, desc = self.model.inference_all_description_feature(names, self.cfg.DATASET.GPT_PATH)
         fused = self._fuse(visual, text, desc)
         raw_layers = self.model.collect_blockwise_cls_features(loader)
-        raw_prototypes, adapter_input_anchors = {}, {}
+        raw_prototypes, adapter_input_anchors, raw_reference_anchors = {}, {}, {}
         for block, item in raw_layers.items():
             vals, ys = item["raw_reference_cls"], item["labels"]
             adapter_input_anchors[int(block)] = item["adapter_input_cls"].float().cpu()
+            raw_reference_anchors[int(block)] = vals.float().cpu()
             rows = []
             for cls in class_ids:
                 v = vals[ys.eq(int(cls))]
@@ -239,6 +240,7 @@ class Runner:
             # Historical adapter-input CLS anchors permit auditing the actual
             # residual emitted by a newly inserted expert without retaining images.
             "adapter_input_anchors": adapter_input_anchors,
+            "raw_reference_anchors": raw_reference_anchors,
             "creation_session": len(old_states),
         }
 
@@ -251,6 +253,18 @@ class Runner:
             ids.extend(torch.as_tensor(state["class_ids"]).tolist())
             protos.extend(torch.as_tensor(raw).unbind(0))
         return torch.tensor(ids, dtype=torch.long), torch.stack(protos).to(self.device)
+
+    def _raw_reference_anchor_history(self, states, block):
+        values = []
+        for state in states:
+            anchors = state.get("raw_reference_anchors", {}).get(int(block))
+            if anchors is None or anchors.numel() == 0:
+                raise RuntimeError(
+                    f"Historical raw-reference anchors missing for MoE block {block}; "
+                    "the checkpoint cannot certify actual expert residual protection."
+                )
+            values.append(torch.as_tensor(anchors).float())
+        return torch.cat(values, dim=0).to(self.device)
 
     def _adapter_input_history(self, states, block):
         values = []
@@ -313,7 +327,7 @@ class Runner:
         beta = float(self.cfg.DATASET.BETA)
         logit_scale = self.model.classification_scale()
         history_raw = {
-            b: F.normalize(self._raw_history(old_states, b)[1].float(), dim=-1)
+            b: F.normalize(self._raw_reference_anchor_history(old_states, b), dim=-1)
             for b in selected_blocks
         }
         history_inputs = {
@@ -686,7 +700,7 @@ class Runner:
         path = Path(_get(cfg, "DIR", "checkpoints/fscil_moe"))
         path.mkdir(parents=True, exist_ok=True)
         payload = {
-            "schema_version": 21,
+            "schema_version": 22,
             "completed_session": int(completed_session),
             "model_state": {k:v.detach().cpu() for k,v in self.model.state_dict().items()},
             "moe_topology": self.model.export_moe_topology(),
@@ -715,8 +729,8 @@ class Runner:
         if not resume:
             return
         payload = torch.load(resume, map_location="cpu", weights_only=False)
-        if int(payload.get("schema_version", -1)) != 21:
-            raise ValueError("This unified architecture requires checkpoint schema 21; restart from Session 0.")
+        if int(payload.get("schema_version", -1)) != 22:
+            raise ValueError("This unified architecture requires checkpoint schema 22; restart from Session 0.")
         self.model.rebuild_moe_topology(payload["moe_topology"])
         self.model.load_state_dict(payload["model_state"], strict=True)
         self.states = payload["states"]

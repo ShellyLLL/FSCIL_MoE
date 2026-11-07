@@ -39,6 +39,11 @@ class PrototypeAndStateTests(unittest.TestCase):
         self.assertNotIn("encoder_versions", merged)
         self.assertNotIn("task_ids", merged)
 
+    def test_low_shot_apc_policy_returns_no_expansion_without_cv(self):
+        runner = Runner.__new__(Runner)
+        dataset = SimpleNamespace(labels=[0, 1], source_ids=[10, 20])
+        self.assertEqual(runner._support_folds(dataset), [])
+
     def test_source_grouped_folds_keep_every_source_wholly_in_one_partition(self):
         dataset = SimpleNamespace(
             labels=[0, 0, 0, 0, 1, 1, 1, 1],
