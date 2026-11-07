@@ -65,6 +65,13 @@ class UnifiedMoETests(unittest.TestCase):
         self.assertEqual(len(aux), 2)
         torch.testing.assert_close(aux[0]["raw_reference_cls"], expected[0])
         torch.testing.assert_close(aux[1]["raw_reference_cls"], expected[1])
+    def test_incremental_expert_uses_its_own_configured_bottleneck(self):
+        adapter = VisualMoEAdapter(48, num_experts=2, reduction=4, incremental_reduction=12)
+        adapter.add_expert(session_id=1)
+        self.assertEqual(adapter.experts[0].c_fc.out_features, 12)
+        self.assertEqual(adapter.experts[-1].c_fc.out_features, 4)
+        topology = adapter.export_topology()
+        self.assertEqual(topology["incremental_reduction"], 12)
     def test_router_requires_frozen_reference_feature(self):
         adapter = VisualMoEAdapter(8, num_experts=2, reduction=2)
         with self.assertRaises(ValueError):
