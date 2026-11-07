@@ -21,6 +21,10 @@ def _get(node, name, default):
     return getattr(node, name, default) if node is not None else default
 
 
+class OldGateConstraintError(RuntimeError):
+    """Raised when a trained incremental expert violates historical anchor protection."""
+
+
 class Runner:
     """All sessions share one current encoder and one all-seen BiMC cosine classifier."""
     def __init__(self, cfg):
@@ -159,11 +163,53 @@ class Runner:
         desc_list, desc = self.model.inference_all_description_feature(names, self.cfg.DATASET.GPT_PATH)
         return text, desc, desc_list
 
+    @staticmethod
+    def _loo_class_prototypes(features, labels, source_ids, class_ids,
+                              query_labels, query_source_ids):
+        """Build per-query prototypes with the query's source removed.
+
+        Inputs are L2-normalized image embeddings. This is used in both base
+        and incremental optimization so no query can appear in its own class
+        prototype, even when the training augmentation differs from extraction.
+        """
+        class_ids = torch.as_tensor(class_ids, device=features.device, dtype=torch.long)
+        query_labels = torch.as_tensor(query_labels, device=features.device, dtype=torch.long)
+        query_source_ids = torch.as_tensor(query_source_ids, device=features.device).reshape(-1)
+        source_ids = torch.as_tensor(source_ids, device=features.device).reshape(-1)
+        sums, counts = [], []
+        for cls in class_ids:
+            mask = labels.eq(cls)
+            selected = features[mask]
+            if selected.numel() == 0:
+                raise ValueError(f"No support features for class {int(cls)}.")
+            sums.append(selected.sum(0))
+            counts.append(int(mask.sum().item()))
+        sums = torch.stack(sums)
+        counts = torch.tensor(counts, device=features.device, dtype=features.dtype)
+        rows = []
+        for label, source_id in zip(query_labels, query_source_ids):
+            row = []
+            for index, cls in enumerate(class_ids):
+                total = sums[index]
+                count = counts[index]
+                if int(label) == int(cls):
+                    own = labels.eq(cls) & source_ids.eq(source_id)
+                    if int(own.sum().item()) != 1 or count.item() <= 1:
+                        raise ValueError("LOO prototype requires exactly one query source and another support.")
+                    total = total - features[own][0]
+                    count = count - 1
+                row.append(F.normalize(total / count, dim=-1))
+            rows.append(torch.stack(row))
+        return torch.stack(rows)
+
     def _fuse(self, visual, text, desc):
         lam_t = float(self.cfg.TRAINER.BiMC.LAMBDA_T) if self.cfg.TRAINER.BiMC.TEXT_CALIBRATION else 0.0
-        text_cal = F.normalize((1-lam_t)*text + lam_t*desc, dim=-1)
+        # Preserve the patent's linear calibration magnitudes. Cosine scoring
+        # performs normalization after the visual/text fusion, not between
+        # the two modality-calibration equations.
+        text_cal = (1.0-lam_t)*text.float() + lam_t*desc.float()
         beta = float(self.cfg.DATASET.BETA)
-        return F.normalize(beta*text_cal + (1-beta)*visual, dim=-1)
+        return beta*text_cal + (1.0-beta)*visual.float()
 
     def _build_state(self, class_ids, loader, old_states, calibrate_visual):
         feat, labels, sources = self._extract_support(loader)
@@ -251,9 +297,13 @@ class Runner:
         old_bank = self._merge_states(old_states, self.device)
         old_proto = old_bank["fused_proto"]
         lambda_t = float(self.cfg.TRAINER.BiMC.LAMBDA_T) if self.cfg.TRAINER.BiMC.TEXT_CALIBRATION else 0.0
-        new_text = F.normalize((1-lambda_t)*text + lambda_t*desc, dim=-1)
+        new_text = (1.0-lambda_t)*text.float() + lambda_t*desc.float()
         beta = float(self.cfg.DATASET.BETA)
-        history_raw = {b: self._raw_history(old_states, b)[1] for b in selected_blocks}
+        logit_scale = self.model.classification_scale()
+        history_raw = {
+            b: F.normalize(self._raw_history(old_states, b)[1].float(), dim=-1)
+            for b in selected_blocks
+        }
         logs = []
         for epoch in range(epochs):
             self.model.train()
@@ -284,9 +334,11 @@ class Runner:
                     visual_loo = self.model.calibrate_incremental_visual(
                         visual_loo.reshape(-1, visual_loo.size(-1))
                     ).reshape_as(visual_loo)
-                fused_loo = F.normalize(beta*new_text[None] + (1-beta)*visual_loo, dim=-1)
+                fused_loo = beta*new_text[None] + (1.0-beta)*visual_loo
                 full_bank = torch.cat([old_proto[None].expand(len(labels), -1, -1), fused_loo], dim=1)
-                logits = torch.einsum("nd,ncd->nc", query_feat, full_bank)
+                logits = logit_scale * torch.einsum(
+                    "nd,ncd->nc", query_feat, F.normalize(full_bank, dim=-1)
+                )
                 all_ids = torch.cat([old_bank["class_ids"], torch.as_tensor(class_ids, device=self.device)])
                 target_ids = all_ids
                 targets = self._columns(labels, target_ids)
@@ -307,6 +359,18 @@ class Runner:
             logs.append({"epoch": epoch+1, "loss": total/max(1,len(fit_extract_loader.dataset))})
         for _, adapter in self._adapters():
             adapter.freeze_all()
+        max_old_gate = float(_get(self.cfg.TRAINER.BiMC.PROTECTION, "MAX_OLD_GATE", 0.05))
+        gate_audit = {}
+        for block in selected_blocks:
+            adapter = dict(self._adapters())[block]
+            gates = adapter.newest_gate(history_raw[block]).detach()
+            gate_audit[int(block)] = float(gates.max().item())
+        self._last_old_gate_audit = gate_audit
+        if any(value > max_old_gate for value in gate_audit.values()):
+            raise OldGateConstraintError(
+                "New-expert gate exceeds MAX_OLD_GATE on stored historical "
+                f"raw-reference prototypes: {gate_audit}"
+            )
         return logs
 
     @torch.no_grad()
@@ -325,7 +389,9 @@ class Runner:
         for batch in validation_loader:
             images, y = self.parse_batch(batch)
             q = F.normalize(self.model.extract_img_feature(images).float(), dim=-1)
-            logits = q @ all_proto.t()
+            logits = self.model.classification_scale() * (
+                q @ F.normalize(all_proto, dim=-1).t()
+            )
             target = self._columns(y, all_ids)
             loss_sum += float(F.cross_entropy(logits, target, reduction="sum"))
             count += len(y)
@@ -353,7 +419,17 @@ class Runner:
         fold_expanded_losses = []
         fold_gains = []
 
+        cv_rng = {
+            "python": random.getstate(), "numpy": np.random.get_state(),
+            "torch": torch.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        }
         for fit_idx, val_idx in folds:
+            random.setstate(cv_rng["python"])
+            np.random.set_state(cv_rng["numpy"])
+            torch.set_rng_state(cv_rng["torch"])
+            if torch.cuda.is_available() and cv_rng["cuda"] is not None:
+                torch.cuda.set_rng_state_all(cv_rng["cuda"])
             fit_train = self._loader(
                 train_loader.dataset, fit_idx, train_loader.batch_size, True
             )
@@ -381,14 +457,20 @@ class Runner:
                 baseline_loss = self._evaluate_candidate(
                     val_loader, fit_extract, old_states, class_ids, text, desc
                 )
+                gate_audit = {}
                 if fold_candidates:
-                    self._candidate_train(
-                        task_id, fold_candidates, fit_train, fit_extract,
-                        old_states, class_ids, text, desc
-                    )
-                    expanded_loss = self._evaluate_candidate(
-                        val_loader, fit_extract, old_states, class_ids, text, desc
-                    )
+                    try:
+                        self._candidate_train(
+                            task_id, fold_candidates, fit_train, fit_extract,
+                            old_states, class_ids, text, desc
+                        )
+                        gate_audit = dict(getattr(self, "_last_old_gate_audit", {}))
+                        expanded_loss = self._evaluate_candidate(
+                            val_loader, fit_extract, old_states, class_ids, text, desc
+                        )
+                    except OldGateConstraintError:
+                        gate_audit = dict(getattr(self, "_last_old_gate_audit", {}))
+                        expanded_loss = float("inf")
                 else:
                     # The policy predicts no expansion in this fold.
                     expanded_loss = baseline_loss
@@ -396,6 +478,9 @@ class Runner:
                 fold_baseline_losses.append(float(baseline_loss))
                 fold_expanded_losses.append(float(expanded_loss))
                 fold_gains.append(gain)
+                if any(v > float(_get(self.cfg.TRAINER.BiMC.PROTECTION, "MAX_OLD_GATE", 0.05))
+                       for v in gate_audit.values()):
+                    fold_gains[-1] = float("-inf")
             finally:
                 self.model.rebuild_moe_topology(topology_before)
                 self.model.load_state_dict(state_before, strict=True)
@@ -472,6 +557,16 @@ class Runner:
                 task_id, final_candidates, train_loader, extract_loader,
                 old_states, class_ids, text, desc
             )
+        except OldGateConstraintError as exc:
+            self.model.rebuild_moe_topology(topology_before)
+            self.model.load_state_dict(state_before, strict=True)
+            for _, adapter in self._adapters():
+                adapter.freeze_all()
+            return {
+                "expanded": [], "candidate_layers": final_candidates,
+                "reason": f"Historical anchor gate constraint rejected expansion: {exc}",
+                **diagnostics, "logs": [],
+            }
         except Exception:
             self.model.rebuild_moe_topology(topology_before)
             self.model.load_state_dict(state_before, strict=True)
@@ -496,15 +591,26 @@ class Runner:
         text, desc = state["text_features"].to(self.device), state["description_proto"].to(self.device)
         for epoch in range(epochs):
             self.model.eval()
-            feat, labels, _ = self._extract_support(extract_loader)
-            visual = self._class_prototypes(feat, labels, class_ids)
-            prototypes = self._fuse(visual, text, desc)
+            support_feat, support_labels, support_sources = self._extract_support(extract_loader)
             self.model.train()
             for batch in train_loader:
                 images, y = self.parse_batch(batch)
+                query_sources = self._source(batch).to(self.device)
+                visual_loo = self._loo_class_prototypes(
+                    support_feat, support_labels, support_sources, class_ids,
+                    y, query_sources,
+                )
+                prototypes = self._fuse(visual_loo, text[None], desc[None])
                 optimizer.zero_grad(set_to_none=True)
-                logits, _, _ = self.model.forward_train(images, prototypes)
+                feature, _ = self.model.extract_img_feature_train(images)
+                logits = self.model.classification_scale() * torch.einsum(
+                    "bd,bcd->bc",
+                    F.normalize(feature.float(), dim=-1),
+                    F.normalize(prototypes.float(), dim=-1),
+                )
                 loss = F.cross_entropy(logits, self._columns(y, class_ids))
+                if not torch.isfinite(loss):
+                    raise FloatingPointError("Non-finite base-session LOO classification loss.")
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(params, 1.0)
                 optimizer.step()

@@ -52,6 +52,7 @@ TRAINER:
 
     PROTECTION:
       OLD_GATE_WEIGHT: 0.1
+      MAX_OLD_GATE: 0.05
 
     CHECKPOINT:
       ENABLE: True

@@ -19,8 +19,10 @@ class PrototypeAndStateTests(unittest.TestCase):
         text = F.normalize(torch.tensor([[0., 0., 1.], [0., 1., 0.]]), dim=-1)
         desc = F.normalize(torch.tensor([[0., 0.5, 0.5], [0.5, 0.5, 0.]]), dim=-1)
         fused = runner._fuse(visual, text, desc)
+        expected = 0.3 * (0.5 * text + 0.5 * desc) + 0.7 * visual
         self.assertEqual(tuple(fused.shape), (2, 3))
-        torch.testing.assert_close(fused.norm(dim=-1), torch.ones(2))
+        torch.testing.assert_close(fused, expected)
+        self.assertFalse(torch.allclose(fused.norm(dim=-1), torch.ones(2)))
 
     def test_global_classifier_merges_all_classes_without_task_gate_or_versions(self):
         states = [
@@ -86,6 +88,34 @@ class PrototypeAndStateTests(unittest.TestCase):
         adapter.eval()
         after, _ = adapter(x, ref)
         torch.testing.assert_close(before, after, rtol=0, atol=0)
+
+    def test_incremental_router_is_invariant_to_reference_scale(self):
+        adapter = VisualMoEAdapter(8, num_experts=2, reduction=2)
+        adapter.add_expert(session_id=1)
+        reference = torch.randn(5, 8)
+        torch.testing.assert_close(
+            adapter.newest_gate(reference),
+            adapter.newest_gate(17.0 * reference),
+        )
+
+    def test_loo_prototypes_exclude_exact_query_source(self):
+        features = F.normalize(torch.tensor([
+            [1., 0.], [0., 1.], [0.8, 0.2], [0.2, 0.8]
+        ]), dim=-1)
+        labels = torch.tensor([0, 0, 1, 1])
+        sources = torch.tensor([10, 11, 20, 21])
+        prototypes = Runner._loo_class_prototypes(
+            features, labels, sources, torch.tensor([0, 1]),
+            torch.tensor([0, 1]), torch.tensor([10, 21]),
+        )
+        torch.testing.assert_close(prototypes[0, 0], features[1])
+        torch.testing.assert_close(
+            prototypes[0, 1], F.normalize(features[2:4].mean(0), dim=-1)
+        )
+        torch.testing.assert_close(prototypes[1, 1], features[2])
+        torch.testing.assert_close(
+            prototypes[1, 0], F.normalize(features[:2].mean(0), dim=-1)
+        )
 
 
 if __name__ == "__main__":

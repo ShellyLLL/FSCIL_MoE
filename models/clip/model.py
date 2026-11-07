@@ -1,5 +1,6 @@
 
 from collections import OrderedDict
+import math
 from typing import Tuple, Union
 
 import numpy as np
@@ -151,12 +152,14 @@ class BottleneckExpert(nn.Module):
 
 
 class VisualMoEAdapter(nn.Module):
-    """Base experts use one Softmax pool; every incremental expert has an independent Sigmoid gate.
+    """Base experts use one Softmax pool; incremental experts use independent Sigmoid gates.
 
-    Routers consume the frozen-backbone reference CLS feature. Experts transform
-    the enhanced hidden sequence. The two routing pools are never jointly
-    normalized and no Top-K selection is applied.
+    Every router consumes the L2-normalized frozen-backbone reference CLS feature.
+    Experts transform the enhanced hidden sequence. The two routing pools are
+    never jointly normalized and no Top-K selection is applied.
     """
+    INITIAL_INCREMENTAL_GATE = 0.1
+
     def __init__(self, d_model, num_experts=4, reduction=4, incremental_reduction=None):
         super().__init__()
         self.d_model = int(d_model)
@@ -169,7 +172,7 @@ class VisualMoEAdapter(nn.Module):
             raise ValueError("At least one base expert is required.")
         self.layer_norm = nn.LayerNorm(self.d_model, elementwise_affine=False)
         self.experts = nn.ModuleList([
-            BottleneckExpert(self.d_model, self.default_reduction, zero_init_up=False)
+            BottleneckExpert(self.d_model, self.default_reduction, zero_init_up=True)
             for _ in range(self.base_expert_count)
         ])
         self.base_router = nn.Linear(self.d_model, self.base_expert_count)
@@ -211,10 +214,12 @@ class VisualMoEAdapter(nn.Module):
         reference = next(self.base_router.parameters())
         expert = BottleneckExpert(self.d_model, reduction, zero_init_up=True)
         router = nn.Linear(self.d_model, 1)
-        # A low initial gate keeps the newly added residual conservative;
-        # the classification and old-gate objectives subsequently learn it.
-        nn.init.normal_(router.weight, std=0.01)
-        nn.init.constant_(router.bias, -1.0)
+        # Start from a small, input-independent residual gate. The zero-up
+        # expert preserves the function exactly at insertion; the router can
+        # learn a class-discriminative response after the expert starts learning.
+        nn.init.zeros_(router.weight)
+        gate = float(self.INITIAL_INCREMENTAL_GATE)
+        nn.init.constant_(router.bias, math.log(gate / (1.0 - gate)))
         expert.to(device=reference.device, dtype=reference.dtype)
         router.to(device=reference.device, dtype=reference.dtype)
         self.experts.append(expert)
@@ -232,7 +237,10 @@ class VisualMoEAdapter(nn.Module):
         if self.num_experts <= self.base_expert_count:
             raise RuntimeError("There is no incremental expert to inspect.")
         router = self.incremental_routers[-1]
-        values = torch.as_tensor(raw_reference_cls, device=router.weight.device, dtype=router.weight.dtype)
+        values = torch.as_tensor(
+            raw_reference_cls, device=router.weight.device, dtype=torch.float32
+        )
+        values = F.normalize(values, dim=-1).to(dtype=router.weight.dtype)
         return torch.sigmoid(router(values)).squeeze(-1)
 
     def export_topology(self):
@@ -307,7 +315,9 @@ class VisualMoEAdapter(nn.Module):
                 or raw_reference_cls.shape != (x.size(1), self.d_model)):
             raise ValueError("raw_reference_cls must have shape [batch, d_model].")
         expert_input = self.layer_norm(x)
-        route_input = raw_reference_cls.to(dtype=expert_input.dtype)
+        route_input = F.normalize(raw_reference_cls.float(), dim=-1).to(
+            device=expert_input.device, dtype=expert_input.dtype
+        )
         base_weights = torch.softmax(self.base_router(route_input), dim=-1)
         residual = torch.zeros_like(expert_input)
         base_norms = []

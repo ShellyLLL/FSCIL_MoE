@@ -116,13 +116,18 @@ class BiMC(nn.Module):
         return all_desc, torch.stack(centers)
 
     def soft_calibration(self, base_protos, cur_protos):
-        base = F.normalize(base_protos.to(self.device).float(), dim=-1)
-        current = F.normalize(cur_protos.to(self.device).float(), dim=-1)
+        # The patent's visual prototype is already normalized before calibration.
+        # Keep the weighted base-prototype resultant unnormalized: its magnitude
+        # is part of the visual/text balance in the subsequent inter-modal fusion.
+        base = torch.as_tensor(base_protos, device=self.device, dtype=torch.float32)
+        current = torch.as_tensor(cur_protos, device=self.device, dtype=torch.float32)
+        base_for_similarity = F.normalize(base, dim=-1)
+        current_for_similarity = F.normalize(current, dim=-1)
         tau = float(self.cfg.TRAINER.BiMC.TAU)
-        weights = torch.softmax(tau * current @ base.t(), dim=-1)
-        inherited = F.normalize(weights @ base, dim=-1)
+        weights = torch.softmax(tau * current_for_similarity @ base_for_similarity.t(), dim=-1)
+        inherited = weights @ base
         lam = float(self.cfg.TRAINER.BiMC.LAMBDA_I)
-        return F.normalize((1.0 - lam) * current + lam * inherited, dim=-1)
+        return (1.0 - lam) * current + lam * inherited
 
     @torch.no_grad()
     def set_base_visual_prototype(self, prototypes):
@@ -213,9 +218,16 @@ class BiMC(nn.Module):
     def fuse_prototypes(self, state):
         return F.normalize(torch.as_tensor(state["fused_proto"], device=self.device).float(), dim=-1)
 
+    def classification_scale(self):
+        """Frozen CLIP logit scale used for stable prototype cross-entropy training."""
+        return self.clip_model.logit_scale.detach().float().exp().clamp(max=100.0)
+
     def forward_train(self, images, prototypes):
         feature, aux = self.extract_img_feature_train(images)
-        logits = F.normalize(feature.float(), dim=-1) @ F.normalize(prototypes.float(), dim=-1).t()
+        logits = self.classification_scale() * (
+            F.normalize(feature.float(), dim=-1)
+            @ F.normalize(prototypes.float(), dim=-1).t()
+        )
         return logits, feature, aux
 
     def export_moe_topology(self):
