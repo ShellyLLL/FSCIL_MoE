@@ -402,13 +402,26 @@ class Runner:
         that fold's untouched sources. We do not intersect fold proposals or
         select a winning subset on the same validation folds.
         """
+        apc_cfg = self.cfg.TRAINER.BiMC.APC
+        if not bool(_get(apc_cfg, "ENABLE", True)):
+            return {
+                "expanded": [], "candidate_layers": [],
+                "reason": "APC disabled by configuration", "logs": [],
+            }
         if not self.apc_state:
             raise RuntimeError("Base APC thresholds are not initialized.")
         folds = self._support_folds(train_loader.dataset)
         if not folds:
-            raise RuntimeError(
-                "Source-exclusive expansion validation requires at least 3 shots per class."
-            )
+            # With fewer than three independent support sources per class,
+            # expansion benefit cannot be estimated with the declared
+            # source-held-out procedure. Do not silently substitute an
+            # in-sample heuristic or abort the entire FSCIL run.
+            return {
+                "expanded": [], "candidate_layers": [],
+                "reason": "Insufficient independent support sources for APC risk validation; expansion conservatively skipped",
+                "validation_status": "insufficient_support_sources",
+                "logs": [],
+            }
         text, desc, _ = self._text(class_ids)
         fold_candidate_sets = []
         fold_baseline_losses = []
@@ -636,7 +649,7 @@ class Runner:
         path = Path(_get(cfg, "DIR", "checkpoints/fscil_moe"))
         path.mkdir(parents=True, exist_ok=True)
         payload = {
-            "schema_version": 20,
+            "schema_version": 21,
             "completed_session": int(completed_session),
             "model_state": {k:v.detach().cpu() for k,v in self.model.state_dict().items()},
             "moe_topology": self.model.export_moe_topology(),
@@ -644,15 +657,17 @@ class Runner:
             "apc_state": self.apc_state,
             "acc_list": self.acc_list,
             "task_acc_list": self.task_acc_list,
+            "session_diagnostics": self.session_diagnostics,
             "support_manifest": self.data_manager.get_support_manifest(),
             "rng": {"python": random.getstate(), "numpy": np.random.get_state(),
                     "torch": torch.get_rng_state(),
                     "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None},
         }
-        target = path / f"session_{completed_session:02d}.pth"
-        temp = target.with_suffix(".tmp")
-        torch.save(payload, temp)
-        os.replace(temp, target)
+        if bool(_get(cfg, "SAVE_EVERY_SESSION", True)):
+            target = path / f"session_{completed_session:02d}.pth"
+            temp = target.with_suffix(".tmp")
+            torch.save(payload, temp)
+            os.replace(temp, target)
         latest = path / "latest.pth"
         latest_tmp = latest.with_suffix(".tmp")
         torch.save(payload, latest_tmp)
@@ -663,8 +678,8 @@ class Runner:
         if not resume:
             return
         payload = torch.load(resume, map_location="cpu", weights_only=False)
-        if int(payload.get("schema_version", -1)) != 20:
-            raise ValueError("This unified architecture requires checkpoint schema 20; restart from Session 0.")
+        if int(payload.get("schema_version", -1)) != 21:
+            raise ValueError("This unified architecture requires checkpoint schema 21; restart from Session 0.")
         self.model.rebuild_moe_topology(payload["moe_topology"])
         self.model.load_state_dict(payload["model_state"], strict=True)
         self.states = payload["states"]
@@ -676,6 +691,7 @@ class Runner:
         self.apc_state = payload["apc_state"]
         self.acc_list = payload["acc_list"]
         self.task_acc_list = payload["task_acc_list"]
+        self.session_diagnostics = payload.get("session_diagnostics", [])
         self.data_manager.load_support_manifest(payload["support_manifest"])
         self.start_session = int(payload["completed_session"]) + 1
         random.setstate(payload["rng"]["python"])
@@ -731,6 +747,26 @@ class Runner:
                 pd = float(np.mean(drops)) if drops else 0.0
             self.acc_list.append(metrics["mean_acc"])
             self.task_acc_list.append(task_acc)
+            diagnostic = {
+                "session": int(task_id),
+                "candidate_layers": list(adaptation.get("candidate_layers", [])),
+                "expanded_layers": list(adaptation.get("expanded", [])),
+                "reason": adaptation.get("reason", "base session"),
+                "validation_status": adaptation.get("validation_status", "not_applicable"),
+                "fold_candidate_layers": adaptation.get("fold_candidate_layers", []),
+                "fold_baseline_nll": adaptation.get("fold_baseline_nll", []),
+                "fold_expanded_nll": adaptation.get("fold_expanded_nll", []),
+                "fold_risk_gains": adaptation.get("fold_risk_gains", []),
+                "mean_risk_gain": adaptation.get("mean_risk_gain"),
+                "required_risk_gain": adaptation.get("required_risk_gain"),
+                "old_gate_audit": getattr(self, "_last_old_gate_audit", {}),
+                "expert_topology": self.model.export_moe_topology(),
+                "mean_acc": float(metrics["mean_acc"]),
+                "macro_task_acc": float(metrics["macro_task_acc"]),
+                "task_acc": [float(x) for x in task_acc],
+                "pd": float(pd),
+            }
+            self.session_diagnostics.append(diagnostic)
             self._save_checkpoint(task_id)
             print(
                 f"=> Session {task_id}: Acc={metrics['mean_acc']:.3f}, "
