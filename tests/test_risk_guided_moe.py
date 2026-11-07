@@ -53,7 +53,6 @@ class PrototypeAndStateTests(unittest.TestCase):
 
     def test_base_visual_anchor_is_installed_once_and_used_for_incremental_calibration(self):
         model = BiMC.__new__(BiMC)
-        nn = torch.nn
         model.device = torch.device("cpu")
         model.cfg = SimpleNamespace(
             TRAINER=SimpleNamespace(BiMC=SimpleNamespace(TAU=8.0, LAMBDA_I=0.2))
