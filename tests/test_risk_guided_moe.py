@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 from engine.engine import Runner
 from models.clip.model import VisualMoEAdapter
+from models.bimc import BiMC
 
 
 class PrototypeAndStateTests(unittest.TestCase):
@@ -49,6 +50,33 @@ class PrototypeAndStateTests(unittest.TestCase):
             fit_sources = {dataset.source_ids[i] for i in fit}
             val_sources = {dataset.source_ids[i] for i in val}
             self.assertFalse(fit_sources & val_sources)
+
+    def test_base_visual_anchor_is_installed_once_and_used_for_incremental_calibration(self):
+        model = BiMC.__new__(BiMC)
+        nn = torch.nn
+        model.device = torch.device("cpu")
+        model.cfg = SimpleNamespace(
+            TRAINER=SimpleNamespace(BiMC=SimpleNamespace(TAU=8.0, LAMBDA_I=0.2))
+        )
+        base = F.normalize(torch.tensor([[1., 0., 0.], [0., 1., 0.]]), dim=-1)
+        novel = F.normalize(torch.tensor([[0.8, 0.2, 0.]]), dim=-1)
+        model.base_vision_prototype = None
+        model.set_base_visual_prototype(base)
+        calibrated = model.calibrate_incremental_visual(novel)
+        self.assertEqual(tuple(calibrated.shape), (1, 3))
+        torch.testing.assert_close(model.base_vision_prototype, base)
+        with self.assertRaises(RuntimeError):
+            model.set_base_visual_prototype(torch.flip(base, dims=[0]))
+
+    def test_incremental_calibration_fails_with_actionable_error_without_base_anchor(self):
+        model = BiMC.__new__(BiMC)
+        model.device = torch.device("cpu")
+        model.cfg = SimpleNamespace(
+            TRAINER=SimpleNamespace(BiMC=SimpleNamespace(TAU=8.0, LAMBDA_I=0.2))
+        )
+        model.base_vision_prototype = None
+        with self.assertRaisesRegex(RuntimeError, "Session 0 image_proto"):
+            model.calibrate_incremental_visual(torch.tensor([[1., 0., 0.]]))
 
     def test_expansion_is_function_preserving_at_creation(self):
         torch.manual_seed(4)
