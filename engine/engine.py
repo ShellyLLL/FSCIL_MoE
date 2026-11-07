@@ -339,12 +339,23 @@ class Runner:
         if not folds:
             raise RuntimeError("Source-exclusive expansion validation requires at least 3 shots per class.")
         text, desc, _ = self._text(class_ids)
-        # New raw features and APC decisions are derived from the frozen reference stream.
-        provisional = self._build_state(class_ids, extract_loader, old_states, False)
-        candidates = [x["block"] for x in self._candidate_layers(provisional, old_states) if x["candidate"]]
-        candidates = sorted(candidates)
+        # Propose layers separately inside each source-held-out training fold.
+        # A validation source is never used to decide which layers are eligible
+        # in the fold where that source is evaluated.
+        fold_candidate_sets = []
+        for fit_idx, _ in folds:
+            fit_extract = self._loader(
+                extract_loader.dataset, fit_idx, extract_loader.batch_size, False
+            )
+            fold_state = self._build_state(class_ids, fit_extract, old_states, False)
+            fold_candidates = {
+                row["block"] for row in self._candidate_layers(fold_state, old_states)
+                if row["candidate"]
+            }
+            fold_candidate_sets.append(fold_candidates)
+        candidates = sorted(set.intersection(*fold_candidate_sets)) if fold_candidate_sets else []
         if not candidates:
-            return {"expanded": [], "candidate_layers": [], "logs": []}
+            return {"expanded": [], "candidate_layers": [], "fold_candidate_layers": fold_candidate_sets, "logs": []}
         subsets = [tuple(candidates[i] for i in range(len(candidates)) if mask & (1 << i))
                    for mask in range(1 << len(candidates))]
         # Evaluate the no-expansion baseline and every candidate subset on
