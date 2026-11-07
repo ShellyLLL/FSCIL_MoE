@@ -295,7 +295,8 @@ class VisualMoEAdapter(nn.Module):
     def forward(self, x, raw_reference_cls):
         if x.ndim != 3:
             raise ValueError("VisualMoEAdapter expects [tokens, batch, dim].")
-        if raw_reference_cls.ndim != 2 or raw_reference_cls.shape != (x.size(1), self.d_model):
+        if (raw_reference_cls is None or raw_reference_cls.ndim != 2
+                or raw_reference_cls.shape != (x.size(1), self.d_model)):
             raise ValueError("raw_reference_cls must have shape [batch, d_model].")
         expert_input = self.layer_norm(x)
         route_input = raw_reference_cls.to(dtype=expert_input.dtype)
