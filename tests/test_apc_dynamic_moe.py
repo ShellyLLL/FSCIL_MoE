@@ -3,7 +3,7 @@ import copy
 import unittest
 import torch
 import torch.nn.functional as F
-from models.clip.model import Transformer, VisualMoEAdapter
+from models.clip.model import Transformer, VisionTransformer, VisualMoEAdapter
 
 
 class UnifiedMoETests(unittest.TestCase):
@@ -72,6 +72,18 @@ class UnifiedMoETests(unittest.TestCase):
         self.assertEqual(adapter.experts[-1].c_fc.out_features, 4)
         topology = adapter.export_topology()
         self.assertEqual(topology["incremental_reduction"], 12)
+    def test_tiny_vit_runs_both_streams_and_returns_one_image_embedding(self):
+        torch.manual_seed(23)
+        model = VisionTransformer(
+            input_resolution=32, patch_size=8, width=16, layers=2, heads=2, output_dim=8
+        )
+        model.transformer.resblocks[0].moe_adapter = VisualMoEAdapter(16, 2, 4)
+        model.eval()
+        feature, aux = model(torch.randn(2, 3, 32, 32), return_moe_aux=True)
+        self.assertEqual(tuple(feature.shape), (2, 8))
+        self.assertEqual(len(aux), 1)
+        self.assertEqual(tuple(aux[0]["raw_reference_cls"].shape), (2, 16))
+        self.assertEqual(tuple(aux[0]["block_out"].shape), (2, 16))
     def test_router_requires_frozen_reference_feature(self):
         adapter = VisualMoEAdapter(8, num_experts=2, reduction=2)
         with self.assertRaises(ValueError):
