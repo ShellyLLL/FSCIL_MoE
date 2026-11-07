@@ -141,7 +141,7 @@ class Runner:
                 selected = features[labels.eq(cls)]
                 if selected.numel() == 0:
                     raise ValueError(f"No features for class {int(cls)}.")
-                result.append(F.normalize(selected.mean(0), dim=-1))
+                result.append(BiMC.mean_normalized_features(selected, dim=0))
             return torch.stack(result)
         banks = []
         for sid, query_label in zip(query_sources, exclude_sources):
@@ -153,7 +153,7 @@ class Runner:
                 selected = features[mask]
                 if selected.numel() == 0:
                     raise ValueError("A query has no source-exclusive support prototype.")
-                prototypes.append(F.normalize(selected.mean(0), dim=-1))
+                prototypes.append(BiMC.mean_normalized_features(selected, dim=0))
             banks.append(torch.stack(prototypes))
         return torch.stack(banks)
 
@@ -198,18 +198,14 @@ class Runner:
                         raise ValueError("LOO prototype requires exactly one query source and another support.")
                     total = total - features[own][0]
                     count = count - 1
-                row.append(F.normalize(total / count, dim=-1))
+                # Features are normalized sample embeddings. The LOO
+                # prototype is their arithmetic mean, not a normalized mean.
+                row.append(total / count)
             rows.append(torch.stack(row))
         return torch.stack(rows)
 
     def _fuse(self, visual, text, desc):
-        lam_t = float(self.cfg.TRAINER.BiMC.LAMBDA_T) if self.cfg.TRAINER.BiMC.TEXT_CALIBRATION else 0.0
-        # Preserve the patent's linear calibration magnitudes. Cosine scoring
-        # performs normalization after the visual/text fusion, not between
-        # the two modality-calibration equations.
-        text_cal = (1.0-lam_t)*text.float() + lam_t*desc.float()
-        beta = float(self.cfg.DATASET.BETA)
-        return beta*text_cal + (1.0-beta)*visual.float()
+        return self.model.fuse_modalities(visual, text, desc)
 
     def _build_state(self, class_ids, loader, old_states, calibrate_visual):
         feat, labels, sources = self._extract_support(loader)
@@ -229,7 +225,7 @@ class Runner:
                 v = vals[ys.eq(int(cls))]
                 if not len(v):
                     raise ValueError(f"Missing raw reference features for class {cls}, block {block}.")
-                rows.append(F.normalize(v.float().mean(0), dim=-1))
+                rows.append(BiMC.mean_normalized_features(v.float(), dim=0))
             raw_prototypes[int(block)] = torch.stack(rows).cpu()
         return {
             "class_ids": torch.as_tensor(class_ids, dtype=torch.long),

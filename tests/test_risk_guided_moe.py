@@ -101,6 +101,24 @@ class PrototypeAndStateTests(unittest.TestCase):
             adapter.newest_gate(17.0 * reference),
         )
 
+    def test_mean_of_normalized_features_preserves_resultant_magnitude(self):
+        features = torch.tensor([[3.0, 0.0], [0.0, 2.0]])
+        prototype = BiMC.mean_normalized_features(features, dim=0)
+        torch.testing.assert_close(prototype, torch.tensor([0.5, 0.5]))
+        self.assertAlmostEqual(float(prototype.norm()), 2 ** -0.5, places=6)
+
+    def test_base_visual_anchor_preserves_resultant_magnitude(self):
+        model = BiMC.__new__(BiMC)
+        model.device = torch.device("cpu")
+        model.base_vision_prototype = None
+        model.cfg = SimpleNamespace(
+            TRAINER=SimpleNamespace(BiMC=SimpleNamespace(TAU=8.0, LAMBDA_I=0.2))
+        )
+        base = torch.tensor([[0.5, 0.0, 0.0], [0.0, 0.25, 0.0]])
+        model.set_base_visual_prototype(base)
+        torch.testing.assert_close(model.base_vision_prototype, base)
+        self.assertFalse(torch.allclose(model.base_vision_prototype.norm(dim=-1), torch.ones(2)))
+
     def test_loo_prototypes_exclude_exact_query_source(self):
         features = F.normalize(torch.tensor([
             [1., 0.], [0., 1.], [0.8, 0.2], [0.2, 0.8]
@@ -113,7 +131,7 @@ class PrototypeAndStateTests(unittest.TestCase):
         )
         torch.testing.assert_close(prototypes[0, 0], features[1])
         torch.testing.assert_close(
-            prototypes[0, 1], F.normalize(features[2:4].mean(0), dim=-1)
+            prototypes[0, 1], features[2:4].mean(0)
         )
         torch.testing.assert_close(prototypes[1, 1], features[2])
         torch.testing.assert_close(

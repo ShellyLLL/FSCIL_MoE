@@ -90,6 +90,34 @@ class BiMC(nn.Module):
                 item[key] = torch.cat(item[key], dim=0)
         return collected
 
+    @staticmethod
+    def mean_normalized_features(features, dim=0):
+        """Mean of per-sample L2-normalized features (BiMC Eq. 2/description center).
+
+        Deliberately do not normalize the resultant mean: its magnitude carries
+        information about within-class/description dispersion and participates
+        in the subsequent linear modality calibration.
+        """
+        values = torch.as_tensor(features)
+        if values.ndim < 2 or values.numel() == 0:
+            raise ValueError("Prototype features must be a non-empty tensor with a feature dimension.")
+        if not torch.isfinite(values).all():
+            raise FloatingPointError("Prototype features contain non-finite values.")
+        result = F.normalize(values.float(), dim=-1).mean(dim=dim)
+        if not torch.isfinite(result).all():
+            raise FloatingPointError("Prototype mean contains non-finite values.")
+        return result
+
+    def calibrate_text(self, text_features, description_center):
+        lam = float(self.cfg.TRAINER.BiMC.LAMBDA_T) if self.cfg.TRAINER.BiMC.TEXT_CALIBRATION else 0.0
+        return (1.0 - lam) * text_features.float() + lam * description_center.float()
+
+    def fuse_modalities(self, visual_prototype, text_features, description_center):
+        """BiMC inter-modal calibration; cosine normalization belongs to scoring."""
+        beta = float(self.cfg.DATASET.BETA)
+        calibrated_text = self.calibrate_text(text_features, description_center)
+        return beta * calibrated_text + (1.0 - beta) * visual_prototype.float()
+
     @torch.no_grad()
     def inference_text_feature(self, class_names, template, cls_begin_index=0):
         result = []
@@ -112,7 +140,7 @@ class BiMC(nn.Module):
             tokens = clip.tokenize(descriptions[key]).to(self.device)
             features = F.normalize(self.clip_model.encode_text(tokens), dim=-1)
             all_desc.append(features)
-            centers.append(F.normalize(features.mean(0), dim=-1))
+            centers.append(self.mean_normalized_features(features, dim=0))
         return all_desc, torch.stack(centers)
 
     def soft_calibration(self, base_protos, cur_protos):
@@ -142,7 +170,9 @@ class BiMC(nn.Module):
         norms = value.norm(dim=-1)
         if torch.any(norms <= 1e-12):
             raise ValueError("Base visual prototypes contain zero-norm rows.")
-        value = F.normalize(value, dim=-1).detach().clone()
+        # Keep the mean-of-normalized-samples resultant unchanged. Its norm
+        # must not be silently reset before visual/text inter-modal fusion.
+        value = value.detach().clone()
         if self.base_vision_prototype is not None:
             existing = self.base_vision_prototype.to(device=value.device, dtype=value.dtype)
             if existing.shape != value.shape or not torch.allclose(
@@ -187,21 +217,18 @@ class BiMC(nn.Module):
             selected = features[labels.eq(cls)]
             if selected.numel() == 0:
                 raise ValueError(f"Missing support examples for global class {int(cls)}.")
-            image_proto.append(F.normalize(selected.mean(0), dim=-1))
+            image_proto.append(self.mean_normalized_features(selected, dim=0))
         image_proto = torch.stack(image_proto)
         if int(ids.min().item()) > 0 and calibrate_novel_vision_proto:
             image_proto = self.calibrate_incremental_visual(image_proto)
         elif int(ids.min().item()) == 0:
-            self.base_vision_prototype = image_proto.detach().clone()
+            self.set_base_visual_prototype(image_proto)
 
         text = self.inference_text_feature(class_names, self.template)
         desc_list, desc_center = self.inference_all_description_feature(
             class_names, self.cfg.DATASET.GPT_PATH
         )
-        lambda_t = float(self.cfg.TRAINER.BiMC.LAMBDA_T) if self.cfg.TRAINER.BiMC.TEXT_CALIBRATION else 0.0
-        text_calibrated = F.normalize((1.0-lambda_t)*text + lambda_t*desc_center, dim=-1)
-        beta = float(self.cfg.DATASET.BETA)
-        fused = F.normalize(beta*text_calibrated + (1.0-beta)*image_proto, dim=-1)
+        fused = self.fuse_modalities(image_proto, text, desc_center)
         return {
             "class_ids": ids.detach().clone(),
             "class_index": ids.detach().clone(),
