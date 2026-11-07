@@ -6,7 +6,7 @@ This branch now implements a single-current-encoder FSCIL path. It deliberately 
 
 ## 1. One deployed prediction function
 
-For every query image and every seen class, use the same current visual encoder and the same normalized fused prototype bank:
+For every query image and every seen class, use the same current visual encoder and one fused prototype bank. The final cosine score normalizes the query and class prototype:
 
 ```
 visual prototype -> visual intra-modal calibration
@@ -34,7 +34,7 @@ Text calibration follows the patent's linear equation without normalizing the ca
 ]
 Inter-modal fusion preserves the linear-combination magnitude; normalization occurs only inside the final cosine score:
 [
-\mu_c=\operatorname{Norm}(\beta\tilde\mu_c^T+(1-\beta)\tilde\mu_c^I).
+\mu_c=\beta\tilde\mu_c^T+(1-\beta)\tilde\mu_c^I.
 ]
 The only classifier is:
 [
