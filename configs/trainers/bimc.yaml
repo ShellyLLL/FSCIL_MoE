@@ -48,6 +48,7 @@ TRAINER:
     APC:
       ENABLE: True
       ALPHA: 0.05
+      SIGNIFICANCE: 0.05
 
     PROTECTION:
       OLD_GATE_WEIGHT: 0.1
