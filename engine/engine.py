@@ -230,9 +230,9 @@ class Runner:
         params = []
         for block in selected_blocks:
             adapter = dict(self._adapters())[block]
-            params += [{"params": adapter.experts[-1].parameters(),
+            params += [{"params": list(adapter.experts[-1].parameters()),
                         "lr": float(optim_cfg.LR_INCREMENTAL_EXPERT)},
-                       {"params": adapter.incremental_routers[-1].parameters(),
+                       {"params": list(adapter.incremental_routers[-1].parameters()),
                         "lr": float(optim_cfg.LR_INCREMENTAL_ROUTER)}]
         if not params:
             return []
@@ -243,10 +243,6 @@ class Runner:
         # are recomputed from the candidate encoder and query-exclusive support.
         old_bank = self._merge_states(old_states, self.device)
         old_proto = old_bank["fused_proto"]
-        text_cal = self._fuse(
-            torch.zeros_like(old_bank["image_proto"]), old_bank["text_features"],
-            old_bank["description_proto"]
-        ) if False else None
         lambda_t = float(self.cfg.TRAINER.BiMC.LAMBDA_T) if self.cfg.TRAINER.BiMC.TEXT_CALIBRATION else 0.0
         new_text = F.normalize((1-lambda_t)*text + lambda_t*desc, dim=-1)
         beta = float(self.cfg.DATASET.BETA)
@@ -263,6 +259,7 @@ class Runner:
                 query_feat = F.normalize(query_feat.float(), dim=-1)
                 # LOO prototypes are rebuilt from the current candidate weights.
                 current_support, current_labels, current_sources = self._extract_support(fit_extract_loader)
+                self.model.train()
                 proto_rows = []
                 for qlabel, qsid in zip(labels, sid):
                     class_rows = []
@@ -353,6 +350,7 @@ class Runner:
                 fit_extract = self._loader(extract_loader.dataset, fit_idx, extract_loader.batch_size, False)
                 val = self._loader(extract_loader.dataset, val_idx, extract_loader.batch_size, False)
                 before = self.model.export_moe_topology()
+                before_state = copy.deepcopy(self.model.state_dict())
                 try:
                     if subset:
                         self._candidate_train(task_id, subset, fit_train, fit_extract,
@@ -362,6 +360,9 @@ class Runner:
                     ))
                 finally:
                     self.model.rebuild_moe_topology(before)
+                    self.model.load_state_dict(before_state, strict=True)
+                    for _, adapter in self._adapters():
+                        adapter.freeze_all()
             scores.append((subset, np.asarray(fold_scores, dtype=np.float64)))
         baseline = next(values for subset, values in scores if not subset)
         candidates_scores = []
