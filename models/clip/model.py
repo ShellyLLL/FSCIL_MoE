@@ -243,6 +243,20 @@ class VisualMoEAdapter(nn.Module):
         values = F.normalize(values, dim=-1).to(dtype=router.weight.dtype)
         return torch.sigmoid(router(values)).squeeze(-1)
 
+    def newest_residual(self, raw_reference_cls, adapter_input_cls):
+        """Return the newest expert's gate and actual gated CLS residual."""
+        raw = torch.as_tensor(raw_reference_cls)
+        hidden = torch.as_tensor(adapter_input_cls)
+        if raw.ndim != 2 or hidden.ndim != 2 or raw.shape != hidden.shape:
+            raise ValueError("Historical reference and adapter-input anchors must both be [N, d_model].")
+        if raw.shape[-1] != self.d_model:
+            raise ValueError("Historical anchor dimension does not match adapter width.")
+        router = self.incremental_routers[-1]
+        hidden = hidden.to(device=router.weight.device, dtype=router.weight.dtype)
+        gate = self.newest_gate(raw)
+        residual = self.experts[-1](self.layer_norm(hidden)) * gate.unsqueeze(-1)
+        return gate, residual
+
     def export_topology(self):
         return {
             "version": 3,

@@ -377,13 +377,11 @@ class Runner:
                 protection_terms, gate_audit, residual_audit = [], {}, {}
                 for block in selected_blocks:
                     adapter = dict(self._adapters())[block]
-                    gates = adapter.newest_gate(history_raw[block])
                     # Evaluate the actual newly emitted expert residual on
                     # stored historical adapter inputs, not only its gate.
-                    expert_input = adapter.layer_norm(
-                        history_inputs[block].to(dtype=next(adapter.experts[-1].parameters()).dtype)
+                    gates, residual = adapter.newest_residual(
+                        history_raw[block], history_inputs[block]
                     )
-                    residual = adapter.experts[-1](expert_input) * gates.unsqueeze(-1)
                     relative_residual = residual.float().norm(dim=-1) / (
                         history_inputs[block].float().norm(dim=-1).clamp_min(1e-12)
                     )
@@ -406,11 +404,22 @@ class Runner:
         for _, adapter in self._adapters():
             adapter.freeze_all()
         max_old_gate = float(_get(self.cfg.TRAINER.BiMC.PROTECTION, "MAX_OLD_GATE", 0.05))
-        gate_audit = {}
-        for block in selected_blocks:
-            adapter = dict(self._adapters())[block]
-            gates = adapter.newest_gate(history_raw[block]).detach()
-            gate_audit[int(block)] = float(gates.max().item())
+        gate_audit, residual_audit = {}, {}
+        with torch.no_grad():
+            for block in selected_blocks:
+                adapter = dict(self._adapters())[block]
+                gates, residual = adapter.newest_residual(
+                    history_raw[block], history_inputs[block]
+                )
+                gates, residual = gates.detach(), residual.detach().float()
+                relative_residual = residual.norm(dim=-1) / (
+                    history_inputs[block].float().norm(dim=-1).clamp_min(1e-12)
+                )
+                gate_audit[int(block)] = float(gates.max().item())
+                residual_audit[int(block)] = {
+                    "mean_relative_residual": float(relative_residual.mean().item()),
+                    "max_relative_residual": float(relative_residual.max().item()),
+                }
         self._last_old_gate_audit = gate_audit
         self._last_old_residual_audit = residual_audit
         if any(value > max_old_gate for value in gate_audit.values()):

@@ -84,6 +84,20 @@ class UnifiedMoETests(unittest.TestCase):
         self.assertEqual(len(aux), 1)
         self.assertEqual(tuple(aux[0]["raw_reference_cls"].shape), (2, 16))
         self.assertEqual(tuple(aux[0]["block_out"].shape), (2, 16))
+    def test_newest_residual_audit_measures_actual_gated_expert_output(self):
+        adapter = VisualMoEAdapter(8, num_experts=2, reduction=2)
+        adapter.add_expert(session_id=1, reduction=2)
+        with torch.no_grad():
+            adapter.experts[-1].c_proj.weight.normal_()
+            adapter.experts[-1].c_proj.bias.normal_()
+        raw = torch.randn(5, 8)
+        hidden = torch.randn(5, 8)
+        gate, residual = adapter.newest_residual(raw, hidden)
+        self.assertEqual(tuple(gate.shape), (5,))
+        self.assertEqual(tuple(residual.shape), (5, 8))
+        self.assertTrue(torch.isfinite(residual).all())
+        self.assertTrue(torch.all(residual.norm(dim=-1) > 0))
+
     def test_router_requires_frozen_reference_feature(self):
         adapter = VisualMoEAdapter(8, num_experts=2, reduction=2)
         with self.assertRaises(ValueError):
