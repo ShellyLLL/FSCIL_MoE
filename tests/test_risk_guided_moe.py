@@ -64,7 +64,10 @@ class PrototypeAndStateTests(unittest.TestCase):
         model.base_vision_prototype = None
         model.set_base_visual_prototype(base)
         calibrated = model.calibrate_incremental_visual(novel)
+        weights = torch.softmax(8.0 * (novel @ base.t()), dim=-1)
+        expected = 0.8 * novel + 0.2 * (weights @ base)
         self.assertEqual(tuple(calibrated.shape), (1, 3))
+        torch.testing.assert_close(calibrated, expected)
         torch.testing.assert_close(model.base_vision_prototype, base)
         with self.assertRaises(RuntimeError):
             model.set_base_visual_prototype(torch.flip(base, dims=[0]))
