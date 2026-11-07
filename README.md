@@ -46,57 +46,20 @@ python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/t
 python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc_ensemble.yaml
 ~~~
 
-### Dynamic FSCIL MoE runs
+### Unified dynamic FSCIL MoE architecture
 
-The `bimc.yaml` configuration now auto-saves a dataset/seed-specific fixed
-support manifest, alongside session checkpoints, query-exclusive LOO training
-and demand-driven dynamic experts. For reproducible comparisons across model
-variants, explicitly reuse one manifest and run a no-expansion baseline:
+The active implementation is on `codex/fscil-unified-expansion-architecture`.
 
-~~~BASH
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --support_manifest checkpoints/fscil_moe/cub_seed1_support.json --expansion_mode none
-~~~
+The classifier uses one current visual encoder and one all-seen-class cosine prototype bank. Visual intra-modal calibration, text intra-modal calibration, and inter-modal fusion produce one fused prototype per seen class. Inference is a single cosine similarity calculation over every seen class. This implementation does **not** use category-masked BiMC†, MGC, CMNN, per-class encoder versions, or task gates.
 
-The default `auto` mode computes each layer's discriminative coverage deficit:
-only samples with a negative all-seen visual LOO margin and descriptor coverage
-excess contribute expansion evidence. The largest positive eligible layer adds
-one Linear Gate, Expert and Scale. Training uses one softmax over `NULL` and all
-dynamic experts, refreshed query-exclusive visual prototypes each epoch, and only
-visual classification plus historical-path invariance losses. Deployment uses the
-same logits with hard Top-1 routing. A candidate is retained only when its hard
-deployment LOO objective plus historical invariance is lower than the pre-candidate
-objective; otherwise the exact pre-expansion state is restored. Force/session/block
-overrides are intentionally unavailable in the production path.
-The explicit full-auto CUB200 command is:
+The visual MoE uses two streams over the frozen CLIP ViT:
+- A frozen reference stream supplies the raw CLS feature for APC and every expert router.
+- An enhanced stream applies residual experts and supplies the final image feature.
 
-~~~BASH
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --expansion_mode auto
-~~~
+Base experts share a Softmax router. Every incremental expert has an independent Sigmoid router. The pools are not jointly normalized and do not use Top-K. Incremental training freezes the backbone, base experts/router and historical experts/routers; only newly added experts and their own routers are trainable. APC proposes candidate layers from fixed base raw-prototype thresholds; joint layer subsets are then compared with the no-expansion model using source-grouped validation and the same all-class classifier.
 
-For staged development, reuse Session 0 and stop after Task 3 without changing
-the normal full-run default:
-
-~~~BASH
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --resume checkpoints/fscil_moe/session_00.pth --expansion_mode auto --end_session 3
-~~~
-
-Resume from a checkpoint produced by this safety-bounded version with:
-
-~~~BASH
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --resume checkpoints/fscil_moe/session_03.pth
-~~~
-
-Legacy dynamic-expert checkpoint schemas are intentionally rejected when they
-predate the current logit-NULL routing and transactional safety contract.
-
-Each completed session also records per-expert/null routing and a deterministic
-support-proxy leave-one-expert-out diagnostic (`accuracy_gain` and
-`margin_gain`). It masks the selected residual without re-routing to another
-expert, so the reported value is that expert's direct marginal contribution.
-Historical experts additionally receive a support-only forward-interference
-report. Accuracy targets are kept outside runtime; use
-`python tools/report_regression.py --accuracies ...` after a run.
-
+**Architecture acceptance is not yet declared.** Run `python -m pytest -q` and inspect the GitHub Actions result before starting the full CUB200 experiment. No AA/PD improvement is claimed until controlled experiments complete.
+  
 ## Acknowledgment
 
 In this repository, we build our code based on the following excellent open-source projects. We sincerely thank all the authors for sharing their great work:
@@ -106,6 +69,4 @@ In this repository, we build our code based on the following excellent open-sour
 - [FeCAM](https://github.com/dipamgoswami/FeCAM)
 - [CuPL](https://github.com/sarahpratt/CuPL)
 - [AdaptCLIPZS](https://github.com/cvl-umass/AdaptCLIPZS)
-
-
 
