@@ -238,12 +238,12 @@ class Runner:
                 source_id = int(source)
                 if source_id in targets:
                     raise ValueError(f"Historical support source {source_id} appears more than once.")
-                if int(state["feature_anchor_session"]) != int(state.get("creation_session", -1)):
+            if int(state["feature_anchor_session"]) != int(state.get("creation_session", -1)):
                 raise RuntimeError(
                     "Historical feature anchor session metadata is inconsistent; "
                     "restart from Session 0 with checkpoint schema 24."
                 )
-            targets[source_id] = (int(label), F.normalize(feature.float(), dim=-1))
+                targets[source_id] = (int(label), F.normalize(feature.float(), dim=-1))
         if not targets:
             raise ValueError("Historical support feature target bank is empty.")
         return targets
