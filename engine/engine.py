@@ -21,8 +21,8 @@ def _get(node, name, default):
     return getattr(node, name, default) if node is not None else default
 
 
-class OldGateConstraintError(RuntimeError):
-    """Raised when a trained incremental expert violates historical anchor protection."""
+class HistoricalFeatureConstraintError(RuntimeError):
+    """Raised when a candidate encoder regresses on previously learned support data."""
 
 
 class Runner:
@@ -113,6 +113,207 @@ class Runner:
                 raise RuntimeError("Empty source-exclusive CV fold.")
             folds.append((fit_idx, val_idx))
         return folds
+
+    def _assert_aligned_support_datasets(self, train_dataset, extract_dataset):
+        """Require optimizer and deterministic extraction views to index identical sources."""
+        train_labels = np.asarray(train_dataset.labels)
+        extract_labels = np.asarray(extract_dataset.labels)
+        train_sources = np.asarray(train_dataset.source_ids)
+        extract_sources = np.asarray(extract_dataset.source_ids)
+        if (train_labels.shape != extract_labels.shape
+                or train_sources.shape != extract_sources.shape
+                or not np.array_equal(train_labels, extract_labels)
+                or not np.array_equal(train_sources, extract_sources)):
+            raise RuntimeError(
+                "APC fitting and extraction datasets do not have identical label/source ordering."
+            )
+        if len(np.unique(train_sources)) != len(train_sources):
+            raise RuntimeError("A session support set contains duplicate source IDs.")
+
+    def _trainable_parameter_ids(self):
+        return {id(parameter) for parameter in self.model.parameters() if parameter.requires_grad}
+
+    def _assert_trainable_scope(self, expected_parameters, context):
+        expected = {id(parameter) for parameter in expected_parameters}
+        actual = self._trainable_parameter_ids()
+        if actual != expected:
+            names = {
+                name: ("expected" if id(parameter) in expected else "unexpected")
+                for name, parameter in self.model.named_parameters()
+                if parameter.requires_grad
+            }
+            raise RuntimeError(
+                f"{context}: requires_grad scope differs from the architecture contract; "
+                f"unexpected_trainables={names}"
+            )
+
+    def _assert_optimizer_scope(self, optimizer, expected_parameters, context):
+        parameters = [
+            parameter
+            for group in optimizer.param_groups
+            for parameter in group["params"]
+        ]
+        ids = [id(parameter) for parameter in parameters]
+        expected = {id(parameter) for parameter in expected_parameters}
+        if len(ids) != len(set(ids)) or set(ids) != expected:
+            raise RuntimeError(
+                f"{context}: optimizer parameters must contain each and only each "
+                "architecture-authorized trainable parameter exactly once."
+            )
+
+    def _snapshot_frozen_parameters(self, expected_parameters):
+        trainable = {id(parameter) for parameter in expected_parameters}
+        return {
+            name: parameter.detach().cpu().clone()
+            for name, parameter in self.model.named_parameters()
+            if id(parameter) not in trainable
+        }
+
+    def _assert_gradient_scope(self, expected_parameters, context):
+        trainable = {id(parameter) for parameter in expected_parameters}
+        unexpected, non_finite = [], []
+        for name, parameter in self.model.named_parameters():
+            if parameter.grad is not None and id(parameter) not in trainable:
+                unexpected.append(name)
+            elif parameter.grad is not None and not torch.isfinite(parameter.grad).all():
+                non_finite.append(name)
+        if unexpected or non_finite:
+            raise RuntimeError(
+                f"{context}: gradient scope violation; unexpected={unexpected}, "
+                f"non_finite={non_finite}"
+            )
+
+    def _assert_frozen_unchanged(self, snapshot, context):
+        changed = []
+        current = dict(self.model.named_parameters())
+        for name, before in snapshot.items():
+            parameter = current.get(name)
+            if parameter is None or not torch.equal(parameter.detach().cpu(), before):
+                changed.append(name)
+        if changed:
+            raise RuntimeError(f"{context}: frozen parameters changed: {changed}")
+
+    def _assert_all_parameters_frozen(self, context):
+        trainable = [
+            name for name, parameter in self.model.named_parameters()
+            if parameter.requires_grad
+        ]
+        if trainable:
+            raise RuntimeError(f"{context}: parameters remain trainable after the phase: {trainable}")
+
+    def _restore_candidate_snapshot(self, topology, state):
+        self.model.rebuild_moe_topology(topology)
+        self.model.load_state_dict(state, strict=True)
+        for _, adapter in self._adapters():
+            adapter.freeze_all()
+        self._assert_all_parameters_frozen("APC candidate rollback")
+        current = self.model.state_dict()
+        changed = [
+            key for key, value in state.items()
+            if key not in current or not torch.equal(current[key].detach().cpu(), value.detach().cpu())
+        ]
+        if changed:
+            raise RuntimeError(f"APC rollback did not restore the exact model state: {changed}")
+
+    def _historical_feature_targets(self, old_states):
+        targets = {}
+        for state in old_states:
+            required = ("support_features", "support_labels", "support_source_ids")
+            if any(key not in state for key in required):
+                raise RuntimeError(
+                    "Historical feature targets are missing. Restart from Session 0 "
+                    "with checkpoint schema 23."
+                )
+            features = torch.as_tensor(state["support_features"]).float().cpu()
+            labels = torch.as_tensor(state["support_labels"]).long().cpu().reshape(-1)
+            sources = torch.as_tensor(state["support_source_ids"]).long().cpu().reshape(-1)
+            if features.ndim != 2 or len(features) != len(labels) or len(labels) != len(sources):
+                raise ValueError("Historical support features, labels, and source IDs do not align.")
+            if not torch.isfinite(features).all():
+                raise FloatingPointError("Historical support feature targets contain non-finite values.")
+            for feature, label, source in zip(features, labels, sources):
+                source_id = int(source)
+                if source_id in targets:
+                    raise ValueError(f"Historical support source {source_id} appears more than once.")
+                targets[source_id] = (int(label), F.normalize(feature.float(), dim=-1))
+        if not targets:
+            raise ValueError("Historical support feature target bank is empty.")
+        return targets
+
+    def _historical_support_loader(self, task_id, old_states):
+        if int(task_id) <= 0 or not old_states:
+            raise ValueError("Historical support preservation is only defined after Session 0.")
+        targets = self._historical_feature_targets(old_states)
+        loader = self.data_manager.get_dataloader(
+            int(task_id) - 1, source="train", mode="test", accumulate_past=True
+        )
+        dataset_sources = np.asarray(loader.dataset.source_ids, dtype=np.int64)
+        dataset_labels = np.asarray(loader.dataset.labels, dtype=np.int64)
+        if len(dataset_sources) != len(targets) or set(dataset_sources.tolist()) != set(targets):
+            raise RuntimeError(
+                "Checkpointed historical support sources do not match the current support manifest."
+            )
+        for source_id, label in zip(dataset_sources, dataset_labels):
+            if targets[int(source_id)][0] != int(label):
+                raise RuntimeError(
+                    f"Historical support label mismatch for source {int(source_id)}."
+                )
+        return loader, targets
+
+    def _historical_target_batch(self, batch, targets):
+        source_ids = self._source(batch).tolist()
+        labels = torch.as_tensor(batch["label"]).long().reshape(-1).tolist()
+        rows = []
+        for source_id, label in zip(source_ids, labels):
+            item = targets.get(int(source_id))
+            if item is None:
+                raise KeyError(f"No historical feature target for source {int(source_id)}.")
+            target_label, feature = item
+            if int(target_label) != int(label):
+                raise ValueError(f"Historical target label mismatch for source {int(source_id)}.")
+            rows.append(feature)
+        return torch.stack(rows).to(self.device, dtype=torch.float32)
+
+    @torch.no_grad()
+    def _evaluate_old_feature_preservation(self, loader, targets, old_bank):
+        self.model.eval()
+        prototypes = F.normalize(old_bank["fused_proto"].float(), dim=-1)
+        class_ids = old_bank["class_ids"].to(self.device)
+        cosine_values, drift_values = [], []
+        baseline_correct = candidate_correct = lost_correct = count = 0
+        for batch in loader:
+            images, labels = self.parse_batch(batch)
+            target_features = F.normalize(self._historical_target_batch(batch, targets), dim=-1)
+            current_features = F.normalize(
+                self.model.extract_img_feature(images).float(), dim=-1
+            )
+            cosine = F.cosine_similarity(current_features, target_features, dim=-1)
+            drift = (current_features - target_features).norm(dim=-1)
+            target_columns = self._columns(labels, class_ids)
+            baseline_prediction = (target_features @ prototypes.t()).argmax(dim=-1)
+            current_prediction = (current_features @ prototypes.t()).argmax(dim=-1)
+            baseline_ok = baseline_prediction.eq(target_columns)
+            current_ok = current_prediction.eq(target_columns)
+            cosine_values.extend(cosine.cpu().tolist())
+            drift_values.extend(drift.cpu().tolist())
+            baseline_correct += int(baseline_ok.sum().item())
+            candidate_correct += int(current_ok.sum().item())
+            lost_correct += int((baseline_ok & ~current_ok).sum().item())
+            count += int(labels.numel())
+        if count == 0:
+            raise RuntimeError("Historical support preservation audit received no samples.")
+        return {
+            "count": count,
+            "mean_cosine_similarity": float(np.mean(cosine_values)),
+            "min_cosine_similarity": float(np.min(cosine_values)),
+            "mean_l2_drift": float(np.mean(drift_values)),
+            "max_l2_drift": float(np.max(drift_values)),
+            "baseline_correct": baseline_correct,
+            "candidate_correct": candidate_correct,
+            "baseline_accuracy": float(baseline_correct / count),
+            "candidate_accuracy": float(candidate_correct / count),
+            "lost_previously_correct": lost_correct,
+        }
 
     def _loader(self, dataset, indices, batch_size, shuffle):
         return DataLoader(Subset(dataset, indices), batch_size=batch_size, shuffle=shuffle,
@@ -236,6 +437,9 @@ class Runner:
             "description_proto": desc.detach().cpu(),
             "description_features": [x.detach().cpu() for x in desc_list],
             "fused_proto": fused.detach().cpu(),
+            "support_features": feat.detach().cpu(),
+            "support_labels": labels.detach().cpu(),
+            "support_source_ids": sources.detach().cpu(),
             "raw_layer_prototypes": raw_prototypes,
             # Historical adapter-input CLS anchors permit auditing the actual
             # residual emitted by a newly inserted expert without retaining images.
@@ -278,6 +482,64 @@ class Runner:
             values.append(torch.as_tensor(anchors).float())
         return torch.cat(values, dim=0).to(self.device)
 
+    @torch.no_grad()
+    def _refresh_historical_support_features(self, task_id):
+        """Refresh every stored support target/anchor in the current encoder space."""
+        loader = self.data_manager.get_dataloader(
+            int(task_id), source="train", mode="test", accumulate_past=True
+        )
+        features, labels, sources = self._extract_support(loader)
+        source_ids = sources.detach().cpu().long().tolist()
+        if len(set(source_ids)) != len(source_ids):
+            raise RuntimeError("Accumulated historical support loader contains duplicate source IDs.")
+        index_by_source = {int(source): index for index, source in enumerate(source_ids)}
+        all_state_sources = [
+            int(source)
+            for state in self.states
+            for source in torch.as_tensor(state["support_source_ids"]).tolist()
+        ]
+        if len(all_state_sources) != len(set(all_state_sources)) or set(all_state_sources) != set(source_ids):
+            raise RuntimeError(
+                "Stored per-session support sources do not exactly match the accumulated support manifest."
+            )
+        for state in self.states:
+            ordered_sources = torch.as_tensor(state["support_source_ids"]).long().tolist()
+            indices = torch.tensor(
+                [index_by_source[int(source)] for source in ordered_sources],
+                device=features.device, dtype=torch.long,
+            )
+            state["support_features"] = features.index_select(0, indices).detach().cpu()
+            state["support_labels"] = labels.index_select(0, indices).detach().cpu()
+            state["support_source_ids"] = sources.index_select(0, indices).detach().cpu()
+
+        raw_layers = self.model.collect_blockwise_cls_features(loader)
+        for block, item in raw_layers.items():
+            layer_sources = torch.as_tensor(item["source_ids"]).long().tolist()
+            if len(set(layer_sources)) != len(layer_sources) or set(layer_sources) != set(source_ids):
+                raise RuntimeError(f"Block {block} historical anchor sources are incomplete or duplicated.")
+            layer_index = {int(source): index for index, source in enumerate(layer_sources)}
+            raw_reference = item["raw_reference_cls"].float()
+            adapter_input = item["adapter_input_cls"].float()
+            layer_labels = item["labels"].long()
+            for state in self.states:
+                ordered_sources = torch.as_tensor(state["support_source_ids"]).long().tolist()
+                indices = torch.tensor([layer_index[int(source)] for source in ordered_sources])
+                state["raw_reference_anchors"][int(block)] = raw_reference.index_select(0, indices).cpu()
+                state["adapter_input_anchors"][int(block)] = adapter_input.index_select(0, indices).cpu()
+                state_labels = torch.as_tensor(state["support_labels"]).long()
+                if not torch.equal(layer_labels.index_select(0, indices), state_labels):
+                    raise RuntimeError(f"Block {block} historical anchor labels do not align.")
+                prototypes = []
+                class_ids = torch.as_tensor(state["class_ids"]).long()
+                for class_id in class_ids:
+                    selected = raw_reference.index_select(0, indices)[state_labels.eq(int(class_id))]
+                    if not selected.numel():
+                        raise RuntimeError(
+                            f"Missing refreshed raw-reference anchors for class {int(class_id)}, block {block}."
+                        )
+                    prototypes.append(BiMC.mean_normalized_features(selected, dim=0))
+                state["raw_layer_prototypes"][int(block)] = torch.stack(prototypes).cpu()
+
     def _calibrate_apc(self, base_state):
         thresholds = {}
         for block, item in base_state["raw_layer_prototypes"].items():
@@ -300,26 +562,36 @@ class Runner:
         return result
 
     def _candidate_train(self, task_id, selected_blocks, fit_loader, fit_extract_loader,
-                         old_states, class_ids, text, desc):
+                         old_states, class_ids, text, desc, old_support_loader,
+                         old_feature_targets):
+        adapters = dict(self._adapters())
+        selected_blocks = sorted(set(int(block) for block in selected_blocks))
+        if not selected_blocks or any(block not in adapters for block in selected_blocks):
+            raise ValueError("Candidate training requires valid, non-empty expandable block indices.")
         for _, adapter in self._adapters():
             adapter.freeze_all()
         for block in selected_blocks:
             self.model.add_expert(block, task_id)
+
+        expected_params = []
         optim_cfg = self.cfg.TRAINER.BiMC.OPTIM
         params = []
         for block in selected_blocks:
-            adapter = dict(self._adapters())[block]
-            params += [{"params": list(adapter.experts[-1].parameters()),
-                        "lr": float(optim_cfg.LR_INCREMENTAL_EXPERT)},
-                       {"params": list(adapter.incremental_routers[-1].parameters()),
-                        "lr": float(optim_cfg.LR_INCREMENTAL_ROUTER)}]
-        if not params:
-            return []
+            adapter = adapters[block]
+            expert_params = list(adapter.experts[-1].parameters())
+            router_params = list(adapter.incremental_routers[-1].parameters())
+            expected_params.extend(expert_params)
+            expected_params.extend(router_params)
+            params += [
+                {"params": expert_params, "lr": float(optim_cfg.LR_INCREMENTAL_EXPERT)},
+                {"params": router_params, "lr": float(optim_cfg.LR_INCREMENTAL_ROUTER)},
+            ]
+        self._assert_trainable_scope(expected_params, "incremental expert training")
         optimizer = optim.AdamW(params, weight_decay=float(optim_cfg.WEIGHT_DECAY))
+        self._assert_optimizer_scope(optimizer, expected_params, "incremental expert training")
+        frozen_snapshot = self._snapshot_frozen_parameters(expected_params)
+
         epochs = int(self.cfg.TRAINER.BiMC.INCREMENTAL.EPOCHS)
-        fit_feat, fit_labels, fit_sources = self._extract_support(fit_extract_loader)
-        # Historical classifier rows are immutable; only current-session rows
-        # are recomputed from the candidate encoder and query-exclusive support.
         old_bank = self._merge_states(old_states, self.device)
         old_proto = old_bank["fused_proto"]
         lambda_t = float(self.cfg.TRAINER.BiMC.LAMBDA_T) if self.cfg.TRAINER.BiMC.TEXT_CALIBRATION else 0.0
@@ -327,87 +599,127 @@ class Runner:
         beta = float(self.cfg.DATASET.BETA)
         logit_scale = self.model.classification_scale()
         history_raw = {
-            b: F.normalize(self._raw_reference_anchor_history(old_states, b), dim=-1)
-            for b in selected_blocks
+            block: F.normalize(self._raw_reference_anchor_history(old_states, block), dim=-1)
+            for block in selected_blocks
         }
         history_inputs = {
-            b: self._adapter_input_history(old_states, b)
-            for b in selected_blocks
+            block: self._adapter_input_history(old_states, block)
+            for block in selected_blocks
         }
+        old_count = len(old_support_loader.dataset)
+        if old_count <= 0:
+            raise RuntimeError("Historical feature preservation requires a non-empty old support set.")
+
         logs = []
         for epoch in range(epochs):
             self.model.train()
-            total = 0.0
+            total, distillation_total = 0.0, 0.0
             for batch in fit_loader:
                 images, labels = self.parse_batch(batch)
-                sid = self._source(batch).to(self.device)
+                source_ids = self._source(batch).to(self.device)
                 optimizer.zero_grad(set_to_none=True)
-                query_feat, _ = self.model.extract_img_feature_train(images)
-                query_feat = F.normalize(query_feat.float(), dim=-1)
-                # LOO prototypes are rebuilt from the current candidate weights.
+                query_features, _ = self.model.extract_img_feature_train(images)
+                query_features = F.normalize(query_features.float(), dim=-1)
+
+                # Query-exclusive prototypes are rebuilt under the current candidate weights.
                 current_support, current_labels, current_sources = self._extract_support(fit_extract_loader)
                 self.model.train()
-                proto_rows = []
-                for qlabel, qsid in zip(labels, sid):
+                prototype_rows = []
+                for query_label, query_source in zip(labels, source_ids):
                     class_rows = []
-                    for cls in class_ids:
-                        mask = current_labels.eq(int(cls))
-                        if int(cls) == int(qlabel):
-                            mask = mask & current_sources.ne(qsid)
+                    for class_id in class_ids:
+                        mask = current_labels.eq(int(class_id))
+                        if int(class_id) == int(query_label):
+                            mask = mask & current_sources.ne(query_source)
                         chosen = current_support[mask]
                         if not chosen.numel():
-                            raise ValueError("Incremental classification needs at least two sources per class.")
+                            raise ValueError(
+                                "Incremental classification needs another source after excluding the query source."
+                            )
                         class_rows.append(BiMC.mean_normalized_features(chosen, dim=0))
-                    proto_rows.append(torch.stack(class_rows))
-                visual_loo = torch.stack(proto_rows)
+                    prototype_rows.append(torch.stack(class_rows))
+                visual_loo = torch.stack(prototype_rows)
                 if self.cfg.TRAINER.BiMC.VISION_CALIBRATION:
                     visual_loo = self.model.calibrate_incremental_visual(
                         visual_loo.reshape(-1, visual_loo.size(-1))
                     ).reshape_as(visual_loo)
-                fused_loo = beta*new_text[None] + (1.0-beta)*visual_loo
-                full_bank = torch.cat([old_proto[None].expand(len(labels), -1, -1), fused_loo], dim=1)
-                logits = logit_scale * torch.einsum(
-                    "nd,ncd->nc", query_feat, F.normalize(full_bank, dim=-1)
+                fused_loo = beta * new_text[None] + (1.0 - beta) * visual_loo
+                full_bank = torch.cat(
+                    [old_proto[None].expand(len(labels), -1, -1), fused_loo], dim=1
                 )
-                all_ids = torch.cat([old_bank["class_ids"], torch.as_tensor(class_ids, device=self.device)])
-                target_ids = all_ids
-                targets = self._columns(labels, target_ids)
-                loss = F.cross_entropy(logits, targets)
-                # Suppress each new expert on stored old-class raw reference prototypes.
-                protection_terms, gate_audit, residual_audit = [], {}, {}
+                logits = logit_scale * torch.einsum(
+                    "nd,ncd->nc", query_features, F.normalize(full_bank, dim=-1)
+                )
+                all_ids = torch.cat([
+                    old_bank["class_ids"],
+                    torch.as_tensor(class_ids, device=self.device),
+                ])
+                loss = F.cross_entropy(logits, self._columns(labels, all_ids))
+
+                # Local residual suppression is an auxiliary constraint. The
+                # authoritative preservation test is the final image embedding.
+                protection_terms = []
                 for block in selected_blocks:
-                    adapter = dict(self._adapters())[block]
-                    # Evaluate the actual newly emitted expert residual on
-                    # stored historical adapter inputs, not only its gate.
+                    adapter = adapters[block]
                     gates, residual = adapter.newest_residual(
                         history_raw[block], history_inputs[block]
                     )
                     relative_residual = residual.float().norm(dim=-1) / (
                         history_inputs[block].float().norm(dim=-1).clamp_min(1e-12)
                     )
-                    protection_terms.append(gates.square().mean())
-                    protection_terms.append(relative_residual.square().mean())
-                    gate_audit[int(block)] = float(gates.detach().max().item())
-                    residual_audit[int(block)] = {
-                        "mean_relative_residual": float(relative_residual.detach().mean().item()),
-                        "max_relative_residual": float(relative_residual.detach().max().item()),
-                    }
+                    protection_terms.extend([
+                        gates.square().mean(),
+                        relative_residual.square().mean(),
+                    ])
                 if protection_terms:
-                    loss = loss + float(self.cfg.TRAINER.BiMC.PROTECTION.OLD_GATE_WEIGHT) * torch.stack(protection_terms).mean()
+                    loss = loss + float(
+                        self.cfg.TRAINER.BiMC.PROTECTION.OLD_GATE_WEIGHT
+                    ) * torch.stack(protection_terms).mean()
                 if not torch.isfinite(loss):
                     raise FloatingPointError("Non-finite all-class incremental loss.")
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_([p for g in params for p in g["params"]], 1.0)
+                self._assert_gradient_scope(expected_params, "incremental classification backward")
+                torch.nn.utils.clip_grad_norm_(expected_params, 1.0)
                 optimizer.step()
                 total += float(loss.detach()) * len(labels)
-            logs.append({"epoch": epoch+1, "loss": total/max(1,len(fit_extract_loader.dataset))})
+
+            # A complete old-support distillation pass refreshes the actual
+            # final image embedding, including all downstream attention blocks.
+            # The source IDs resolve targets captured by the previous session.
+            self.model.train()
+            optimizer.zero_grad(set_to_none=True)
+            for old_batch in old_support_loader:
+                old_images, _ = self.parse_batch(old_batch)
+                old_targets = F.normalize(
+                    self._historical_target_batch(old_batch, old_feature_targets), dim=-1
+                )
+                old_current, _ = self.model.extract_img_feature_train(old_images)
+                old_current = F.normalize(old_current.float(), dim=-1)
+                distillation_loss = (
+                    1.0 - F.cosine_similarity(old_current, old_targets, dim=-1)
+                ).sum() / old_count
+                if not torch.isfinite(distillation_loss):
+                    raise FloatingPointError("Non-finite historical feature distillation loss.")
+                distillation_loss.backward()
+                self._assert_gradient_scope(expected_params, "historical feature distillation backward")
+                distillation_total += float(distillation_loss.detach()) * len(old_images)
+            torch.nn.utils.clip_grad_norm_(expected_params, 1.0)
+            optimizer.step()
+            logs.append({
+                "epoch": epoch + 1,
+                "classification_loss": total / max(1, len(fit_extract_loader.dataset)),
+                "old_feature_distillation_loss": distillation_total / old_count,
+            })
+
         for _, adapter in self._adapters():
             adapter.freeze_all()
-        max_old_gate = float(_get(self.cfg.TRAINER.BiMC.PROTECTION, "MAX_OLD_GATE", 0.05))
+        self._assert_all_parameters_frozen("incremental expert training completion")
+        self._assert_frozen_unchanged(frozen_snapshot, "incremental expert training")
+
         gate_audit, residual_audit = {}, {}
         with torch.no_grad():
             for block in selected_blocks:
-                adapter = dict(self._adapters())[block]
+                adapter = adapters[block]
                 gates, residual = adapter.newest_residual(
                     history_raw[block], history_inputs[block]
                 )
@@ -415,19 +727,28 @@ class Runner:
                 relative_residual = residual.norm(dim=-1) / (
                     history_inputs[block].float().norm(dim=-1).clamp_min(1e-12)
                 )
-                gate_audit[int(block)] = float(gates.max().item())
+                gate_audit[int(block)] = {
+                    "mean": float(gates.mean().item()),
+                    "max": float(gates.max().item()),
+                }
                 residual_audit[int(block)] = {
                     "mean_relative_residual": float(relative_residual.mean().item()),
                     "max_relative_residual": float(relative_residual.max().item()),
                 }
         self._last_old_gate_audit = gate_audit
         self._last_old_residual_audit = residual_audit
-        if any(value > max_old_gate for value in gate_audit.values()):
-            raise OldGateConstraintError(
-                "New-expert gate exceeds MAX_OLD_GATE on stored historical "
-                f"raw-reference prototypes: {gate_audit}"
+        old_feature_audit = self._evaluate_old_feature_preservation(
+            old_support_loader, old_feature_targets, old_bank
+        )
+        self._last_old_feature_audit = old_feature_audit
+        if old_feature_audit["lost_previously_correct"] > 0:
+            raise HistoricalFeatureConstraintError(
+                "Candidate expansion changed previously correct historical support predictions: "
+                f"{old_feature_audit}"
             )
         return logs
+
+    @torch.no_grad()
 
     @torch.no_grad()
     def _evaluate_candidate(self, validation_loader, fit_extract_loader, old_states,
@@ -455,61 +776,51 @@ class Runner:
 
     def _select_and_train_expansion(self, task_id, train_loader, extract_loader,
                                     old_states, class_ids, class_names):
-        """Evaluate one predeclared APC expansion policy with source-held-out CV.
-
-        Each fold proposes layers from its fitting sources only, jointly trains
-        all proposed layers, and evaluates the resulting all-seen-class risk on
-        that fold's untouched sources. We do not intersect fold proposals or
-        select a winning subset on the same validation folds.
-        """
+        """Validate the fixed APC proposal policy and commit or roll back atomically."""
+        self._last_old_gate_audit = {}
+        self._last_old_residual_audit = {}
+        self._last_old_feature_audit = {}
         apc_cfg = self.cfg.TRAINER.BiMC.APC
         if not bool(_get(apc_cfg, "ENABLE", True)):
             return {
                 "expanded": [], "candidate_layers": [],
-                "reason": "APC disabled by configuration", "logs": [],
+                "reason": "APC disabled by configuration",
+                "validation_status": "disabled", "logs": [],
             }
         if not self.apc_state:
             raise RuntimeError("Base APC thresholds are not initialized.")
+        self._assert_aligned_support_datasets(train_loader.dataset, extract_loader.dataset)
+        old_support_loader, old_feature_targets = self._historical_support_loader(
+            task_id, old_states
+        )
         folds = self._support_folds(train_loader.dataset)
         if not folds:
-            # With fewer than three independent support sources per class,
-            # expansion benefit cannot be estimated with the declared
-            # source-held-out procedure. Do not silently substitute an
-            # in-sample heuristic or abort the entire FSCIL run.
             return {
                 "expanded": [], "candidate_layers": [],
-                "reason": "Insufficient independent support sources for APC risk validation; expansion conservatively skipped",
+                "reason": "Insufficient independent support sources for source-held-out APC validation",
                 "validation_status": "insufficient_support_sources",
                 "logs": [],
             }
-        text, desc, _ = self._text(class_ids)
-        fold_candidate_sets = []
-        fold_baseline_losses = []
-        fold_expanded_losses = []
-        fold_gains = []
 
+        text, desc, _ = self._text(class_ids)
+        fold_candidate_sets, fold_baseline_losses = [], []
+        fold_expanded_losses, fold_gains, fold_old_feature_audits = [], [], []
         cv_rng = {
             "python": random.getstate(), "numpy": np.random.get_state(),
             "torch": torch.get_rng_state(),
             "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
         }
+
         for fit_idx, val_idx in folds:
             random.setstate(cv_rng["python"])
             np.random.set_state(cv_rng["numpy"])
             torch.set_rng_state(cv_rng["torch"])
             if torch.cuda.is_available() and cv_rng["cuda"] is not None:
                 torch.cuda.set_rng_state_all(cv_rng["cuda"])
-            fit_train = self._loader(
-                train_loader.dataset, fit_idx, train_loader.batch_size, True
-            )
-            fit_extract = self._loader(
-                extract_loader.dataset, fit_idx, extract_loader.batch_size, False
-            )
-            val_loader = self._loader(
-                extract_loader.dataset, val_idx, extract_loader.batch_size, False
-            )
+            fit_train = self._loader(train_loader.dataset, fit_idx, train_loader.batch_size, True)
+            fit_extract = self._loader(extract_loader.dataset, fit_idx, extract_loader.batch_size, False)
+            val_loader = self._loader(extract_loader.dataset, val_idx, extract_loader.batch_size, False)
 
-            # APC proposal is derived only from this fold's fitting sources.
             fold_state = self._build_state(class_ids, fit_extract, old_states, False)
             fold_candidates = sorted(
                 row["block"] for row in self._candidate_layers(fold_state, old_states)
@@ -526,93 +837,80 @@ class Runner:
                 baseline_loss = self._evaluate_candidate(
                     val_loader, fit_extract, old_states, class_ids, text, desc
                 )
-                gate_audit = {}
                 if fold_candidates:
                     try:
                         self._candidate_train(
                             task_id, fold_candidates, fit_train, fit_extract,
-                            old_states, class_ids, text, desc
+                            old_states, class_ids, text, desc,
+                            old_support_loader, old_feature_targets,
                         )
-                        gate_audit = dict(getattr(self, "_last_old_gate_audit", {}))
+                        fold_old_feature_audits.append(dict(self._last_old_feature_audit))
                         expanded_loss = self._evaluate_candidate(
                             val_loader, fit_extract, old_states, class_ids, text, desc
                         )
-                    except OldGateConstraintError:
-                        gate_audit = dict(getattr(self, "_last_old_gate_audit", {}))
+                    except HistoricalFeatureConstraintError:
+                        fold_old_feature_audits.append(dict(self._last_old_feature_audit))
                         expanded_loss = float("inf")
                 else:
-                    # The policy predicts no expansion in this fold.
+                    fold_old_feature_audits.append({})
                     expanded_loss = baseline_loss
-                gain = float(baseline_loss - expanded_loss)
                 fold_baseline_losses.append(float(baseline_loss))
                 fold_expanded_losses.append(float(expanded_loss))
-                fold_gains.append(gain)
-                if any(v > float(_get(self.cfg.TRAINER.BiMC.PROTECTION, "MAX_OLD_GATE", 0.05))
-                       for v in gate_audit.values()):
-                    fold_gains[-1] = float("-inf")
+                fold_gains.append(float(baseline_loss - expanded_loss))
             finally:
-                self.model.rebuild_moe_topology(topology_before)
-                self.model.load_state_dict(state_before, strict=True)
-                for _, adapter in self._adapters():
-                    adapter.freeze_all()
+                self._restore_candidate_snapshot(topology_before, state_before)
 
-        # Re-apply the same fixed APC proposal rule to all current support
-        # sources for the final fit. Validation folds estimate the policy;
-        # they do not choose individual layers or subsets.
+        # The final proposal is re-derived from all current support sources;
+        # validation folds estimate the policy and never select a layer subset.
         full_state = self._build_state(class_ids, extract_loader, old_states, False)
         final_candidates = sorted(
             row["block"] for row in self._candidate_layers(full_state, old_states)
             if row["candidate"]
         )
-
         gains = np.asarray(fold_gains, dtype=np.float64)
         mean_gain = float(gains.mean()) if len(gains) else 0.0
         if len(gains) > 1:
-            # Corrected resampled-t uncertainty accounts conservatively for
-            # overlap between fitting folds (test/train ratio = 1/(K-1)).
             sample_variance = float(gains.var(ddof=1))
             test_train_ratio = 1.0 / max(1, len(gains) - 1)
-            corrected_se = float(np.sqrt((1.0 / len(gains) + test_train_ratio)
-                                         * sample_variance))
+            corrected_se = float(np.sqrt((1.0 / len(gains) + test_train_ratio) * sample_variance))
             from scipy.stats import t as student_t
-            significance = float(
-                _get(self.cfg.TRAINER.BiMC.APC, "SIGNIFICANCE", 0.05)
-            )
+            significance = float(_get(apc_cfg, "SIGNIFICANCE", 0.05))
             critical = float(student_t.ppf(1.0 - significance, df=len(gains) - 1))
             required_gain = critical * corrected_se
         else:
-            corrected_se = float("inf")
-            critical = float("inf")
-            required_gain = float("inf")
+            corrected_se, critical, required_gain = float("inf"), float("inf"), float("inf")
 
         diagnostics = {
             "fold_candidate_layers": fold_candidate_sets,
             "fold_baseline_nll": fold_baseline_losses,
             "fold_expanded_nll": fold_expanded_losses,
             "fold_risk_gains": fold_gains,
+            "fold_old_feature_audits": fold_old_feature_audits,
             "mean_risk_gain": mean_gain,
             "corrected_standard_error": corrected_se,
             "critical_value": critical,
             "required_risk_gain": required_gain,
             "final_candidate_layers": final_candidates,
         }
-
         if not any(fold_candidate_sets):
             return {
                 "expanded": [], "candidate_layers": final_candidates,
                 "reason": "APC proposed no layer in any fitting fold",
+                "validation_status": "no_fold_candidates",
                 **diagnostics, "logs": [],
             }
         if not final_candidates:
             return {
                 "expanded": [], "candidate_layers": [],
                 "reason": "APC proposed no layer on the full support set",
+                "validation_status": "no_full_support_candidates",
                 **diagnostics, "logs": [],
             }
         if not np.isfinite(mean_gain) or mean_gain <= required_gain:
             return {
                 "expanded": [], "candidate_layers": final_candidates,
                 "reason": "Held-out full-class risk improvement did not clear the uncertainty bound",
+                "validation_status": "risk_not_verified",
                 **diagnostics, "logs": [],
             }
 
@@ -624,50 +922,62 @@ class Runner:
         try:
             logs = self._candidate_train(
                 task_id, final_candidates, train_loader, extract_loader,
-                old_states, class_ids, text, desc
+                old_states, class_ids, text, desc,
+                old_support_loader, old_feature_targets,
             )
-        except OldGateConstraintError as exc:
-            self.model.rebuild_moe_topology(topology_before)
-            self.model.load_state_dict(state_before, strict=True)
-            for _, adapter in self._adapters():
-                adapter.freeze_all()
+        except HistoricalFeatureConstraintError as exc:
+            self._restore_candidate_snapshot(topology_before, state_before)
             return {
                 "expanded": [], "candidate_layers": final_candidates,
-                "reason": f"Historical anchor gate constraint rejected expansion: {exc}",
+                "reason": f"Historical feature preservation rejected expansion: {exc}",
+                "validation_status": "historical_feature_regression",
+                "old_feature_audit": dict(self._last_old_feature_audit),
                 **diagnostics, "logs": [],
             }
         except Exception:
-            self.model.rebuild_moe_topology(topology_before)
-            self.model.load_state_dict(state_before, strict=True)
-            for _, adapter in self._adapters():
-                adapter.freeze_all()
+            self._restore_candidate_snapshot(topology_before, state_before)
             raise
         return {
             "expanded": list(final_candidates),
             "candidate_layers": final_candidates,
-            "reason": "Held-out full-class risk improvement accepted",
+            "reason": "Held-out risk and historical feature preservation accepted",
+            "validation_status": "accepted",
+            "old_feature_audit": dict(self._last_old_feature_audit),
             **diagnostics, "logs": logs,
         }
 
     def _base_train(self, state, train_loader, extract_loader):
-        for _, adapter in self._adapters():
+        adapters = self._adapters()
+        if not adapters:
+            raise RuntimeError("Base MoE training was requested without expandable adapters.")
+        expected_params = []
+        for _, adapter in adapters:
             adapter.set_base_trainable()
-        params = [p for _, a in self._adapters() for p in a.parameters() if p.requires_grad]
-        optimizer = optim.AdamW(params, lr=float(self.cfg.TRAINER.BiMC.OPTIM.LR_BASE_MOE),
-                                weight_decay=float(self.cfg.TRAINER.BiMC.OPTIM.WEIGHT_DECAY))
+            expected_params.extend(adapter.base_router.parameters())
+            for expert in adapter.experts[:adapter.base_expert_count]:
+                expected_params.extend(expert.parameters())
+        self._assert_trainable_scope(expected_params, "base expert training")
+        optimizer = optim.AdamW(
+            expected_params,
+            lr=float(self.cfg.TRAINER.BiMC.OPTIM.LR_BASE_MOE),
+            weight_decay=float(self.cfg.TRAINER.BiMC.OPTIM.WEIGHT_DECAY),
+        )
+        self._assert_optimizer_scope(optimizer, expected_params, "base expert training")
+        frozen_snapshot = self._snapshot_frozen_parameters(expected_params)
         epochs = int(self.cfg.TRAINER.BiMC.OPTIM.BASE_EPOCHS)
         class_ids = state["class_ids"].to(self.device)
-        text, desc = state["text_features"].to(self.device), state["description_proto"].to(self.device)
+        text = state["text_features"].to(self.device)
+        desc = state["description_proto"].to(self.device)
         for epoch in range(epochs):
             self.model.eval()
             support_feat, support_labels, support_sources = self._extract_support(extract_loader)
             self.model.train()
             for batch in train_loader:
-                images, y = self.parse_batch(batch)
+                images, labels = self.parse_batch(batch)
                 query_sources = self._source(batch).to(self.device)
                 visual_loo = self._loo_class_prototypes(
-                    support_feat, support_labels, support_sources, class_ids,
-                    y, query_sources,
+                    support_feat, support_labels, support_sources,
+                    class_ids, labels, query_sources,
                 )
                 prototypes = self._fuse(visual_loo, text[None], desc[None])
                 optimizer.zero_grad(set_to_none=True)
@@ -677,15 +987,20 @@ class Runner:
                     F.normalize(feature.float(), dim=-1),
                     F.normalize(prototypes.float(), dim=-1),
                 )
-                loss = F.cross_entropy(logits, self._columns(y, class_ids))
+                loss = F.cross_entropy(logits, self._columns(labels, class_ids))
                 if not torch.isfinite(loss):
                     raise FloatingPointError("Non-finite base-session LOO classification loss.")
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(params, 1.0)
+                self._assert_gradient_scope(expected_params, "base classification backward")
+                torch.nn.utils.clip_grad_norm_(expected_params, 1.0)
                 optimizer.step()
             print(f"=> Base epoch {epoch+1}/{epochs} complete")
         for _, adapter in self._adapters():
             adapter.freeze_all()
+        self._assert_all_parameters_frozen("base expert training completion")
+        self._assert_frozen_unchanged(frozen_snapshot, "base expert training")
+
+    @torch.no_grad()
 
     @torch.no_grad()
     def _evaluate_session(self, task_id, global_state):
@@ -709,7 +1024,7 @@ class Runner:
         path = Path(_get(cfg, "DIR", "checkpoints/fscil_moe"))
         path.mkdir(parents=True, exist_ok=True)
         payload = {
-            "schema_version": 22,
+            "schema_version": 23,
             "completed_session": int(completed_session),
             "model_state": {k:v.detach().cpu() for k,v in self.model.state_dict().items()},
             "moe_topology": self.model.export_moe_topology(),
@@ -738,13 +1053,14 @@ class Runner:
         if not resume:
             return
         payload = torch.load(resume, map_location="cpu", weights_only=False)
-        if int(payload.get("schema_version", -1)) != 22:
-            raise ValueError("This unified architecture requires checkpoint schema 22; restart from Session 0.")
+        if int(payload.get("schema_version", -1)) != 23:
+            raise ValueError("This unified architecture requires checkpoint schema 23 with historical feature anchors; restart from Session 0.")
         self.model.rebuild_moe_topology(payload["moe_topology"])
         self.model.load_state_dict(payload["model_state"], strict=True)
         self.states = payload["states"]
         if not self.states:
             raise ValueError("Unified checkpoint has no base-session prototype state.")
+        self._historical_feature_targets(self.states)
         # Restore the exact post-base-training anchor used by every later
         # incremental visual calibration step.
         self.model.set_base_visual_prototype(self.states[0]["image_proto"])
@@ -786,6 +1102,7 @@ class Runner:
                 self.states.append(state)
                 if self._adapters():
                     self._calibrate_apc(state)
+                self._refresh_historical_support_features(task_id)
             else:
                 adaptation = self._select_and_train_expansion(
                     task_id, train, extract, self.states, classes, names
@@ -795,6 +1112,7 @@ class Runner:
                     bool(self.cfg.TRAINER.BiMC.VISION_CALIBRATION)
                 )
                 self.states.append(state)
+                self._refresh_historical_support_features(task_id)
             global_state = self._merge_states(self.states, self.device)
             metrics = self._evaluate_session(task_id, global_state)
             task_acc = metrics["task_acc"]
@@ -821,6 +1139,9 @@ class Runner:
                 "required_risk_gain": adaptation.get("required_risk_gain"),
                 "old_gate_audit": getattr(self, "_last_old_gate_audit", {}),
                 "old_residual_audit": getattr(self, "_last_old_residual_audit", {}),
+                "old_feature_audit": adaptation.get(
+                    "old_feature_audit", getattr(self, "_last_old_feature_audit", {})
+                ),
                 "expert_topology": self.model.export_moe_topology(),
                 "mean_acc": float(metrics["mean_acc"]),
                 "macro_task_acc": float(metrics["macro_task_acc"]),
