@@ -359,7 +359,7 @@ class PrototypeConfusionMoE(nn.Module):
 
     @torch.no_grad()
     def text_features(self, class_names):
-        templates = self.cfg.TRAINER.PCMOE.TEXT_TEMPLATES or self.clip_model.context_length * [] if False else self.cfg.TRAINER.PCMOE.TEXT_TEMPLATES
+        templates = self.cfg.TRAINER.PCMOE.TEXT_TEMPLATES
         templates = list(templates) if templates else list(self._default_templates())
         outputs, consistency = [], []
         for name in class_names:
