@@ -260,39 +260,45 @@ class PrototypeConfusionRunner:
         optimizer = torch.optim.AdamW(params, lr=cfg.OPTIM.INCREMENTAL_LR,
                                       weight_decay=cfg.OPTIM.WEIGHT_DECAY)
         text, text_consistency = self.model.encode_text_prototypes(names)
+        fit_sources = fit_cache["sources"]
+        fit_labels = fit_cache["labels"]
         for epoch in range(int(cfg.OPTIM.INCREMENTAL_EPOCHS)):
+            # Encode only genuine fit supports; query-specific prototypes exclude
+            # every support view with the same original source id.
+            self.model.eval()
+            with torch.no_grad():
+                fit_enhanced = self._compose_from_cache(fit_cache)
+                loo_visual = build_leave_one_source_out_prototypes(
+                    fit_enhanced, fit_labels, fit_sources, new_ids
+                )
             self.model.train()
             for batch in fit_train:
                 images = batch["image"].to(self.device)
                 labels = batch["label"].long().to(self.device)
+                source_ids = torch.as_tensor(batch.get("source_id", batch.get("idx")),
+                                             device=self.device).reshape(-1)
                 raw, enhanced, _, aux = self.model.encode_features(images, return_aux=True)
-                # Query-exclusive prototypes: every support query is scored
-                # against a bank excluding all views of its own source.
-                fit_rows = self._extract_batch_cache(batch)
-                all_fit = self._extract(fit_extract)
-                loo = build_leave_one_source_out_prototypes(
-                    all_fit["raw"], all_fit["labels"], all_fit["sources"], new_ids
-                )
-                visual_proto = torch.stack([
-                    F.normalize(all_fit["raw"][all_fit["labels"].eq(cid)].mean(0), dim=-1)
-                    for cid in new_ids
-                ])
-                # New experts optimize the same final dual-modality classifier;
-                # history visual/text columns remain active in every CE decision.
+                matches = source_ids[:, None].eq(fit_sources[None, :])
+                if not matches.any(dim=1).all():
+                    raise RuntimeError("Training query source is absent from its LOO support bank.")
+                rows = matches.long().argmax(dim=1)
                 old_enhanced = self._history_enhanced()
-                current_proto = self._current_visual_fit_prototypes(all_fit, new_ids)
-                bank_visual = torch.cat([old_enhanced, current_proto], dim=0)
+                old_per_query = old_enhanced.unsqueeze(0).expand(images.size(0), -1, -1)
+                bank_visual = torch.cat([old_per_query, loo_visual[rows]], dim=1)
                 bank_text = torch.cat([self.text_prototypes, text], dim=0)
-                rv = torch.cat([self.visual_reliability, torch.ones(len(new_ids), device=self.device)])
+                rv = torch.cat([self.visual_reliability,
+                                torch.ones(len(new_ids), device=self.device)])
                 rt = torch.cat([self.text_reliability, text_consistency])
                 logits = fuse_modal_scores(
                     raw, enhanced, bank_visual, bank_text, rv, rt,
                     self.model.temperature_visual, self.model.temperature_text
                 )[0]
-                targets = self.class_ids.new_tensor(self.class_ids.tolist() + [int(x) for x in new_ids])
+                targets = self.class_ids.new_tensor(
+                    self.class_ids.tolist() + [int(x) for x in new_ids]
+                )
                 target_cols = targets[None, :].eq(labels[:, None]).float().argmax(1)
                 loss = F.cross_entropy(logits, target_cols)
-                for layer, layer_aux in aux.items():
+                for layer_aux in aux.values():
                     weights = layer_aux["route_weights"]
                     loss = loss + cfg.LOSS.ROUTE_BALANCE_WEIGHT * (
                         weights.mean(0).pow(2).sum() * weights.size(1)
