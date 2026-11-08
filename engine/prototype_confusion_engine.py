@@ -95,8 +95,8 @@ class PrototypeConfusionRunner:
         return (self._slice(cache, fit), self._slice(cache, calibration),
                 self._slice(cache, risk))
 
-    def _memory_cache(self, field):
-        ids = sorted(self.class_ids)
+    def _memory_cache(self, field, class_ids=None):
+        ids = sorted(self.class_ids if class_ids is None else class_ids)
         raw, labels, sources = [], [], []
         layers = {i: [] for i in self.model.layer_ids}
         for cid in ids:
@@ -314,8 +314,18 @@ class PrototypeConfusionRunner:
                               + cfg.CALIBRATION.LAMBDA_TEXT * self._all_descriptions(ids))
                 visual = enhanced[i:i + 1] @ v.t() / self.visual_temperature
                 textual = fit["raw"][i:i + 1] @ t.t() / self.text_temperature
-                query_logits.append((1.0 - self.inter_modal_beta) * visual
-                                     + self.inter_modal_beta * textual)
+                count = fit["labels"].eq(torch.as_tensor(ids, device=self.device)[None, :]).sum(0).float()
+                concentration = torch.stack([
+                    enhanced[fit["labels"].eq(cid)].mean(0).norm().clamp(0.0, 1.0)
+                    for cid in ids
+                ])
+                kappa = float(cfg.CALIBRATION.RELIABILITY_KAPPA)
+                rv = count / (count + kappa) * concentration
+                rt = torch.stack([self.text_consistency[cid].to(self.device) for cid in ids]).clamp(1e-3, 1.0)
+                alpha = rv / (rv + rt).clamp_min(1e-6)
+                query_logits.append((1.0 - self.inter_modal_beta) *
+                                     (alpha.unsqueeze(0) * visual + (1.0 - alpha.unsqueeze(0)) * textual)
+                                     + self.inter_modal_beta * 0.5 * (visual + textual))
             logits = torch.cat(query_logits, dim=0)
             target = torch.as_tensor(ids, device=self.device)[None, :].eq(
                 fit["labels"][:, None]).long().argmax(1)
@@ -356,8 +366,9 @@ class PrototypeConfusionRunner:
         if not candidate_layers:
             return {"accepted": False, "reason": "APC found no layer above capacity threshold",
                     "apc": apc, "candidate_layers": []}
-        old_fit = self._memory_cache("fit")
-        old_ids = list(self.class_ids)
+        new_ids = [int(x) for x in new_ids]
+        old_ids = [int(x) for x in self.class_ids if int(x) not in new_ids]
+        old_fit = self._memory_cache("fit", old_ids)
         all_fit = {
             "raw": torch.cat([old_fit["raw"], fit_new["raw"].to(self.device)]),
             "labels": torch.cat([old_fit["labels"], fit_new["labels"].to(self.device)]),
@@ -372,7 +383,6 @@ class PrototypeConfusionRunner:
         memory_snapshot = copy.deepcopy(self.class_memory)
         class_ids_snapshot = list(self.class_ids)
         try:
-            history = self._history_layer_means()
             for layer in candidate_layers:
                 self.model.add_expert(
                     layer, session, fit_new["layers"][layer].to(self.device),
@@ -408,8 +418,12 @@ class PrototypeConfusionRunner:
                     targets.append(ids_all.index(int(all_fit["labels"][row].item())))
                 visual_logits = torch.cat(visual_logits)
                 text_logits = torch.cat(text_logits)
-                alpha = 0.5
-                logits = (1.0 - self.inter_modal_beta) * visual_logits + self.inter_modal_beta * text_logits
+                alpha = bank_alpha = self._prototypes()["visual_reliability"]
+                text_reliability = self._prototypes()["text_reliability"]
+                alpha = alpha / (alpha + text_reliability).clamp_min(1e-6)
+                logits = ((1.0 - self.inter_modal_beta) *
+                          (alpha.unsqueeze(0) * visual_logits + (1.0 - alpha.unsqueeze(0)) * text_logits)
+                          + self.inter_modal_beta * 0.5 * (visual_logits + text_logits))
                 target = torch.tensor(targets, device=self.device, dtype=torch.long)
                 loss = F.cross_entropy(logits, target)
                 balance = [item["route_weights"].mean(0).pow(2).sum()
@@ -519,19 +533,21 @@ class PrototypeConfusionRunner:
                 self._text_for_new(names, ids)
                 # Candidate transaction needs new calibration/risk queries.
                 old_memory = copy.deepcopy(self.class_memory)
+                old_class_ids = list(self.class_ids)
+                self.class_ids.extend(ids)
                 self._store_classes(calibration, "calibration")
                 self._store_classes(risk, "risk")
                 result = self._train_incremental(session, fit, ids, apc)
                 if not result["accepted"]:
                     self.class_memory = old_memory
+                    self.class_ids = old_class_ids
                     # Text was staged outside the model transaction; discard it.
                     for cid in ids:
                         self.text_prototypes.pop(cid, None)
                         self.description_prototypes.pop(cid, None)
                         self.text_consistency.pop(cid, None)
                 else:
-                    self.class_ids.extend(ids)
-                    # New fit memory was staged in candidate transaction.
+                    # New fit/calibration/risk feature memories are now committed.
                     self.base_layer_prototypes = self._history_layer_means()
                 # Calibration/risk memory is now committed for accepted tasks.
             self.model.freeze_all()
