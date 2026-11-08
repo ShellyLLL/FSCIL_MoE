@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from engine.engine import Runner
 from models.clip.model import VisualMoEAdapter
 from models.bimc import BiMC
+from utils.evaluator import AccuracyEvaluator
 
 
 class _AdapterModel(nn.Module):
@@ -35,6 +36,38 @@ class _FeatureAuditModel(nn.Module):
 
     def extract_img_feature(self, images):
         return images @ self.weight
+
+
+class SessionMetricTests(unittest.TestCase):
+    def test_bimc_table_aa_and_pd_definitions(self):
+        # The first row of BiMC Table 2 reports A_0=92.58, A_8=86.09,
+        # AA=88.55 and PD=6.49.
+        session_acc = [92.58, 91.88, 89.37, 88.24, 88.42, 87.86, 86.33, 86.16, 86.09]
+        metrics = Runner._compute_fscil_metrics(session_acc)
+        self.assertAlmostEqual(metrics["aa"], 88.5477777778, places=8)
+        self.assertAlmostEqual(metrics["pd"], 6.49, places=8)
+        self.assertAlmostEqual(metrics["base_acc"], 92.58, places=8)
+        self.assertAlmostEqual(metrics["last_acc"], 86.09, places=8)
+
+    def test_current_run_log_uses_session_mean_and_base_to_final_drop(self):
+        session_acc = [86.840, 84.090, 82.190, 78.840, 77.560, 75.750,
+                       75.230, 75.040, 73.320, 73.390, 73.230]
+        metrics = Runner._compute_fscil_metrics(session_acc)
+        self.assertAlmostEqual(metrics["aa"], 77.7709090909, places=8)
+        self.assertAlmostEqual(metrics["pd"], 13.610, places=8)
+
+    def test_pd_is_signed_when_final_accuracy_exceeds_base(self):
+        metrics = Runner._compute_fscil_metrics([80.0, 81.0])
+        self.assertAlmostEqual(metrics["pd"], -1.0, places=8)
+
+    def test_evaluator_preserves_unrounded_cumulative_accuracy(self):
+        evaluator = AccuracyEvaluator([np.asarray([0, 1])])
+        logits = torch.tensor([[2.0, 0.0], [0.0, 2.0], [2.0, 0.0]])
+        labels = torch.tensor([0, 1, 1])
+        metrics = evaluator.calc_accuracy(
+            logits, labels, task_id=0, class_ids=torch.tensor([0, 1])
+        )
+        self.assertAlmostEqual(metrics["mean_acc"], 200.0 / 3.0, places=8)
 
 
 class PrototypeAndStateTests(unittest.TestCase):

@@ -53,6 +53,24 @@ class Runner:
         return torch.as_tensor(value).long().reshape(-1)
 
     @staticmethod
+    def _compute_fscil_metrics(session_accuracies):
+        """Compute the BiMC FSCIL metrics from cumulative session accuracies.
+
+        A_t is the all-seen-class test accuracy after session t.
+        AA_t = mean(A_0, ..., A_t), and PD_t = A_0 - A_t.
+        PD is signed: a negative value means the final accuracy exceeds base.
+        """
+        values = np.asarray(session_accuracies, dtype=np.float64).reshape(-1)
+        if values.size == 0 or not np.isfinite(values).all():
+            raise ValueError("FSCIL metrics require a non-empty finite session-accuracy history.")
+        return {
+            "aa": float(values.mean()),
+            "pd": float(values[0] - values[-1]),
+            "base_acc": float(values[0]),
+            "last_acc": float(values[-1]),
+        }
+
+    @staticmethod
     def _merge_states(states, device):
         rows = []
         for state in states:
@@ -1198,6 +1216,21 @@ class Runner:
         self.acc_list = payload["acc_list"]
         self.task_acc_list = payload["task_acc_list"]
         self.session_diagnostics = payload.get("session_diagnostics", [])
+        # Checkpoints written by earlier revisions stored the same cumulative
+        # session accuracies but used a different PD/AA definition. Recompute
+        # their derived metrics from the authoritative accuracy history.
+        for index, diagnostic in enumerate(self.session_diagnostics):
+            if index >= len(self.acc_list):
+                break
+            historical_metrics = self._compute_fscil_metrics(self.acc_list[:index + 1])
+            diagnostic.update({
+                "session_acc": float(self.acc_list[index]),
+                "aa": historical_metrics["aa"],
+                "pd": historical_metrics["pd"],
+                "base_session_acc": historical_metrics["base_acc"],
+                "final_session_acc": historical_metrics["last_acc"],
+                "metric_definition": "AA=mean(A_0..A_t); PD=A_0-A_t",
+            })
         self.data_manager.load_support_manifest(payload["support_manifest"])
         self.start_session = int(payload["completed_session"]) + 1
         random.setstate(payload["rng"]["python"])
@@ -1246,15 +1279,14 @@ class Runner:
             global_state = self._merge_states(self.states, self.device)
             metrics = self._evaluate_session(task_id, global_state)
             task_acc = metrics["task_acc"]
-            pd = 0.0
-            if task_id > 0:
-                drops = []
-                for old_task in range(task_id):
-                    best = max(self.task_acc_list[s][old_task] for s in range(old_task, task_id))
-                    drops.append(max(0.0, best-task_acc[old_task]))
-                pd = float(np.mean(drops)) if drops else 0.0
-            self.acc_list.append(metrics["mean_acc"])
+            # Acc_t is the cumulative all-seen-class test accuracy at this
+            # session. AA and PD follow the BiMC FSCIL table definitions,
+            # not the task-wise average-forgetting statistic.
+            self.acc_list.append(float(metrics["mean_acc"]))
             self.task_acc_list.append(task_acc)
+            continual_metrics = self._compute_fscil_metrics(self.acc_list)
+            aa = continual_metrics["aa"]
+            pd = continual_metrics["pd"]
             diagnostic = {
                 "session": int(task_id),
                 "candidate_layers": list(adaptation.get("candidate_layers", [])),
@@ -1277,6 +1309,11 @@ class Runner:
                 ),
                 "expert_topology": self.model.export_moe_topology(),
                 "mean_acc": float(metrics["mean_acc"]),
+                "session_acc": float(metrics["mean_acc"]),
+                "aa": float(aa),
+                "base_session_acc": continual_metrics["base_acc"],
+                "final_session_acc": continual_metrics["last_acc"],
+                "metric_definition": "AA=mean(A_0..A_t); PD=A_0-A_t",
                 "macro_task_acc": float(metrics["macro_task_acc"]),
                 "task_acc": [float(x) for x in task_acc],
                 "pd": float(pd),
@@ -1293,7 +1330,7 @@ class Runner:
             ]
             print(
                 f"=> Session {task_id}: Acc={metrics['mean_acc']:.3f}, "
-                f"AA={metrics['macro_task_acc']:.3f}, PD={pd:.3f}, "
+                f"AA={aa:.3f}, PD={pd:.3f}, "
                 f"expanded={adaptation.get('expanded', [])}, "
                 f"candidates={adaptation.get('candidate_layers', [])}, "
                 f"APC(confusion/threshold)={apc_summary}, "
