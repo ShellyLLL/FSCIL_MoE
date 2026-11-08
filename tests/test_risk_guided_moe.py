@@ -1,5 +1,6 @@
 """Regression tests for one current encoder and one all-class BiMC prototype bank."""
 import unittest
+import numpy as np
 import torch.nn as nn
 import torch.optim as optim
 from types import SimpleNamespace
@@ -94,10 +95,7 @@ class PrototypeAndStateTests(unittest.TestCase):
         runner = Runner.__new__(Runner)
         runner.model = _AdapterModel()
         before_topology = runner.model.export_moe_topology()
-        before_state = {
-            key: value.detach().cpu().clone()
-            for key, value in runner.model.state_dict().items()
-        }
+        before_state = runner._snapshot_adapter_state()
         runner.model.adapter.add_expert(session_id=1, reduction=2)
         with torch.no_grad():
             runner.model.adapter.experts[-1].c_proj.bias.fill_(3.0)
@@ -106,67 +104,6 @@ class PrototypeAndStateTests(unittest.TestCase):
         self.assertTrue(all(not p.requires_grad for p in runner.model.parameters()))
         for key, value in before_state.items():
             torch.testing.assert_close(runner.model.state_dict()[key].cpu(), value)
-
-    def test_historical_feature_audit_detects_end_to_end_embedding_regression(self):
-        runner = Runner.__new__(Runner)
-        runner.device = "cpu"
-        runner.model = _FeatureAuditModel()
-        with torch.no_grad():
-            runner.model.weight.copy_(torch.tensor([[0., 1.], [1., 0.]]))
-        batches = [{
-            "image": torch.eye(2),
-            "label": torch.tensor([0, 1]),
-            "source_id": torch.tensor([100, 101]),
-        }]
-        targets = {
-            100: (0, torch.tensor([1., 0.])),
-            101: (1, torch.tensor([0., 1.])),
-        }
-        bank = {
-            "class_ids": torch.tensor([0, 1]),
-            "fused_proto": torch.eye(2),
-        }
-        audit = runner._evaluate_old_feature_preservation(batches, targets, bank)
-        self.assertEqual(audit["count"], 2)
-        self.assertEqual(audit["baseline_correct"], 2)
-        self.assertEqual(audit["candidate_correct"], 0)
-        self.assertEqual(audit["lost_previously_correct"], 2)
-        self.assertAlmostEqual(audit["mean_cosine_similarity"], 0.0, places=6)
-
-    def test_current_feature_refresh_never_overwrites_class_birth_teacher(self):
-        runner = Runner.__new__(Runner)
-        birth = torch.tensor([[1., 0.], [0., 1.]])
-        state = {
-            "support_features": birth.clone(),
-            "support_labels": torch.tensor([0, 1]),
-            "support_source_ids": torch.tensor([20, 21]),
-            "feature_anchor_session": 0,
-            "creation_session": 0,
-        }
-        current = torch.tensor([[0.8, 0.6], [0.6, 0.8]])
-        labels = torch.tensor([0, 1])
-        sources = torch.tensor([20, 21])
-        Runner._update_current_feature_cache(
-            state, current, labels, sources, torch.tensor([0, 1])
-        )
-        torch.testing.assert_close(state["support_features"], birth)
-        torch.testing.assert_close(state["current_support_features"], current)
-        targets = runner._historical_feature_targets([state])
-        torch.testing.assert_close(targets[20][1], birth[0])
-
-    def test_historical_feature_targets_require_complete_session_metadata(self):
-        runner = Runner.__new__(Runner)
-        state = {
-            "support_features": torch.eye(2),
-            "support_labels": torch.tensor([0, 1]),
-            "support_source_ids": torch.tensor([20, 21]),
-            "feature_anchor_session": 0,
-            "creation_session": 0,
-        }
-        targets = runner._historical_feature_targets([state])
-        self.assertEqual(set(targets), {20, 21})
-        with self.assertRaisesRegex(RuntimeError, "schema 24"):
-            runner._historical_feature_targets([{"class_ids": torch.tensor([0])}])
 
     def test_visual_text_intra_modal_and_inter_modal_calibration(self):
         runner = Runner.__new__(Runner)
@@ -235,22 +172,85 @@ class PrototypeAndStateTests(unittest.TestCase):
         dataset = SimpleNamespace(labels=[0, 1], source_ids=[10, 20])
         self.assertEqual(runner._support_folds(dataset), [])
 
-    def test_apc_candidate_set_must_match_every_held_out_fold(self):
-        runner = Runner.__new__(Runner)
-        runner.cfg = SimpleNamespace(
-            TRAINER=SimpleNamespace(BiMC=SimpleNamespace(
-                APC=SimpleNamespace(ENABLE=True, SIGNIFICANCE=0.05)
-            ))
+    def test_fold_specific_apc_policy_outcomes_are_statistically_aggregated(self):
+        gains = [0.02, 0.01, 0.0, 0.015, 0.0]
+        result = Runner._risk_gain_statistics(
+            gains, significance=0.05, test_train_ratio=0.25
         )
-        # Candidate topology differs by fold. The full-data proposal must not
-        # be authorized by risk gains measured for different fold topologies.
-        fold_sets = [[1, 2], [1], [1, 2]]
-        final_set = {1, 2}
-        unstable = [
-            index for index, candidates in enumerate(fold_sets)
-            if set(candidates) != final_set
-        ]
-        self.assertEqual(unstable, [1])
+        self.assertEqual(result["fold_count"], 5)
+        self.assertAlmostEqual(result["mean_risk_gain"], 0.009, places=8)
+        self.assertGreater(result["corrected_standard_error"], 0.0)
+        self.assertAlmostEqual(
+            result["lower_confidence_bound"],
+            result["mean_risk_gain"] - result["required_risk_gain"],
+            places=10,
+        )
+
+    def test_old_route_suppression_uses_stored_prototypes_and_has_gradients(self):
+        adapter = VisualMoEAdapter(8, num_experts=2, reduction=2)
+        adapter.add_expert(session_id=1, reduction=2)
+        raw = torch.randn(6, 8)
+        runner = Runner.__new__(Runner)
+        loss, gates = runner._old_route_suppression_loss(adapter, raw)
+        loss.backward()
+        self.assertEqual(tuple(gates.shape), (6,))
+        self.assertIsNotNone(adapter.incremental_routers[-1].weight.grad)
+        self.assertTrue(torch.isfinite(adapter.incremental_routers[-1].weight.grad).all())
+
+    def test_historical_prototype_gate_bound_is_enforced(self):
+        adapter = VisualMoEAdapter(8, num_experts=2, reduction=2)
+        adapter.add_expert(session_id=1, reduction=2)
+        with torch.no_grad():
+            adapter.incremental_routers[-1].weight.zero_()
+            adapter.incremental_routers[-1].bias.fill_(2.0)
+        runner = Runner.__new__(Runner)
+        runner.device = torch.device("cpu")
+        runner.model = SimpleNamespace(adapters=lambda: [(0, adapter)])
+        runner.cfg = SimpleNamespace(TRAINER=SimpleNamespace(BiMC=SimpleNamespace(
+            PROTECTION=SimpleNamespace(MAX_OLD_GATE=0.05)
+        )))
+        old_states = [{
+            "class_ids": torch.tensor([10, 11]),
+            "raw_layer_prototypes": {0: torch.eye(8)[:2]},
+        }]
+        with self.assertRaisesRegex(RuntimeError, "historical-prototype protection bound"):
+            runner._audit_historical_prototype_gates([0], old_states)
+
+    def test_old_prototype_state_snapshot_detects_mutation(self):
+        states = [{
+            "class_ids": torch.tensor([0, 1]),
+            "image_proto": torch.eye(2),
+            "text_features": torch.eye(2),
+            "description_proto": torch.eye(2),
+            "description_features": [torch.eye(2)[0], torch.eye(2)[1]],
+            "fused_proto": torch.eye(2),
+            "raw_layer_prototypes": {3: torch.eye(2)},
+        }]
+        snapshot = Runner._snapshot_prototype_states(states)
+        Runner._assert_historical_prototypes_unchanged(states, snapshot)
+        states[0]["fused_proto"][0, 0] = 0.0
+        with self.assertRaisesRegex(RuntimeError, "Historical prototype field fused_proto changed"):
+            Runner._assert_historical_prototypes_unchanged(states, snapshot)
+
+    def test_incremental_candidate_api_has_no_historical_image_loader(self):
+        import inspect
+        self.assertFalse(hasattr(Runner, "_historical_support_loader"))
+        self.assertFalse(hasattr(Runner, "_refresh_historical_support_features"))
+        self.assertNotIn(
+            "old_support_loader",
+            inspect.signature(Runner._candidate_train).parameters,
+        )
+
+    def test_training_validation_and_inference_share_scaled_cosine_scorer(self):
+        runner = Runner.__new__(Runner)
+        runner.model = SimpleNamespace(classification_scale=lambda: torch.tensor(7.0))
+        features = torch.tensor([[1.0, 1.0], [0.0, 2.0]])
+        prototypes = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+        actual = runner._classification_logits(features, prototypes)
+        expected = 7.0 * (
+            F.normalize(features, dim=-1) @ F.normalize(prototypes, dim=-1).t()
+        )
+        torch.testing.assert_close(actual, expected)
 
     def test_source_grouped_folds_keep_every_source_wholly_in_one_partition(self):
         dataset = SimpleNamespace(
