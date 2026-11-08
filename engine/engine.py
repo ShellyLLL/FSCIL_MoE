@@ -1,6 +1,7 @@
 """Single-classifier FSCIL training and APC-guided dynamic MoE expansion."""
 import copy
 import json
+import math
 import os
 import random
 import time
@@ -566,25 +567,82 @@ class Runner:
                     prototypes.append(BiMC.mean_normalized_features(selected, dim=0))
                 state["raw_layer_prototypes"][int(block)] = torch.stack(prototypes).cpu()
 
+    @staticmethod
+    def _empirical_upper_quantile(values, alpha):
+        """Return the exact ECDF order statistic used by the APC definition."""
+        values = torch.as_tensor(values, dtype=torch.float64).reshape(-1)
+        if values.numel() == 0 or not torch.isfinite(values).all():
+            raise ValueError("APC calibration requires finite, non-empty base similarities.")
+        alpha = float(alpha)
+        if not 0.0 < alpha < 1.0:
+            raise ValueError("APC alpha must be strictly between zero and one.")
+        rank = max(1, min(values.numel(), math.ceil((1.0 - alpha) * values.numel())))
+        return torch.kthvalue(values, rank).values
+
     def _calibrate_apc(self, base_state):
-        thresholds = {}
+        thresholds, base_statistics = {}, {}
+        alpha = float(self.cfg.TRAINER.BiMC.APC.ALPHA)
         for block, item in base_state["raw_layer_prototypes"].items():
             proto = F.normalize(item.float(), dim=-1)
+            if proto.ndim != 2 or proto.shape[0] < 2:
+                raise ValueError(f"APC block {block} requires at least two base-class prototypes.")
             similarity = proto @ proto.t()
             similarity.fill_diagonal_(-1.0)
             nearest = similarity.max(dim=1).values
-            alpha = float(self.cfg.TRAINER.BiMC.APC.ALPHA)
-            thresholds[int(block)] = float(torch.quantile(nearest, 1.0-alpha).item())
-        self.apc_state = {"thresholds": thresholds, "schema": 1}
+            threshold = self._empirical_upper_quantile(nearest, alpha)
+            thresholds[int(block)] = float(threshold.item())
+            base_statistics[int(block)] = {
+                "num_base_classes": int(proto.shape[0]),
+                "nearest_similarity_min": float(nearest.min().item()),
+                "nearest_similarity_median": float(nearest.median().item()),
+                "nearest_similarity_max": float(nearest.max().item()),
+                "threshold": float(threshold.item()),
+                "threshold_rank": int(math.ceil((1.0 - alpha) * proto.shape[0])),
+            }
+        if not thresholds:
+            raise RuntimeError("APC calibration produced no expandable-layer thresholds.")
+        self.apc_state = {
+            "thresholds": thresholds,
+            "base_statistics": base_statistics,
+            "alpha": alpha,
+            "schema": 2,
+        }
 
     def _candidate_layers(self, new_state, old_states):
         result = []
+        new_ids = torch.as_tensor(new_state["class_ids"]).long().cpu()
         for block, threshold in self.apc_state["thresholds"].items():
-            new_proto = F.normalize(new_state["raw_layer_prototypes"][block].to(self.device).float(), dim=-1)
+            if block not in new_state["raw_layer_prototypes"]:
+                raise RuntimeError(f"New-session raw prototypes are missing APC block {block}.")
+            new_proto = F.normalize(
+                new_state["raw_layer_prototypes"][block].to(self.device).float(), dim=-1
+            )
             old_ids, old_proto = self._raw_history(old_states, block)
-            confusion = (new_proto @ old_proto.t()).max().item()
-            result.append({"block": block, "confusion": float(confusion),
-                           "threshold": float(threshold), "candidate": confusion > threshold})
+            if new_proto.ndim != 2 or old_proto.ndim != 2 or new_proto.shape[1] != old_proto.shape[1]:
+                raise ValueError(f"APC prototype dimensions do not align at block {block}.")
+            similarities = new_proto @ old_proto.t()
+            per_new_max, nearest_old_index = similarities.max(dim=1)
+            max_new_index = int(per_new_max.argmax().item())
+            confusion = float(per_new_max[max_new_index].item())
+            nearest_old_id = int(old_ids[nearest_old_index[max_new_index]].item())
+            new_class_confusions = [
+                {
+                    "class_id": int(class_id),
+                    "max_similarity": float(score.item()),
+                    "nearest_old_class_id": int(old_ids[old_index].item()),
+                }
+                for class_id, score, old_index in zip(new_ids, per_new_max, nearest_old_index)
+            ]
+            result.append({
+                "block": int(block),
+                "confusion": confusion,
+                "threshold": float(threshold),
+                "margin": float(confusion - float(threshold)),
+                "candidate": confusion > float(threshold),
+                "most_confused_new_class_id": int(new_ids[max_new_index].item()),
+                "nearest_old_class_id": nearest_old_id,
+                "new_class_confusions": new_class_confusions,
+            })
         return result
 
     def _candidate_train(self, task_id, selected_blocks, fit_loader, fit_extract_loader,
@@ -831,6 +889,7 @@ class Runner:
         text, desc, _ = self._text(class_ids)
         fold_candidate_sets, fold_baseline_losses = [], []
         fold_expanded_losses, fold_gains, fold_old_feature_audits = [], [], []
+        fold_apc_layer_diagnostics = []
         cv_rng = {
             "python": random.getstate(), "numpy": np.random.get_state(),
             "torch": torch.get_rng_state(),
@@ -848,9 +907,10 @@ class Runner:
             val_loader = self._loader(extract_loader.dataset, val_idx, extract_loader.batch_size, False)
 
             fold_state = self._build_state(class_ids, fit_extract, old_states, False)
+            fold_layer_diagnostics = self._candidate_layers(fold_state, old_states)
+            fold_apc_layer_diagnostics.append(fold_layer_diagnostics)
             fold_candidates = sorted(
-                row["block"] for row in self._candidate_layers(fold_state, old_states)
-                if row["candidate"]
+                row["block"] for row in fold_layer_diagnostics if row["candidate"]
             )
             fold_candidate_sets.append(fold_candidates)
 
@@ -863,6 +923,7 @@ class Runner:
                 baseline_loss = self._evaluate_candidate(
                     val_loader, fit_extract, old_states, class_ids, text, desc
                 )
+                fold_baseline_losses.append(float(baseline_loss))
                 if fold_candidates:
                     try:
                         self._candidate_train(
@@ -877,21 +938,22 @@ class Runner:
                     except HistoricalFeatureConstraintError:
                         fold_old_feature_audits.append(dict(self._last_old_feature_audit))
                         expanded_loss = float("inf")
+                    fold_expanded_losses.append(float(expanded_loss))
+                    fold_gains.append(float(baseline_loss - expanded_loss))
                 else:
+                    # No counterfactual expert was trained; do not fabricate zero risk gains.
                     fold_old_feature_audits.append({})
-                    expanded_loss = baseline_loss
-                fold_baseline_losses.append(float(baseline_loss))
-                fold_expanded_losses.append(float(expanded_loss))
-                fold_gains.append(float(baseline_loss - expanded_loss))
+                    fold_expanded_losses.append(None)
+                    fold_gains.append(None)
             finally:
                 self._restore_candidate_snapshot(topology_before, state_before)
 
         # The final proposal is re-derived from all current support sources;
         # validation folds estimate the policy and never select a layer subset.
         full_state = self._build_state(class_ids, extract_loader, old_states, False)
+        full_apc_layer_diagnostics = self._candidate_layers(full_state, old_states)
         final_candidates = sorted(
-            row["block"] for row in self._candidate_layers(full_state, old_states)
-            if row["candidate"]
+            row["block"] for row in full_apc_layer_diagnostics if row["candidate"]
         )
         # The exact layer set that will be trained must be the layer set whose
         # held-out risk was measured in every fold. Otherwise the CV gains
@@ -908,7 +970,29 @@ class Runner:
                 "validation_status": "candidate_set_unstable",
                 "unstable_fold_indices": unstable_folds,
                 "fold_candidate_layers": fold_candidate_sets,
+                "fold_apc_layer_diagnostics": fold_apc_layer_diagnostics,
+                "apc_layer_diagnostics": full_apc_layer_diagnostics,
                 "final_candidate_layers": final_candidates,
+                "risk_validation_performed": False,
+                "mean_risk_gain": None,
+                "required_risk_gain": None,
+                "logs": [],
+            }
+        if not any(fold_candidate_sets):
+            return {
+                "expanded": [], "candidate_layers": final_candidates,
+                "reason": "APC proposed no layer in any fitting fold",
+                "validation_status": "no_fold_candidates",
+                "fold_candidate_layers": fold_candidate_sets,
+                "fold_baseline_nll": fold_baseline_losses,
+                "fold_expanded_nll": fold_expanded_losses,
+                "fold_risk_gains": fold_gains,
+                "fold_apc_layer_diagnostics": fold_apc_layer_diagnostics,
+                "apc_layer_diagnostics": full_apc_layer_diagnostics,
+                "final_candidate_layers": final_candidates,
+                "risk_validation_performed": False,
+                "mean_risk_gain": None,
+                "required_risk_gain": None,
                 "logs": [],
             }
         gains = np.asarray(fold_gains, dtype=np.float64)
@@ -926,6 +1010,8 @@ class Runner:
 
         diagnostics = {
             "fold_candidate_layers": fold_candidate_sets,
+            "fold_apc_layer_diagnostics": fold_apc_layer_diagnostics,
+            "apc_layer_diagnostics": full_apc_layer_diagnostics,
             "fold_baseline_nll": fold_baseline_losses,
             "fold_expanded_nll": fold_expanded_losses,
             "fold_risk_gains": fold_gains,
@@ -1176,6 +1262,9 @@ class Runner:
                 "reason": adaptation.get("reason", "base session"),
                 "validation_status": adaptation.get("validation_status", "not_applicable"),
                 "fold_candidate_layers": adaptation.get("fold_candidate_layers", []),
+                "fold_apc_layer_diagnostics": adaptation.get("fold_apc_layer_diagnostics", []),
+                "apc_layer_diagnostics": adaptation.get("apc_layer_diagnostics", []),
+                "risk_validation_performed": bool(adaptation.get("risk_validation_performed", adaptation.get("mean_risk_gain") is not None)),
                 "fold_baseline_nll": adaptation.get("fold_baseline_nll", []),
                 "fold_expanded_nll": adaptation.get("fold_expanded_nll", []),
                 "fold_risk_gains": adaptation.get("fold_risk_gains", []),
@@ -1194,12 +1283,21 @@ class Runner:
             }
             self.session_diagnostics.append(diagnostic)
             self._save_checkpoint(task_id)
+            risk_gain = adaptation.get("mean_risk_gain")
+            required_gain = adaptation.get("required_risk_gain")
+            risk_gain_text = "n/a" if risk_gain is None else f"{float(risk_gain):.5f}"
+            required_gain_text = "n/a" if required_gain is None else f"{float(required_gain):.5f}"
+            apc_summary = [
+                f"{row['block']}:{row['confusion']:.4f}/{row['threshold']:.4f}"
+                for row in adaptation.get("apc_layer_diagnostics", [])
+            ]
             print(
                 f"=> Session {task_id}: Acc={metrics['mean_acc']:.3f}, "
                 f"AA={metrics['macro_task_acc']:.3f}, PD={pd:.3f}, "
                 f"expanded={adaptation.get('expanded', [])}, "
                 f"candidates={adaptation.get('candidate_layers', [])}, "
-                f"risk_gain={adaptation.get('mean_risk_gain', adaptation.get('candidate_gain', float('nan'))):.5f}, "
-                f"required_gain={adaptation.get('required_risk_gain', adaptation.get('required_gain', float('nan'))):.5f}, "
+                f"APC(confusion/threshold)={apc_summary}, "
+                f"risk_gain={risk_gain_text}, required_gain={required_gain_text}, "
+                f"risk_tested={adaptation.get('risk_validation_performed', adaptation.get('mean_risk_gain') is not None)}, "
                 f"reason={adaptation.get('reason', 'base session')}"
             )

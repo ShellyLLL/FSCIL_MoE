@@ -168,6 +168,35 @@ class PrototypeAndStateTests(unittest.TestCase):
         self.assertNotIn("encoder_versions", merged)
         self.assertNotIn("task_ids", merged)
 
+    def test_apc_threshold_uses_exact_empirical_ecdf_order_statistic(self):
+        values = torch.tensor([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95])
+        threshold = Runner._empirical_upper_quantile(values, alpha=0.2)
+        self.assertAlmostEqual(float(threshold), 0.8, places=6)
+
+    def test_apc_candidate_diagnostics_report_per_class_confusion_and_margin(self):
+        runner = Runner.__new__(Runner)
+        runner.device = torch.device("cpu")
+        runner.apc_state = {"thresholds": {0: 0.75}}
+        old_states = [{
+            "class_ids": torch.tensor([10, 11]),
+            "raw_layer_prototypes": {
+                0: torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+            },
+        }]
+        new_state = {
+            "class_ids": torch.tensor([20, 21]),
+            "raw_layer_prototypes": {
+                0: torch.tensor([[0.8, 0.6], [0.0, 1.0]])
+            },
+        }
+        row = runner._candidate_layers(new_state, old_states)[0]
+        self.assertTrue(row["candidate"])
+        self.assertAlmostEqual(row["confusion"], 1.0, places=6)
+        self.assertAlmostEqual(row["margin"], 0.25, places=6)
+        self.assertEqual(row["most_confused_new_class_id"], 21)
+        self.assertEqual(row["nearest_old_class_id"], 11)
+        self.assertEqual(len(row["new_class_confusions"]), 2)
+
     def test_low_shot_apc_policy_returns_no_expansion_without_cv(self):
         runner = Runner.__new__(Runner)
         dataset = SimpleNamespace(labels=[0, 1], source_ids=[10, 20])
