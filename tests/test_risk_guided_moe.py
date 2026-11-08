@@ -102,8 +102,12 @@ class PrototypeAndStateTests(unittest.TestCase):
         runner._restore_candidate_snapshot(before_topology, before_state)
         self.assertEqual(runner.model.adapter.num_experts, 2)
         self.assertTrue(all(not p.requires_grad for p in runner.model.parameters()))
-        for key, value in before_state.items():
-            torch.testing.assert_close(runner.model.state_dict()[key].cpu(), value)
+        restored = runner._snapshot_adapter_state()
+        self.assertEqual(set(restored), set(before_state))
+        for block, values in before_state.items():
+            self.assertEqual(set(restored[block]), set(values))
+            for key, value in values.items():
+                torch.testing.assert_close(restored[block][key], value)
 
     def test_visual_text_intra_modal_and_inter_modal_calibration(self):
         runner = Runner.__new__(Runner)

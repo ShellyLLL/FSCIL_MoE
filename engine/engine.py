@@ -253,6 +253,23 @@ class Runner:
             if id(parameter) not in trainable
         }
 
+    def _assert_gradient_scope(self, expected_parameters, context):
+        trainable = {id(parameter) for parameter in expected_parameters}
+        unexpected, non_finite, missing = [], [], []
+        for name, parameter in self.model.named_parameters():
+            if id(parameter) in trainable:
+                if parameter.grad is None:
+                    missing.append(name)
+                elif not torch.isfinite(parameter.grad).all():
+                    non_finite.append(name)
+            elif parameter.grad is not None:
+                unexpected.append(name)
+        if unexpected or non_finite or missing:
+            raise RuntimeError(
+                f"{context}: gradient scope violation; unexpected={unexpected}, "
+                f"non_finite={non_finite}, missing={missing}"
+            )
+
     def _assert_frozen_unchanged(self, snapshot, context):
         current = {
             f"{block}.{name}": parameter
