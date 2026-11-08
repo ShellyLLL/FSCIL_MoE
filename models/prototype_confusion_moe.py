@@ -135,10 +135,13 @@ class UnifiedTopKRouter(nn.Module):
         self.columns.append(column)
         return self.columns[-1]
 
-    def forward(self, x, top_k):
+    def forward(self, x, top_k, excluded=()):
         logits = torch.cat([column(x) for column in self.columns], dim=-1)
-        k = min(max(1, int(top_k)), logits.size(1))
-        selected_logits, selected_ids = logits.topk(k, dim=-1)
+        masked = logits.clone()
+        if excluded:
+            masked[:, [int(i) for i in excluded]] = float("-inf")
+        k = min(max(1, int(top_k)), int(torch.isfinite(masked[0]).sum().item()))
+        selected_logits, selected_ids = masked.topk(k, dim=-1)
         weights = torch.softmax(selected_logits, dim=-1)
         dense = torch.zeros_like(logits).scatter(1, selected_ids, weights)
         return logits, dense, selected_ids
@@ -165,9 +168,9 @@ class DynamicLayerMoE(nn.Module):
     def num_experts(self):
         return len(self.experts)
 
-    def forward(self, features):
+    def forward(self, features, excluded=()):
         x = self.norm(features.float())
-        logits, weights, selected = self.router(x, self.top_k)
+        logits, weights, selected = self.router(x, self.top_k, excluded=excluded)
         output = x.new_zeros(x.size(0), self.output_dim)
         # Evaluate only selected experts.  Each expert has one globally shared
         # route column; no task-specific router or Sigmoid side path exists.
@@ -342,11 +345,14 @@ class PrototypeConfusionMoE(nn.Module):
             raise RuntimeError("Frozen ViT capture hooks did not fire for every selected layer.")
         return raw, {i: self._captured[i] for i in self.layer_ids}
 
-    def compose(self, raw, layer_features, return_aux=False):
+    def compose(self, raw, layer_features, return_aux=False, disabled_by_layer=None):
         enhanced = normalize(raw)
         aux = {}
+        disabled_by_layer = disabled_by_layer or {}
         for i in self.layer_ids:
-            residual, info = self.adapters[str(i)](layer_features[i])
+            residual, info = self.adapters[str(i)](
+                layer_features[i], excluded=disabled_by_layer.get(i, disabled_by_layer.get(str(i), ()))
+            )
             enhanced = enhanced + self.layer_scale[str(i)] * residual
             aux[i] = info
         enhanced = normalize(enhanced)
