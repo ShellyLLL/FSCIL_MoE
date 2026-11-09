@@ -53,7 +53,9 @@ def main():
     parser.add_argument('--end_session', type=int, default=-1)
     parser.add_argument('opts', nargs=argparse.REMAINDER)
     args = parser.parse_args()
-    cfg = extend_pcmoe_cfg(extend_cfg(CN()))
+    cfg = CN()
+    extend_cfg(cfg)
+    extend_pcmoe_cfg(cfg)
     for path in (args.data_cfg, args.train_cfg):
         with open(path, 'r', encoding='utf-8') as handle:
             cfg.merge_from_other_cfg(CN.load_cfg(handle))
