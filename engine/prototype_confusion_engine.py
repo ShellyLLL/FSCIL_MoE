@@ -172,6 +172,20 @@ class PrototypeConfusionRunner:
                 layer_proto[layer][int(cid)] = normalize(cache["layers"][layer][mask].mean(0))
         return raw_proto, layer_proto
 
+    def _calibrate_visual_bank(self, prototypes):
+        """Apply visual intra-modal calibration to [C,D] or [B,C,D] banks."""
+        base_count = int(self.cfg.DATASET.NUM_INIT_CLS)
+        if prototypes.size(-2) <= base_count:
+            return normalize(prototypes)
+        lam = float(self.cfg.TRAINER.PCMOE.CALIBRATION.LAMBDA_VISUAL)
+        tau = float(self.cfg.TRAINER.PCMOE.CALIBRATION.VISUAL_TAU)
+        base = normalize(prototypes[..., :base_count, :])
+        novel = normalize(prototypes[..., base_count:, :])
+        weights = torch.softmax(tau * torch.matmul(novel, base.transpose(-1, -2)), dim=-1)
+        transported = normalize(torch.matmul(weights, base))
+        calibrated = normalize((1.0 - lam) * novel + lam * transported)
+        return torch.cat([normalize(prototypes[..., :base_count, :]), calibrated], dim=-2)
+
     def _prototypes(self, disabled=None):
         fit = self._memory_cache("fit")
         ids = sorted(self.class_ids)
@@ -190,16 +204,7 @@ class PrototypeConfusionRunner:
         concentration = torch.stack(concentration)
         # Intra-modal visual calibration: new visual means inherit the
         # discriminative geometry of the fixed base-class visual prototypes.
-        base_count = int(self.cfg.DATASET.NUM_INIT_CLS)
-        base = visual[:base_count]
-        lam = float(self.cfg.TRAINER.PCMOE.CALIBRATION.LAMBDA_VISUAL)
-        tau = float(self.cfg.TRAINER.PCMOE.CALIBRATION.VISUAL_TAU)
-        if visual.size(0) > base_count and base.numel():
-            novel = visual[base_count:]
-            weights = torch.softmax(tau * (novel @ base.t()), dim=-1)
-            transported = normalize(weights @ base)
-            visual = torch.cat([visual[:base_count],
-                                normalize((1.0 - lam) * novel + lam * transported)], dim=0)
+        visual = self._calibrate_visual_bank(visual)
         text = self._all_text(ids)
         descriptions = self._all_descriptions(ids)
         # Intra-modal text calibration (BiMC's description-to-class semantic
@@ -335,6 +340,7 @@ class PrototypeConfusionRunner:
                 loo = source_exclusive_means(
                     enhanced, fit["labels"], fit["sources"], ids, query_indices=rows
                 )
+                loo = self._calibrate_visual_bank(loo)
                 visual = torch.bmm(enhanced[begin:end].unsqueeze(1), loo.transpose(1, 2)).squeeze(1)
                 textual = fit["raw"][begin:end] @ calibrated_text.t()
                 alpha_rows = alpha.unsqueeze(0)
@@ -443,6 +449,7 @@ class PrototypeConfusionRunner:
                     enhanced_all, all_fit["labels"], all_fit["sources"], ids_all,
                     query_indices=rows
                 )
+                loo = self._calibrate_visual_bank(loo)
                 visual_logits, text_logits, targets = [], [], []
                 calibrated_text = normalize((1.0 - cfg.CALIBRATION.LAMBDA_TEXT) * text
                                              + cfg.CALIBRATION.LAMBDA_TEXT * descriptions)
