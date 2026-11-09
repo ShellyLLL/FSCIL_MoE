@@ -146,11 +146,19 @@ class UnifiedTopKRouter(nn.Module):
         return self.columns[-1]
 
     def forward(self, x, top_k, excluded=()):
+        if not self.columns:
+            raise RuntimeError("Unified router has no experts.")
         logits = torch.cat([column(x) for column in self.columns], dim=-1)
         masked = logits.clone()
         if excluded:
-            masked[:, [int(i) for i in excluded]] = float("-inf")
-        k = min(max(1, int(top_k)), int(torch.isfinite(masked[0]).sum().item()))
+            excluded_ids = [int(i) for i in excluded]
+            if any(i < 0 or i >= len(self.columns) for i in excluded_ids):
+                raise IndexError("Excluded expert index is outside the router topology.")
+            masked[:, excluded_ids] = float("-inf")
+        available = int(torch.isfinite(masked[0]).sum().item())
+        if available == 0:
+            raise RuntimeError("Router exclusion disabled every expert.")
+        k = min(max(1, int(top_k)), available)
         selected_logits, selected_ids = masked.topk(k, dim=-1)
         weights = torch.softmax(selected_logits, dim=-1)
         dense = torch.zeros_like(logits).scatter(1, selected_ids, weights)
@@ -171,7 +179,6 @@ class DynamicLayerMoE(nn.Module):
             for _ in range(self.base_expert_count)
         ])
         self.router = UnifiedTopKRouter(input_dim, self.base_expert_count)
-        self.scale = nn.Parameter(torch.tensor(float(scale_init)))
         self.birth_sessions = [0] * self.base_expert_count
 
     @property
@@ -188,7 +195,7 @@ class DynamicLayerMoE(nn.Module):
             mask = weights[:, expert_id].gt(0)
             if mask.any():
                 output[mask] += expert(x[mask]) * weights[mask, expert_id:expert_id + 1]
-        return self.scale * output, {
+        return output, {
             "router_logits": logits, "route_weights": weights,
             "selected_experts": selected,
         }
@@ -202,7 +209,7 @@ class DynamicLayerMoE(nn.Module):
     def add_expert(self, session_id, new_features, historical_features):
         """Append a small expert and initialize its one router column by separation."""
         self.freeze_all()
-        device = self.scale.device
+        device = self.norm.weight.device
         expert = BottleneckExpert(
             self.input_dim, self.output_dim, self.incremental_reduction, zero_up=True
         ).to(device=device)
@@ -275,7 +282,7 @@ class DynamicLayerMoE(nn.Module):
             ))
             self.router.add_column()
             self.birth_sessions.append(int(item["birth_session"]))
-        self.to(self.scale.device)
+        self.to(self.norm.weight.device)
         self.freeze_all()
 
 
