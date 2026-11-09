@@ -304,31 +304,45 @@ class PrototypeConfusionRunner:
         for epoch in range(int(cfg.OPTIM.BASE_EPOCHS)):
             self.model.train()
             enhanced, aux = self.model.compose(fit["raw"], fit["layers"], return_aux=True)
-            # LOO visual means prevent support queries from appearing in their
-            # own visual prototype.  Base session uses the same final classifier.
-            loo = source_exclusive_means(enhanced, fit["labels"], fit["sources"], ids)
-            query_logits = []
-            for i in range(enhanced.size(0)):
-                v = loo[i]
-                t = normalize((1.0 - cfg.CALIBRATION.LAMBDA_TEXT) * text
-                              + cfg.CALIBRATION.LAMBDA_TEXT * self._all_descriptions(ids))
-                visual = enhanced[i:i + 1] @ v.t() / self.visual_temperature
-                textual = fit["raw"][i:i + 1] @ t.t() / self.text_temperature
-                count = fit["labels"].eq(torch.as_tensor(ids, device=self.device)[None, :]).sum(0).float()
+            # Class reliability is a calibration statistic, not a trainable
+            # shortcut.  Detach it from the expert optimization graph.
+            with torch.no_grad():
+                counts = torch.stack([fit["labels"].eq(cid).sum() for cid in ids]).float()
                 concentration = torch.stack([
-                    enhanced[fit["labels"].eq(cid)].mean(0).norm().clamp(0.0, 1.0)
+                    enhanced.detach()[fit["labels"].eq(cid)].mean(0).norm().clamp(0.0, 1.0)
                     for cid in ids
                 ])
                 kappa = float(cfg.CALIBRATION.RELIABILITY_KAPPA)
-                rv = count / (count + kappa) * concentration
-                rt = torch.stack([self.text_consistency[cid].to(self.device) for cid in ids]).clamp(1e-3, 1.0)
-                alpha = rv / (rv + rt).clamp_min(1e-6)
-                query_logits.append((1.0 - self.inter_modal_beta) *
-                                     (alpha.unsqueeze(0) * visual + (1.0 - alpha.unsqueeze(0)) * textual)
-                                     + self.inter_modal_beta * 0.5 * (visual + textual))
-            logits = torch.cat(query_logits, dim=0)
-            target = torch.as_tensor(ids, device=self.device)[None, :].eq(
-                fit["labels"][:, None]).long().argmax(1)
+                rv = counts / (counts + kappa) * concentration
+                rt = torch.stack([self.text_consistency[cid].to(self.device)
+                                  for cid in ids]).clamp(1e-3, 1.0)
+                alpha = (rv / (rv + rt).clamp_min(1e-6)).detach()
+                calibrated_text = normalize(
+                    (1.0 - cfg.CALIBRATION.LAMBDA_TEXT) * text
+                    + cfg.CALIBRATION.LAMBDA_TEXT * self._all_descriptions(ids)
+                )
+                target = torch.as_tensor(ids, device=self.device)[None, :].eq(
+                    fit["labels"][:, None]).long().argmax(1)
+            # Construct only a minibatch of source-exclusive prototype banks
+            # at a time; the full [N,C,D] tensor is prohibitively large on CUB.
+            batch_size = int(cfg.OPTIM.BASE_BATCH_SIZE)
+            loss_sum = enhanced.sum() * 0.0
+            for begin in range(0, enhanced.size(0), batch_size):
+                end = min(begin + batch_size, enhanced.size(0))
+                rows = torch.arange(begin, end, device=self.device)
+                loo = source_exclusive_means(
+                    enhanced, fit["labels"], fit["sources"], ids, query_indices=rows
+                )
+                visual = torch.bmm(enhanced[begin:end].unsqueeze(1), loo.transpose(1, 2)).squeeze(1)
+                textual = fit["raw"][begin:end] @ calibrated_text.t()
+                alpha_rows = alpha.unsqueeze(0)
+                logits = ((1.0 - self.inter_modal_beta) *
+                          (alpha_rows * visual / self.visual_temperature
+                           + (1.0 - alpha_rows) * textual / self.text_temperature)
+                          + self.inter_modal_beta * 0.5 *
+                          (visual / self.visual_temperature + textual / self.text_temperature))
+                loss_sum = loss_sum + F.cross_entropy(logits, target[begin:end], reduction="sum")
+            loss = loss_sum / enhanced.size(0)
             loss = F.cross_entropy(logits, target)
             balance = []
             for item in aux.values():
@@ -383,6 +397,10 @@ class PrototypeConfusionRunner:
         memory_snapshot = copy.deepcopy(self.class_memory)
         class_ids_snapshot = list(self.class_ids)
         try:
+            # Stage fit prototypes before any all-class reliability or
+            # candidate-bank computation.  The outer session transaction owns
+            # rollback of this staged memory if expansion is rejected.
+            self._store_classes(fit_new, "fit")
             for layer in candidate_layers:
                 self.model.add_expert(
                     layer, session, fit_new["layers"][layer].to(self.device),
@@ -399,6 +417,11 @@ class PrototypeConfusionRunner:
             descriptions = torch.stack([self.description_prototypes[cid] for cid in ids_all]).to(self.device)
             for epoch in range(int(cfg.OPTIM.INCREMENTAL_EPOCHS)):
                 self.model.train()
+                with torch.no_grad():
+                    reliability_bank = self._prototypes()
+                    alpha = (reliability_bank["visual_reliability"] /
+                             (reliability_bank["visual_reliability"]
+                              + reliability_bank["text_reliability"]).clamp_min(1e-6)).detach()
                 enhanced_all, aux = self.model.compose(
                     all_fit["raw"], all_fit["layers"], return_aux=True
                 )
@@ -418,9 +441,6 @@ class PrototypeConfusionRunner:
                     targets.append(ids_all.index(int(all_fit["labels"][row].item())))
                 visual_logits = torch.cat(visual_logits)
                 text_logits = torch.cat(text_logits)
-                alpha = bank_alpha = self._prototypes()["visual_reliability"]
-                text_reliability = self._prototypes()["text_reliability"]
-                alpha = alpha / (alpha + text_reliability).clamp_min(1e-6)
                 logits = ((1.0 - self.inter_modal_beta) *
                           (alpha.unsqueeze(0) * visual_logits + (1.0 - alpha.unsqueeze(0)) * text_logits)
                           + self.inter_modal_beta * 0.5 * (visual_logits + text_logits))
@@ -438,8 +458,7 @@ class PrototypeConfusionRunner:
             # Temporarily expose new class fit/calibration/risk features so the
             # baseline and candidate are evaluated against identical all-class
             # data.  This is not a commit; rollback restores it if rejected.
-            self._store_classes(fit_new, "fit")
-            # calibration/risk caches are staged by caller before this call.
+            # Fit, calibration and risk features are staged by the caller.
             baseline_disabled = {
                 layer: (self.model.adapters[str(layer)].num_experts - 1,)
                 for layer in candidate_layers
