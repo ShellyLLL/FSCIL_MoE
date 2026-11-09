@@ -77,10 +77,13 @@ class PrototypeConfusionRunner:
             indices = sorted(indices, key=lambda i: int(cache["sources"][i]))
             rng = np.random.default_rng(int(self.cfg.SEED) * 100003 + int(session) * 997 + int(cid))
             rng.shuffle(indices)
-            if len(indices) < 3:
+            distinct_sources = torch.unique(cache["sources"][indices]).numel()
+            if distinct_sources < 3:
                 raise ValueError(
-                    "PC-MoE risk-controlled expansion requires >=3 distinct support sources "
-                    "per class (fit/calibration/risk)."
+                    "PC-MoE risk-controlled expansion requires >=3 distinct source images "
+                    "per class (fit/calibration/risk); class {} has {}.".format(
+                        int(cid), int(distinct_sources)
+                    )
                 )
             n_cal = max(1, int(round(0.2 * len(indices))))
             n_risk = max(1, int(round(0.2 * len(indices))))
@@ -449,10 +452,12 @@ class PrototypeConfusionRunner:
             # New class fit/calibration/risk memories and text prototypes
             # are staged by run() before this transaction.  Class acquisition
             # is independent of whether extra model capacity is accepted.
+            route_cfg = cfg.LOSS
             for layer in candidate_layers:
                 self.model.add_expert(
                     layer, session, fit_new["layers"][layer].to(self.device),
-                    old_fit["layers"][layer]
+                    old_fit["layers"][layer],
+                    route_margin=float(route_cfg.ROUTE_MARGIN)
                 )
             self.model.set_incremental_trainable(candidate_layers)
             parameters = []
@@ -500,10 +505,24 @@ class PrototypeConfusionRunner:
                           + self.inter_modal_beta * 0.5 * (visual_logits + text_logits))
                 target = torch.tensor(targets, device=self.device, dtype=torch.long)
                 loss = F.cross_entropy(logits, target)
-                balance = [item["route_weights"].mean(0).pow(2).sum()
-                           * item["route_weights"].size(1) for item in aux.values()]
-                if balance:
-                    loss = loss + float(cfg.LOSS.ROUTE_BALANCE_WEIGHT) * torch.stack(balance).mean()
+
+                # Incremental routing is not forced toward uniform expert use.
+                # The new gate must cross the old Top-k boundary on novel
+                # support while remaining below that boundary on every stored
+                # historical class. Old experts and old gate columns stay frozen.
+                route_new, route_old = [], []
+                for layer in candidate_layers:
+                    adapter = self.model.adapters[str(layer)]
+                    terms = adapter.route_margin_loss(
+                        query_layers[layer], old_fit["layers"][layer],
+                        margin=float(route_cfg.ROUTE_MARGIN)
+                    )
+                    route_new.append(terms["new"])
+                    route_old.append(terms["historical"])
+                if route_new:
+                    loss = loss + float(route_cfg.NEW_ROUTE_WEIGHT) * torch.stack(route_new).mean()
+                    loss = loss + float(route_cfg.HISTORICAL_ROUTE_WEIGHT) * torch.stack(route_old).mean()
+
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(parameters, 1.0)
@@ -526,20 +545,66 @@ class PrototypeConfusionRunner:
                 candidate_bank, "risk", None, candidate_t
             )
             old_per_class = [cid for cid in old_ids if cid in candidate_per_class]
+            new_per_class = [cid for cid in new_ids if cid in candidate_per_class]
             old_delta = max(
                 (candidate_per_class[cid] - baseline_per_class[cid] for cid in old_per_class),
                 default=0.0
             )
+            new_delta = max(
+                (candidate_per_class[cid] - baseline_per_class[cid] for cid in new_per_class),
+                default=0.0
+            )
             risk_gain = float((baseline_risk - candidate_risk).item())
+
+            # Evaluate the *inference* router on source-disjoint risk examples.
+            # The route-margin loss itself is never used as an acceptance proxy.
+            route_checks = {}
+            for layer in candidate_layers:
+                adapter = self.model.adapters[str(layer)]
+                old_queries = self._query_cache("risk")
+                old_queries = {
+                    key: value for key, value in old_queries.items()
+                }
+                old_mask = torch.isin(
+                    old_queries["labels"],
+                    torch.as_tensor(old_ids, device=self.device, dtype=torch.long)
+                )
+                new_mask = torch.isin(
+                    old_queries["labels"],
+                    torch.as_tensor(new_ids, device=self.device, dtype=torch.long)
+                )
+                old_route = adapter.route_drift(old_queries["layers"][layer][old_mask])
+                new_route = adapter.route_drift(old_queries["layers"][layer][new_mask])
+                route_checks[int(layer)] = {
+                    "historical_mean_drift": float(old_route["drift"].mean().item()),
+                    "historical_max_drift": float(old_route["drift"].max().item()),
+                    "historical_intrusion_rate": float(
+                        old_route["new_expert_selected"].float().mean().item()
+                    ),
+                    "novel_activation_rate": float(
+                        new_route["new_expert_selected"].float().mean().item()
+                    ),
+                    "novel_mean_weight": float(new_route["new_expert_weight"].mean().item()),
+                }
+            route_ok = all(
+                item["historical_max_drift"] <= float(route_cfg.MAX_HISTORICAL_ROUTE_DRIFT)
+                and item["historical_intrusion_rate"] <= float(route_cfg.MAX_HISTORICAL_INTRUSION_RATE)
+                and item["novel_activation_rate"] >= float(route_cfg.MIN_NOVEL_ACTIVATION_RATE)
+                for item in route_checks.values()
+            )
             accepted = (
                 risk_gain >= float(cfg.EXPANSION.MIN_RISK_GAIN)
                 and old_delta <= float(cfg.EXPANSION.MAX_OLD_CLASS_RISK_INCREASE)
+                and new_delta <= float(cfg.EXPANSION.MAX_NEW_CLASS_RISK_INCREASE)
+                and route_ok
             )
             result = {
                 "accepted": accepted, "candidate_layers": candidate_layers,
                 "baseline_all_class_risk": float(baseline_risk.item()),
                 "candidate_all_class_risk": float(candidate_risk.item()),
                 "risk_gain": risk_gain, "worst_old_class_risk_increase": float(old_delta),
+                "worst_new_class_risk_increase": float(new_delta),
+                "route_checks": route_checks, "route_constraints_passed": route_ok,
                 "baseline_per_class_risk": baseline_per_class,
                 "candidate_per_class_risk": candidate_per_class,
                 "apc": apc,
