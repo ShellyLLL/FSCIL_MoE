@@ -152,6 +152,8 @@ class PrototypeConfusionTests(unittest.TestCase):
         self.assertEqual(set(per_class), {10, 20, 30})
         with self.assertRaises(ValueError):
             balanced_risk(logits, labels, [10, 20])
+        with self.assertRaises(ValueError):
+            balanced_risk(logits[:2], labels[:2], [10, 20, 30])
 
 
 if __name__ == '__main__':
