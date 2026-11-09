@@ -32,11 +32,11 @@ def class_means(features, labels, class_ids):
 
 
 def source_exclusive_means(features, labels, source_ids, class_ids, query_indices=None):
-    """Build source-exclusive prototype banks only for requested query rows.
+    """Build query-specific class means after removing every view of its source.
 
-    Excluding a source globally prevents leakage when an original image has
-    multiple deterministic views. query_indices bounds peak memory for
-    base-session training with thousands of support examples.
+    Class sufficient statistics are computed once. For each queried source,
+    its per-class contribution is subtracted in one vectorized operation;
+    this avoids materializing an N-by-C-by-D bank for the full support set.
     """
     features = normalize(features)
     labels = torch.as_tensor(labels, device=features.device, dtype=torch.long)
@@ -44,24 +44,39 @@ def source_exclusive_means(features, labels, source_ids, class_ids, query_indice
     classes = torch.as_tensor(class_ids, device=features.device, dtype=torch.long)
     if features.size(0) != labels.numel() or labels.numel() != sources.numel():
         raise ValueError("Features, labels and source ids must have equal lengths.")
+    if classes.numel() == 0 or classes.unique().numel() != classes.numel():
+        raise ValueError("Class ids must be non-empty and unique.")
+    membership = labels[:, None].eq(classes[None, :])
+    if not membership.sum(1).eq(1).all():
+        raise ValueError("Every support label must map to exactly one requested class.")
+    class_index = membership.long().argmax(1)
+    class_count = torch.bincount(class_index, minlength=classes.numel())
+    class_sum = features.new_zeros(classes.numel(), features.size(-1))
+    class_sum.index_add_(0, class_index, features)
     if query_indices is None:
         query_indices = torch.arange(features.size(0), device=features.device)
     else:
         query_indices = torch.as_tensor(query_indices, device=features.device, dtype=torch.long)
-    result = []
-    for query_index in query_indices.tolist():
-        source = sources[query_index]
-        keep = sources.ne(source)
-        rows = []
-        for cid in classes:
-            values = features[keep & labels.eq(cid)]
-            if values.numel() == 0:
-                raise ValueError("LOO bank empty for class {} and source {}".format(int(cid), int(source.item())))
-            rows.append(normalize(values.mean(0)))
-        result.append(torch.stack(rows))
-    if not result:
+    if query_indices.numel() == 0:
         return features.new_empty((0, classes.numel(), features.size(-1)))
-    return torch.stack(result)
+    query_sources = sources[query_indices]
+    unique_sources, inverse = torch.unique(query_sources, sorted=False, return_inverse=True)
+    banks_by_source = []
+    for source in unique_sources:
+        source_mask = sources.eq(source)
+        source_indices = class_index[source_mask]
+        source_sum = features.new_zeros(classes.numel(), features.size(-1))
+        source_sum.index_add_(0, source_indices, features[source_mask])
+        source_count = torch.bincount(source_indices, minlength=classes.numel())
+        remaining = class_count - source_count
+        if remaining.le(0).any():
+            missing = classes[remaining.le(0)].tolist()
+            raise ValueError("LOO bank empty for source {} in classes {}".format(int(source.item()), missing))
+        means = (class_sum - source_sum) / remaining.to(features.dtype).unsqueeze(1)
+        banks_by_source.append(normalize(means))
+    return torch.stack(banks_by_source)[inverse]
+
+
 def prototype_confusion(layer_features, labels, new_class_ids,
                         historical_layer_prototypes, apc_reference):
     """APC: nearest inter-class similarity percentile against base-session reference."""
