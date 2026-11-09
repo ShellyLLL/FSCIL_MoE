@@ -566,7 +566,7 @@ class PrototypeConfusionRunner:
         )
         base_mask = torch.isin(labels, base_ids)
         pred_ids = bank["ids"].cpu()[logits.argmax(dim=1)]
-        base_accuracy = float(pred_ids[base_mask].eq(labels[base_mask]).float().mean().item())
+        base_accuracy = float(100.0 * pred_ids[base_mask].eq(labels[base_mask]).float().mean().item())
         if session == 0:
             self.base_accuracy = base_accuracy
         pd = (0.0 if self.base_accuracy is None else
