@@ -281,6 +281,33 @@ class PrototypeConfusionRunner:
                 self.cfg.TRAINER.PCMOE.CALIBRATION.MAX_TEMPERATURE).item()))
         return values[0], values[1]
 
+    @torch.no_grad()
+    def _fit_inter_modal_beta(self, bank, temperatures):
+        """Select one base-session inter-modal coefficient on held-out calibration data."""
+        cache = self._calibration_features()
+        if cache is None:
+            return float(self.inter_modal_beta)
+        enhanced = self.model.compose(cache["raw"], cache["layers"])
+        visual = normalize(enhanced) @ bank["visual"].t() / float(temperatures[0])
+        textual = normalize(cache["raw"]) @ bank["text"].t() / float(temperatures[1])
+        ids = bank["ids"]
+        match = cache["labels"][:, None].eq(ids[None, :])
+        if not match.sum(1).eq(1).all():
+            raise ValueError("Calibration labels must map exactly once into the all-class bank.")
+        targets = match.long().argmax(1)
+        rv, rt = bank["visual_reliability"], bank["text_reliability"]
+        alpha = rv / (rv + rt).clamp_min(1e-6)
+        best_beta, best_risk = None, float("inf")
+        for beta in torch.linspace(0.0, 1.0, 21, device=self.device):
+            logits = ((1.0 - beta) * (
+                alpha.unsqueeze(0) * visual + (1.0 - alpha.unsqueeze(0)) * textual
+            ) + beta * 0.5 * (visual + textual))
+            risk, _ = balanced_risk(logits, cache["labels"], ids)
+            value = float(risk.item())
+            if value < best_risk:
+                best_beta, best_risk = float(beta.item()), value
+        return best_beta
+
     def _query_cache(self, field):
         return self._memory_cache(field)
 
@@ -606,8 +633,12 @@ class PrototypeConfusionRunner:
                 })
                 bank, temps = self._fit_bank_and_temperatures()
                 self.visual_temperature, self.text_temperature = temps
+                self.inter_modal_beta = self._fit_inter_modal_beta(bank, temps)
                 self.model.set_temperatures(*temps)
-                result = {"base_session": True, "accepted": False}
+                result = {
+                    "base_session": True, "accepted": False,
+                    "base_calibrated_inter_modal_beta": self.inter_modal_beta,
+                }
             else:
                 fit_before = self._memory_cache("fit")
                 apc = prototype_confusion(
