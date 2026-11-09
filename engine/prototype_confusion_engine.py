@@ -642,10 +642,10 @@ class PrototypeConfusionRunner:
             else:
                 fit_before = self._memory_cache("fit")
                 apc = prototype_confusion(
-                    fit["layers"].to(self.device) if False else fit["layers"],
+                    {layer: values.to(self.device) for layer, values in fit["layers"].items()},
                     fit["labels"].to(self.device), ids,
                     {layer: torch.stack([self._history_layer_means()[layer][cid]
-                                         for cid in sorted(self.class_ids)])
+                                         for cid in sorted(self.class_ids)]).to(self.device)
                      for layer in self.model.layer_ids},
                     self.apc_reference,
                 )
