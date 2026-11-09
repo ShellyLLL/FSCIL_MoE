@@ -222,6 +222,29 @@ class PrototypeConfusionTests(unittest.TestCase):
         self.assertEqual(cache["sources"][0].item(), -1)
         self.assertTrue(torch.equal(cache["prototype_mask"], torch.tensor([True, False, False])))
 
+    def test_support_split_reserves_two_fit_sources_for_leave_one_out(self):
+        runner = PrototypeConfusionRunner.__new__(PrototypeConfusionRunner)
+        runner.cfg = type("Cfg", (), {"SEED": 7})()
+        cache = {
+            "raw": torch.randn(3, 4),
+            "labels": torch.tensor([10, 10, 10]),
+            "sources": torch.tensor([100, 101, 102]),
+            "layers": {2: torch.randn(3, 4)},
+        }
+        with self.assertRaisesRegex(ValueError, "requires >=4 distinct source images"):
+            runner._split(cache, 1)
+
+        cache = {
+            "raw": torch.randn(4, 4),
+            "labels": torch.tensor([10, 10, 10, 10]),
+            "sources": torch.tensor([100, 101, 102, 103]),
+            "layers": {2: torch.randn(4, 4)},
+        }
+        fit, calibration, risk = runner._split(cache, 1)
+        self.assertEqual(fit["raw"].size(0), 2)
+        self.assertEqual(calibration["raw"].size(0), 1)
+        self.assertEqual(risk["raw"].size(0), 1)
+
     def test_temperature_fitting_runs_and_respects_configured_bounds(self):
         runner = PrototypeConfusionRunner.__new__(PrototypeConfusionRunner)
         runner.device = "cpu"
