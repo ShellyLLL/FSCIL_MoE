@@ -114,17 +114,29 @@ def make_apc_reference(layer_prototypes):
 
 
 def balanced_risk(logits, labels, class_ids):
-    """Mean per-class NLL; no class/task prior can hide a harmed old class."""
-    class_ids = torch.as_tensor(class_ids, device=labels.device, dtype=torch.long)
+    """Strict macro NLL: every requested class must be represented exactly in the bank."""
+    logits = torch.as_tensor(logits).float()
+    labels = torch.as_tensor(labels, device=logits.device, dtype=torch.long).reshape(-1)
+    class_ids = torch.as_tensor(class_ids, device=logits.device, dtype=torch.long).reshape(-1)
+    if logits.ndim != 2 or logits.size(0) != labels.numel():
+        raise ValueError("Risk logits must be [N,C] and align with query labels.")
+    if class_ids.numel() == 0 or class_ids.unique().numel() != class_ids.numel():
+        raise ValueError("Risk class ids must be non-empty and unique.")
     targets = labels[:, None].eq(class_ids[None, :])
     if not targets.sum(1).eq(1).all():
         raise ValueError("Risk classifier must contain every query label exactly once.")
+    counts = targets.sum(0)
+    if counts.eq(0).any():
+        missing = class_ids[counts.eq(0)].tolist()
+        raise ValueError("Balanced risk requires at least one query for every class: {}".format(missing))
     columns = targets.long().argmax(1)
-    losses = F.cross_entropy(logits.float(), columns, reduction="none")
-    class_losses = [losses[labels.eq(cid)].mean() for cid in class_ids if labels.eq(cid).any()]
-    return torch.stack(class_losses).mean(), {
-        int(cid): float(losses[labels.eq(cid)].mean().item())
-        for cid in class_ids if labels.eq(cid).any()
+    losses = F.cross_entropy(logits, columns, reduction="none")
+    class_losses = torch.stack([
+        losses[labels.eq(cid)].mean() for cid in class_ids
+    ])
+    return class_losses.mean(), {
+        int(cid): float(class_losses[index].item())
+        for index, cid in enumerate(class_ids)
     }
 
 
@@ -145,7 +157,7 @@ class BottleneckExpert(nn.Module):
 
 
 class UnifiedTopKRouter(nn.Module):
-    """A single append-only set of logits and one shared sparse Top-k Softmax."""
+    """One append-only router; all old and new experts share the same Top-k Softmax."""
     def __init__(self, input_dim, count):
         super().__init__()
         self.input_dim = int(input_dim)
@@ -160,20 +172,37 @@ class UnifiedTopKRouter(nn.Module):
         self.columns.append(column)
         return self.columns[-1]
 
-    def forward(self, x, top_k, excluded=()):
+    def logits(self, x):
+        if x.ndim != 2:
+            raise ValueError("Unified router input must have shape [N,D].")
+        if x.size(0) == 0:
+            raise ValueError("Unified router does not accept an empty batch.")
         if not self.columns:
             raise RuntimeError("Unified router has no experts.")
-        logits = torch.cat([column(x) for column in self.columns], dim=-1)
+        return torch.cat([column(x) for column in self.columns], dim=-1)
+
+    def forward(self, x, top_k, excluded=()):
+        logits = self.logits(x)
+        k = int(top_k)
+        if k < 1:
+            raise ValueError("Top-k must be a positive integer.")
         masked = logits.clone()
         if excluded:
             excluded_ids = [int(i) for i in excluded]
+            if len(set(excluded_ids)) != len(excluded_ids):
+                raise ValueError("Excluded expert indices must be unique.")
             if any(i < 0 or i >= len(self.columns) for i in excluded_ids):
                 raise IndexError("Excluded expert index is outside the router topology.")
             masked[:, excluded_ids] = float("-inf")
-        available = int(torch.isfinite(masked[0]).sum().item())
-        if available == 0:
-            raise RuntimeError("Router exclusion disabled every expert.")
-        k = min(max(1, int(top_k)), available)
+        available = torch.isfinite(masked).sum(dim=1)
+        if not available.eq(available[0]).all():
+            raise RuntimeError("Router availability must be consistent across a batch.")
+        if int(available[0].item()) < k:
+            raise ValueError(
+                "Top-k={} exceeds the {} experts available after exclusions.".format(
+                    k, int(available[0].item())
+                )
+            )
         selected_logits, selected_ids = masked.topk(k, dim=-1)
         weights = torch.softmax(selected_logits, dim=-1)
         dense = torch.zeros_like(logits).scatter(1, selected_ids, weights)
@@ -188,6 +217,10 @@ class DynamicLayerMoE(nn.Module):
         self.base_expert_count = int(base_experts)
         self.incremental_reduction = int(incremental_reduction)
         self.top_k = int(top_k)
+        if self.base_expert_count < 1:
+            raise ValueError("At least one base expert is required.")
+        if self.top_k < 1 or self.top_k > self.base_expert_count:
+            raise ValueError("Top-k must be between one and the number of base experts.")
         self.norm = nn.LayerNorm(input_dim)
         self.experts = nn.ModuleList([
             BottleneckExpert(input_dim, output_dim, base_reduction)
@@ -221,8 +254,27 @@ class DynamicLayerMoE(nn.Module):
             p.grad = None
         self.eval()
 
-    def add_expert(self, session_id, new_features, historical_features):
-        """Append a small expert and initialize its one router column by separation."""
+    def add_expert(self, session_id, new_features, historical_features, route_margin=0.05):
+        """Append a zero-output expert without changing any historical support route.
+
+        The new gate starts strictly below the minimum historical Top-k boundary.
+        Its trainable margin objective must then separate new support from the
+        complete historical feature memory; no class/task mask is used at inference.
+        """
+        new_features = torch.as_tensor(new_features, device=self.norm.weight.device).float()
+        historical_features = torch.as_tensor(
+            historical_features, device=self.norm.weight.device
+        ).float()
+        margin = float(route_margin)
+        if not math.isfinite(margin) or margin <= 0:
+            raise ValueError("Routing margin must be finite and positive.")
+        if new_features.ndim != 2 or new_features.size(0) == 0:
+            raise ValueError("A new expert requires non-empty [N,D] new-class features.")
+        if historical_features.ndim != 2 or historical_features.size(0) == 0:
+            raise ValueError("A new expert requires non-empty [N,D] historical features.")
+        if new_features.size(1) != self.input_dim or historical_features.size(1) != self.input_dim:
+            raise ValueError("Expert initialization features have an incompatible width.")
+
         self.freeze_all()
         device = self.norm.weight.device
         expert = BottleneckExpert(
@@ -231,21 +283,75 @@ class DynamicLayerMoE(nn.Module):
         self.experts.append(expert)
         column = self.router.add_column().to(device=device)
         self.birth_sessions.append(int(session_id))
-        new_x = self.norm(torch.as_tensor(new_features, device=device).float())
-        old_x = self.norm(torch.as_tensor(historical_features, device=device).float())
-        if new_x.numel() and old_x.numel():
-            direction = F.normalize(new_x.mean(0) - old_x.mean(0), dim=0)
-            old_new_logits = self.router(new_x, self.top_k)[0][:, :-1]
-            old_old_logits = self.router(old_x, self.top_k)[0][:, :-1]
-            current_boundary = old_new_logits.topk(min(self.top_k, old_new_logits.size(1)), dim=1).values[:, -1].mean()
-            history_boundary = old_old_logits.topk(min(self.top_k, old_old_logits.size(1)), dim=1).values[:, -1].mean()
-            separation = torch.dot(direction, new_x.mean(0) - old_x.mean(0)).clamp_min(1e-4)
-            scale = ((current_boundary - history_boundary + 0.5) / separation).clamp(0.1, 8.0)
-            with torch.no_grad():
-                column.weight.copy_((scale * direction).view(1, -1))
-                column.bias.copy_(history_boundary - 0.25 - scale * torch.dot(direction, old_x.mean(0)))
+
+        with torch.no_grad():
+            old_x = self.norm(historical_features)
+            old_logits = self.router.logits(old_x)[:, :-1]
+            if old_logits.size(1) < self.top_k:
+                raise RuntimeError("Historical expert pool cannot satisfy the configured Top-k.")
+            old_boundary = old_logits.topk(self.top_k, dim=1).values[:, -1]
+            # A constant gate below every stored historical boundary guarantees
+            # exact old Top-k membership and Softmax weights at initialization.
+            column.weight.zero_()
+            column.bias.copy_(old_boundary.min() - margin)
+
         self.set_newest_trainable()
         return self.num_experts - 1
+
+    def route_margin_loss(self, new_features, historical_features, margin=0.05):
+        """Learn a new-expert decision boundary while protecting historical routes.
+
+        New samples must cross the old-pool Top-k boundary; historical samples
+        must remain below it. Since old router columns are frozen, these hinge
+        terms provide a direct gradient to the new column even before the new
+        expert is selected by the sparse forward pass.
+        """
+        if self.num_experts <= self.base_expert_count:
+            raise RuntimeError("Routing margin loss requires an incremental expert.")
+        margin = float(margin)
+        if not math.isfinite(margin) or margin <= 0:
+            raise ValueError("Routing margin must be finite and positive.")
+        device = self.norm.weight.device
+        new_x = self.norm(torch.as_tensor(new_features, device=device).float())
+        old_x = self.norm(torch.as_tensor(historical_features, device=device).float())
+        if new_x.ndim != 2 or new_x.size(0) == 0:
+            raise ValueError("New-route supervision requires non-empty new features.")
+        if old_x.ndim != 2 or old_x.size(0) == 0:
+            raise ValueError("Historical-route protection requires non-empty old features.")
+
+        new_logits = self.router.logits(new_x)
+        old_logits = self.router.logits(old_x)
+        new_boundary = new_logits[:, :-1].topk(self.top_k, dim=1).values[:, -1].detach()
+        old_boundary = old_logits[:, :-1].topk(self.top_k, dim=1).values[:, -1].detach()
+        new_score = new_logits[:, -1]
+        old_score = old_logits[:, -1]
+        new_loss = F.relu(new_boundary + margin - new_score).mean()
+        historical_loss = F.relu(old_score - old_boundary + margin).mean()
+        return {
+            "new": new_loss,
+            "historical": historical_loss,
+            "new_activation_rate": (new_score > new_boundary).float().mean().detach(),
+            "historical_intrusion_rate": (old_score > old_boundary).float().mean().detach(),
+        }
+
+    @torch.no_grad()
+    def route_drift(self, features):
+        """Compare current routes with the exact old-pool Top-k Softmax routes."""
+        if self.num_experts <= self.base_expert_count:
+            raise RuntimeError("Route drift requires an incremental expert.")
+        x = self.norm(torch.as_tensor(features, device=self.norm.weight.device).float())
+        logits, current_weights, _ = self.router(x, self.top_k)
+        old_logits = logits[:, :-1]
+        old_values, old_ids = old_logits.topk(self.top_k, dim=1)
+        old_weights = torch.softmax(old_values, dim=1)
+        old_reference = torch.zeros_like(old_logits).scatter(1, old_ids, old_weights)
+        drift = (current_weights[:, :-1] - old_reference).abs().sum(dim=1)
+        drift = drift + current_weights[:, -1]
+        return {
+            "drift": drift,
+            "new_expert_weight": current_weights[:, -1],
+            "new_expert_selected": current_weights[:, -1].gt(0),
+        }
 
     def set_newest_trainable(self):
         if self.num_experts <= self.base_expert_count:
@@ -272,6 +378,7 @@ class DynamicLayerMoE(nn.Module):
         return {
             "input_dim": self.input_dim, "output_dim": self.output_dim,
             "base_expert_count": self.base_expert_count, "top_k": self.top_k,
+            "routing_version": "global_topk_stability_margin_v1",
             "experts": [
                 {"reduction": max(1, self.input_dim // expert.down.out_features),
                  "birth_session": self.birth_sessions[i]}
@@ -285,7 +392,8 @@ class DynamicLayerMoE(nn.Module):
         if (int(spec["input_dim"]) != self.input_dim or
                 int(spec["output_dim"]) != self.output_dim or
                 int(spec["base_expert_count"]) != self.base_expert_count or
-                int(spec["top_k"]) != self.top_k):
+                int(spec["top_k"]) != self.top_k or
+                spec.get("routing_version") != "global_topk_stability_margin_v1"):
             raise ValueError("Checkpoint MoE topology is incompatible with this configuration.")
         self.experts = nn.ModuleList()
         self.router = UnifiedTopKRouter(self.input_dim, 0)
@@ -433,8 +541,10 @@ class PrototypeConfusionMoE(nn.Module):
             p.grad = None
         self.clip_model.eval()
 
-    def add_expert(self, layer, session, new_features, historical_features):
-        return self.adapters[str(layer)].add_expert(session, new_features, historical_features)
+    def add_expert(self, layer, session, new_features, historical_features, route_margin=0.05):
+        return self.adapters[str(layer)].add_expert(
+            session, new_features, historical_features, route_margin=route_margin
+        )
 
     def topology(self):
         return {str(i): self.adapters[str(i)].topology() for i in self.layer_ids}
