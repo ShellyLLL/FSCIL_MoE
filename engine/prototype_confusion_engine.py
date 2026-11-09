@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from datasets.data_manager import DatasetManager
+from utils.evaluator import AccuracyEvaluator
 from models.prototype_confusion_moe import (
     PrototypeConfusionMoE, balanced_risk, class_means, make_apc_reference,
     normalize, prototype_confusion, source_exclusive_means,
@@ -35,6 +36,7 @@ class PrototypeConfusionRunner:
         self.text_temperature = float(cfg.TRAINER.PCMOE.CALIBRATION.INITIAL_TEMPERATURE_TEXT)
         self.inter_modal_beta = float(cfg.TRAINER.PCMOE.CALIBRATION.INTER_MODAL_BETA)
         self.diagnostics = []
+        self.base_accuracy = None
         self.start_session = 0
         self._load_resume()
 
@@ -511,6 +513,43 @@ class PrototypeConfusionRunner:
             raise
 
 
+    @torch.no_grad()
+    def _evaluate_all_seen(self, session):
+        """Evaluate the sole all-seen-class classifier; never use task IDs for prediction."""
+        loader = self.data.get_dataloader(session, "test", mode="test", accumulate_past=False)
+        bank = self._prototypes()
+        all_logits, all_labels = [], []
+        self.model.eval()
+        for batch in loader:
+            images = batch["image"].to(self.device)
+            raw, enhanced, _ = self.model.encode(images)
+            logits = self._score(raw, enhanced, bank)[0]
+            all_logits.append(logits.cpu())
+            all_labels.append(batch["label"].long().cpu())
+        logits = torch.cat(all_logits)
+        labels = torch.cat(all_labels)
+        evaluator = AccuracyEvaluator(self.data.class_index_in_task)
+        metrics = evaluator.calc_accuracy(
+            logits, labels, session, class_ids=bank["ids"].cpu()
+        )
+        base_ids = torch.as_tensor(
+            self.data.class_index_in_task[0], dtype=torch.long
+        )
+        base_mask = torch.isin(labels, base_ids)
+        pred_ids = bank["ids"].cpu()[logits.argmax(dim=1)]
+        base_accuracy = float(pred_ids[base_mask].eq(labels[base_mask]).float().mean().item())
+        if session == 0:
+            self.base_accuracy = base_accuracy
+        pd = (0.0 if self.base_accuracy is None else
+              float(self.base_accuracy - base_accuracy))
+        metrics.update({
+            "AA": float(np.mean(metrics["task_acc"])) if metrics["task_acc"] else 0.0,
+            "PD": pd,
+            "base_class_accuracy": base_accuracy,
+            "num_seen_classes": int(bank["ids"].numel()),
+        })
+        return metrics
+
     def run(self):
         end = int(self.cfg.TRAINER.PCMOE.END_SESSION)
         end = self.data.num_tasks - 1 if end < 0 else min(end, self.data.num_tasks - 1)
@@ -571,6 +610,8 @@ class PrototypeConfusionRunner:
                     self.base_layer_prototypes = self._history_layer_means()
                 # Calibration/risk memory is now committed for accepted tasks.
             self.model.freeze_all()
+            evaluation = self._evaluate_all_seen(session)
+            result["evaluation"] = evaluation
             self.diagnostics.append({"session": session, **result})
             self._save(session)
             print("[PC-MoE][Session {}] {}".format(
@@ -594,6 +635,7 @@ class PrototypeConfusionRunner:
             "text_temperature": self.text_temperature,
             "inter_modal_beta": self.inter_modal_beta,
             "diagnostics": self.diagnostics,
+            "base_accuracy": self.base_accuracy,
             "support_manifest": self.data.get_support_manifest(),
             "rng": {"python": random.getstate(), "numpy": np.random.get_state(),
                     "torch": torch.get_rng_state(),
@@ -626,6 +668,7 @@ class PrototypeConfusionRunner:
         self.text_temperature = float(payload["text_temperature"])
         self.inter_modal_beta = float(payload["inter_modal_beta"])
         self.diagnostics = list(payload["diagnostics"])
+        self.base_accuracy = payload.get("base_accuracy")
         self.start_session = int(payload["completed_session"]) + 1
         rng = payload.get("rng", {})
         if rng:
