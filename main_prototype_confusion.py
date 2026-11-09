@@ -39,7 +39,16 @@ def extend_pcmoe_cfg(cfg):
     p.OPTIM.INCREMENTAL_LR = 3e-4
     p.OPTIM.WEIGHT_DECAY = 1e-4
     p.LOSS = CN()
+    # Incremental routing uses margin-based novel activation and historical
+    # route protection; uniform expert usage is deliberately not imposed.
     p.LOSS.ROUTE_BALANCE_WEIGHT = 0.01
+    p.LOSS.ROUTE_MARGIN = 0.05
+    p.LOSS.NEW_ROUTE_WEIGHT = 1.0
+    p.LOSS.HISTORICAL_ROUTE_WEIGHT = 1.0
+    p.LOSS.MAX_HISTORICAL_ROUTE_DRIFT = 0.05
+    p.LOSS.MAX_HISTORICAL_INTRUSION_RATE = 0.01
+    p.LOSS.MIN_NOVEL_ACTIVATION_RATE = 0.20
+    p.EXPANSION.MAX_NEW_CLASS_RISK_INCREASE = 0.01
     p.CHECKPOINT = CN()
     p.CHECKPOINT.DIR = 'checkpoints/prototype_confusion_moe'
     p.CHECKPOINT.RESUME = ''
