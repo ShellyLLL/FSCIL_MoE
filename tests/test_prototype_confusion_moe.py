@@ -257,6 +257,104 @@ class PrototypeConfusionTests(unittest.TestCase):
         self.assertTrue(0.02 <= textual <= 2.0)
         self.assertTrue(np.isfinite([visual, textual]).all())
 
+    def test_incremental_transaction_exception_restores_exact_model_topology_and_weights(self):
+        from torch import nn
+
+        class FakeModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.adapters = nn.ModuleDict({
+                    "2": DynamicLayerMoE(
+                        4, 4, base_experts=2, base_reduction=2,
+                        incremental_reduction=2, top_k=1, scale_init=0.5
+                    )
+                })
+                self.register_buffer("temperature", torch.tensor([0.1, 0.1]))
+            def topology(self):
+                return {key: value.topology() for key, value in self.adapters.items()}
+            def add_expert(self, layer, session, new, old, route_margin=0.05):
+                return self.adapters[str(layer)].add_expert(
+                    session, new, old, route_margin=route_margin
+                )
+            def set_incremental_trainable(self, layers):
+                for adapter in self.adapters.values():
+                    adapter.freeze_all()
+                for layer in layers:
+                    self.adapters[str(layer)].set_newest_trainable()
+            def freeze_all(self):
+                for adapter in self.adapters.values():
+                    adapter.freeze_all()
+            def set_temperatures(self, visual, text):
+                self.temperature.copy_(torch.tensor([visual, text]))
+            def rebuild_topology(self, topology):
+                for key, spec in topology.items():
+                    self.adapters[key].rebuild(spec)
+
+        runner = PrototypeConfusionRunner.__new__(PrototypeConfusionRunner)
+        runner.device = "cpu"
+        runner.model = FakeModel()
+        runner.class_ids = [10, 20]
+        runner.class_memory = {
+            10: {"fit": {
+                "kind": "prototype", "raw": torch.tensor([[1., 0., 0., 0.]]),
+                "sources": None,
+                "layers": {2: torch.tensor([[0.2, 0.1, 0.3, 0.4]])}, "count": 4,
+            }},
+            20: {"fit": {
+                "kind": "samples",
+                "raw": torch.tensor([[0., 1., 0., 0.], [0., 0.9, 0.1, 0.]]),
+                "sources": torch.tensor([200, 201]),
+                "layers": {2: torch.tensor([[0.1, 0.2, 0.3, 0.4], [0.2, 0.1, 0.4, 0.3]])},
+            }},
+        }
+        runner.visual_temperature, runner.text_temperature = 0.1, 0.1
+        runner.text_prototypes = {10: torch.tensor([1., 0., 0., 0.]),
+                                  20: torch.tensor([0., 1., 0., 0.])}
+        runner.description_prototypes = dict(runner.text_prototypes)
+        runner.text_consistency = {10: torch.tensor(1.), 20: torch.tensor(1.)}
+        runner.cfg = type("Cfg", (), {
+            "TRAINER": type("TrainerCfg", (), {
+                "PCMOE": type("PCMOECfg", (), {
+                    "LOSS": type("LossCfg", (), {
+                        "ROUTE_MARGIN": 0.05, "NEW_ROUTE_WEIGHT": 1.0,
+                        "HISTORICAL_ROUTE_WEIGHT": 1.0
+                    })(),
+                    "OPTIM": type("OptimCfg", (), {
+                        "INCREMENTAL_LR": 1e-3, "WEIGHT_DECAY": 0.0,
+                        "INCREMENTAL_EPOCHS": 0
+                    })(),
+                    "CALIBRATION": type("CalibrationCfg", (), {
+                        "LAMBDA_TEXT": 0.5
+                    })(),
+                    "EXPANSION": type("ExpansionCfg", (), {
+                        "APC_MIN_PERCENTILE": 0.8, "MAX_LAYERS_PER_SESSION": 1
+                    })()
+                })()
+            })()
+        })()
+        before_topology = runner.model.topology()
+        before_state = {k: v.clone() for k, v in runner.model.state_dict().items()}
+        fit_new = {
+            "raw": torch.tensor([[0., 1., 0., 0.], [0., 0.8, 0.2, 0.]]),
+            "labels": torch.tensor([20, 20]),
+            "sources": torch.tensor([200, 201]),
+            "layers": {2: torch.tensor([[0.1, 0.2, 0.3, 0.4], [0.2, 0.1, 0.4, 0.3]])},
+        }
+        def fail_after_candidate_training(*args, **kwargs):
+            raise RuntimeError("injected failure after candidate expert training")
+        runner._fit_bank_and_temperatures = fail_after_candidate_training
+        with self.assertRaisesRegex(RuntimeError, "injected failure"):
+            runner._train_incremental(
+                1, fit_new, [20], {2: {"mean": 0.95}}
+            )
+        self.assertEqual(runner.model.topology(), before_topology)
+        after_state = runner.model.state_dict()
+        self.assertEqual(set(after_state), set(before_state))
+        for key in before_state:
+            torch.testing.assert_close(after_state[key], before_state[key])
+        self.assertEqual(runner.class_ids, [10, 20])
+        self.assertEqual(runner.class_memory[20]["fit"]["kind"], "samples")
+
     def test_checkpoint_round_trip_restores_prototype_memory_and_session_state(self):
         import tempfile
         from pathlib import Path
