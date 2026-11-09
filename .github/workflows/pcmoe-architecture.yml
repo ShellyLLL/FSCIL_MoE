@@ -27,7 +27,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install numpy pillow yacs ftfy regex tqdm
+          python -m pip install numpy pillow yacs ftfy regex tqdm scikit-learn
       - name: Compile PC-MoE modules
         run: |
           python -m py_compile models/prototype_confusion_moe.py
