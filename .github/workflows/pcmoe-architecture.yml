@@ -1,0 +1,41 @@
+name: PC-MoE Architecture Tests
+
+on:
+  push:
+    branches:
+      - feature/prototype-confusion-dynamic-moe-fscil
+    paths:
+      - "models/prototype_confusion_moe.py"
+      - "engine/prototype_confusion_engine.py"
+      - "tests/test_prototype_confusion_moe.py"
+      - "main_prototype_confusion.py"
+      - ".github/workflows/pcmoe-architecture.yml"
+  pull_request:
+    branches:
+      - feature/prototype-confusion-dynamic-moe-fscil
+
+jobs:
+  architecture-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+      - name: Install CPU test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install numpy pillow yacs ftfy regex tqdm
+      - name: Compile PC-MoE modules
+        run: |
+          python -m py_compile models/prototype_confusion_moe.py
+          python -m py_compile engine/prototype_confusion_engine.py
+          python -m py_compile main_prototype_confusion.py
+          python -m py_compile tests/test_prototype_confusion_moe.py
+      - name: Run architecture invariant tests
+        env:
+          PYTHONPATH: .
+        run: python -m unittest -v tests.test_prototype_confusion_moe
