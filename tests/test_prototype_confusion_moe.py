@@ -82,6 +82,47 @@ class PrototypeConfusionTests(unittest.TestCase):
         layer.freeze_all()
         self.assertFalse(any(p.requires_grad for p in layer.parameters()))
 
+    def test_new_gate_initialization_preserves_historical_topk_exactly(self):
+        torch.manual_seed(31)
+        layer = DynamicLayerMoE(8, 8, base_experts=4, base_reduction=2,
+                               incremental_reduction=4, top_k=2, scale_init=0.5)
+        old = torch.randn(32, 8)
+        with torch.no_grad():
+            old_x = layer.norm(old)
+            old_logits, old_weights, old_ids = layer.router(old_x, layer.top_k)
+            old_output, _ = layer(old)
+            layer.add_expert(1, torch.randn(6, 8) + 1.5, old)
+            new_logits, new_weights, new_ids = layer.router(layer.norm(old), layer.top_k)
+            new_output, _ = layer(old)
+        torch.testing.assert_close(new_ids, old_ids)
+        torch.testing.assert_close(new_weights[:, :-1], old_weights)
+        torch.testing.assert_close(new_weights[:, -1], torch.zeros(old.size(0)))
+        torch.testing.assert_close(new_output, old_output, atol=1e-6, rtol=1e-6)
+        self.assertTrue(torch.all(new_logits[:, -1] < old_logits.topk(2, dim=1).values[:, -1]))
+
+    def test_new_gate_receives_gradient_before_sparse_activation(self):
+        torch.manual_seed(32)
+        layer = DynamicLayerMoE(8, 8, base_experts=3, base_reduction=2,
+                               incremental_reduction=4, top_k=2, scale_init=0.5)
+        new = torch.randn(7, 8) + 1.0
+        old = torch.randn(24, 8)
+        layer.add_expert(1, new, old)
+        terms = layer.route_margin_loss(new, old, margin=0.05)
+        loss = terms["new"] + terms["historical"]
+        loss.backward()
+        gate = layer.router.columns[-1]
+        self.assertIsNotNone(gate.weight.grad)
+        self.assertGreater(float(gate.weight.grad.abs().sum()), 0.0)
+        self.assertGreater(float(terms["new"].item()), 0.0)
+        self.assertEqual(float(terms["historical_intrusion_rate"].item()), 0.0)
+
+    def test_router_rejects_invalid_topk_instead_of_silently_changing_it(self):
+        router = UnifiedTopKRouter(4, 3)
+        with self.assertRaises(ValueError):
+            router(torch.randn(2, 4), top_k=4)
+        with self.assertRaises(ValueError):
+            router(torch.randn(2, 4), top_k=0)
+
     def test_visual_intra_modal_calibration_is_applied_to_per_query_banks(self):
         runner = PrototypeConfusionRunner.__new__(PrototypeConfusionRunner)
         runner.cfg = type("Cfg", (), {
