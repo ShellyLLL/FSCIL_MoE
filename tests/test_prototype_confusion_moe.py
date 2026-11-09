@@ -29,15 +29,17 @@ class PrototypeConfusionTests(unittest.TestCase):
 
     def test_source_exclusion_removes_all_views_of_same_source(self):
         features = F.normalize(torch.tensor([
-            [1., 0.], [0.9, 0.1], [0., 1.], [-1., 0.]
+            [1., 0.], [0.9, 0.1], [0.8, 0.2], [0., 1.], [-1., 0.]
         ]), dim=-1)
-        labels = torch.tensor([0, 0, 1, 1])
-        sources = torch.tensor([7, 7, 8, 9])
+        labels = torch.tensor([0, 0, 0, 1, 1])
+        sources = torch.tensor([7, 7, 10, 8, 9])
         bank = source_exclusive_means(
-            features, labels, sources, [0, 1], query_indices=[0, 2]
+            features, labels, sources, [0, 1], query_indices=[0, 3]
         )
         # Both views of source 7 are excluded for the first query.
-        torch.testing.assert_close(bank[0, 0], features.new_tensor([0., 1.]))
+        torch.testing.assert_close(bank[0, 0], features[2])
+        # The second query excludes source 8, not its other class-1 peer.
+        torch.testing.assert_close(bank[1, 1], features[4])
         self.assertEqual(tuple(bank.shape), (2, 2, 2))
 
     def test_source_exclusive_banks_are_bounded_to_requested_queries(self):
