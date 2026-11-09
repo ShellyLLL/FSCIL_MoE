@@ -443,27 +443,31 @@ class PrototypeConfusionRunner:
                     alpha = (reliability_bank["visual_reliability"] /
                              (reliability_bank["visual_reliability"]
                               + reliability_bank["text_reliability"]).clamp_min(1e-6)).detach()
-                enhanced_all, aux = self.model.compose(
-                    all_fit["raw"], all_fit["layers"], return_aux=True
-                )
                 new_mask = torch.isin(all_fit["labels"], torch.as_tensor(new_ids, device=self.device))
                 rows = torch.where(new_mask)[0]
-                loo = source_exclusive_means(
-                    enhanced_all, all_fit["labels"], all_fit["sources"], ids_all,
-                    query_indices=rows
+                with torch.no_grad():
+                    enhanced_bank = self.model.compose(all_fit["raw"], all_fit["layers"])
+                    loo = source_exclusive_means(
+                        enhanced_bank, all_fit["labels"], all_fit["sources"], ids_all,
+                        query_indices=rows
+                    )
+                    loo = self._calibrate_visual_bank(loo)
+                query_layers = {
+                    layer: values[rows] for layer, values in all_fit["layers"].items()
+                }
+                enhanced_queries, aux = self.model.compose(
+                    all_fit["raw"][rows], query_layers, return_aux=True
                 )
-                loo = self._calibrate_visual_bank(loo)
-                visual_logits, text_logits, targets = [], [], []
                 calibrated_text = normalize((1.0 - cfg.CALIBRATION.LAMBDA_TEXT) * text
                                              + cfg.CALIBRATION.LAMBDA_TEXT * descriptions)
-                for local_row, row in enumerate(rows.tolist()):
-                    visual_logits.append(enhanced_all[row:row + 1] @ loo[local_row].t()
-                                          / self.visual_temperature)
-                    text_logits.append(all_fit["raw"][row:row + 1] @ calibrated_text.t()
-                                       / self.text_temperature)
-                    targets.append(ids_all.index(int(all_fit["labels"][row].item())))
-                visual_logits = torch.cat(visual_logits)
-                text_logits = torch.cat(text_logits)
+                visual_logits = torch.bmm(
+                    enhanced_queries.unsqueeze(1), loo.transpose(1, 2)
+                ).squeeze(1) / self.visual_temperature
+                text_logits = all_fit["raw"][rows] @ calibrated_text.t() / self.text_temperature
+                targets = [
+                    ids_all.index(int(all_fit["labels"][row].item()))
+                    for row in rows.tolist()
+                ]
                 logits = ((1.0 - self.inter_modal_beta) *
                           (alpha.unsqueeze(0) * visual_logits + (1.0 - alpha.unsqueeze(0)) * text_logits)
                           + self.inter_modal_beta * 0.5 * (visual_logits + text_logits))
