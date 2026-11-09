@@ -27,9 +27,16 @@ class CUB200(DatasetBase):
 
 
     def load_data(self):
-        image_file = os.path.join(self.root, 'CUB_200_2011/images.txt')
-        split_file = os.path.join(self.root, 'CUB_200_2011/train_test_split.txt')
-        class_file = os.path.join(self.root, 'CUB_200_2011/image_class_labels.txt')
+        # Accept ROOT as either the dataset directory itself
+        # (/.../CUB_200_2011) or its parent for legacy configurations.
+        dataset_root = (
+            self.root
+            if os.path.isfile(os.path.join(self.root, 'images.txt'))
+            else os.path.join(self.root, 'CUB_200_2011')
+        )
+        image_file = os.path.join(dataset_root, 'images.txt')
+        split_file = os.path.join(dataset_root, 'train_test_split.txt')
+        class_file = os.path.join(dataset_root, 'image_class_labels.txt')
         id2image = self.list2dict(self.text_read(image_file))
         id2train = self.list2dict(self.text_read(split_file))  # 1: train images; 0: test iamges
         id2class = self.list2dict(self.text_read(class_file))
@@ -45,7 +52,7 @@ class CUB200(DatasetBase):
         train_targets = []
         data2target = {}
         for k in train_idx:
-            image_path = os.path.join(self.root, 'CUB_200_2011/images', id2image[k])
+            image_path = os.path.join(dataset_root, 'images', id2image[k])
             train_data.append(image_path)
             train_targets.append(int(id2class[k]) - 1)
             data2target[image_path] = (int(id2class[k]) - 1)
