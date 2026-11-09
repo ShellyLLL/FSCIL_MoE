@@ -88,6 +88,55 @@ diagnostics are not a substitute for test accuracy. `TaskDiagnostic` reports
 the actual task selection rate and an oracle-task within-class upper bound;
 the latter uses test labels only for analysis, never for predictions.
 
+## Prototype-Confusion Guided Dynamic MoE-FSCIL
+
+The new PC-MoE implementation is an independent training path and does not
+reuse the legacy task-gated BiMC runner. It freezes the complete CLIP ViT
+feature stream and adds layer-wise parallel residual experts over captured
+frozen hidden states. Every layer uses one append-only Top-k Softmax router
+over the complete old/new expert pool.
+
+Prototype confusion (APC) compares each novel class's nearest old/within-new
+prototype similarity with the base-session layer-wise confusion reference.
+APC only ranks candidate layers. Candidate experts are trained jointly, then
+a held-out, source-disjoint, class-balanced NLL over **all seen classes**
+compares the candidate architecture with the unchanged-capacity baseline.
+Expansion is committed only when global risk improves by the configured
+minimum and the worst old-class risk increase remains below its limit.
+Rejecting capacity never rejects the new classes: their support/text prototype
+memory is still committed and classified by the existing expert pool.
+
+Visual intra-modal calibration transports novel visual prototypes toward the
+base visual prototype geometry; text intra-modal calibration combines CLIP
+class text with available CuPL/LLM descriptions; inter-modal calibration
+reliability-weights the two calibrated score streams. The dynamic MoE visual
+embedding and calibrated text embedding meet in the same all-seen-class
+logit space for training, capacity-risk evaluation, and inference.
+
+Run the independent PC-MoE path with:
+
+~~~BASH
+python main_prototype_confusion.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/prototype_confusion_moe.yaml
+~~~
+
+To resume a PC-MoE checkpoint:
+
+~~~BASH
+python main_prototype_confusion.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/prototype_confusion_moe.yaml --resume checkpoints/prototype_confusion_moe/session_03.pth
+~~~
+
+Architecture invariant tests (not FSCIL performance experiments):
+
+~~~BASH
+python -m unittest tests.test_prototype_confusion_moe
+~~~
+
+Session checkpoints include expert topology/weights, all-class fit/calibration/
+risk feature memories (no old images), text and description prototypes,
+temperatures, APC reference distributions, support manifest, diagnostics and
+random states. Each session also reports all-seen-class task accuracy (AA) and
+base-class accuracy drop (PD).
+
 ## Acknowledgment
 
 In this repository, we build our code based on the following excellent open-source projects. We sincerely thank all the authors for sharing their great work:
