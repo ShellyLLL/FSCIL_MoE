@@ -93,16 +93,28 @@ the latter uses test labels only for analysis, never for predictions.
 The new PC-MoE implementation is an independent training path and does not
 reuse the legacy task-gated BiMC runner. It freezes the complete CLIP ViT
 feature stream and adds layer-wise parallel residual experts over captured
-frozen hidden states. Every layer uses one append-only Top-k Softmax router
-over the complete old/new expert pool.
+frozen hidden states. Every layer uses one append-only global Top-k Softmax
+router over the complete old/new expert pool; no task-specific router or
+task-ID inference branch is used.
 
 Prototype confusion (APC) compares each novel class's nearest old/within-new
 prototype similarity with the base-session layer-wise confusion reference.
-APC only ranks candidate layers. Candidate experts are trained jointly, then
-a held-out, source-disjoint, class-balanced NLL over **all seen classes**
-compares the candidate architecture with the unchanged-capacity baseline.
-Expansion is committed only when global risk improves by the configured
-minimum and the worst old-class risk increase remains below its limit.
+APC only proposes candidate layers; it does not itself authorize capacity.
+Each appended gate is initialized strictly below the historical Top-k boundary,
+so historical Top-k membership and Softmax weights are exactly preserved at
+birth. During incremental training, a margin objective gives the new gate a
+direct gradient before it is selected: novel support is trained to cross the
+old-pool Top-k boundary, while all historical fit features are trained to
+remain below it. Historical experts and historical router columns remain
+frozen. Incremental training does not impose uniform expert usage.
+
+Candidate experts are assessed on source-disjoint risk examples using the
+same global inference router. A candidate is committed only when the
+class-balanced all-seen-class NLL improves, old- and new-class risk regressions
+remain bounded, historical route drift/intrusion stay within limits, and the
+new expert reaches the minimum novel-class activation coverage. Expansion
+rejection never rejects the new classes: their support/text prototype memory
+is still retained and classified by the existing expert pool.
 Rejecting capacity never rejects the new classes: their support/text prototype
 memory is still committed and classified by the existing expert pool.
 
