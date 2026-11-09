@@ -221,6 +221,118 @@ class PrototypeConfusionTests(unittest.TestCase):
         self.assertEqual(cache["sources"][0].item(), -1)
         self.assertTrue(torch.equal(cache["prototype_mask"], torch.tensor([True, False, False])))
 
+    def test_temperature_fitting_runs_and_respects_configured_bounds(self):
+        runner = PrototypeConfusionRunner.__new__(PrototypeConfusionRunner)
+        runner.device = "cpu"
+        runner.visual_temperature = 0.1
+        runner.text_temperature = 0.1
+        runner.cfg = type("Cfg", (), {
+            "TRAINER": type("TrainerCfg", (), {
+                "PCMOE": type("PCMOECfg", (), {
+                    "CALIBRATION": type("CalibrationCfg", (), {
+                        "MIN_TEMPERATURE": 0.02, "MAX_TEMPERATURE": 2.0
+                    })()
+                })()
+            })()
+        })()
+        class Model:
+            def compose(self, raw, layers, disabled_by_layer=None):
+                return F.normalize(raw, dim=-1)
+        runner.model = Model()
+        runner._calibration_features = lambda: {
+            "raw": F.normalize(torch.tensor([
+                [1., 0.], [0.9, 0.1], [0., 1.], [0.1, 0.9]
+            ]), dim=-1),
+            "layers": {},
+            "labels": torch.tensor([10, 10, 20, 20]),
+        }
+        bank = {
+            "visual": F.normalize(torch.tensor([[1., 0.], [0., 1.]]), dim=-1),
+            "text": F.normalize(torch.tensor([[0.9, 0.1], [0.1, 0.9]]), dim=-1),
+            "ids": torch.tensor([10, 20]),
+        }
+        visual, textual = runner._fit_temperatures(bank)
+        self.assertTrue(0.02 <= visual <= 2.0)
+        self.assertTrue(0.02 <= textual <= 2.0)
+        self.assertTrue(np.isfinite([visual, textual]).all())
+
+    def test_checkpoint_round_trip_restores_prototype_memory_and_session_state(self):
+        import tempfile
+        from pathlib import Path
+
+        class FakeModel:
+            def __init__(self):
+                self.value = torch.tensor([3.0])
+                self.temperatures = None
+                self.restored_topology = None
+            def state_dict(self):
+                return {"value": self.value.clone()}
+            def topology(self):
+                return {"experts": [0, 1]}
+            def rebuild_topology(self, topology):
+                self.restored_topology = topology
+            def load_state_dict(self, state, strict=True):
+                self.value = state["value"].clone()
+            def freeze_all(self):
+                pass
+            def set_temperatures(self, visual, text):
+                self.temperatures = (float(visual), float(text))
+
+        class FakeData:
+            def get_support_manifest(self):
+                return {"version": 1, "sessions": {}}
+            def load_support_manifest(self, manifest):
+                self.loaded_manifest = manifest
+
+        with tempfile.TemporaryDirectory() as directory:
+            runner = PrototypeConfusionRunner.__new__(PrototypeConfusionRunner)
+            runner.cfg = type("Cfg", (), {
+                "TRAINER": type("TrainerCfg", (), {
+                    "PCMOE": type("PCMOECfg", (), {
+                        "CHECKPOINT": type("CheckpointCfg", (), {"DIR": directory, "RESUME": ""})()
+                    })()
+                })()
+            })()
+            runner.model = FakeModel()
+            runner.data = FakeData()
+            runner.class_ids = [10]
+            runner.class_memory = {10: {"fit": {
+                "kind": "prototype", "raw": torch.tensor([[1., 0.]]),
+                "layers": {2: torch.tensor([[0.5, 0.5]])}, "count": 3,
+            }}}
+            runner.text_prototypes = {10: torch.tensor([1., 0.])}
+            runner.description_prototypes = {10: torch.tensor([1., 0.])}
+            runner.text_consistency = {10: torch.tensor(0.9)}
+            runner.apc_reference = {2: torch.tensor([0.2])}
+            runner.base_layer_prototypes = {2: {10: torch.tensor([0.5, 0.5])}}
+            runner.visual_temperature, runner.text_temperature = 0.2, 0.3
+            runner.inter_modal_beta = 0.4
+            runner.diagnostics = [{"session": 2}]
+            runner.base_accuracy = 71.5
+            runner.start_session = 0
+            runner._save(2)
+
+            restored = PrototypeConfusionRunner.__new__(PrototypeConfusionRunner)
+            restored.cfg = type("Cfg", (), {
+                "TRAINER": type("TrainerCfg", (), {
+                    "PCMOE": type("PCMOECfg", (), {
+                        "CHECKPOINT": type("CheckpointCfg", (), {
+                            "RESUME": str(Path(directory) / "session_02.pth")
+                        })()
+                    })()
+                })()
+            })()
+            restored.model = FakeModel()
+            restored.data = FakeData()
+            restored._load_resume()
+            self.assertEqual(restored.start_session, 3)
+            self.assertEqual(restored.class_ids, [10])
+            self.assertEqual(restored.class_memory[10]["fit"]["kind"], "prototype")
+            self.assertEqual(restored.inter_modal_beta, 0.4)
+            self.assertEqual(restored.model.temperatures, (0.2, 0.3))
+            self.assertEqual(restored.model.restored_topology, {"experts": [0, 1]})
+            torch.testing.assert_close(restored.model.value, torch.tensor([3.0]))
+
     def test_balanced_risk_requires_every_query_label_in_global_bank(self):
         logits = torch.tensor([[4., 0., 0.], [0., 3., 0.], [0., 0., 2.]])
         labels = torch.tensor([10, 20, 30])
