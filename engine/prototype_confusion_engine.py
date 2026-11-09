@@ -1,5 +1,6 @@
 """Training, expansion transactions and all-class evaluation for PC-MoE FSCIL."""
 import copy
+import math
 import json
 import os
 import random
