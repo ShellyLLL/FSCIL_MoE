@@ -308,15 +308,17 @@ class PrototypeConfusionRunner:
         ids = sorted(self.class_ids)
         fit = self._memory_cache("fit")
         text = self._all_text(ids)
+        batch_size = int(cfg.OPTIM.BASE_BATCH_SIZE)
         for epoch in range(int(cfg.OPTIM.BASE_EPOCHS)):
             self.model.train()
-            enhanced, aux = self.model.compose(fit["raw"], fit["layers"], return_aux=True)
-            # Class reliability is a calibration statistic, not a trainable
-            # shortcut.  Detach it from the expert optimization graph.
+            # Freeze a detached prototype snapshot for this epoch.  Queries
+            # still backpropagate through the live MoE, while prototype banks
+            # do not retain an N-by-C-by-D autograd graph.
             with torch.no_grad():
+                enhanced_bank = self.model.compose(fit["raw"], fit["layers"])
                 counts = torch.stack([fit["labels"].eq(cid).sum() for cid in ids]).float()
                 concentration = torch.stack([
-                    enhanced.detach()[fit["labels"].eq(cid)].mean(0).norm().clamp(0.0, 1.0)
+                    enhanced_bank[fit["labels"].eq(cid)].mean(0).norm().clamp(0.0, 1.0)
                     for cid in ids
                 ])
                 kappa = float(cfg.CALIBRATION.RELIABILITY_KAPPA)
@@ -330,39 +332,40 @@ class PrototypeConfusionRunner:
                 )
                 target = torch.as_tensor(ids, device=self.device)[None, :].eq(
                     fit["labels"][:, None]).long().argmax(1)
-            # Construct only a minibatch of source-exclusive prototype banks
-            # at a time; the full [N,C,D] tensor is prohibitively large on CUB.
-            batch_size = int(cfg.OPTIM.BASE_BATCH_SIZE)
-            loss_sum = enhanced.sum() * 0.0
-            for begin in range(0, enhanced.size(0), batch_size):
-                end = min(begin + batch_size, enhanced.size(0))
+            epoch_loss = 0.0
+            for begin in range(0, fit["raw"].size(0), batch_size):
+                end = min(begin + batch_size, fit["raw"].size(0))
                 rows = torch.arange(begin, end, device=self.device)
+                batch_layers = {layer: values[begin:end]
+                                for layer, values in fit["layers"].items()}
+                enhanced, aux = self.model.compose(
+                    fit["raw"][begin:end], batch_layers, return_aux=True
+                )
                 loo = source_exclusive_means(
-                    enhanced, fit["labels"], fit["sources"], ids, query_indices=rows
+                    enhanced_bank, fit["labels"], fit["sources"], ids, query_indices=rows
                 )
                 loo = self._calibrate_visual_bank(loo)
-                visual = torch.bmm(enhanced[begin:end].unsqueeze(1), loo.transpose(1, 2)).squeeze(1)
+                visual = torch.bmm(enhanced.unsqueeze(1), loo.transpose(1, 2)).squeeze(1)
                 textual = fit["raw"][begin:end] @ calibrated_text.t()
-                alpha_rows = alpha.unsqueeze(0)
                 logits = ((1.0 - self.inter_modal_beta) *
-                          (alpha_rows * visual / self.visual_temperature
-                           + (1.0 - alpha_rows) * textual / self.text_temperature)
+                          (alpha.unsqueeze(0) * visual / self.visual_temperature
+                           + (1.0 - alpha.unsqueeze(0)) * textual / self.text_temperature)
                           + self.inter_modal_beta * 0.5 *
                           (visual / self.visual_temperature + textual / self.text_temperature))
-                loss_sum = loss_sum + F.cross_entropy(logits, target[begin:end], reduction="sum")
-            loss = loss_sum / enhanced.size(0)
-            balance = []
-            for item in aux.values():
-                importance = item["route_weights"].mean(0)
-                balance.append(importance.pow(2).sum() * item["route_weights"].size(1))
-            if balance:
-                loss = loss + float(cfg.LOSS.ROUTE_BALANCE_WEIGHT) * torch.stack(balance).mean()
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(parameters, 1.0)
-            optimizer.step()
+                loss = F.cross_entropy(logits, target[begin:end])
+                balance = []
+                for item in aux.values():
+                    importance = item["route_weights"].mean(0)
+                    balance.append(importance.pow(2).sum() * item["route_weights"].size(1))
+                if balance:
+                    loss = loss + float(cfg.LOSS.ROUTE_BALANCE_WEIGHT) * torch.stack(balance).mean()
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(parameters, 1.0)
+                optimizer.step()
+                epoch_loss += float(loss.detach().item()) * (end - begin)
             print("[PC-MoE][Base] epoch={}/{} loss={:.5f}".format(
-                epoch + 1, cfg.OPTIM.BASE_EPOCHS, float(loss.item())))
+                epoch + 1, cfg.OPTIM.BASE_EPOCHS, epoch_loss / fit["raw"].size(0)))
         self.model.freeze_all()
 
     def _history_layer_means(self):
