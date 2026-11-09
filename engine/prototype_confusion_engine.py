@@ -379,10 +379,21 @@ class PrototypeConfusionRunner:
     def _train_incremental(self, session, fit_new, new_ids, apc):
         cfg = self.cfg.TRAINER.PCMOE
         candidate_layers = self._candidate_layers(apc)
-        if not candidate_layers:
-            return {"accepted": False, "reason": "APC found no layer above capacity threshold",
-                    "apc": apc, "candidate_layers": []}
         new_ids = [int(x) for x in new_ids]
+        if not candidate_layers:
+            # No capacity request: still acquire the new classes with the
+            # unchanged expert pool and calibrate the all-seen classifier.
+            baseline_bank, baseline_t = self._fit_bank_and_temperatures()
+            baseline_risk, per_class = self._risk(
+                baseline_bank, "risk", None, baseline_t
+            )
+            self.visual_temperature, self.text_temperature = baseline_t
+            return {
+                "accepted": False, "reason": "APC found no layer above capacity threshold",
+                "apc": apc, "candidate_layers": [],
+                "baseline_all_class_risk": float(baseline_risk.item()),
+                "baseline_per_class_risk": per_class,
+            }
         old_ids = [int(x) for x in self.class_ids if int(x) not in new_ids]
         old_fit = self._memory_cache("fit", old_ids)
         all_fit = {
@@ -399,10 +410,9 @@ class PrototypeConfusionRunner:
         memory_snapshot = copy.deepcopy(self.class_memory)
         class_ids_snapshot = list(self.class_ids)
         try:
-            # Stage fit prototypes before any all-class reliability or
-            # candidate-bank computation.  The outer session transaction owns
-            # rollback of this staged memory if expansion is rejected.
-            self._store_classes(fit_new, "fit")
+            # New class fit/calibration/risk memories and text prototypes
+            # are staged by run() before this transaction.  Class acquisition
+            # is independent of whether extra model capacity is accepted.
             for layer in candidate_layers:
                 self.model.add_expert(
                     layer, session, fit_new["layers"][layer].to(self.device),
@@ -496,6 +506,9 @@ class PrototypeConfusionRunner:
             if accepted:
                 self.visual_temperature, self.text_temperature = candidate_t
                 return result
+            # Reject only the added capacity.  The class-incremental task and
+            # its support/text memories remain valid under the old experts.
+            self.visual_temperature, self.text_temperature = baseline_t
             raise _RejectExpansion(result)
         except _RejectExpansion as rejected:
             self.model.rebuild_topology(topology_snapshot)
@@ -587,28 +600,19 @@ class PrototypeConfusionRunner:
                      for layer in self.model.layer_ids},
                     self.apc_reference,
                 )
-                # Stage class text before risk scoring; staged support memory is
-                # committed only after candidate decision.
+                # New classes are always acquired.  APC controls only whether
+                # additional experts are proposed; rejection must never erase
+                # the novel classes from the global classifier.
                 self._text_for_new(names, ids)
-                # Candidate transaction needs new calibration/risk queries.
-                old_memory = copy.deepcopy(self.class_memory)
-                old_class_ids = list(self.class_ids)
                 self.class_ids.extend(ids)
+                self._store_classes(fit, "fit")
                 self._store_classes(calibration, "calibration")
                 self._store_classes(risk, "risk")
                 result = self._train_incremental(session, fit, ids, apc)
-                if not result["accepted"]:
-                    self.class_memory = old_memory
-                    self.class_ids = old_class_ids
-                    # Text was staged outside the model transaction; discard it.
-                    for cid in ids:
-                        self.text_prototypes.pop(cid, None)
-                        self.description_prototypes.pop(cid, None)
-                        self.text_consistency.pop(cid, None)
-                else:
-                    # New fit/calibration/risk feature memories are now committed.
-                    self.base_layer_prototypes = self._history_layer_means()
-                # Calibration/risk memory is now committed for accepted tasks.
+                # The class memory transaction commits regardless of capacity
+                # acceptance.  A rejected candidate restores only model topology
+                # and parameters to the old expert pool.
+                self.base_layer_prototypes = self._history_layer_means()
             self.model.freeze_all()
             evaluation = self._evaluate_all_seen(session)
             result["evaluation"] = evaluation
