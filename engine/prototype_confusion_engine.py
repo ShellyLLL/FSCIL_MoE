@@ -740,7 +740,7 @@ class PrototypeConfusionRunner:
         directory = Path(self.cfg.TRAINER.PCMOE.CHECKPOINT.DIR)
         directory.mkdir(parents=True, exist_ok=True)
         payload = {
-            "schema_version": 1, "completed_session": int(session),
+            "schema_version": 2, "completed_session": int(session),
             "model": {k: v.detach().cpu() for k, v in self.model.state_dict().items()},
             "topology": self.model.topology(),
             "class_ids": list(self.class_ids), "class_memory": self.class_memory,
@@ -769,8 +769,12 @@ class PrototypeConfusionRunner:
         if not path:
             return
         payload = torch.load(path, map_location="cpu", weights_only=False)
-        if payload.get("schema_version") != 1:
-            raise ValueError("Unsupported PC-MoE checkpoint schema.")
+        if payload.get("schema_version") != 2:
+            raise ValueError(
+                "Unsupported PC-MoE checkpoint schema. This routing architecture requires "
+                "schema 2; schema-1 checkpoints predate stability-constrained global Top-k "
+                "routing and must not be silently resumed."
+            )
         self.model.rebuild_topology(payload["topology"])
         self.model.load_state_dict(payload["model"], strict=True)
         self.model.freeze_all()
