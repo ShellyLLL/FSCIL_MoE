@@ -529,6 +529,7 @@ class PrototypeConfusionRunner:
         except _RejectExpansion as rejected:
             self.model.rebuild_topology(topology_snapshot)
             self.model.load_state_dict(model_snapshot, strict=True)
+            self.model.set_temperatures(self.visual_temperature, self.text_temperature)
             self.model.freeze_all()
             self.class_memory = memory_snapshot
             self.class_ids = class_ids_snapshot
