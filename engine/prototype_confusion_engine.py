@@ -19,7 +19,7 @@ from models.prototype_confusion_moe import (
 
 
 class PrototypeConfusionRunner:
-    """Feature-memory FSCIL: no old images, no task oracle, one global classifier."""
+    """Prototype-memory FSCIL: no old samples, no task oracle, one global classifier."""
     def __init__(self, cfg):
         self.cfg = cfg
         self.data = DatasetManager(cfg)
@@ -101,36 +101,116 @@ class PrototypeConfusionRunner:
                 self._slice(cache, risk))
 
     def _memory_cache(self, field, class_ids=None):
+        """Assemble current-session samples plus one stored centroid per old class.
+
+        Historical sample-level features are never persisted.  Prototype records
+        contribute exactly one row and a synthetic negative source id, while
+        current-session records retain their true source ids for LOO exclusion.
+        """
         ids = sorted(self.class_ids if class_ids is None else class_ids)
         raw, labels, sources = [], [], []
         layers = {i: [] for i in self.model.layer_ids}
-        for cid in ids:
-            part = self.class_memory[cid][field]
-            if part is None or part["raw"].numel() == 0:
+        class_counts = {}
+        prototype_mask = []
+        for position, cid in enumerate(ids):
+            part = self.class_memory[cid].get(field)
+            if part is None:
                 continue
-            raw.append(part["raw"])
-            labels.append(torch.full((part["raw"].size(0),), cid, dtype=torch.long))
-            sources.append(part["sources"])
+            kind = part.get("kind")
+            values = part["raw"]
+            if kind == "prototype":
+                if values.ndim != 2 or values.size(0) != 1:
+                    raise ValueError("Historical prototype memory must contain exactly one row per class.")
+                source_values = torch.tensor([-(position + 1)], dtype=torch.long)
+                class_counts[int(cid)] = int(part["count"])
+                prototype_mask.append(torch.ones(1, dtype=torch.bool))
+            elif kind == "samples":
+                if values.ndim != 2 or values.size(0) == 0:
+                    raise ValueError("Current-session sample memory must be a non-empty [N,D] tensor.")
+                source_values = torch.as_tensor(part["sources"], dtype=torch.long).reshape(-1)
+                if source_values.numel() != values.size(0) or source_values.lt(0).any():
+                    raise ValueError("Current-session source ids must be non-negative and align with features.")
+                class_counts[int(cid)] = int(values.size(0))
+                prototype_mask.append(torch.zeros(values.size(0), dtype=torch.bool))
+            else:
+                raise ValueError(
+                    "Unknown class-memory record type for class {} field {}.".format(cid, field)
+                )
+            raw.append(values)
+            labels.append(torch.full((values.size(0),), int(cid), dtype=torch.long))
+            sources.append(source_values)
             for layer in self.model.layer_ids:
-                layers[layer].append(part["layers"][layer])
+                layer_values = part["layers"][layer]
+                if layer_values.ndim != 2 or layer_values.size(0) != values.size(0):
+                    raise ValueError("Layer memory shape does not match raw feature memory.")
+                layers[layer].append(layer_values)
         if not raw:
             return None
         return {
             "raw": torch.cat(raw).to(self.device),
             "labels": torch.cat(labels).to(self.device),
             "sources": torch.cat(sources).to(self.device),
+            "prototype_mask": torch.cat(prototype_mask).to(self.device),
+            "class_counts": class_counts,
             "layers": {i: torch.cat(v).to(self.device) for i, v in layers.items()},
         }
 
     def _store_classes(self, split_cache, field):
+        """Stage only the current session's support features until its transaction ends."""
         for cid in torch.unique(split_cache["labels"], sorted=True).tolist():
             idx = torch.where(split_cache["labels"].eq(cid))[0]
             self.class_memory.setdefault(int(cid), {})[field] = {
+                "kind": "samples",
                 "raw": split_cache["raw"][idx].clone(),
                 "sources": split_cache["sources"][idx].clone(),
                 "layers": {i: split_cache["layers"][i][idx].clone()
                            for i in self.model.layer_ids},
             }
+
+    def _compress_class_memory(self):
+        """Replace every completed class/session sample set with one centroid.
+
+        This is the no-replay boundary: after compression, no per-example raw
+        feature, hidden feature, source id, or route record survives in memory.
+        """
+        for cid, fields in self.class_memory.items():
+            for field, part in list(fields.items()):
+                if part is None or part.get("kind") == "prototype":
+                    continue
+                if part.get("kind") != "samples":
+                    raise ValueError("Cannot compress unknown memory type for class {}.".format(cid))
+                count = int(part["raw"].size(0))
+                if count < 1:
+                    raise ValueError("Cannot create an empty class prototype.")
+                fields[field] = {
+                    "kind": "prototype",
+                    "raw": normalize(part["raw"].mean(0, keepdim=True)).cpu(),
+                    "layers": {
+                        layer: values.mean(0, keepdim=True).cpu()
+                        for layer, values in part["layers"].items()
+                    },
+                    "count": count,
+                }
+
+    def _assert_prototype_only_memory(self):
+        """Fail closed if a checkpoint would retain historical sample replay."""
+        for cid, fields in self.class_memory.items():
+            for field, part in fields.items():
+                if part is None:
+                    continue
+                if part.get("kind") != "prototype" or "sources" in part:
+                    raise RuntimeError(
+                        "Checkpoint blocked: class {} field {} still contains sample-level memory.".format(
+                            cid, field
+                        )
+                    )
+                if part["raw"].ndim != 2 or part["raw"].size(0) != 1:
+                    raise RuntimeError("Checkpoint blocked: memory must contain one raw centroid per class.")
+                if any(value.ndim != 2 or value.size(0) != 1
+                       for value in part["layers"].values()):
+                    raise RuntimeError("Checkpoint blocked: memory must contain one layer centroid per class.")
+                if int(part.get("count", 0)) < 1:
+                    raise RuntimeError("Checkpoint blocked: prototype support count is invalid.")
 
     def _all_text(self, ids=None):
         ids = sorted(self.class_ids if ids is None else ids)
@@ -200,7 +280,7 @@ class PrototypeConfusionRunner:
             values = enhanced[fit["labels"].eq(cid)]
             mean = values.mean(0)
             visual.append(normalize(mean))
-            counts.append(values.size(0))
+            counts.append(fit["class_counts"][cid])
             concentration.append(mean.norm().clamp(0.0, 1.0))
         visual = torch.stack(visual)
         counts = torch.tensor(counts, device=self.device, dtype=torch.float32)
@@ -399,12 +479,20 @@ class PrototypeConfusionRunner:
         self.model.freeze_all()
 
     def _history_layer_means(self):
+        """Return one normalized layer prototype per seen class; never expand old samples."""
         fit = self._memory_cache("fit")
         result = {}
         for layer in self.model.layer_ids:
             result[layer] = {}
             for cid in sorted(self.class_ids):
-                result[layer][cid] = normalize(fit["layers"][layer][fit["labels"].eq(cid)].mean(0))
+                values = fit["layers"][layer][fit["labels"].eq(cid)]
+                if values.size(0) != 1:
+                    raise RuntimeError(
+                        "Historical layer memory must be one class prototype, got {} rows for class {}.".format(
+                            values.size(0), cid
+                        )
+                    )
+                result[layer][cid] = normalize(values[0])
         return result
 
     def _candidate_layers(self, apc):
@@ -432,6 +520,7 @@ class PrototypeConfusionRunner:
                 "apc": apc, "candidate_layers": [],
                 "baseline_all_class_risk": float(baseline_risk.item()),
                 "baseline_per_class_risk": per_class,
+                "risk_protocol": "historical class-risk centroids plus current-session held-out risk supports; not historical per-example empirical risk",
             }
         old_ids = [int(x) for x in self.class_ids if int(x) not in new_ids]
         old_fit = self._memory_cache("fit", old_ids)
@@ -623,6 +712,7 @@ class PrototypeConfusionRunner:
                 "baseline_per_class_risk": baseline_per_class,
                 "candidate_per_class_risk": candidate_per_class,
                 "apc": apc,
+                "risk_protocol": "historical class-risk centroids plus current-session held-out risk supports; not historical per-example empirical risk",
             }
             if accepted:
                 self.visual_temperature, self.text_temperature = candidate_t
@@ -720,8 +810,7 @@ class PrototypeConfusionRunner:
                     "base_calibrated_inter_modal_beta": self.inter_modal_beta,
                 }
             else:
-                fit_before = self._memory_cache("fit")
-                apc = prototype_confusion(
+                        apc = prototype_confusion(
                     {layer: values.to(self.device) for layer, values in fit["layers"].items()},
                     fit["labels"].to(self.device), ids,
                     {layer: torch.stack([self._history_layer_means()[layer][cid]
@@ -742,6 +831,8 @@ class PrototypeConfusionRunner:
                 # acceptance.  A rejected candidate restores only model topology
                 # and parameters to the old expert pool.
                 self.base_layer_prototypes = self._history_layer_means()
+            self._compress_class_memory()
+            self._assert_prototype_only_memory()
             self.model.freeze_all()
             evaluation = self._evaluate_all_seen(session)
             result["evaluation"] = evaluation
@@ -752,10 +843,12 @@ class PrototypeConfusionRunner:
             ))
 
     def _save(self, session):
+        self._compress_class_memory()
+        self._assert_prototype_only_memory()
         directory = Path(self.cfg.TRAINER.PCMOE.CHECKPOINT.DIR)
         directory.mkdir(parents=True, exist_ok=True)
         payload = {
-            "schema_version": 2, "completed_session": int(session),
+            "schema_version": 3, "completed_session": int(session),
             "model": {k: v.detach().cpu() for k, v in self.model.state_dict().items()},
             "topology": self.model.topology(),
             "class_ids": list(self.class_ids), "class_memory": self.class_memory,
@@ -784,12 +877,26 @@ class PrototypeConfusionRunner:
         if not path:
             return
         payload = torch.load(path, map_location="cpu", weights_only=False)
-        if payload.get("schema_version") != 2:
+        if payload.get("schema_version") != 3:
             raise ValueError(
-                "Unsupported PC-MoE checkpoint schema. This routing architecture requires "
-                "schema 2; schema-1 checkpoints predate stability-constrained global Top-k "
-                "routing and must not be silently resumed."
+                "Unsupported PC-MoE checkpoint schema. This architecture requires schema 3 "
+                "with prototype-only historical memory; older checkpoints retain sample-level "
+                "feature replay and must not be silently resumed."
             )
+        memory = payload.get("class_memory", {})
+        for cid, fields in memory.items():
+            for field, part in fields.items():
+                if part is None:
+                    continue
+                if (part.get("kind") != "prototype" or "sources" in part
+                        or part["raw"].ndim != 2 or part["raw"].size(0) != 1
+                        or any(value.ndim != 2 or value.size(0) != 1
+                               for value in part["layers"].values())):
+                    raise ValueError(
+                        "Checkpoint contains sample-level historical memory for class {} field {}.".format(
+                            cid, field
+                        )
+                    )
         self.model.rebuild_topology(payload["topology"])
         self.model.load_state_dict(payload["model"], strict=True)
         self.model.freeze_all()
