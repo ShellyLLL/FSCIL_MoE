@@ -1,5 +1,6 @@
 """Architecture invariants for Prototype-Confusion Guided Dynamic MoE-FSCIL."""
 import unittest
+import numpy as np
 import torch
 import torch.nn.functional as F
 
