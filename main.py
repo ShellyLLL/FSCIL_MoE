@@ -106,9 +106,60 @@ def extend_cfg(cfg):
     cfg.TRAINER.BiMC.FUSED_CONFLICT_MARGIN = 0.05
     cfg.TRAINER.BiMC.END_SESSION = -1
 
+def extend_pcmoe_cfg(cfg):
+    """Register PC-MoE options in the shared entry-point configuration."""
+    cfg.TRAINER.PCMOE = CN()
+    p = cfg.TRAINER.PCMOE
+    p.ENABLE = False
+    p.END_SESSION = -1
+    p.TEXT_TEMPLATES = []
+    p.VISUAL_MOE = CN()
+    p.VISUAL_MOE.INSERT_BLOCKS = [-4, -3, -2, -1]
+    p.VISUAL_MOE.NUM_BASE_EXPERTS = 4
+    p.VISUAL_MOE.BASE_REDUCTION = 4
+    p.VISUAL_MOE.INCREMENTAL_REDUCTION = 16
+    p.VISUAL_MOE.BASE_SCALE_INIT = 0.5
+    p.VISUAL_MOE.TOP_K = 2
+    p.CALIBRATION = CN()
+    p.CALIBRATION.INITIAL_TEMPERATURE_VISUAL = 0.1
+    p.CALIBRATION.INITIAL_TEMPERATURE_TEXT = 0.1
+    p.CALIBRATION.MIN_TEMPERATURE = 0.02
+    p.CALIBRATION.MAX_TEMPERATURE = 2.0
+    p.CALIBRATION.RELIABILITY_KAPPA = 2.0
+    p.CALIBRATION.LAMBDA_VISUAL = 0.1
+    p.CALIBRATION.VISUAL_TAU = 16.0
+    p.CALIBRATION.LAMBDA_TEXT = 0.5
+    p.CALIBRATION.INTER_MODAL_BETA = 0.3
+    p.EXPANSION = CN()
+    p.EXPANSION.APC_MIN_PERCENTILE = 0.8
+    p.EXPANSION.MAX_LAYERS_PER_SESSION = 4
+    p.EXPANSION.MIN_RISK_GAIN = 0.001
+    p.EXPANSION.MAX_OLD_CLASS_RISK_INCREASE = 0.01
+    p.EXPANSION.MAX_NEW_CLASS_RISK_INCREASE = 0.01
+    p.OPTIM = CN()
+    p.OPTIM.BASE_EPOCHS = 50
+    p.OPTIM.BASE_BATCH_SIZE = 64
+    p.OPTIM.BASE_LR = 1e-4
+    p.OPTIM.INCREMENTAL_EPOCHS = 10
+    p.OPTIM.INCREMENTAL_LR = 3e-4
+    p.OPTIM.WEIGHT_DECAY = 1e-4
+    p.LOSS = CN()
+    p.LOSS.ROUTE_BALANCE_WEIGHT = 0.01
+    p.LOSS.ROUTE_MARGIN = 0.05
+    p.LOSS.NEW_ROUTE_WEIGHT = 1.0
+    p.LOSS.HISTORICAL_ROUTE_WEIGHT = 1.0
+    p.LOSS.MAX_HISTORICAL_ROUTE_DRIFT = 0.05
+    p.LOSS.MAX_HISTORICAL_INTRUSION_RATE = 0.01
+    p.LOSS.MIN_NOVEL_ACTIVATION_RATE = 0.20
+    p.CHECKPOINT = CN()
+    p.CHECKPOINT.DIR = 'checkpoints/prototype_confusion_moe'
+    p.CHECKPOINT.RESUME = ''
+
+
 def setup_cfg(dataset_cfg_file, method_cfg_file, opts=None):
     cfg = CN()
     extend_cfg(cfg)
+    extend_pcmoe_cfg(cfg)
     # YACS opens paths with the platform default encoding.  Trainer files carry
     # Chinese comments and are UTF-8, so explicitly load them to keep Windows
     # runs reproducible instead of depending on the active code page.
@@ -132,16 +183,22 @@ def main():
     overrides = list(args.opts)
     if args.resume:
         overrides += ['TRAINER.BiMC.CHECKPOINT.RESUME', args.resume]
+        overrides += ['TRAINER.PCMOE.CHECKPOINT.RESUME', args.resume]
     if args.support_manifest:
         overrides += ['DATASET.SUPPORT_MANIFEST_PATH', args.support_manifest]
     if args.end_session >= 0:
         overrides += ['TRAINER.BiMC.END_SESSION', str(args.end_session)]
+        overrides += ['TRAINER.PCMOE.END_SESSION', str(args.end_session)]
     cfg = setup_cfg(args.data_cfg, args.train_cfg, overrides)
     set_seed(cfg.SEED)
     set_gpu(cfg.DEVICE.GPU_ID)
     
-    from engine.engine import Runner
-    engine = Runner(cfg)
+    if cfg.TRAINER.PCMOE.ENABLE:
+        from engine.prototype_confusion_engine import PrototypeConfusionRunner
+        engine = PrototypeConfusionRunner(cfg)
+    else:
+        from engine.engine import Runner
+        engine = Runner(cfg)
     engine.run()
 
 if __name__ == '__main__':
