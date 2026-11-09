@@ -134,16 +134,22 @@ reliability-weights the two calibrated score streams. The dynamic MoE visual
 embedding and calibrated text embedding meet in the same all-seen-class
 logit space for training, capacity-risk evaluation, and inference.
 
-Run the independent PC-MoE path with:
+PC-MoE is selected through the shared `main.py` entry point and the `PCMOE.ENABLE: True` setting in `bimc.yaml`. The PC-MoE architecture and runner remain unchanged; only configuration registration and dispatch are unified. Example CUB200 run:
 
 ~~~BASH
-python main_prototype_confusion.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/prototype_confusion_moe.yaml
+python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml
+~~~
+
+To stop after Base Session:
+
+~~~BASH
+python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --end_session 0
 ~~~
 
 To resume a PC-MoE checkpoint:
 
 ~~~BASH
-python main_prototype_confusion.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/prototype_confusion_moe.yaml --resume checkpoints/prototype_confusion_moe/session_03.pth
+python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --resume checkpoints/prototype_confusion_moe/session_03.pth
 ~~~
 
 Architecture invariant tests (not FSCIL performance experiments):
