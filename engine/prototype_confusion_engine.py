@@ -79,10 +79,12 @@ class PrototypeConfusionRunner:
             rng = np.random.default_rng(int(self.cfg.SEED) * 100003 + int(session) * 997 + int(cid))
             rng.shuffle(indices)
             distinct_sources = torch.unique(cache["sources"][indices]).numel()
-            if distinct_sources < 3:
+            # Leave at least two fit sources for source-exclusive LOO
+            # prototypes, plus one independent calibration and one risk source.
+            if distinct_sources < 4:
                 raise ValueError(
-                    "PC-MoE risk-controlled expansion requires >=3 distinct source images "
-                    "per class (fit/calibration/risk); class {} has {}.".format(
+                    "PC-MoE requires >=4 distinct source images per class "
+                    "(>=2 fit for LOO, 1 calibration, 1 risk); class {} has {}.".format(
                         int(cid), int(distinct_sources)
                     )
                 )
