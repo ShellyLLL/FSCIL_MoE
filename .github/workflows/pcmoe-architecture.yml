@@ -8,7 +8,10 @@ on:
       - "models/prototype_confusion_moe.py"
       - "engine/prototype_confusion_engine.py"
       - "tests/test_prototype_confusion_moe.py"
-      - "main_prototype_confusion.py"
+      - "main.py"
+      - "configs/trainers/bimc.yaml"
+      - "configs/datasets/*.yaml"
+      - "datasets/cub200.py"
       - ".github/workflows/pcmoe-architecture.yml"
   pull_request:
     branches:
@@ -32,7 +35,7 @@ jobs:
         run: |
           python -m py_compile models/prototype_confusion_moe.py
           python -m py_compile engine/prototype_confusion_engine.py
-          python -m py_compile main_prototype_confusion.py
+          python -m py_compile main.py
           python -m py_compile tests/test_prototype_confusion_moe.py
       - name: Run architecture invariant tests
         env:
