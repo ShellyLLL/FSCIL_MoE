@@ -144,6 +144,23 @@ class PrototypeConfusionTests(unittest.TestCase):
         torch.testing.assert_close(calibrated[:, :2], prototypes[:, :2])
         self.assertFalse(torch.allclose(calibrated[:, 2], prototypes[:, 2]))
 
+    def test_source_exclusive_bank_supports_old_centroids_and_current_new_samples(self):
+        features = F.normalize(torch.tensor([
+            [1., 0.], [0.9, 0.1], [0.8, 0.2], [0., 1.]
+        ]), dim=-1)
+        labels = torch.tensor([0, 1, 1, 1])
+        # Class 0 is a single historical centroid with a negative synthetic
+        # source id; class 1 has current-session samples with real source ids.
+        sources = torch.tensor([-1, 20, 21, 22])
+        bank = source_exclusive_means(
+            features, labels, sources, [0, 1], query_indices=[1, 2, 3]
+        )
+        self.assertEqual(tuple(bank.shape), (3, 2, 2))
+        torch.testing.assert_close(bank[:, 0], features[0].expand(3, -1))
+        for row, query in enumerate([1, 2, 3]):
+            remaining = features[(labels == 1) & (sources != sources[query])]
+            torch.testing.assert_close(bank[row, 1], F.normalize(remaining.mean(0), dim=0))
+
     def test_completed_class_memory_is_compressed_to_single_prototypes(self):
         runner = PrototypeConfusionRunner.__new__(PrototypeConfusionRunner)
         runner.model = type("Model", (), {"layer_ids": [2, 5]})()
