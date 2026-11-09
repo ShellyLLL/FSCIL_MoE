@@ -286,6 +286,7 @@ class PrototypeConfusionTests(unittest.TestCase):
         class FakeModel(nn.Module):
             def __init__(self):
                 super().__init__()
+                self.layer_ids = [2]
                 self.adapters = nn.ModuleDict({
                     "2": DynamicLayerMoE(
                         4, 4, base_experts=2, base_reduction=2,
