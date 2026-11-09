@@ -575,6 +575,17 @@ class PrototypeConfusionRunner:
                 )
                 old_route = adapter.route_drift(old_queries["layers"][layer][old_mask])
                 new_route = adapter.route_drift(old_queries["layers"][layer][new_mask])
+                novel_labels = old_queries["labels"][new_mask]
+                per_new_class_activation = {}
+                for cid in new_ids:
+                    class_mask = novel_labels.eq(int(cid))
+                    if not class_mask.any():
+                        raise RuntimeError(
+                            "Expansion risk set is missing novel class {}.".format(cid)
+                        )
+                    per_new_class_activation[int(cid)] = float(
+                        new_route["new_expert_selected"][class_mask].float().mean().item()
+                    )
                 route_checks[int(layer)] = {
                     "historical_mean_drift": float(old_route["drift"].mean().item()),
                     "historical_max_drift": float(old_route["drift"].max().item()),
@@ -584,12 +595,16 @@ class PrototypeConfusionRunner:
                     "novel_activation_rate": float(
                         new_route["new_expert_selected"].float().mean().item()
                     ),
+                    "novel_activation_by_class": per_new_class_activation,
                     "novel_mean_weight": float(new_route["new_expert_weight"].mean().item()),
                 }
             route_ok = all(
                 item["historical_max_drift"] <= float(route_cfg.MAX_HISTORICAL_ROUTE_DRIFT)
                 and item["historical_intrusion_rate"] <= float(route_cfg.MAX_HISTORICAL_INTRUSION_RATE)
-                and item["novel_activation_rate"] >= float(route_cfg.MIN_NOVEL_ACTIVATION_RATE)
+                and all(
+                    rate >= float(route_cfg.MIN_NOVEL_ACTIVATION_RATE)
+                    for rate in item["novel_activation_by_class"].values()
+                )
                 for item in route_checks.values()
             )
             accepted = (
