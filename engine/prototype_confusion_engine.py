@@ -479,20 +479,19 @@ class PrototypeConfusionRunner:
         self.model.freeze_all()
 
     def _history_layer_means(self):
-        """Return one normalized layer prototype per seen class; never expand old samples."""
+        """Return one normalized layer prototype per seen class."""
         fit = self._memory_cache("fit")
         result = {}
         for layer in self.model.layer_ids:
             result[layer] = {}
             for cid in sorted(self.class_ids):
                 values = fit["layers"][layer][fit["labels"].eq(cid)]
-                if values.size(0) != 1:
-                    raise RuntimeError(
-                        "Historical layer memory must be one class prototype, got {} rows for class {}.".format(
-                            values.size(0), cid
-                        )
-                    )
-                result[layer][cid] = normalize(values[0])
+                if values.size(0) == 0:
+                    raise RuntimeError("Missing layer memory for class {}.".format(cid))
+                # At the base session, current fit examples are still available
+                # for base training; after session commit, each old class has
+                # exactly one stored prototype row.
+                result[layer][cid] = normalize(values.mean(0))
         return result
 
     def _candidate_layers(self, apc):
@@ -810,7 +809,7 @@ class PrototypeConfusionRunner:
                     "base_calibrated_inter_modal_beta": self.inter_modal_beta,
                 }
             else:
-                        apc = prototype_confusion(
+                apc = prototype_confusion(
                     {layer: values.to(self.device) for layer, values in fit["layers"].items()},
                     fit["labels"].to(self.device), ids,
                     {layer: torch.stack([self._history_layer_means()[layer][cid]
