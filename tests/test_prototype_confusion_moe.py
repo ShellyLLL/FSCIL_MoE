@@ -144,6 +144,66 @@ class PrototypeConfusionTests(unittest.TestCase):
         torch.testing.assert_close(calibrated[:, :2], prototypes[:, :2])
         self.assertFalse(torch.allclose(calibrated[:, 2], prototypes[:, 2]))
 
+    def test_completed_class_memory_is_compressed_to_single_prototypes(self):
+        runner = PrototypeConfusionRunner.__new__(PrototypeConfusionRunner)
+        runner.model = type("Model", (), {"layer_ids": [2, 5]})()
+        runner.class_memory = {
+            10: {
+                "fit": {
+                    "kind": "samples",
+                    "raw": torch.tensor([[1., 0.], [0.8, 0.2], [0.9, 0.1]]),
+                    "sources": torch.tensor([1, 2, 3]),
+                    "layers": {
+                        2: torch.tensor([[1., 0.], [0.8, 0.2], [0.9, 0.1]]),
+                        5: torch.tensor([[0., 1.], [0.2, 0.8], [0.1, 0.9]]),
+                    },
+                }
+            }
+        }
+        runner._compress_class_memory()
+        runner._assert_prototype_only_memory()
+        item = runner.class_memory[10]["fit"]
+        self.assertEqual(item["kind"], "prototype")
+        self.assertNotIn("sources", item)
+        self.assertEqual(tuple(item["raw"].shape), (1, 2))
+        self.assertEqual(tuple(item["layers"][2].shape), (1, 2))
+        self.assertEqual(item["count"], 3)
+
+    def test_checkpoint_guard_rejects_sample_level_historical_memory(self):
+        runner = PrototypeConfusionRunner.__new__(PrototypeConfusionRunner)
+        runner.class_memory = {
+            10: {"fit": {
+                "kind": "samples",
+                "raw": torch.randn(3, 4),
+                "sources": torch.tensor([1, 2, 3]),
+                "layers": {2: torch.randn(3, 4)},
+            }}
+        }
+        with self.assertRaises(RuntimeError):
+            runner._assert_prototype_only_memory()
+
+    def test_memory_cache_uses_one_old_centroid_and_current_novel_supports(self):
+        runner = PrototypeConfusionRunner.__new__(PrototypeConfusionRunner)
+        runner.model = type("Model", (), {"layer_ids": [2]})()
+        runner.device = "cpu"
+        runner.class_ids = [10, 20]
+        runner.class_memory = {
+            10: {"fit": {
+                "kind": "prototype", "raw": torch.tensor([[1., 0.]]),
+                "layers": {2: torch.tensor([[0.5, 0.5]])}, "count": 5,
+            }},
+            20: {"fit": {
+                "kind": "samples", "raw": torch.tensor([[0., 1.], [0.1, 0.9]]),
+                "sources": torch.tensor([100, 101]),
+                "layers": {2: torch.tensor([[0.2, 0.8], [0.3, 0.7]])},
+            }},
+        }
+        cache = runner._memory_cache("fit")
+        self.assertEqual(tuple(cache["raw"].shape), (3, 2))
+        self.assertEqual(cache["class_counts"], {10: 5, 20: 2})
+        self.assertEqual(cache["sources"][0].item(), -1)
+        self.assertTrue(torch.equal(cache["prototype_mask"], torch.tensor([True, False, False])))
+
     def test_balanced_risk_requires_every_query_label_in_global_bank(self):
         logits = torch.tensor([[4., 0., 0.], [0., 3., 0.], [0., 0., 2.]])
         labels = torch.tensor([10, 20, 30])
