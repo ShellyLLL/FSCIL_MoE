@@ -351,7 +351,6 @@ class PrototypeConfusionRunner:
                           (visual / self.visual_temperature + textual / self.text_temperature))
                 loss_sum = loss_sum + F.cross_entropy(logits, target[begin:end], reduction="sum")
             loss = loss_sum / enhanced.size(0)
-            loss = F.cross_entropy(logits, target)
             balance = []
             for item in aux.values():
                 importance = item["route_weights"].mean(0)
