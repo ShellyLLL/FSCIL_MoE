@@ -31,27 +31,37 @@ def class_means(features, labels, class_ids):
     return torch.stack(means), torch.tensor(counts, device=features.device)
 
 
-def source_exclusive_means(features, labels, source_ids, class_ids):
-    """[N,C,D] prototype bank; every query source is removed from every class."""
+def source_exclusive_means(features, labels, source_ids, class_ids, query_indices=None):
+    """Build source-exclusive prototype banks only for requested query rows.
+
+    Excluding a source globally prevents leakage when an original image has
+    multiple deterministic views. query_indices bounds peak memory for
+    base-session training with thousands of support examples.
+    """
     features = normalize(features)
     labels = torch.as_tensor(labels, device=features.device, dtype=torch.long)
     sources = torch.as_tensor(source_ids, device=features.device).reshape(-1)
     classes = torch.as_tensor(class_ids, device=features.device, dtype=torch.long)
     if features.size(0) != labels.numel() or labels.numel() != sources.numel():
         raise ValueError("Features, labels and source ids must have equal lengths.")
+    if query_indices is None:
+        query_indices = torch.arange(features.size(0), device=features.device)
+    else:
+        query_indices = torch.as_tensor(query_indices, device=features.device, dtype=torch.long)
     result = []
-    for source in sources:
-        rows = []
+    for query_index in query_indices.tolist():
+        source = sources[query_index]
         keep = sources.ne(source)
+        rows = []
         for cid in classes:
             values = features[keep & labels.eq(cid)]
             if values.numel() == 0:
-                raise ValueError("LOO bank empty for class {} and source {}".format(int(cid), source.item()))
+                raise ValueError("LOO bank empty for class {} and source {}".format(int(cid), int(source.item())))
             rows.append(normalize(values.mean(0)))
         result.append(torch.stack(rows))
+    if not result:
+        return features.new_empty((0, classes.numel(), features.size(-1)))
     return torch.stack(result)
-
-
 def prototype_confusion(layer_features, labels, new_class_ids,
                         historical_layer_prototypes, apc_reference):
     """APC: nearest inter-class similarity percentile against base-session reference."""
