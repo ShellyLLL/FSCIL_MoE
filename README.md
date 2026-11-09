@@ -108,15 +108,24 @@ old-pool Top-k boundary, while all historical fit features are trained to
 remain below it. Historical experts and historical router columns remain
 frozen. Incremental training does not impose uniform expert usage.
 
-Candidate experts are assessed on source-disjoint risk examples using the
-same global inference router. A candidate is committed only when the
-class-balanced all-seen-class NLL improves, old- and new-class risk regressions
-remain bounded, historical route drift/intrusion stay within limits, and the
-new expert reaches the minimum novel-class activation coverage. Expansion
-rejection never rejects the new classes: their support/text prototype memory
-is still retained and classified by the existing expert pool.
-Rejecting capacity never rejects the new classes: their support/text prototype
-memory is still committed and classified by the existing expert pool.
+Historical memory is strictly prototype-only. At the end of each session,
+fit, calibration and risk records are compressed independently to one class
+centroid per feature space, together with a count; per-example features,
+source IDs and route records are discarded. During a new session, only that
+session's support examples are available as sample-level features. Historical
+classes contribute their stored centroids to route protection, calibration
+and risk-anchor calculations. Consequently, the all-class risk gate is a
+prototype-anchored risk proxy, not an empirical risk measured on replayed old
+examples; it must not be described as old-sample replay or exact old test risk.
+
+Candidate experts are assessed on the same global inference router. A
+candidate is committed only when the class-balanced all-seen-class
+prototype-anchored risk improves, old- and new-class risk regressions remain
+bounded, historical prototype route drift/intrusion stay within limits, and
+every new class reaches the minimum novel-expert activation coverage.
+Expansion rejection never rejects the new classes: their current-session
+class prototypes and text prototypes are retained and classified by the
+existing expert pool.
 
 Visual intra-modal calibration transports novel visual prototypes toward the
 base visual prototype geometry; text intra-modal calibration combines CLIP
@@ -143,8 +152,10 @@ Architecture invariant tests (not FSCIL performance experiments):
 python -m unittest tests.test_prototype_confusion_moe
 ~~~
 
-Session checkpoints include expert topology/weights, all-class fit/calibration/
-risk feature memories (no old images), text and description prototypes,
+Session checkpoints use schema 3 and include expert topology/weights,
+prototype-only class fit/calibration/risk memories (one centroid per class
+and feature space, with no old per-example features or source IDs), text and
+description prototypes,
 temperatures, APC reference distributions, support manifest, diagnostics and
 random states. Each session also reports all-seen-class task accuracy (AA) and
 base-class accuracy drop (PD).
