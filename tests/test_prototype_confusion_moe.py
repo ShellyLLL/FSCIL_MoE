@@ -7,6 +7,7 @@ from models.prototype_confusion_moe import (
     UnifiedTopKRouter, DynamicLayerMoE, source_exclusive_means,
     prototype_confusion, make_apc_reference, balanced_risk,
 )
+from engine.prototype_confusion_engine import PrototypeConfusionRunner
 
 
 class PrototypeConfusionTests(unittest.TestCase):
@@ -80,6 +81,27 @@ class PrototypeConfusionTests(unittest.TestCase):
                             for name in trainable))
         layer.freeze_all()
         self.assertFalse(any(p.requires_grad for p in layer.parameters()))
+
+    def test_visual_intra_modal_calibration_is_applied_to_per_query_banks(self):
+        runner = PrototypeConfusionRunner.__new__(PrototypeConfusionRunner)
+        runner.cfg = type("Cfg", (), {
+            "DATASET": type("DatasetCfg", (), {"NUM_INIT_CLS": 2})(),
+            "TRAINER": type("TrainerCfg", (), {
+                "PCMOE": type("PCMOECfg", (), {
+                    "CALIBRATION": type("CalibrationCfg", (), {
+                        "LAMBDA_VISUAL": 0.5, "VISUAL_TAU": 8.0
+                    })()
+                })()
+            })()
+        })()
+        prototypes = F.normalize(torch.tensor([
+            [[1., 0.], [0., 1.], [0.8, 0.6]],
+            [[1., 0.], [0., 1.], [0.6, 0.8]],
+        ]), dim=-1)
+        calibrated = runner._calibrate_visual_bank(prototypes)
+        self.assertEqual(tuple(calibrated.shape), tuple(prototypes.shape))
+        torch.testing.assert_close(calibrated[:, :2], prototypes[:, :2])
+        self.assertFalse(torch.allclose(calibrated[:, 2], prototypes[:, 2]))
 
     def test_balanced_risk_requires_every_query_label_in_global_bank(self):
         logits = torch.tensor([[4., 0., 0.], [0., 3., 0.], [0., 0., 2.]])
