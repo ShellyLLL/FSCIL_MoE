@@ -394,6 +394,7 @@ class PrototypeConfusionRunner:
                 baseline_bank, "risk", None, baseline_t
             )
             self.visual_temperature, self.text_temperature = baseline_t
+            self.model.set_temperatures(*baseline_t)
             return {
                 "accepted": False, "reason": "APC found no layer above capacity threshold",
                 "apc": apc, "candidate_layers": [],
@@ -512,10 +513,12 @@ class PrototypeConfusionRunner:
             }
             if accepted:
                 self.visual_temperature, self.text_temperature = candidate_t
+                self.model.set_temperatures(*candidate_t)
                 return result
             # Reject only the added capacity.  The class-incremental task and
             # its support/text memories remain valid under the old experts.
             self.visual_temperature, self.text_temperature = baseline_t
+            self.model.set_temperatures(*baseline_t)
             raise _RejectExpansion(result)
         except _RejectExpansion as rejected:
             self.model.rebuild_topology(topology_snapshot)
@@ -596,6 +599,7 @@ class PrototypeConfusionRunner:
                 })
                 bank, temps = self._fit_bank_and_temperatures()
                 self.visual_temperature, self.text_temperature = temps
+                self.model.set_temperatures(*temps)
                 result = {"base_session": True, "accepted": False}
             else:
                 fit_before = self._memory_cache("fit")
@@ -677,6 +681,7 @@ class PrototypeConfusionRunner:
         self.base_layer_prototypes = payload["base_layer_prototypes"]
         self.visual_temperature = float(payload["visual_temperature"])
         self.text_temperature = float(payload["text_temperature"])
+        self.model.set_temperatures(self.visual_temperature, self.text_temperature)
         self.inter_modal_beta = float(payload["inter_modal_beta"])
         self.diagnostics = list(payload["diagnostics"])
         self.base_accuracy = payload.get("base_accuracy")
