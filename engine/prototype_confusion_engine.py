@@ -425,16 +425,17 @@ class PrototypeConfusionRunner:
                 enhanced_all, aux = self.model.compose(
                     all_fit["raw"], all_fit["layers"], return_aux=True
                 )
-                loo = source_exclusive_means(
-                    enhanced_all, all_fit["labels"], all_fit["sources"], ids_all
-                )
                 new_mask = torch.isin(all_fit["labels"], torch.as_tensor(new_ids, device=self.device))
                 rows = torch.where(new_mask)[0]
+                loo = source_exclusive_means(
+                    enhanced_all, all_fit["labels"], all_fit["sources"], ids_all,
+                    query_indices=rows
+                )
                 visual_logits, text_logits, targets = [], [], []
                 calibrated_text = normalize((1.0 - cfg.CALIBRATION.LAMBDA_TEXT) * text
                                              + cfg.CALIBRATION.LAMBDA_TEXT * descriptions)
-                for row in rows.tolist():
-                    visual_logits.append(enhanced_all[row:row + 1] @ loo[row].t()
+                for local_row, row in enumerate(rows.tolist()):
+                    visual_logits.append(enhanced_all[row:row + 1] @ loo[local_row].t()
                                           / self.visual_temperature)
                     text_logits.append(all_fit["raw"][row:row + 1] @ calibrated_text.t()
                                        / self.text_temperature)
