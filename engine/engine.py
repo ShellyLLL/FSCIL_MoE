@@ -17,6 +17,8 @@ from tqdm import tqdm
 
 from datasets.data_manager import DatasetManager
 from models.bimc import BiMC, build_loo_cache_from_embeddings
+from utils.apc import (build_few_shot_apc_reference, evaluate_few_shot_apc,
+                       update_few_shot_apc_memory)
 from utils.evaluator import AccuracyEvaluator
 
 
@@ -54,6 +56,7 @@ class Runner:
         self.acc_list, self.task_acc_list = [], []
         self.session_diagnostics = []
         self.task_gate_biases = []
+        self.apc_state = None
         self.evaluator = AccuracyEvaluator(self.data_manager.class_index_in_task)
         self._resume_completed_session = -1
         self._resume_state_dict_list = []
@@ -298,7 +301,7 @@ class Runner:
             payload["task_states"][0] = dict(payload["task_states"][0])
             payload["task_states"][0]["image_proto"] = base_proto
             payload["task_states"][0]["encoder_version"] = 0
-        elif schema not in (7, 8, 9):
+        elif schema not in (7, 8, 9, 10):
             raise ValueError("Checkpoint topology is incompatible; resume from Session 0.")
         if schema in (7, 8) and int(payload["completed_session"]) != 0:
             raise ValueError("The calibrated gate and task-local objective need a base-only "
@@ -350,6 +353,7 @@ class Runner:
                                                torch.as_tensor(sources, dtype=torch.long).cpu())
             base_state["creation_session"] = 0
         self._resume_state_dict_list = payload.get("task_states", [])
+        self.apc_state = payload.get("apc_state")
         self.task_gate_biases = ([0.0] if schema in (6, 7, 8) else
                                  list(payload["task_gate_biases"]))
         if len(self.task_gate_biases) != completed_session + 1:
@@ -360,6 +364,8 @@ class Runner:
         self._resume_completed_session = completed_session
         if hasattr(self.model_without_dp, "restore_fused_history"):
             self.model_without_dp.restore_fused_history(self._resume_state_dict_list)
+        if self.apc_state is None and self._apc_enabled():
+            self._rebuild_apc_state(completed_session)
         self._restore_rng_state(payload.get("rng_state"))
         print(f"=> Resumed session {self._resume_completed_session} from {path}")
 
@@ -370,10 +376,11 @@ class Runner:
         directory.mkdir(parents=True, exist_ok=True)
         topology = self.model_without_dp.export_moe_topology()
         payload = {
-            "schema_version": 9,
+            "schema_version": 10,
             "completed_session": int(completed_session),
             "model_state": self._cpu_copy(self.model_without_dp.state_dict()),
             "moe_topology": topology,
+            "apc_state": self._cpu_copy(self.apc_state),
             "task_states": self._cpu_copy(state_dict_list),
             "task_gate_biases": list(self.task_gate_biases),
             "base_vision_prototype": self._cpu_copy(self.model_without_dp.base_vision_prototype),
@@ -634,6 +641,81 @@ class Runner:
                            loader(extract_data, held_out, False)))
         return result
 
+    def _apc_enabled(self):
+        return (bool(self._visual_moe_cfg().ENABLE) and
+                bool(_cfg_value(getattr(self.cfg.TRAINER.BiMC, "APC", None), "ENABLE", False)))
+
+    def _apc_task_specs(self):
+        shot = int(self.cfg.DATASET.NUM_INC_SHOT)
+        if shot < 3:
+            raise ValueError("Few-shot APC requires at least three incremental support shots.")
+        base_count = len(self.data_manager.class_index_in_task[0])
+        history_count = base_count
+        specs = []
+        for task_id in range(1, self.data_manager.num_tasks):
+            new_count = len(self.data_manager.class_index_in_task[task_id])
+            specs.append({"task_id": int(task_id),
+                          "competitor_count": int(history_count + new_count - 1),
+                          "new_class_count": int(new_count)})
+            history_count += new_count
+        return specs
+
+    @torch.no_grad()
+    def _collect_anchor_block_features(self, loader):
+        return self.model_without_dp.collect_blockwise_cls_features(loader, max_session=0)
+
+    def _initialize_apc_state(self):
+        if not self._apc_enabled():
+            self.apc_state = None
+            return None
+        apc_cfg = self.cfg.TRAINER.BiMC.APC
+        shot = int(self.cfg.DATASET.NUM_INC_SHOT)
+        base_ids = [int(x) for x in self.data_manager.class_index_in_task[0]]
+        base_loader = self.data_manager.get_dataloader(
+            0, source="train", mode="test", accumulate_past=False)
+        base_features = self._collect_anchor_block_features(base_loader)
+        self.apc_state = build_few_shot_apc_reference(
+            base_features, base_ids, self._apc_task_specs(),
+            shot=shot,
+            episodes=int(_cfg_value(apc_cfg, "EPISODES", 512)),
+            alpha=float(_cfg_value(apc_cfg, "ALPHA", 0.05)),
+            seed=(int(_cfg_value(apc_cfg, "SEED", -1))
+                  if int(_cfg_value(apc_cfg, "SEED", -1)) >= 0 else int(self.cfg.SEED)),
+            device=self.device)
+        print("=> [APC] calibrated: shot={} query_shot={} episodes={} blocks={}".format(
+            self.apc_state["shot"], self.apc_state["query_shot"],
+            self.apc_state["episodes"], sorted(self.apc_state["layers"])))
+        return self.apc_state
+
+    def _rebuild_apc_state(self, completed_session):
+        self._initialize_apc_state()
+        for task_id in range(1, int(completed_session) + 1):
+            loader = self.data_manager.get_dataloader(
+                task_id, source="train", mode="test", accumulate_past=False)
+            features = self._collect_anchor_block_features(loader)
+            class_ids = [int(x) for x in self.data_manager.class_index_in_task[task_id]]
+            update_few_shot_apc_memory(self.apc_state, features, class_ids)
+        print("=> [APC] reconstructed anchor memory through session {}".format(
+            int(completed_session)))
+
+    def _evaluate_apc_for_task(self, folds, class_ids):
+        if not self._apc_enabled() or self.apc_state is None:
+            return None
+        fold_features = [self._collect_anchor_block_features(fit_extract)
+                         for _, fit_extract, _ in folds]
+        result = evaluate_few_shot_apc(
+            fold_features, self.apc_state, [int(x) for x in class_ids], device=self.device)
+        for block, values in result["layers"].items():
+            print("=> [APC][B{}] confusion={:.4f} threshold={:.4f} candidate={}".format(
+                block, values["observed_max_confusion"], values["threshold"],
+                values["candidate"]))
+        return result
+
+    def _commit_apc_memory(self, loader, class_ids):
+        if self._apc_enabled() and self.apc_state is not None:
+            features = self._collect_anchor_block_features(loader)
+            update_few_shot_apc_memory(self.apc_state, features, class_ids)
+
     def _representation_drift(self, images, current_version, previous_version):
         """Differentiable cosine drift on current support images only.
 
@@ -720,7 +802,7 @@ class Runner:
         return total / max(count, 1)
 
     def train_incremental_task(self, task_id, train_loader, extract_loader, class_index,
-                               current_class_name, enable_visual_calibration):
+                               current_class_name, enable_visual_calibration, apc_result=None):
         text, description = self._text_prototypes(current_class_name, class_index)
         folds = self._support_folds(train_loader, extract_loader)
         previous_version = self._current_encoder_version()
@@ -729,7 +811,7 @@ class Runner:
             adapter.freeze_all()
         if not folds:
             return {"trained": False, "decisions": [], "expanded": [],
-                    "encoder_version": previous_version}
+                    "encoder_version": previous_version, "apc": apc_result}
         null_losses = [self._held_out_loss(val, fit_extract, class_index, text, description,
                                            previous_version, enable_visual_calibration)
                        for _, fit_extract, val in folds]
@@ -758,10 +840,23 @@ class Runner:
             print(f"=> [Candidate][Task {task_id}][B{block_idx}] "
                   f"gain={decisions[-1]['gain']:.5f} se={decisions[-1]['gain_se']:.5f}")
         best = max(decisions, key=lambda row: row["gain"], default=None)
+        # APC is a tie-breaker only: every layer still receives the original
+        # five-fold predictive-risk evaluation. It cannot override a materially
+        # better Risk-Stable candidate or veto a baseline candidate.
+        apc_blocks = set((apc_result or {}).get("candidate_blocks", []))
+        apc_selected = None
+        if best is not None and apc_blocks:
+            near_best = [row for row in decisions
+                         if row["gain"] >= best["gain"] - best["gain_se"]]
+            calibrated = [row for row in near_best if row["block_idx"] in apc_blocks]
+            if calibrated:
+                best = max(calibrated, key=lambda row: row["gain"])
+                apc_selected = int(best["block_idx"])
         # One-standard-error selection favours the null model on five-shot noise.
         if best is None or best["gain"] <= best["gain_se"]:
             return {"trained": False, "decisions": decisions, "expanded": [],
-                    "encoder_version": previous_version}
+                    "encoder_version": previous_version, "apc": apc_result,
+                    "apc_selected_block": None}
         block_idx = best["block_idx"]
         adapter = self._adapter_by_block(block_idx)
         expert_id = self.model_without_dp.add_expert(block_idx, task_id)
@@ -772,7 +867,8 @@ class Runner:
               f"validation_gain={best['gain']:.5f}")
         return {"trained": True, "decisions": decisions,
                 "expanded": [{"block_idx": block_idx, "expert_id": expert_id,
-                              "epochs": epochs}], "encoder_version": task_id}
+                              "epochs": epochs}], "encoder_version": task_id,
+                "apc": apc_result, "apc_selected_block": apc_selected}
 
     def _build_and_refine_task_state(self, current_class_name, extract_loader, class_index,
                                      old_state, enable_visual_calibration, encoder_version):
@@ -917,7 +1013,7 @@ class Runner:
 
         for task_id in range(start_task, end_task + 1):
             self.model.eval()
-            plan_summary, adaptation = None, None
+            plan_summary, adaptation, apc_result = None, None, None
             final_routing = {}
             class_index = self.data_manager.class_index_in_task[task_id]
             current_class_name = np.array(self.data_manager.class_names)[class_index].tolist()
@@ -939,6 +1035,8 @@ class Runner:
                         current_class_name, extract_loader, class_index, calibrate_novel_vision_proto=False
                     )
                     task_stat["class_ids"] = torch.as_tensor(class_index, device=self.device, dtype=torch.long)
+                    if self._apc_enabled():
+                        self._initialize_apc_state()
                 state_dict_list.append(task_stat)
                 state_dict_list[-1]["creation_session"] = int(task_id)
             else:
@@ -946,9 +1044,11 @@ class Runner:
                 enable_visual_calibration = bool(self.cfg.TRAINER.BiMC.VISION_CALIBRATION)
                 if use_moe:
                     self._routing_diagnostics(extract_loader, f"task{task_id}-before", current_task=task_id)
+                    apc_folds = self._support_folds(train_loader, extract_loader)
+                    apc_result = self._evaluate_apc_for_task(apc_folds, class_index)
                     adaptation = self.train_incremental_task(
                         task_id, train_loader, extract_loader, class_index,
-                        current_class_name, enable_visual_calibration,
+                        current_class_name, enable_visual_calibration, apc_result=apc_result,
                     )
                     plan_summary = self._cpu_copy(adaptation["decisions"])
                 self.model.eval()
@@ -960,6 +1060,7 @@ class Runner:
                 )
                 state_dict_list.append(task_stat)
                 state_dict_list[-1]["creation_session"] = int(task_id)
+                self._commit_apc_memory(extract_loader, class_index)
 
             gate_diagnostics = self._calibrate_task_gate(task_id, state_dict_list)
             merged_state = self.merge_dicts(state_dict_list)
@@ -987,6 +1088,7 @@ class Runner:
                 "support_manifest_hash": self._support_manifest_hash(),
                 "plan": plan_summary,
                 "adaptation": self._cpu_copy(adaptation),
+                "apc": self._cpu_copy(apc_result),
                 "anchor_gate": gate_diagnostics,
                 "routing": self._cpu_copy(final_routing),
                 "expert_counts": {
