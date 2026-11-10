@@ -18,7 +18,7 @@ from models.prototype_confusion_moe import (
     normalize, prototype_confusion, source_exclusive_means,
 )
 
-APC_VERSION = "cardinality_matched_empirical_tail_by_v1"
+APC_VERSION = "cardinality_matched_bootstrap_percentile_v2"
 
 
 def finalize_fscil_metrics(metrics, base_accuracy, is_final_session):
@@ -92,7 +92,7 @@ class PrototypeConfusionRunner:
         }
 
     def _split(self, cache, session):
-        """Split support by source image, never by individual view/sample index."""
+        """Source-disjoint support partition with explicit 1- to 5-shot fallbacks."""
         fit, calibration, risk = [], [], []
         for cid in torch.unique(cache["labels"], sorted=True).tolist():
             indices = torch.where(cache["labels"].eq(cid))[0].tolist()
@@ -101,34 +101,40 @@ class PrototypeConfusionRunner:
                 source_id = int(cache["sources"][index].item())
                 source_to_indices.setdefault(source_id, []).append(index)
             source_ids = sorted(source_to_indices)
-            if len(source_ids) < 4:
-                raise ValueError(
-                    "PC-MoE requires >=4 distinct source images per class "
-                    "(>=2 fit sources, 1 calibration source, 1 risk source); "
-                    "class {} has {}.".format(int(cid), len(source_ids))
-                )
+            n = len(source_ids)
+            if n < 1:
+                raise ValueError("Class {} has no independent support source.".format(int(cid)))
             rng = np.random.default_rng(
                 int(self.cfg.SEED) * 100003 + int(session) * 997 + int(cid)
             )
             rng.shuffle(source_ids)
-            n_cal = max(1, int(round(0.2 * len(source_ids))))
-            n_risk = max(1, int(round(0.2 * len(source_ids))))
-            while len(source_ids) - n_cal - n_risk < 2:
-                if n_cal > 1:
-                    n_cal -= 1
-                elif n_risk > 1:
-                    n_risk -= 1
-                else:
-                    raise ValueError("Support split cannot retain two fitting source images.")
-            risk_sources = source_ids[:n_risk]
-            calibration_sources = source_ids[n_risk:n_risk + n_cal]
-            fit_sources = source_ids[n_risk + n_cal:]
-            if len(fit_sources) < 2 or not calibration_sources or not risk_sources:
-                raise RuntimeError("Source-disjoint support partition invariant was violated.")
-            if (set(fit_sources) & set(calibration_sources)
-                    or set(fit_sources) & set(risk_sources)
-                    or set(calibration_sources) & set(risk_sources)):
-                raise RuntimeError("A source image was assigned to multiple support partitions.")
+            if n == 1:
+                n_fit, n_cal, n_risk = 1, 0, 0
+            elif n == 2:
+                n_fit, n_cal, n_risk = 1, 0, 1
+            elif n == 3:
+                n_fit, n_cal, n_risk = 2, 0, 1
+            elif n == 4:
+                n_fit, n_cal, n_risk = 2, 1, 1
+            else:
+                n_cal = max(1, int(round(0.2 * n)))
+                n_risk = max(2, int(round(0.2 * n)))
+                n_fit = n - n_cal - n_risk
+                while n_fit < 2:
+                    if n_cal > 1:
+                        n_cal -= 1
+                    elif n_risk > 2:
+                        n_risk -= 1
+                    else:
+                        raise ValueError("Support partition cannot retain two fitting sources.")
+                    n_fit = n - n_cal - n_risk
+            fit_sources = source_ids[:n_fit]
+            calibration_sources = source_ids[n_fit:n_fit + n_cal]
+            risk_sources = source_ids[n_fit + n_cal:]
+            if (len(fit_sources), len(calibration_sources), len(risk_sources)) != (n_fit, n_cal, n_risk):
+                raise RuntimeError("Few-shot source partition cardinality mismatch.")
+            if len(set(fit_sources + calibration_sources + risk_sources)) != n:
+                raise RuntimeError("A source image was assigned to multiple partitions.")
             for source_id in fit_sources:
                 fit.extend(source_to_indices[source_id])
             for source_id in calibration_sources:
@@ -442,6 +448,30 @@ class PrototypeConfusionRunner:
             logits = self._score(cache["raw"], enhanced, bank, vt, tt)[0]
             return balanced_risk(logits, cache["labels"], bank["ids"])
 
+    def _risk_source_losses(self, bank, disabled=None, temperatures=None):
+        """Paired per-source NLL observations for novel-class capacity validation."""
+        cache = self._query_cache("risk")
+        if cache is None:
+            raise RuntimeError("Missing independent risk query features.")
+        with torch.no_grad():
+            enhanced = self.model.compose(cache["raw"], cache["layers"], disabled_by_layer=disabled)
+            vt, tt = ((self.visual_temperature, self.text_temperature)
+                      if temperatures is None else temperatures)
+            logits = self._score(cache["raw"], enhanced, bank, vt, tt)[0]
+            match = cache["labels"][:, None].eq(bank["ids"][None, :])
+            if not match.sum(1).eq(1).all():
+                raise RuntimeError("Risk labels must map exactly once into the global classifier.")
+            losses = F.cross_entropy(logits, match.long().argmax(1), reduction="none")
+            observations = {}
+            for cid in bank["ids"].tolist():
+                mask = cache["labels"].eq(int(cid))
+                source_ids, class_losses = cache["sources"][mask], losses[mask]
+                values = [class_losses[source_ids.eq(source)].mean()
+                          for source in torch.unique(source_ids, sorted=True)]
+                if values:
+                    observations[int(cid)] = torch.stack(values).detach().cpu()
+            return observations
+
     def _fit_bank_and_temperatures(self, disabled=None):
         bank = self._prototypes(disabled=disabled)
         temperatures = self._fit_temperatures(bank, disabled=disabled)
@@ -532,46 +562,37 @@ class PrototypeConfusionRunner:
                 result[layer][cid] = normalize(values.mean(0))
         return result
 
-    @staticmethod
-    def _apc_by_discoveries(apc, fdr_q):
-        """Benjamini-Yekutieli correction for dependent layer/class tests."""
-        tests = []
-        for layer, stats in apc.items():
-            for cid, value in stats.get("p_value_by_class", {}).items():
-                p_value = float(value)
-                if not np.isfinite(p_value) or not 0.0 <= p_value <= 1.0:
-                    raise ValueError("APC p-values must be finite and in [0,1].")
-                tests.append((p_value, int(layer), int(cid)))
-        if not tests:
-            return {}
-        tests.sort(key=lambda x: x[0])
-        m = len(tests)
-        harmonic = sum(1.0 / rank for rank in range(1, m + 1))
-        cutoff = None
-        for rank, (p_value, _, _) in enumerate(tests, start=1):
-            if p_value <= float(fdr_q) * rank / (m * harmonic):
-                cutoff = p_value
-        if cutoff is None:
-            return {}
-        discoveries = {}
-        for p_value, layer, cid in tests:
-            if p_value <= cutoff:
-                discoveries.setdefault(layer, []).append(cid)
-        return {layer: sorted(classes) for layer, classes in discoveries.items()}
-
     def _candidate_layers(self, apc):
+        """Select layers using cardinality-matched empirical confusion percentiles."""
         cfg = self.cfg.TRAINER.PCMOE.EXPANSION
-        discoveries = self._apc_by_discoveries(apc, float(cfg.APC_FDR_Q))
-        ordered = sorted(discoveries, key=lambda layer: min(
-            float(apc[layer]["p_value_by_class"][cid]) for cid in discoveries[layer]))
-        return ordered[:int(cfg.MAX_LAYERS_PER_SESSION)]
+        threshold = float(cfg.APC_MIN_PERCENTILE)
+        if not 0.0 < threshold < 1.0:
+            raise ValueError("APC_MIN_PERCENTILE must lie strictly between zero and one.")
+        ranked = []
+        for layer, stats in apc.items():
+            values = [float(value) for value in stats.get("score_by_class", {}).values()]
+            qualifying = [value for value in values
+                          if np.isfinite(value) and value >= threshold]
+            if qualifying:
+                ranked.append((max(qualifying), int(layer)))
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+        return [layer for _, layer in ranked[:int(cfg.MAX_LAYERS_PER_SESSION)]]
 
-    def _demand_classes_by_layer(self, apc, candidate_layers, fdr_q):
-        discoveries = self._apc_by_discoveries(apc, float(fdr_q))
-        demand = {int(layer): discoveries[int(layer)] for layer in candidate_layers
-                  if int(layer) in discoveries}
+    def _demand_classes_by_layer(self, apc, candidate_layers, min_percentile):
+        """Retain only class/layer pairs crossing the calibrated percentile threshold."""
+        threshold = float(min_percentile)
+        if not 0.0 < threshold < 1.0:
+            raise ValueError("APC_MIN_PERCENTILE must lie strictly between zero and one.")
+        demand = {}
+        for layer in candidate_layers:
+            selected = sorted(
+                int(cid) for cid, value in apc[int(layer)].get("score_by_class", {}).items()
+                if np.isfinite(float(value)) and float(value) >= threshold
+            )
+            if selected:
+                demand[int(layer)] = selected
         if len(demand) != len(candidate_layers):
-            raise RuntimeError("Candidate layer has no statistically supported APC demand.")
+            raise RuntimeError("Candidate layer has no class above the calibrated APC threshold.")
         return demand
 
     def _train_incremental(self, session, fit_new, new_ids, apc):
@@ -579,23 +600,49 @@ class PrototypeConfusionRunner:
         candidate_layers = self._candidate_layers(apc)
         new_ids = [int(x) for x in new_ids]
         demand_classes = self._demand_classes_by_layer(
-            apc, candidate_layers, cfg.EXPANSION.APC_FDR_Q
+            apc, candidate_layers, cfg.EXPANSION.APC_MIN_PERCENTILE
         ) if candidate_layers else {}
         if not candidate_layers:
             # No capacity request: still acquire the new classes with the
             # unchanged expert pool and calibrate the all-seen classifier.
             baseline_bank, baseline_t = self._fit_bank_and_temperatures()
-            baseline_risk, per_class = self._risk(
-                baseline_bank, "risk", None, baseline_t
-            )
             self.visual_temperature, self.text_temperature = baseline_t
             self.model.set_temperatures(*baseline_t)
             return {
                 "accepted": False, "reason": "APC found no layer above capacity threshold",
                 "apc": apc, "candidate_layers": [], "demand_class_ids": {},
-                "baseline_all_class_risk": float(baseline_risk.item()),
-                "baseline_per_class_risk": per_class,
-                "risk_protocol": "historical class-risk centroids plus current-session held-out risk supports; prototype-risk surrogate, not historical per-example empirical risk",
+                "risk_protocol": "No expansion candidate; calibration updated without requiring a risk partition.",
+            }
+        demand_per_class = sorted({
+            int(cid) for classes in demand_classes.values() for cid in classes
+        })
+        fit_source_counts = {
+            int(cid): int(torch.unique(
+                fit_new["sources"][fit_new["labels"].eq(int(cid))]
+            ).numel()) for cid in new_ids
+        }
+        risk_cache = self._query_cache("risk")
+        risk_source_counts = {}
+        if risk_cache is not None:
+            for cid in new_ids:
+                mask = risk_cache["labels"].eq(int(cid))
+                risk_source_counts[int(cid)] = int(torch.unique(risk_cache["sources"][mask]).numel())
+        insufficient_fit = [cid for cid in new_ids if fit_source_counts.get(cid, 0) < 2]
+        insufficient_risk = [cid for cid in new_ids if risk_source_counts.get(cid, 0) < 2]
+        if insufficient_fit or insufficient_risk:
+            _, baseline_t = self._fit_bank_and_temperatures()
+            self.visual_temperature, self.text_temperature = baseline_t
+            self.model.set_temperatures(*baseline_t)
+            return {
+                "accepted": False,
+                "reason": "Insufficient independent few-shot evidence for expert-capacity acceptance",
+                "insufficient_fit_sources": insufficient_fit,
+                "insufficient_risk_sources": insufficient_risk,
+                "fit_source_counts": fit_source_counts,
+                "risk_source_counts": risk_source_counts,
+                "candidate_layers": candidate_layers,
+                "demand_class_ids": demand_classes,
+                "risk_protocol": "Capacity fail-closed unless every novel class has at least two fitting and two independent risk sources.",
             }
         old_ids = [int(x) for x in self.class_ids if int(x) not in new_ids]
         old_fit = self._memory_cache("fit", old_ids)
@@ -746,6 +793,24 @@ class PrototypeConfusionRunner:
                 baseline_per_class[cid] - candidate_per_class[cid]
                 for cid in demand_per_class
             ]))
+            baseline_source_losses = self._risk_source_losses(
+                baseline_bank, baseline_disabled, baseline_t
+            )
+            candidate_source_losses = self._risk_source_losses(
+                candidate_bank, None, candidate_t
+            )
+            paired_gains = []
+            for cid in demand_per_class:
+                if cid not in baseline_source_losses or cid not in candidate_source_losses:
+                    raise RuntimeError("Demand class {} lacks paired source losses.".format(cid))
+                if baseline_source_losses[cid].numel() != candidate_source_losses[cid].numel():
+                    raise RuntimeError("Paired risk source count changed for class {}.".format(cid))
+                paired_gains.extend(
+                    (baseline_source_losses[cid] - candidate_source_losses[cid]).tolist()
+                )
+            if not paired_gains:
+                raise RuntimeError("No paired demand-class risk observations.")
+            worst_demand_source_gain = float(min(paired_gains))
 
             # Evaluate the *inference* router on source-disjoint risk examples.
             # The route-margin loss itself is never used as an acceptance proxy.
@@ -815,6 +880,7 @@ class PrototypeConfusionRunner:
             accepted = (
                 risk_gain >= float(cfg.EXPANSION.MIN_RISK_GAIN)
                 and demand_risk_gain >= float(cfg.EXPANSION.MIN_DEMAND_RISK_GAIN)
+                and worst_demand_source_gain >= 0.0
                 and old_delta <= float(cfg.EXPANSION.MAX_OLD_CLASS_RISK_INCREASE)
                 and new_delta <= float(cfg.EXPANSION.MAX_NEW_CLASS_RISK_INCREASE)
                 and route_ok
@@ -825,6 +891,7 @@ class PrototypeConfusionRunner:
                 "baseline_all_class_risk": float(baseline_risk.item()),
                 "candidate_all_class_risk": float(candidate_risk.item()),
                 "risk_gain": risk_gain, "demand_class_risk_gain": demand_risk_gain,
+                "worst_demand_source_gain": worst_demand_source_gain,
                 "demand_class_ids": demand_classes,
                 "worst_old_class_risk_increase": float(old_delta),
                 "worst_new_class_risk_increase": float(new_delta),
@@ -983,7 +1050,7 @@ class PrototypeConfusionRunner:
             for layer, stats in sorted(result.get("apc", {}).items(), key=lambda item: int(item[0])):
                 apc_parts.append("L{} confusion_mean={:.3f} min_p={:.5f} K={}".format(
                     int(layer), float(stats.get("mean", 0.0)),
-                    min(stats.get("p_value_by_class", {0: 1.0}).values()),
+                    min(stats.get("tail_fraction_by_class", {0: 1.0}).values()),
                     int(stats.get("comparison_count", 0))
                 ))
             if apc_parts:
@@ -1050,7 +1117,7 @@ class PrototypeConfusionRunner:
         directory = Path(self.cfg.TRAINER.PCMOE.CHECKPOINT.DIR)
         directory.mkdir(parents=True, exist_ok=True)
         payload = {
-            "schema_version": 5, "apc_version": APC_VERSION, "completed_session": int(session),
+            "schema_version": 6, "apc_version": APC_VERSION, "completed_session": int(session),
             "model": {k: v.detach().cpu() for k, v in self.model.state_dict().items()},
             "topology": self.model.topology(),
             "class_ids": list(self.class_ids), "class_memory": self.class_memory,
@@ -1079,10 +1146,10 @@ class PrototypeConfusionRunner:
         if not path:
             return
         payload = torch.load(path, map_location="cpu", weights_only=False)
-        if payload.get("schema_version") != 5 or payload.get("apc_version") != APC_VERSION:
+        if payload.get("schema_version") != 6 or payload.get("apc_version") != APC_VERSION:
             raise ValueError(
-                "Unsupported PC-MoE checkpoint/APC schema. This version requires schema 5 "
-                "with cardinality-matched empirical APC null distributions and prototype-only "
+                "Unsupported PC-MoE checkpoint/APC schema. This version requires schema 6 "
+                "with cardinality-matched bootstrap APC reference distributions and prototype-only "
                 "historical memory. Older checkpoints must be restarted from Session 0."
             )
         apc_reference = payload.get("apc_reference")

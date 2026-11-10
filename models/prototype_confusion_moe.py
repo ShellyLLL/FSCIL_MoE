@@ -105,7 +105,11 @@ def _cardinality_matched_null_maxima(pairwise_similarity, competitor_count,
 
 def prototype_confusion(layer_features, labels, new_class_ids,
                         historical_layer_prototypes, apc_reference):
-    """Class/layer empirical upper-tail p-values at matched competitor cardinality."""
+    """Class/layer bootstrap tail scores at matched competitor cardinality.
+
+    Bootstrap repetitions approximate the empirical reference distribution; they
+    are not independent class observations and are not inferential p-values.
+    """
     output = {}
     for layer, values in layer_features.items():
         new_proto, _ = class_means(values, labels, new_class_ids)
@@ -139,7 +143,7 @@ def prototype_confusion(layer_features, labels, new_class_ids,
             "class_ids": [int(cid) for cid in new_class_ids],
             "score_by_class": {int(cid): float(scores[i].item())
                                for i, cid in enumerate(new_class_ids)},
-            "p_value_by_class": {int(cid): float(p_values[i].item())
+            "tail_fraction_by_class": {int(cid): float(p_values[i].item())
                                  for i, cid in enumerate(new_class_ids)},
             "scores": scores, "p_values": p_values,
             "mean": float(scores.mean().item()),

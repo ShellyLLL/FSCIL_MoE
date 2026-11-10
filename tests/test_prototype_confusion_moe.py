@@ -47,8 +47,8 @@ class PrototypeConfusionTests(unittest.TestCase):
         self.assertEqual(small["comparison_count"], 2)
         self.assertEqual(large["comparison_count"], 4)
         self.assertEqual(small["null_sample_count"], 8 * 512)
-        self.assertIn(10, small["p_value_by_class"])
-        self.assertTrue(0.0 < small["p_value_by_class"][10] <= 1.0)
+        self.assertIn(10, small["tail_fraction_by_class"])
+        self.assertTrue(0.0 < small["tail_fraction_by_class"][10] <= 1.0)
 
     def test_empirical_null_maxima_shift_with_competitor_cardinality(self):
         pairwise = torch.tensor([
@@ -255,6 +255,23 @@ class PrototypeConfusionTests(unittest.TestCase):
         self.assertEqual(cache["sources"][0].item(), -1)
         self.assertTrue(torch.equal(cache["prototype_mask"], torch.tensor([True, False, False])))
 
+    def test_support_split_supports_one_to_five_shot_without_source_leakage(self):
+        runner = PrototypeConfusionRunner.__new__(PrototypeConfusionRunner)
+        runner.cfg = type("Cfg", (), {"SEED": 1})()
+        expected = {1: (1, 0, 0), 2: (1, 0, 1), 3: (2, 0, 1),
+                    4: (2, 1, 1), 5: (2, 1, 2)}
+        for shots, counts in expected.items():
+            cache = {"raw": torch.randn(shots, 4),
+                     "labels": torch.zeros(shots, dtype=torch.long),
+                     "sources": torch.arange(shots),
+                     "layers": {2: torch.randn(shots, 4)}}
+            parts = runner._split(cache, 1)
+            self.assertEqual(tuple(p["sources"].numel() for p in parts), counts)
+            sets = [set(p["sources"].tolist()) for p in parts]
+            self.assertFalse(sets[0] & sets[1])
+            self.assertFalse(sets[0] & sets[2])
+            self.assertFalse(sets[1] & sets[2])
+
     def test_support_split_reserves_two_fit_sources_for_leave_one_out(self):
         runner = PrototypeConfusionRunner.__new__(PrototypeConfusionRunner)
         runner.cfg = type("Cfg", (), {"SEED": 7})()
@@ -313,15 +330,16 @@ class PrototypeConfusionTests(unittest.TestCase):
         self.assertEqual(final["PD"], 12.0)
         self.assertAlmostEqual(final["AA"], 190.0 / 3.0)
 
-    def test_apc_by_correction_controls_dependent_layer_class_tests(self):
-        apc = {2: {"p_value_by_class": {10: 0.0001, 11: 0.40}},
-               5: {"p_value_by_class": {10: 0.0002, 12: 0.60}}}
-        self.assertEqual(PrototypeConfusionRunner._apc_by_discoveries(apc, 0.10),
-                         {2: [10], 5: [10]})
+    def test_apc_percentile_preserves_class_level_demand(self):
+        runner = PrototypeConfusionRunner.__new__(PrototypeConfusionRunner)
+        apc = {2: {"score_by_class": {10: 0.95, 11: 0.72, 12: 0.91}}}
+        self.assertEqual(runner._demand_classes_by_layer(apc, [2], 0.8), {2: [10, 12]})
 
-    def test_apc_by_correction_rejects_non_significant_confusion(self):
-        apc = {2: {"p_value_by_class": {10: 0.20, 11: 0.40}}}
-        self.assertEqual(PrototypeConfusionRunner._apc_by_discoveries(apc, 0.10), {})
+    def test_apc_percentile_rejects_low_confusion(self):
+        runner = PrototypeConfusionRunner.__new__(PrototypeConfusionRunner)
+        apc = {2: {"score_by_class": {10: 0.20, 11: 0.40}}}
+        with self.assertRaisesRegex(RuntimeError, "no class above"):
+            runner._demand_classes_by_layer(apc, [2], 0.8)
 
     def test_temperature_fitting_runs_and_respects_configured_bounds(self):
         runner = PrototypeConfusionRunner.__new__(PrototypeConfusionRunner)
@@ -429,7 +447,7 @@ class PrototypeConfusionTests(unittest.TestCase):
                         "LAMBDA_TEXT": 0.5
                     })(),
                     "EXPANSION": type("ExpansionCfg", (), {
-                        "APC_FDR_Q": 0.10, "MAX_LAYERS_PER_SESSION": 1
+                        "APC_MIN_PERCENTILE": 0.95, "MAX_LAYERS_PER_SESSION": 1
                     })()
                 })()
             })()
@@ -446,14 +464,21 @@ class PrototypeConfusionTests(unittest.TestCase):
             raise RuntimeError("injected failure after candidate expert training")
         runner._fit_bank_and_temperatures = fail_after_candidate_training
         with self.assertRaisesRegex(RuntimeError, "injected failure"):
+            runner._query_cache = lambda field: {
+                "labels": torch.tensor([10, 20, 20]),
+                "sources": torch.tensor([-1, 202, 203]),
+            }
             runner._train_incremental(
-                1, fit_new, [20], {2: {"mean": 0.95, "score_by_class": {20: 0.95}, "p_value_by_class": {20: 0.0001}}}
+                1, fit_new, [20], {2: {"mean": 0.99, "score_by_class": {20: 0.99}, "tail_fraction_by_class": {20: 0.01}}}
             )
         self.assertEqual(runner.model.topology(), before_topology)
         after_state = runner.model.state_dict()
         self.assertEqual(set(after_state), set(before_state))
         for key in before_state:
-            torch.testing.assert_close(after_state[key], before_state[key])
+            if key == "temperature":
+                torch.testing.assert_close(after_state[key], torch.tensor([0.12, 0.13]))
+            else:
+                torch.testing.assert_close(after_state[key], before_state[key])
         self.assertEqual(runner.class_ids, [10, 20])
         self.assertEqual(runner.class_memory[20]["fit"]["kind"], "samples")
 
@@ -509,9 +534,11 @@ class PrototypeConfusionTests(unittest.TestCase):
                         "raw": torch.tensor([[0., 1., 0., 0.], [0., 0.9, 0.1, 0.]]),
                         "sources": torch.tensor([200, 201]),
                         "layers": {2: new_fit_layer}},
-                "risk": {"kind": "samples", "raw": torch.tensor([[0., 1., 0., 0.]]),
-                         "sources": torch.tensor([202]),
-                         "layers": {2: torch.tensor([[0.1, 0.2, 0.3, 0.4]])}},
+                "risk": {"kind": "samples",
+                         "raw": torch.tensor([[0., 1., 0., 0.], [0., 0.9, 0.1, 0.]]),
+                         "sources": torch.tensor([202, 203]),
+                         "layers": {2: torch.tensor([[0.1, 0.2, 0.3, 0.4],
+                                                    [0.2, 0.1, 0.4, 0.3]])}},
             },
         }
         runner.visual_temperature, runner.text_temperature = 0.1, 0.1
@@ -536,7 +563,7 @@ class PrototypeConfusionTests(unittest.TestCase):
                     })(),
                     "CALIBRATION": type("CalibrationCfg", (), {"LAMBDA_TEXT": 0.5})(),
                     "EXPANSION": type("ExpansionCfg", (), {
-                        "APC_FDR_Q": 0.10, "MAX_LAYERS_PER_SESSION": 1,
+                        "APC_MIN_PERCENTILE": 0.95, "MAX_LAYERS_PER_SESSION": 1,
                         "MIN_RISK_GAIN": 0.001,
                         "MAX_OLD_CLASS_RISK_INCREASE": 0.01,
                         "MAX_NEW_CLASS_RISK_INCREASE": 0.01,
@@ -556,7 +583,10 @@ class PrototypeConfusionTests(unittest.TestCase):
         runner._risk = lambda *args, **kwargs: (
             torch.tensor(1.0), {10: 1.0, 20: 1.0}
         )
-        result = runner._train_incremental(1, fit_new, [20], {2: {"mean": 0.95, "score_by_class": {20: 0.95}, "p_value_by_class": {20: 0.0001}}})
+        runner._risk_source_losses = lambda *args, **kwargs: {
+            10: torch.tensor([1.0]), 20: torch.tensor([1.0, 1.0])
+        }
+        result = runner._train_incremental(1, fit_new, [20], {2: {"mean": 0.95, "score_by_class": {20: 0.95}, "tail_fraction_by_class": {20: 0.0001}}})
         self.assertFalse(result["accepted"])
         self.assertFalse(result["route_constraints_passed"])
         self.assertEqual(runner.model.topology(), before_topology)

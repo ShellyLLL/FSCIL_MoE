@@ -102,9 +102,11 @@ prototype similarity with a frozen base-session layer-wise reference. For each
 session, it constructs an empirical null distribution of maximum similarities
 using base classes as pseudo-queries facing the same number K of competitors.
 Competitors are sampled without replacement when possible and with replacement
-when K exceeds the base-class pool. The finite-sample upper-tail empirical
-p-value is computed for every layer/class pair. A Benjamini-Yekutieli correction
-controls false discoveries under arbitrary dependence among these tests.
+when K exceeds the base-class pool. A tail fraction is estimated for every layer/class pair. Repeated competitor
+resamples are Monte Carlo approximations to an empirical bootstrap reference;
+they are not independent class observations and are not inferential p-values.
+The calibrated confusion-percentile threshold is an operational capacity
+trigger, not a formal multiple-testing guarantee.
 APC proposes capacity-demanding layer/class pairs; it does not authorize
 capacity by itself. The calibration relies on approximate exchangeability of
 base and novel class geometry and is not a distribution-free guarantee.
@@ -169,7 +171,7 @@ Architecture invariant tests (not FSCIL performance experiments):
 python -m unittest tests.test_prototype_confusion_moe
 ~~~
 
-Session checkpoints use schema 5 and include the base pairwise-similarity
+Session checkpoints use schema 6 and include the base pairwise-similarity
 geometry used to construct cardinality-matched empirical APC nulls, expert topology/weights,
 prototype-only class fit/calibration/risk memories (one centroid per class
 and feature space, with no old per-example features or source IDs), text and
@@ -190,3 +192,10 @@ In this repository, we build our code based on the following excellent open-sour
 - [CuPL](https://github.com/sarahpratt/CuPL)
 - [AdaptCLIPZS](https://github.com/cvl-umass/AdaptCLIPZS)
 
+
+
+Few-shot support is partitioned by independent source image. One-shot classes
+remain classifiable without capacity expansion; expert-capacity acceptance is
+fail-closed unless every novel class has at least two fitting sources and two
+independent risk sources. Paired demanded-class risk observations must all
+improve, in addition to the macro risk and historical-protection constraints.
