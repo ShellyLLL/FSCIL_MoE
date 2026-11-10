@@ -645,79 +645,66 @@ class Runner:
 
     def _apc_enabled(self):
         visual_cfg = getattr(self.cfg.TRAINER.BiMC, "VISUAL_MOE", None)
+        apc_cfg = getattr(self.cfg.TRAINER.BiMC, "APC", None)
         return (bool(_cfg_value(visual_cfg, "ENABLE", False)) and
-                bool(_cfg_value(getattr(self.cfg.TRAINER.BiMC, "APC", None), "ENABLE", False)))
-
-    def _apc_task_specs(self):
-        shot = int(self.cfg.DATASET.NUM_INC_SHOT)
-        if shot < 3:
-            raise ValueError("Few-shot APC requires at least three incremental support shots.")
-        base_count = len(self.data_manager.class_index_in_task[0])
-        history_count = base_count
-        specs = []
-        for task_id in range(1, self.data_manager.num_tasks):
-            new_count = len(self.data_manager.class_index_in_task[task_id])
-            specs.append({"task_id": int(task_id),
-                          "competitor_count": int(history_count + new_count - 1),
-                          "new_class_count": int(new_count)})
-            history_count += new_count
-        return specs
+                bool(_cfg_value(apc_cfg, "ENABLE", False)))
 
     @torch.no_grad()
-    def _collect_anchor_block_features(self, loader):
-        return self.model_without_dp.collect_blockwise_cls_features(loader, max_session=0)
+    def _collect_raw_block_features(self, loader):
+        return self.model_without_dp.collect_blockwise_cls_features(
+            loader, disable_moe=True
+        )
 
     def _initialize_apc_state(self):
         if not self._apc_enabled():
             self.apc_state = None
             return None
         apc_cfg = self.cfg.TRAINER.BiMC.APC
-        shot = int(self.cfg.DATASET.NUM_INC_SHOT)
-        base_ids = [int(x) for x in self.data_manager.class_index_in_task[0]]
+        base_ids = [int(value) for value in self.data_manager.class_index_in_task[0]]
         base_loader = self.data_manager.get_dataloader(
-            0, source="train", mode="test", accumulate_past=False)
-        base_features = self._collect_anchor_block_features(base_loader)
+            0, source="train", mode="test", accumulate_past=False
+        )
+        base_features = self._collect_raw_block_features(base_loader)
         self.apc_state = build_few_shot_apc_reference(
-            base_features, base_ids, self._apc_task_specs(),
-            shot=shot,
-            episodes=int(_cfg_value(apc_cfg, "EPISODES", 512)),
-            alpha=float(_cfg_value(apc_cfg, "ALPHA", 0.05)),
-            seed=(int(_cfg_value(apc_cfg, "SEED", -1))
-                  if int(_cfg_value(apc_cfg, "SEED", -1)) >= 0 else int(self.cfg.SEED)),
-            device=self.device)
-        print("=> [APC] calibrated: shot={} query_shot={} episodes={} blocks={}".format(
-            self.apc_state["shot"], self.apc_state["query_shot"],
-            self.apc_state["episodes"], sorted(self.apc_state["layers"])))
+            base_features, base_ids,
+            quantile=float(_cfg_value(apc_cfg, "QUANTILE", 0.95)),
+        )
+        print("=> [APC] fixed thresholds from real base classes: classes={} quantile={} blocks={}".format(
+            len(base_ids), self.apc_state["quantile"], sorted(self.apc_state["layers"])))
         return self.apc_state
 
     def _rebuild_apc_state(self, completed_session):
         self._initialize_apc_state()
+        expected_shot = int(self.cfg.DATASET.NUM_INC_SHOT)
         for task_id in range(1, int(completed_session) + 1):
             loader = self.data_manager.get_dataloader(
                 task_id, source="train", mode="test", accumulate_past=False)
-            features = self._collect_anchor_block_features(loader)
-            class_ids = [int(x) for x in self.data_manager.class_index_in_task[task_id]]
-            update_few_shot_apc_memory(self.apc_state, features, class_ids)
-        print("=> [APC] reconstructed anchor memory through session {}".format(
+            features = self._collect_raw_block_features(loader)
+            class_ids = [int(value) for value in self.data_manager.class_index_in_task[task_id]]
+            update_few_shot_apc_memory(
+                self.apc_state, features, class_ids, expected_shot=expected_shot)
+        print("=> [APC] restored real support prototypes through Session {}".format(
             int(completed_session)))
 
-    def _evaluate_apc_for_task(self, folds, class_ids):
+    def _evaluate_apc_for_task(self, extract_loader, class_ids):
         if not self._apc_enabled() or self.apc_state is None:
             return None
-        fold_features = [self._collect_anchor_block_features(fit_extract)
-                         for _, fit_extract, _ in folds]
+        features = self._collect_raw_block_features(extract_loader)
         result = evaluate_few_shot_apc(
-            fold_features, self.apc_state, [int(x) for x in class_ids], device=self.device)
+            features, self.apc_state, [int(value) for value in class_ids],
+            expected_shot=int(self.cfg.DATASET.NUM_INC_SHOT))
         for block, values in result["layers"].items():
-            print("=> [APC][B{}] confusion={:.4f} threshold={:.4f} candidate={}".format(
-                block, values["observed_max_confusion"], values["threshold"],
-                values["candidate"]))
+            print("=> [APC][B{}] real-support confusion={:.4f} base-threshold={:.4f} candidate={}".format(
+                block, values["observed_max_confusion"], values["threshold"], values["candidate"]))
         return result
 
     def _commit_apc_memory(self, loader, class_ids):
-        if self._apc_enabled() and self.apc_state is not None:
-            features = self._collect_anchor_block_features(loader)
-            update_few_shot_apc_memory(self.apc_state, features, class_ids)
+        if not self._apc_enabled() or self.apc_state is None:
+            return
+        features = self._collect_raw_block_features(loader)
+        update_few_shot_apc_memory(
+            self.apc_state, features, class_ids,
+            expected_shot=int(self.cfg.DATASET.NUM_INC_SHOT))
 
     def _representation_drift(self, images, current_version, previous_version):
         """Differentiable cosine drift on current support images only.
