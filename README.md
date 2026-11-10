@@ -98,14 +98,21 @@ router over the complete old/new expert pool; no task-specific router or
 task-ID inference branch is used.
 
 Prototype confusion (APC) compares each novel class's nearest old/within-new
-prototype similarity with the base-session layer-wise confusion reference.
+prototype similarity with a frozen base-session layer-wise reference. The raw
+nearest-neighbour maximum is corrected for the number of competing classes
+using the empirical pairwise-similarity CDF and the order-statistic factor
+F(s)^m before ranking against the base-class maxima. This avoids interpreting
+the natural growth of a maximum over more classes as increased confusion.
 APC only proposes candidate layers; it does not itself authorize capacity.
 Each appended gate is initialized strictly below the historical Top-k boundary,
 so historical Top-k membership and Softmax weights are exactly preserved at
-birth. During incremental training, a margin objective gives the new gate a
-direct gradient before it is selected: novel support is trained to cross the
-old-pool Top-k boundary, while all historical fit features are trained to
-remain below it. Historical experts and historical router columns remain
+birth. During incremental training, APC demand is retained at class level: only
+novel classes whose calibrated confusion percentile crosses the capacity
+threshold are positive route targets for the new expert. Historical classes
+and current non-demand novel classes are protected negatives. A margin
+objective gives the new gate a direct gradient before it is selected:
+demanded novel support is trained to cross the old-pool Top-k boundary,
+while protected features are trained to remain below it. Historical experts and historical router columns remain
 frozen. Incremental training does not impose uniform expert usage.
 
 Historical memory is strictly prototype-only. At the end of each session,
@@ -158,7 +165,8 @@ Architecture invariant tests (not FSCIL performance experiments):
 python -m unittest tests.test_prototype_confusion_moe
 ~~~
 
-Session checkpoints use schema 3 and include expert topology/weights,
+Session checkpoints use schema 4 and include the cardinality-corrected APC
+reference, expert topology/weights,
 prototype-only class fit/calibration/risk memories (one centroid per class
 and feature space, with no old per-example features or source IDs), text and
 description prototypes,

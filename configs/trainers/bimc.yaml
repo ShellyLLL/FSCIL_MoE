@@ -86,7 +86,6 @@ TRAINER:
     FUSED_CONFLICT_MARGIN: 0.05
 
 # Prototype-Confusion Guided Dynamic MoE-FSCIL (selected by main.py)
-TRAINER:
   PCMOE:
     ENABLE: True
     END_SESSION: -1
@@ -131,7 +130,8 @@ TRAINER:
       HISTORICAL_ROUTE_WEIGHT: 1.0
       MAX_HISTORICAL_ROUTE_DRIFT: 0.05
       MAX_HISTORICAL_INTRUSION_RATE: 0.01
-      MIN_NOVEL_ACTIVATION_RATE: 0.20
+      MIN_DEMAND_ACTIVATION_RATE: 0.20
+      MAX_NONDEMAND_ACTIVATION_RATE: 0.01
     CHECKPOINT:
       DIR: "checkpoints/prototype_confusion_moe"
       RESUME: ""

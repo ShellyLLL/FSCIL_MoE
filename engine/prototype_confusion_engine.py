@@ -18,6 +18,26 @@ from models.prototype_confusion_moe import (
     normalize, prototype_confusion, source_exclusive_means,
 )
 
+APC_VERSION = "cardinality_corrected_nearest_v2"
+
+
+def finalize_fscil_metrics(metrics, base_accuracy, is_final_session):
+    """AA is macro task accuracy; Final Acc and PD are emitted only at final session."""
+    result = dict(metrics)
+    task_accuracies = result.get("task_acc", [])
+    result["AA"] = float(np.mean(task_accuracies)) if task_accuracies else 0.0
+    if is_final_session:
+        if base_accuracy is None:
+            raise RuntimeError("Cannot compute final PD without Session-0 base accuracy.")
+        if "mean_acc" not in result or "base_class_accuracy" not in result:
+            raise ValueError("Final evaluation is missing all-class or base-class accuracy.")
+        result["Final Acc"] = float(result["mean_acc"])
+        result["PD"] = float(base_accuracy - result["base_class_accuracy"])
+    else:
+        result.pop("Final Acc", None)
+        result.pop("PD", None)
+    return result
+
 
 class PrototypeConfusionRunner:
     """Prototype-memory FSCIL: no old samples, no task oracle, one global classifier."""
@@ -72,34 +92,49 @@ class PrototypeConfusionRunner:
         }
 
     def _split(self, cache, session):
+        """Split support by source image, never by individual view/sample index."""
         fit, calibration, risk = [], [], []
         for cid in torch.unique(cache["labels"], sorted=True).tolist():
             indices = torch.where(cache["labels"].eq(cid))[0].tolist()
-            indices = sorted(indices, key=lambda i: int(cache["sources"][i]))
-            rng = np.random.default_rng(int(self.cfg.SEED) * 100003 + int(session) * 997 + int(cid))
-            rng.shuffle(indices)
-            distinct_sources = torch.unique(cache["sources"][indices]).numel()
-            # Leave at least two fit sources for source-exclusive LOO
-            # prototypes, plus one independent calibration and one risk source.
-            if distinct_sources < 4:
+            source_to_indices = {}
+            for index in indices:
+                source_id = int(cache["sources"][index].item())
+                source_to_indices.setdefault(source_id, []).append(index)
+            source_ids = sorted(source_to_indices)
+            if len(source_ids) < 4:
                 raise ValueError(
                     "PC-MoE requires >=4 distinct source images per class "
-                    "(>=2 fit for LOO, 1 calibration, 1 risk); class {} has {}.".format(
-                        int(cid), int(distinct_sources)
-                    )
+                    "(>=2 fit sources, 1 calibration source, 1 risk source); "
+                    "class {} has {}.".format(int(cid), len(source_ids))
                 )
-            n_cal = max(1, int(round(0.2 * len(indices))))
-            n_risk = max(1, int(round(0.2 * len(indices))))
-            while len(indices) - n_cal - n_risk < 1:
+            rng = np.random.default_rng(
+                int(self.cfg.SEED) * 100003 + int(session) * 997 + int(cid)
+            )
+            rng.shuffle(source_ids)
+            n_cal = max(1, int(round(0.2 * len(source_ids))))
+            n_risk = max(1, int(round(0.2 * len(source_ids))))
+            while len(source_ids) - n_cal - n_risk < 2:
                 if n_cal > 1:
                     n_cal -= 1
                 elif n_risk > 1:
                     n_risk -= 1
                 else:
-                    raise ValueError("Support split cannot retain a fitting sample.")
-            risk.extend(indices[:n_risk])
-            calibration.extend(indices[n_risk:n_risk + n_cal])
-            fit.extend(indices[n_risk + n_cal:])
+                    raise ValueError("Support split cannot retain two fitting source images.")
+            risk_sources = source_ids[:n_risk]
+            calibration_sources = source_ids[n_risk:n_risk + n_cal]
+            fit_sources = source_ids[n_risk + n_cal:]
+            if len(fit_sources) < 2 or not calibration_sources or not risk_sources:
+                raise RuntimeError("Source-disjoint support partition invariant was violated.")
+            if (set(fit_sources) & set(calibration_sources)
+                    or set(fit_sources) & set(risk_sources)
+                    or set(calibration_sources) & set(risk_sources)):
+                raise RuntimeError("A source image was assigned to multiple support partitions.")
+            for source_id in fit_sources:
+                fit.extend(source_to_indices[source_id])
+            for source_id in calibration_sources:
+                calibration.extend(source_to_indices[source_id])
+            for source_id in risk_sources:
+                risk.extend(source_to_indices[source_id])
         return (self._slice(cache, fit), self._slice(cache, calibration),
                 self._slice(cache, risk))
 
@@ -498,16 +533,38 @@ class PrototypeConfusionRunner:
         return result
 
     def _candidate_layers(self, apc):
+        """Propose layers only when aggregate class confusion exceeds the base reference."""
         cfg = self.cfg.TRAINER.PCMOE.EXPANSION
+        threshold = float(cfg.APC_MIN_PERCENTILE)
         ordered = sorted(apc, key=lambda layer: apc[layer]["mean"], reverse=True)
-        selected = [layer for layer in ordered
-                    if apc[layer]["mean"] >= float(cfg.APC_MIN_PERCENTILE)]
+        selected = [layer for layer in ordered if float(apc[layer]["mean"]) >= threshold]
         return selected[:int(cfg.MAX_LAYERS_PER_SESSION)]
+
+    @staticmethod
+    def _demand_classes_by_layer(apc, candidate_layers, threshold):
+        """Retain class-level APC demand for routing supervision and acceptance."""
+        demand = {}
+        for layer in candidate_layers:
+            scores = apc[int(layer)].get("score_by_class", {})
+            selected = sorted(
+                int(cid) for cid, score in scores.items()
+                if float(score) >= float(threshold)
+            )
+            if not selected:
+                raise RuntimeError(
+                    "Candidate layer {} has no class-level APC demand despite passing "
+                    "the aggregate capacity gate.".format(layer)
+                )
+            demand[int(layer)] = selected
+        return demand
 
     def _train_incremental(self, session, fit_new, new_ids, apc):
         cfg = self.cfg.TRAINER.PCMOE
         candidate_layers = self._candidate_layers(apc)
         new_ids = [int(x) for x in new_ids]
+        demand_classes = self._demand_classes_by_layer(
+            apc, candidate_layers, cfg.EXPANSION.APC_MIN_PERCENTILE
+        ) if candidate_layers else {}
         if not candidate_layers:
             # No capacity request: still acquire the new classes with the
             # unchanged expert pool and calibrate the all-seen classifier.
@@ -519,7 +576,7 @@ class PrototypeConfusionRunner:
             self.model.set_temperatures(*baseline_t)
             return {
                 "accepted": False, "reason": "APC found no layer above capacity threshold",
-                "apc": apc, "candidate_layers": [],
+                "apc": apc, "candidate_layers": [], "demand_class_ids": {},
                 "baseline_all_class_risk": float(baseline_risk.item()),
                 "baseline_per_class_risk": per_class,
                 "risk_protocol": "historical class-risk centroids plus current-session held-out risk supports; not historical per-example empirical risk",
@@ -545,8 +602,14 @@ class PrototypeConfusionRunner:
             # is independent of whether extra model capacity is accepted.
             route_cfg = cfg.LOSS
             for layer in candidate_layers:
+                demand_ids = torch.as_tensor(
+                    demand_classes[int(layer)], device=self.device, dtype=torch.long
+                )
+                demand_mask = torch.isin(fit_new["labels"].to(self.device), demand_ids)
+                if not demand_mask.any():
+                    raise RuntimeError("APC-demanded classes have no fitting support features.")
                 self.model.add_expert(
-                    layer, session, fit_new["layers"][layer].to(self.device),
+                    layer, session, fit_new["layers"][layer].to(self.device)[demand_mask],
                     old_fit["layers"][layer],
                     route_margin=float(route_cfg.ROUTE_MARGIN)
                 )
@@ -604,8 +667,17 @@ class PrototypeConfusionRunner:
                 route_new, route_old = [], []
                 for layer in candidate_layers:
                     adapter = self.model.adapters[str(layer)]
+                    demand_ids = torch.as_tensor(
+                        demand_classes[int(layer)], device=self.device, dtype=torch.long
+                    )
+                    demand_mask = torch.isin(all_fit["labels"][rows], demand_ids)
+                    protected_new_mask = ~demand_mask
+                    protected_features = [old_fit["layers"][layer]]
+                    if protected_new_mask.any():
+                        protected_features.append(query_layers[layer][protected_new_mask])
                     terms = adapter.route_margin_loss(
-                        query_layers[layer], old_fit["layers"][layer],
+                        query_layers[layer][demand_mask],
+                        torch.cat(protected_features, dim=0),
                         margin=float(route_cfg.ROUTE_MARGIN)
                     )
                     route_new.append(terms["new"])
@@ -668,16 +740,24 @@ class PrototypeConfusionRunner:
                 new_route = adapter.route_drift(old_queries["layers"][layer][new_mask])
                 novel_labels = old_queries["labels"][new_mask]
                 per_new_class_activation = {}
+                demand_activation, non_demand_activation = {}, {}
+                demanded = set(demand_classes[int(layer)])
                 for cid in new_ids:
                     class_mask = novel_labels.eq(int(cid))
                     if not class_mask.any():
                         raise RuntimeError(
                             "Expansion risk set is missing novel class {}.".format(cid)
                         )
-                    per_new_class_activation[int(cid)] = float(
+                    rate = float(
                         new_route["new_expert_selected"][class_mask].float().mean().item()
                     )
+                    per_new_class_activation[int(cid)] = rate
+                    if int(cid) in demanded:
+                        demand_activation[int(cid)] = rate
+                    else:
+                        non_demand_activation[int(cid)] = rate
                 route_checks[int(layer)] = {
+                    "demand_class_ids": sorted(demanded),
                     "historical_mean_drift": float(old_route["drift"].mean().item()),
                     "historical_max_drift": float(old_route["drift"].max().item()),
                     "historical_intrusion_rate": float(
@@ -687,14 +767,20 @@ class PrototypeConfusionRunner:
                         new_route["new_expert_selected"].float().mean().item()
                     ),
                     "novel_activation_by_class": per_new_class_activation,
+                    "demand_activation_by_class": demand_activation,
+                    "non_demand_activation_by_class": non_demand_activation,
                     "novel_mean_weight": float(new_route["new_expert_weight"].mean().item()),
                 }
             route_ok = all(
                 item["historical_max_drift"] <= float(route_cfg.MAX_HISTORICAL_ROUTE_DRIFT)
                 and item["historical_intrusion_rate"] <= float(route_cfg.MAX_HISTORICAL_INTRUSION_RATE)
                 and all(
-                    rate >= float(route_cfg.MIN_NOVEL_ACTIVATION_RATE)
-                    for rate in item["novel_activation_by_class"].values()
+                    rate >= float(route_cfg.MIN_DEMAND_ACTIVATION_RATE)
+                    for rate in item["demand_activation_by_class"].values()
+                )
+                and all(
+                    rate <= float(route_cfg.MAX_NONDEMAND_ACTIVATION_RATE)
+                    for rate in item["non_demand_activation_by_class"].values()
                 )
                 for item in route_checks.values()
             )
@@ -706,6 +792,7 @@ class PrototypeConfusionRunner:
             )
             result = {
                 "accepted": accepted, "candidate_layers": candidate_layers,
+                "demand_class_ids": demand_classes,
                 "baseline_all_class_risk": float(baseline_risk.item()),
                 "candidate_all_class_risk": float(candidate_risk.item()),
                 "risk_gain": risk_gain, "worst_old_class_risk_increase": float(old_delta),
@@ -755,27 +842,28 @@ class PrototypeConfusionRunner:
             logits = self._score(raw, enhanced, bank)[0]
             all_logits.append(logits.cpu())
             all_labels.append(batch["label"].long().cpu())
-        logits = torch.cat(all_logits)
-        labels = torch.cat(all_labels)
+        logits, labels = torch.cat(all_logits), torch.cat(all_labels)
+        class_ids = bank["ids"].cpu()
+        target_match = labels[:, None].eq(class_ids[None, :])
+        if not target_match.sum(1).eq(1).all():
+            raise RuntimeError(
+                "All-class classifier does not contain every evaluation label exactly once."
+            )
         evaluator = AccuracyEvaluator(self.data.class_index_in_task)
-        metrics = evaluator.calc_accuracy(
-            logits, labels, session, class_ids=bank["ids"].cpu()
-        )
-        base_ids = torch.as_tensor(
-            self.data.class_index_in_task[0], dtype=torch.long
-        )
+        metrics = evaluator.calc_accuracy(logits, labels, session, class_ids=class_ids)
+        base_ids = torch.as_tensor(self.data.class_index_in_task[0], dtype=torch.long)
         base_mask = torch.isin(labels, base_ids)
-        pred_ids = bank["ids"].cpu()[logits.argmax(dim=1)]
-        base_accuracy = float(100.0 * pred_ids[base_mask].eq(labels[base_mask]).float().mean().item())
+        if not base_mask.any():
+            raise RuntimeError("All-seen evaluation set contains no base-class examples.")
+        pred_ids = class_ids[logits.argmax(dim=1)]
+        base_accuracy = float(
+            100.0 * pred_ids[base_mask].eq(labels[base_mask]).float().mean().item()
+        )
         if session == 0:
             self.base_accuracy = base_accuracy
-        pd = (0.0 if self.base_accuracy is None else
-              float(self.base_accuracy - base_accuracy))
         metrics.update({
-            "AA": float(np.mean(metrics["task_acc"])) if metrics["task_acc"] else 0.0,
-            "PD": pd,
             "base_class_accuracy": base_accuracy,
-            "num_seen_classes": int(bank["ids"].numel()),
+            "num_seen_classes": int(class_ids.numel()),
         })
         return metrics
 
@@ -837,6 +925,10 @@ class PrototypeConfusionRunner:
             self._assert_prototype_only_memory()
             self.model.freeze_all()
             evaluation = self._evaluate_all_seen(session)
+            evaluation = finalize_fscil_metrics(
+                evaluation, self.base_accuracy,
+                is_final_session=(session == self.data.num_tasks - 1)
+            )
             result["evaluation"] = evaluation
             self.diagnostics.append({"session": session, **result})
             self._save(session)
@@ -881,7 +973,7 @@ class PrototypeConfusionRunner:
 
             metrics = result.get("evaluation", {})
             metric_parts = []
-            for key in ("AA", "PD", "base_avg_acc", "inc_avg_acc"):
+            for key in ("mean_acc", "AA", "base_avg_acc", "inc_avg_acc"):
                 if key in metrics and metrics[key] is not None:
                     metric_parts.append("{}={:.2f}".format(key, float(metrics[key])))
             if "num_seen_classes" in metrics:
@@ -891,13 +983,41 @@ class PrototypeConfusionRunner:
                     int(session), " | ".join(metric_parts)
                 ))
 
+        final_session = self.data.num_tasks - 1
+        final_record = next(
+            (item for item in reversed(self.diagnostics) if int(item["session"]) == final_session),
+            None
+        )
+        if final_record is not None:
+            final_metrics = final_record.get("evaluation", {})
+            if not {"Final Acc", "AA", "PD"}.issubset(final_metrics):
+                raise RuntimeError("Final-session diagnostics are missing Final Acc, AA or PD.")
+            print(
+                "[PC-MoE][Final] Final Acc={:.2f} AA={:.2f} PD={:.2f}pp "
+                "(Base Acc={:.2f} -> Final Base Acc={:.2f})".format(
+                    float(final_metrics["Final Acc"]), float(final_metrics["AA"]),
+                    float(final_metrics["PD"]), float(self.base_accuracy),
+                    float(final_metrics["base_class_accuracy"])
+                )
+            )
+        elif self.diagnostics:
+            last = self.diagnostics[-1]
+            metrics = last.get("evaluation", {})
+            print(
+                "[PC-MoE][Partial] Session={:02d} Acc={:.2f} AA={:.2f}; "
+                "PD deferred until the final real FSCIL session.".format(
+                    int(last["session"]), float(metrics.get("mean_acc", 0.0)),
+                    float(metrics.get("AA", 0.0))
+                )
+            )
+
     def _save(self, session):
         self._compress_class_memory()
         self._assert_prototype_only_memory()
         directory = Path(self.cfg.TRAINER.PCMOE.CHECKPOINT.DIR)
         directory.mkdir(parents=True, exist_ok=True)
         payload = {
-            "schema_version": 3, "completed_session": int(session),
+            "schema_version": 4, "apc_version": APC_VERSION, "completed_session": int(session),
             "model": {k: v.detach().cpu() for k, v in self.model.state_dict().items()},
             "topology": self.model.topology(),
             "class_ids": list(self.class_ids), "class_memory": self.class_memory,
@@ -926,12 +1046,26 @@ class PrototypeConfusionRunner:
         if not path:
             return
         payload = torch.load(path, map_location="cpu", weights_only=False)
-        if payload.get("schema_version") != 3:
+        if payload.get("schema_version") != 4 or payload.get("apc_version") != APC_VERSION:
             raise ValueError(
-                "Unsupported PC-MoE checkpoint schema. This architecture requires schema 3 "
-                "with prototype-only historical memory; older checkpoints retain sample-level "
-                "feature replay and must not be silently resumed."
+                "Unsupported PC-MoE checkpoint/APC schema. This version requires schema 4 "
+                "with cardinality-corrected APC statistics and prototype-only historical memory. "
+                "Older checkpoints must be restarted from Session 0; they cannot be silently reused."
             )
+        apc_reference = payload.get("apc_reference")
+        if not isinstance(apc_reference, dict) or not apc_reference:
+            raise ValueError("Checkpoint is missing the cardinality-corrected APC reference.")
+        for layer, item in apc_reference.items():
+            if not isinstance(item, dict):
+                raise ValueError("Checkpoint APC reference for layer {} is malformed.".format(layer))
+            pairwise = torch.as_tensor(item.get("pairwise_similarity", []))
+            base_max = torch.as_tensor(item.get("base_max_percentile", []))
+            base_count = int(item.get("base_class_count", 0))
+            if (base_count < 3 or pairwise.numel() != base_count * (base_count - 1) // 2
+                    or base_max.numel() != base_count
+                    or not torch.isfinite(pairwise).all()
+                    or not torch.isfinite(base_max).all()):
+                raise ValueError("Checkpoint APC reference for layer {} is inconsistent.".format(layer))
         memory = payload.get("class_memory", {})
         for cid, fields in memory.items():
             for field, part in fields.items():

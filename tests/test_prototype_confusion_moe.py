@@ -8,7 +8,7 @@ from models.prototype_confusion_moe import (
     UnifiedTopKRouter, DynamicLayerMoE, source_exclusive_means,
     prototype_confusion, make_apc_reference, balanced_risk,
 )
-from engine.prototype_confusion_engine import PrototypeConfusionRunner
+from engine.prototype_confusion_engine import PrototypeConfusionRunner, finalize_fscil_metrics
 
 
 class PrototypeConfusionTests(unittest.TestCase):
@@ -28,6 +28,27 @@ class PrototypeConfusionTests(unittest.TestCase):
             self.assertTrue(torch.isfinite(item['scores']).all())
             self.assertGreaterEqual(item['mean'], 0.0)
             self.assertLessEqual(item['mean'], 1.0)
+
+    def test_apc_corrects_for_the_number_of_competing_old_classes(self):
+        base = F.normalize(torch.tensor([
+            [1., 0.], [0.8, 0.6], [0., 1.], [-0.8, 0.6],
+            [-1., 0.], [0., -1.], [0.6, -0.8], [-0.6, -0.8],
+        ]), dim=-1)
+        reference = make_apc_reference({2: base})
+        labels = torch.tensor([10, 10])
+        new_features = {2: torch.tensor([[1., 0.], [1., 0.]])}
+        small_history = {2: torch.tensor([[0., 1.], [-1., 0.]])}
+        large_history = {2: torch.cat([
+            small_history[2], torch.tensor([[0., -1.], [-0.8, -0.6]])
+        ])}
+        small = prototype_confusion(new_features, labels, [10], small_history, reference)[2]
+        large = prototype_confusion(new_features, labels, [10], large_history, reference)[2]
+        self.assertEqual(small["comparison_count"], 2)
+        self.assertEqual(large["comparison_count"], 4)
+        self.assertLess(
+            float(large["cardinality_adjusted_cdf"][0]),
+            float(small["cardinality_adjusted_cdf"][0])
+        )
 
     def test_source_exclusion_removes_all_views_of_same_source(self):
         features = F.normalize(torch.tensor([
@@ -245,6 +266,46 @@ class PrototypeConfusionTests(unittest.TestCase):
         self.assertEqual(calibration["raw"].size(0), 1)
         self.assertEqual(risk["raw"].size(0), 1)
 
+    def test_support_split_keeps_all_views_of_a_source_in_one_partition(self):
+        runner = PrototypeConfusionRunner.__new__(PrototypeConfusionRunner)
+        runner.cfg = type("Cfg", (), {"SEED": 17})()
+        cache = {
+            "raw": torch.randn(12, 4),
+            "labels": torch.tensor([10] * 12),
+            "sources": torch.tensor([100, 100, 101, 101, 102, 103, 104, 104, 105, 105, 106, 106]),
+            "layers": {2: torch.randn(12, 4)},
+        }
+        fit, calibration, risk = runner._split(cache, 2)
+        source_sets = [set(part["sources"].tolist()) for part in (fit, calibration, risk)]
+        self.assertFalse(source_sets[0] & source_sets[1])
+        self.assertFalse(source_sets[0] & source_sets[2])
+        self.assertFalse(source_sets[1] & source_sets[2])
+        self.assertGreaterEqual(len(source_sets[0]), 2)
+        self.assertGreaterEqual(len(source_sets[1]), 1)
+        self.assertGreaterEqual(len(source_sets[2]), 1)
+        self.assertEqual(
+            fit["raw"].size(0) + calibration["raw"].size(0) + risk["raw"].size(0), 12
+        )
+
+    def test_pd_is_reported_only_at_the_final_session(self):
+        metrics = {
+            "mean_acc": 63.5, "task_acc": [80.0, 60.0, 50.0],
+            "base_class_accuracy": 70.0,
+        }
+        partial = finalize_fscil_metrics(metrics, 82.0, is_final_session=False)
+        self.assertNotIn("PD", partial)
+        self.assertNotIn("Final Acc", partial)
+        self.assertAlmostEqual(partial["AA"], (80.0 + 60.0 + 50.0) / 3.0)
+        final = finalize_fscil_metrics(metrics, 82.0, is_final_session=True)
+        self.assertEqual(final["Final Acc"], 63.5)
+        self.assertEqual(final["PD"], 12.0)
+        self.assertAlmostEqual(final["AA"], 190.0 / 3.0)
+
+    def test_apc_demand_is_preserved_per_class(self):
+        apc = {2: {"mean": 0.85, "score_by_class": {10: 0.95, 11: 0.72, 12: 0.91}}}
+        demand = PrototypeConfusionRunner._demand_classes_by_layer(apc, [2], 0.8)
+        self.assertEqual(demand, {2: [10, 12]})
+
     def test_temperature_fitting_runs_and_respects_configured_bounds(self):
         runner = PrototypeConfusionRunner.__new__(PrototypeConfusionRunner)
         runner.device = "cpu"
@@ -369,7 +430,7 @@ class PrototypeConfusionTests(unittest.TestCase):
         runner._fit_bank_and_temperatures = fail_after_candidate_training
         with self.assertRaisesRegex(RuntimeError, "injected failure"):
             runner._train_incremental(
-                1, fit_new, [20], {2: {"mean": 0.95}}
+                1, fit_new, [20], {2: {"mean": 0.95, "score_by_class": {20: 0.95}}}
             )
         self.assertEqual(runner.model.topology(), before_topology)
         after_state = runner.model.state_dict()
@@ -449,7 +510,8 @@ class PrototypeConfusionTests(unittest.TestCase):
                         "HISTORICAL_ROUTE_WEIGHT": 1.0,
                         "MAX_HISTORICAL_ROUTE_DRIFT": 0.05,
                         "MAX_HISTORICAL_INTRUSION_RATE": 0.01,
-                        "MIN_NOVEL_ACTIVATION_RATE": 0.20
+                        "MIN_DEMAND_ACTIVATION_RATE": 0.20,
+                        "MAX_NONDEMAND_ACTIVATION_RATE": 0.01
                     })(),
                     "OPTIM": type("OptimCfg", (), {
                         "INCREMENTAL_LR": 1e-3, "WEIGHT_DECAY": 0.0,
@@ -476,7 +538,7 @@ class PrototypeConfusionTests(unittest.TestCase):
         runner._risk = lambda *args, **kwargs: (
             torch.tensor(1.0), {10: 1.0, 20: 1.0}
         )
-        result = runner._train_incremental(1, fit_new, [20], {2: {"mean": 0.95}})
+        result = runner._train_incremental(1, fit_new, [20], {2: {"mean": 0.95, "score_by_class": {20: 0.95}}})
         self.assertFalse(result["accepted"])
         self.assertFalse(result["route_constraints_passed"])
         self.assertEqual(runner.model.topology(), before_topology)
@@ -535,7 +597,11 @@ class PrototypeConfusionTests(unittest.TestCase):
             runner.text_prototypes = {10: torch.tensor([1., 0.])}
             runner.description_prototypes = {10: torch.tensor([1., 0.])}
             runner.text_consistency = {10: torch.tensor(0.9)}
-            runner.apc_reference = {2: torch.tensor([0.2])}
+            runner.apc_reference = {2: {
+                "pairwise_similarity": torch.tensor([0.1, 0.2, 0.3]),
+                "base_max_percentile": torch.tensor([0.2, 0.4, 0.8]),
+                "base_class_count": 3,
+            }}
             runner.base_layer_prototypes = {2: {10: torch.tensor([0.5, 0.5])}}
             runner.visual_temperature, runner.text_temperature = 0.2, 0.3
             runner.inter_modal_beta = 0.4
