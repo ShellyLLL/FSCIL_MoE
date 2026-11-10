@@ -62,7 +62,7 @@ class CUB200(DatasetBase):
         test_targets = []
         data2target = {}
         for k in test_idx:
-            image_path = os.path.join(self.root, 'CUB_200_2011/images', id2image[k])
+            image_path = os.path.join(dataset_root, 'images', id2image[k])
             test_data.append(image_path)
             test_targets.append(int(id2class[k]) - 1)
             data2target[image_path] = (int(id2class[k]) - 1)
