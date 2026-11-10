@@ -24,7 +24,6 @@ MODEL:
 TRAINER:
   BiMC:
     PREC: "amp"
-    END_SESSION: -1
 
     VISION_CALIBRATION: True
     LAMBDA_I: 0.1

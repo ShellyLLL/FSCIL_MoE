@@ -926,10 +926,7 @@ class Runner:
         return result
 
     def run(self):
-        configured_end = int(_cfg_value(self.cfg.TRAINER.BiMC, "END_SESSION", -1))
-        final_task = self.data_manager.num_tasks - 1 if configured_end < 0 else min(
-            configured_end, self.data_manager.num_tasks - 1
-        )
+        final_task = self.data_manager.num_tasks - 1
         state_list = list(self._resume_state_dict_list)
         start_task = self._resume_completed_session + 1
         visual_cfg = getattr(self.cfg.TRAINER.BiMC, "VISUAL_MOE", None)

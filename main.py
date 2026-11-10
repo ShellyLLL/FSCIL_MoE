@@ -116,7 +116,6 @@ def main():
     parser.add_argument('--train_cfg', type=str, required=True, help="Path to the training configuration file")
     parser.add_argument('--resume', type=str, default='', help='Session checkpoint to resume from')
     parser.add_argument('--support_manifest', type=str, default='', help='Optional fixed support manifest JSON')
-    parser.add_argument('--end_session', type=int, default=-1, help='Stop after this FSCIL session')
     parser.add_argument('opts', nargs=argparse.REMAINDER, help='Additional KEY VALUE YACS overrides')
     args = parser.parse_args()
     overrides = list(args.opts)
@@ -124,8 +123,6 @@ def main():
         overrides += ['TRAINER.BiMC.CHECKPOINT.RESUME', args.resume]
     if args.support_manifest:
         overrides += ['DATASET.SUPPORT_MANIFEST_PATH', args.support_manifest]
-    if args.end_session >= 0:
-        overrides += ['TRAINER.BiMC.END_SESSION', str(args.end_session)]
     cfg = setup_cfg(args.data_cfg, args.train_cfg, overrides)
     set_seed(cfg.SEED)
     set_gpu(cfg.DEVICE.GPU_ID)
