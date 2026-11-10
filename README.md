@@ -88,100 +88,6 @@ diagnostics are not a substitute for test accuracy. `TaskDiagnostic` reports
 the actual task selection rate and an oracle-task within-class upper bound;
 the latter uses test labels only for analysis, never for predictions.
 
-## Prototype-Confusion Guided Dynamic MoE-FSCIL
-
-The new PC-MoE implementation is an independent training path and does not
-reuse the legacy task-gated BiMC runner. It freezes the complete CLIP ViT
-feature stream and adds layer-wise parallel residual experts over captured
-frozen hidden states. Every layer uses one append-only global Top-k Softmax
-router over the complete old/new expert pool; no task-specific router or
-task-ID inference branch is used.
-
-Prototype confusion (APC) compares each novel class's nearest old/within-new
-prototype similarity with a frozen base-session layer-wise reference. For each
-session, it constructs an empirical null distribution of maximum similarities
-using base classes as pseudo-queries facing the same number K of competitors.
-Competitors are sampled without replacement when possible and with replacement
-when K exceeds the base-class pool. A tail fraction is estimated for every layer/class pair. Repeated competitor
-resamples are Monte Carlo approximations to an empirical bootstrap reference;
-they are not independent class observations and are not inferential p-values.
-The calibrated confusion-percentile threshold is an operational capacity
-trigger, not a formal multiple-testing guarantee.
-APC proposes capacity-demanding layer/class pairs; it does not authorize
-capacity by itself. The calibration relies on approximate exchangeability of
-base and novel class geometry and is not a distribution-free guarantee.
-Each appended gate is initialized strictly below the historical Top-k boundary,
-so historical Top-k membership and Softmax weights are exactly preserved at
-birth. During incremental training, APC demand is retained at class level: only
-novel classes whose calibrated confusion percentile crosses the capacity
-threshold are positive route targets for the new expert. Historical classes
-and current non-demand novel classes are protected negatives. A margin
-objective gives the new gate a direct gradient before it is selected:
-demanded novel support is trained to cross the old-pool Top-k boundary,
-while protected features are trained to remain below it. Historical experts and historical router columns remain
-frozen. Incremental training does not impose uniform expert usage.
-
-Historical memory is strictly prototype-only. At the end of each session,
-fit, calibration and risk records are compressed independently to one class
-centroid per feature space, together with a count; per-example features,
-source IDs and route records are discarded. During a new session, only that
-session's support examples are available as sample-level features. Historical
-classes contribute their stored centroids to route protection, calibration
-and risk-anchor calculations. Consequently, the all-class risk gate is a
-prototype-anchored risk proxy, not an empirical risk measured on replayed old
-examples; it must not be described as old-sample replay or exact old test risk.
-
-Candidate experts are assessed on the same global inference router. A
-candidate is committed only when the class-balanced all-seen-class
-prototype-anchored risk improves, old- and new-class risk regressions remain
-bounded, historical prototype route drift/intrusion stay within limits, and
-every new class reaches the minimum novel-expert activation coverage.
-Expansion rejection never rejects the new classes: their current-session
-class prototypes and text prototypes are retained and classified by the
-existing expert pool.
-
-Visual intra-modal calibration transports novel visual prototypes toward the
-base visual prototype geometry; text intra-modal calibration combines CLIP
-class text with available CuPL/LLM descriptions; inter-modal calibration
-reliability-weights the two calibrated score streams. The dynamic MoE visual
-embedding and calibrated text embedding meet in the same all-seen-class
-logit space for training, capacity-risk evaluation, and inference.
-
-PC-MoE is selected through the shared `main.py` entry point and the `PCMOE.ENABLE: True` setting in `bimc.yaml`. The PC-MoE architecture and runner remain unchanged; only configuration registration and dispatch are unified. Example CUB200 run:
-
-~~~BASH
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml
-~~~
-
-To stop after Base Session:
-
-~~~BASH
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --end_session 0
-~~~
-
-To resume a PC-MoE checkpoint:
-
-~~~BASH
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --resume checkpoints/prototype_confusion_moe/session_03.pth
-~~~
-
-Architecture invariant tests (not FSCIL performance experiments):
-
-~~~BASH
-python -m unittest tests.test_prototype_confusion_moe
-~~~
-
-Session checkpoints use schema 6 and include the base pairwise-similarity
-geometry used to construct cardinality-matched empirical APC nulls, expert topology/weights,
-prototype-only class fit/calibration/risk memories (one centroid per class
-and feature space, with no old per-example features or source IDs), text and
-description prototypes,
-temperatures, APC reference distributions, support manifest, diagnostics and
-random states. Each session reports all-seen-class accuracy and macro task-average
-accuracy (AA). Final Acc and PD are reported only at the final real FSCIL session.
-Expansion acceptance additionally requires risk reduction on APC-demanded
-classes. Historical risk is a prototype-risk surrogate, not old-example empirical risk.
-
 ## Acknowledgment
 
 In this repository, we build our code based on the following excellent open-source projects. We sincerely thank all the authors for sharing their great work:
@@ -194,8 +100,32 @@ In this repository, we build our code based on the following excellent open-sour
 
 
 
-Few-shot support is partitioned by independent source image. One-shot classes
-remain classifiable without capacity expansion; expert-capacity acceptance is
-fail-closed unless every novel class has at least two fitting sources and two
-independent risk sources. Paired demanded-class risk observations must all
-improve, in addition to the macro risk and historical-protection constraints.
+## Few-shot calibrated APC expansion decisions
+
+The default FSCIL runner remains the Risk-Stable BiMC pipeline. APC is an
+optional, calibrated selector for expansion location; it does not replace
+the base objective, expert descriptors, five-fold candidate training,
+leave-one-source-out fused classifier, held-out predictive-risk acceptance,
+versioned prototypes, or bilevel task-gated inference.
+
+At Session 0, APC builds an empirical null distribution from base-class
+support episodes using the same incremental shot count. Each pseudo-novel
+class is evaluated with leave-one-out (S-1)-shot prototypes, while its
+historical competitors use S-shot prototypes. Calibration is conditioned on
+the number of novel classes and the exact number of competing historical and
+current classes, and applies a Bonferroni-adjusted family-wise threshold
+across expandable blocks. All APC features are extracted in encoder version 0.
+
+At each incremental task, APC evaluates five cross-fitted (S-1)-shot
+prototypes. Every expandable block still undergoes the original Risk-Stable
+five-fold candidate training and held-out predictive-risk evaluation. APC can
+only break a one-standard-error tie between risk-equivalent blocks; it cannot
+veto an otherwise accepted Risk-Stable candidate or override a materially
+better predictive-risk result. A committed session appends its full S-shot
+anchor prototypes to APC memory. The APC memory and calibration state are
+stored in schema-10 checkpoints; schema-9 checkpoints rebuild this auxiliary
+state from their fixed support manifest without retraining the model.
+
+APC settings are under `TRAINER.BiMC.APC` in `configs/trainers/bimc.yaml`:
+`ENABLE`, `EPISODES`, `ALPHA`, and `SEED`. The default calibration uses
+512 episodes and family-wise alpha 0.05.
