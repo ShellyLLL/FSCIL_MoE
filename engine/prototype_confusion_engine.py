@@ -840,9 +840,56 @@ class PrototypeConfusionRunner:
             result["evaluation"] = evaluation
             self.diagnostics.append({"session": session, **result})
             self._save(session)
-            print("[PC-MoE][Session {}] {}".format(
-                session, json.dumps(result, ensure_ascii=False, sort_keys=True, default=str)
+            # Keep stdout focused on decisions and metrics. Full per-class risks,
+            # tensor diagnostics and route details remain in the checkpoint diagnostics.
+            accepted = bool(result.get("accepted", False))
+            candidates = result.get("candidate_layers", [])
+            if accepted:
+                expansion_state = "ACCEPTED"
+            elif candidates:
+                expansion_state = "REJECTED"
+            else:
+                expansion_state = "NOT_TRIGGERED"
+
+            print("[PC-MoE][Session {:02d}] expansion={} candidates={} reason={}".format(
+                int(session), expansion_state, candidates,
+                result.get("reason", "capacity transaction evaluated")
             ))
+
+            apc_parts = []
+            for layer, stats in sorted(result.get("apc", {}).items(), key=lambda item: int(item[0])):
+                apc_parts.append("L{} mean={:.3f} p90={:.3f}".format(
+                    int(layer), float(stats.get("mean", 0.0)), float(stats.get("p90", 0.0))
+                ))
+            if apc_parts:
+                print("[PC-MoE][Session {:02d}] APC: {}".format(
+                    int(session), " | ".join(apc_parts)
+                ))
+
+            risk_fields = (
+                "baseline_all_class_risk", "candidate_all_class_risk", "risk_gain",
+                "worst_old_class_risk_increase", "worst_new_class_risk_increase",
+            )
+            risk_parts = [
+                "{}={:.4f}".format(key, float(result[key]))
+                for key in risk_fields if key in result and result[key] is not None
+            ]
+            if risk_parts:
+                print("[PC-MoE][Session {:02d}] Risk: {}".format(
+                    int(session), " | ".join(risk_parts)
+                ))
+
+            metrics = result.get("evaluation", {})
+            metric_parts = []
+            for key in ("AA", "PD", "base_avg_acc", "inc_avg_acc"):
+                if key in metrics and metrics[key] is not None:
+                    metric_parts.append("{}={:.2f}".format(key, float(metrics[key])))
+            if "num_seen_classes" in metrics:
+                metric_parts.append("seen_classes={}".format(int(metrics["num_seen_classes"])))
+            if metric_parts:
+                print("[PC-MoE][Session {:02d}] Eval: {}".format(
+                    int(session), " | ".join(metric_parts)
+                ))
 
     def _save(self, session):
         self._compress_class_memory()
