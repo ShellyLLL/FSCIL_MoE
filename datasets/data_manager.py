@@ -33,10 +33,7 @@ class DatasetManager:
         manifest_seed = getattr(cfg.DATASET, 'SUPPORT_MANIFEST_SEED', -1)
         self.support_manifest_seed = cfg.SEED if manifest_seed < 0 else manifest_seed
         self.support_manifest_auto_save = getattr(cfg.DATASET, 'SUPPORT_MANIFEST_AUTO_SAVE', True)
-        trainer_cfg = getattr(cfg, 'TRAINER', None)
-        checkpoint_cfg = getattr(getattr(trainer_cfg, 'PCMOE', None), 'CHECKPOINT', None)
-        if checkpoint_cfg is None:
-            checkpoint_cfg = getattr(getattr(trainer_cfg, 'BiMC', None), 'CHECKPOINT', None)
+        checkpoint_cfg = getattr(getattr(getattr(cfg, 'TRAINER', None), 'BiMC', None), 'CHECKPOINT', None)
         self._defer_support_manifest_until_resume = bool(getattr(checkpoint_cfg, 'RESUME', ''))
         
         # training setting of data
