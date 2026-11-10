@@ -87,6 +87,4 @@ TRAINER:
 
     APC:
       ENABLE: True
-      EPISODES: 512
-      ALPHA: 0.05
-      SEED: -1
+      QUANTILE: 0.95
