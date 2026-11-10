@@ -340,7 +340,7 @@ class ExpansionInvariantTests(unittest.TestCase):
                                        torch.eye(2))
             runner.save_checkpoint(0, runner._resume_state_dict_list)
             upgraded = torch.load(Path(directory) / "session_00.pth", weights_only=False)
-            self.assertEqual(upgraded["schema_version"], 10)
+            self.assertEqual(upgraded["schema_version"], 11)
             self.assertEqual(upgraded["task_gate_biases"], [0.0])
 
     def test_candidate_training_uses_fused_leave_one_out_scores(self):
