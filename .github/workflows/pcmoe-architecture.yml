@@ -1,25 +1,23 @@
-name: Risk-Stable FSCIL with Few-Shot APC Tests
+name: Unified Dynamic MoE FSCIL Architecture
 
 on:
   push:
     branches:
-      - feature/prototype-confusion-dynamic-moe-fscil
+      - codex/unified-dynamic-moe-fscil
     paths:
       - "models/bimc.py"
       - "models/clip/model.py"
       - "engine/engine.py"
-      - "utils/apc.py"
-      - "tests/test_risk_guided_moe.py"
-      - "tests/test_few_shot_apc.py"
+      - "tests/test_unified_dynamic_moe.py"
       - "main.py"
       - "configs/trainers/bimc.yaml"
       - ".github/workflows/pcmoe-architecture.yml"
   pull_request:
     branches:
-      - feature/prototype-confusion-dynamic-moe-fscil
+      - codex/unified-dynamic-moe-fscil
 
 jobs:
-  risk-stable-apc-tests:
+  unified-moe-invariants:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -35,14 +33,11 @@ jobs:
       - name: Compile active modules
         run: |
           python -m py_compile models/bimc.py
+          python -m py_compile models/clip/model.py
           python -m py_compile engine/engine.py
-          python -m py_compile utils/apc.py
           python -m py_compile main.py
-          python -m py_compile tests/test_risk_guided_moe.py
-          python -m py_compile tests/test_few_shot_apc.py
-      - name: Run Risk-Stable and APC invariants
+          python -m py_compile tests/test_unified_dynamic_moe.py
+      - name: Run unified architecture invariants
         env:
           PYTHONPATH: .
-        run: |
-          python -m unittest -v tests.test_risk_guided_moe
-          python -m unittest -v tests.test_few_shot_apc
+        run: python -m unittest -v tests.test_unified_dynamic_moe

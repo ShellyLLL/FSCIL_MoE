@@ -134,89 +134,49 @@ class QuickGELU(nn.Module):
         return x * torch.sigmoid(1.702 * x)
 
 
-class RepresentationDescriptor(nn.Module):
-    """FP32 reconstruction descriptor for one expert's local input distribution."""
-
-    def __init__(self, d_model, descriptor_dim=64, eps=1e-4):
-        super().__init__()
-        self.d_model, self.eps = int(d_model), float(eps)
-        self.descriptor_dim = max(1, min(int(descriptor_dim), self.d_model))
-        self.encoder = nn.Linear(self.d_model, self.descriptor_dim)
-        self.activation = QuickGELU()
-        self.decoder = nn.Linear(self.descriptor_dim, self.d_model)
-        self.register_buffer("mean", torch.tensor(0.0, dtype=torch.float32))
-        self.register_buffer("std", torch.tensor(1.0, dtype=torch.float32))
-        self.register_buffer("fit_sample_count", torch.tensor(0, dtype=torch.long))
-        self.register_buffer("calibration_sample_count", torch.tensor(0, dtype=torch.long))
-
-    def _reconstruct_fp32(self, x):
-        encoded = F.linear(x.float(), self.encoder.weight.float(), self.encoder.bias.float())
-        return F.linear(self.activation(encoded), self.decoder.weight.float(), self.decoder.bias.float())
-
-    def forward(self, x):
-        return self._reconstruct_fp32(x).to(dtype=x.dtype)
-
-    def reconstruction_error(self, x):
-        values = x.detach().float()
-        return (self._reconstruct_fp32(values) - values).pow(2).mean(dim=-1)
-
-    @torch.no_grad()
-    def update_stats(self, errors, responsibilities=None, fit_sample_count=None):
-        errors = torch.as_tensor(errors, device=self.mean.device, dtype=torch.float32).reshape(-1)
-        finite = torch.isfinite(errors)
-        errors = errors[finite]
-        if errors.numel() == 0:
-            raise ValueError("descriptor calibration requires finite errors.")
-        weights = torch.ones_like(errors) if responsibilities is None else torch.as_tensor(
-            responsibilities, device=self.mean.device, dtype=torch.float32
-        ).reshape(-1)[finite].clamp_min(0)
-        mass = weights.sum()
-        if not bool(mass.gt(0).item()):
-            raise ValueError("descriptor responsibilities require positive mass.")
-        mean = (weights * errors).sum() / mass
-        variance = (weights * (errors - mean).square()).sum() / mass
-        self.mean.copy_(mean)
-        self.std.copy_(variance.sqrt().clamp_min(max(self.eps, abs(float(mean.item())) * self.eps)))
-        self.fit_sample_count.fill_(errors.numel() if fit_sample_count is None else int(fit_sample_count))
-        self.calibration_sample_count.fill_(errors.numel())
-        return self.mean, self.std
-
-    def standardized_score(self, x):
-        return (self.reconstruction_error(x) - self.mean) / self.std.clamp_min(self.eps)
-
-    def is_ready(self):
-        return int(self.fit_sample_count.item()) > 0 and int(self.calibration_sample_count.item()) > 0
-
-
 class ExpandableRouter(nn.Module):
-    """Soft router with independently freezable output columns."""
+    """A single expandable router whose columns compete in one sparse Top-K space."""
 
     def __init__(self, dim, num_columns=0):
         super().__init__()
-        self.dim, self.columns = int(dim), nn.ModuleList()
+        self.dim = int(dim)
+        self.columns = nn.ModuleList()
         for _ in range(int(num_columns)):
             self.add_column()
 
-    def add_column(self):
+    def add_column(self, init_bias=0.0, zero_weight=False):
         column = nn.Linear(self.dim, 1)
         nn.init.normal_(column.weight, std=0.02)
-        nn.init.zeros_(column.bias)
+        nn.init.constant_(column.bias, float(init_bias))
+        if zero_weight:
+            nn.init.zeros_(column.weight)
         self.columns.append(column)
         return len(self.columns) - 1
 
-    def forward(self, x, num_columns=None):
+    def logits(self, x, num_columns=None):
         if not self.columns:
             raise RuntimeError("ExpandableRouter requires at least one column.")
         selected = self.columns if num_columns is None else self.columns[:int(num_columns)]
-        logits = torch.cat([column(x) for column in selected], dim=-1)
-        return logits, torch.softmax(logits, dim=-1)
+        return torch.cat([column(x) for column in selected], dim=-1)
+
+    def forward(self, x, top_k=2):
+        logits = self.logits(x)
+        probabilities = torch.softmax(logits, dim=-1)
+        k = min(max(1, int(top_k)), logits.size(-1))
+        selected_logits, selected_indices = torch.topk(logits, k=k, dim=-1)
+        selected_weights = torch.softmax(selected_logits, dim=-1)
+        sparse_weights = torch.zeros_like(logits).scatter(-1, selected_indices, selected_weights)
+        return logits, probabilities, selected_indices, selected_weights, sparse_weights
 
 
 class BottleneckExpert(nn.Module):
+    """Lightweight residual expert with an optionally function-preserving output."""
+
     def __init__(self, d_model, reduction=4, zero_init_up=False):
         super().__init__()
         hidden_dim = max(1, int(d_model) // max(1, int(reduction)))
-        self.c_fc, self.gelu = nn.Linear(d_model, hidden_dim), QuickGELU()
+        self.c_fc = nn.Linear(d_model, hidden_dim)
+        self.gelu = QuickGELU()
         self.c_proj = nn.Linear(hidden_dim, d_model)
         if zero_init_up:
             nn.init.zeros_(self.c_proj.weight)
@@ -227,20 +187,21 @@ class BottleneckExpert(nn.Module):
 
 
 class VisualMoEAdapter(nn.Module):
-    """Unified expert pool, descriptors and expandable soft router."""
+    """Expandable residual experts with one sparse, globally competitive router."""
 
     def __init__(self, d_model, num_experts=4, reduction=4, residual_scale_init=1.0,
-                 descriptor_dim=64, descriptor_eps=1e-4):
+                 top_k=2):
         super().__init__()
-        self.d_model, self.base_expert_count = int(d_model), int(num_experts)
-        self.default_reduction, self.descriptor_dim = int(reduction), int(descriptor_dim)
-        self.descriptor_eps = float(descriptor_eps)
+        if int(num_experts) < 2:
+            raise ValueError("VisualMoEAdapter needs at least two base experts for Top-2 routing.")
+        self.d_model = int(d_model)
+        self.base_expert_count = int(num_experts)
+        self.default_reduction = int(reduction)
+        self.top_k = max(1, int(top_k))
         self.layer_norm = LayerNorm(self.d_model)
         self.residual_scale = nn.Parameter(torch.ones(1) * float(residual_scale_init))
-        self.experts = nn.ModuleList([BottleneckExpert(self.d_model, reduction)
-                                      for _ in range(self.base_expert_count)])
-        self.descriptors = nn.ModuleList([
-            RepresentationDescriptor(self.d_model, descriptor_dim, descriptor_eps)
+        self.experts = nn.ModuleList([
+            BottleneckExpert(self.d_model, self.default_reduction)
             for _ in range(self.base_expert_count)
         ])
         self.router = ExpandableRouter(self.d_model, self.base_expert_count)
@@ -253,137 +214,209 @@ class VisualMoEAdapter(nn.Module):
     def num_incremental_experts(self):
         return max(0, self.num_experts - self.base_expert_count)
 
-    def assert_descriptors_ready(self):
-        if len(self.descriptors) != self.num_experts:
-            raise RuntimeError("every deployed expert must own one descriptor.")
-        missing = [i for i, descriptor in enumerate(self.descriptors) if not descriptor.is_ready()]
-        if missing:
-            raise RuntimeError(f"deployed experts have uncalibrated descriptors: {missing}")
-
-    def descriptor_scores(self, x, require_ready=True):
-        if require_ready:
-            self.assert_descriptors_ready()
-        return torch.stack([descriptor.standardized_score(x) for descriptor in self.descriptors], dim=-1)
-
-    @torch.no_grad()
-    def update_descriptor_stats(self, errors, expert_id, responsibilities=None, fit_sample_count=None):
-        return self.descriptors[int(expert_id)].update_stats(
-            errors, responsibilities=responsibilities, fit_sample_count=fit_sample_count
-        )
-
     def freeze_all(self):
         for parameter in self.parameters():
             parameter.requires_grad = False
             parameter.grad = None
         self.eval()
 
-    def set_newest_trainable(self, descriptor=False):
+    def set_newest_trainable(self):
         if self.num_experts <= self.base_expert_count:
-            raise RuntimeError("there is no incremental expert to train.")
+            raise RuntimeError("There is no incremental expert to train.")
         self.freeze_all()
         for module in (self.experts[-1], self.router.columns[-1]):
             for parameter in module.parameters():
                 parameter.requires_grad = True
-        if descriptor:
-            for parameter in self.descriptors[-1].parameters():
-                parameter.requires_grad = True
         self.train()
 
     def add_expert(self, session_id, reduction=None):
+        """Append a zero-output expert and a dormant router column.
+
+        The new column starts below the existing routes. Its activation is
+        learned from current-class support while historical class statistics
+        explicitly constrain it to stay outside their Top-K routing regions.
+        """
         self.freeze_all()
         reduction = self.default_reduction if reduction is None else int(reduction)
-        self.experts.append(BottleneckExpert(self.d_model, reduction, zero_init_up=True).to(
-            device=self.residual_scale.device, dtype=self.residual_scale.dtype))
-        self.descriptors.append(RepresentationDescriptor(
-            self.d_model, self.descriptor_dim, self.descriptor_eps).to(device=self.residual_scale.device))
-        self.router.add_column()
-        self.router.columns[-1].to(device=self.residual_scale.device, dtype=self.residual_scale.dtype)
+        device = self.residual_scale.device
+        expert_dtype = next(self.experts[0].parameters()).dtype
+        router_dtype = next(self.router.columns[0].parameters()).dtype
+        self.experts.append(BottleneckExpert(
+            self.d_model, reduction, zero_init_up=True
+        ).to(device=device, dtype=expert_dtype))
+        self.router.add_column(init_bias=-5.0, zero_weight=True)
+        self.router.columns[-1].to(device=device, dtype=router_dtype)
         self.expert_birth_sessions.append(int(session_id))
         self.set_newest_trainable()
         return self.num_experts - 1
 
-    def newest_parameters(self, include_descriptor=False):
-        parameters = list(self.experts[-1].parameters()) + list(self.router.columns[-1].parameters())
-        if include_descriptor:
-            parameters += list(self.descriptors[-1].parameters())
-        return parameters
+    def newest_parameters(self):
+        return list(self.experts[-1].parameters()) + list(self.router.columns[-1].parameters())
 
     def historical_named_parameters(self):
         newest = self.num_experts - 1
-        prefixes = (f"experts.{newest}.", f"router.columns.{newest}.", f"descriptors.{newest}.")
+        prefixes = (f"experts.{newest}.", f"router.columns.{newest}.")
         for name, parameter in self.named_parameters():
             if not name.startswith(prefixes):
                 yield name, parameter
 
+    def route_preservation_loss(self, history_mean, history_variance,
+                                margin=0.1, uncertainty=1.0):
+        """Bound new-route activation over stored class-local feature statistics.
+
+        Router columns are linear. For each historical class, the new logit
+        must remain below both experts that won the old Top-2 competition at
+        that class mean. The diagonal covariance supplies a conservative
+        uncertainty term without retaining historical images.
+        """
+        if self.num_experts <= self.base_expert_count:
+            return self.residual_scale.new_zeros((), dtype=torch.float32)
+        means = torch.as_tensor(history_mean, device=self.residual_scale.device,
+                                dtype=torch.float32).reshape(-1, self.d_model)
+        if means.numel() == 0:
+            return self.residual_scale.new_zeros((), dtype=torch.float32)
+        variances = torch.as_tensor(history_variance, device=means.device,
+                                    dtype=torch.float32).reshape_as(means).clamp_min(0.0)
+        old_weights = torch.cat([
+            column.weight.float() for column in self.router.columns[:-1]
+        ], dim=0)
+        old_biases = torch.cat([
+            column.bias.float() for column in self.router.columns[:-1]
+        ], dim=0)
+        old_logits = F.linear(means, old_weights, old_biases)
+        old_top2 = old_logits.topk(k=2, dim=-1).indices
+        selected_weights = old_weights[old_top2]
+        selected_biases = old_biases[old_top2]
+        new_column = self.router.columns[-1]
+        delta_weight = new_column.weight.float().view(1, 1, -1) - selected_weights
+        delta_bias = new_column.bias.float().view(1, 1) - selected_biases
+        mean_difference = (means[:, None, :] * delta_weight).sum(dim=-1) + delta_bias
+        difference_variance = (
+            variances[:, None, :] * delta_weight.square()
+        ).sum(dim=-1).clamp_min(0.0)
+        robust_upper = mean_difference + float(uncertainty) * torch.sqrt(
+            difference_variance + 1e-8
+        )
+        return F.relu(robust_upper + float(margin)).mean()
+
+    def route_objective(self, current_features, history_mean, history_variance,
+                        margin=0.1, uncertainty=1.0):
+        """Activate the new expert for current classes while preserving old Top-2 routes."""
+        if self.num_experts <= self.base_expert_count:
+            raise RuntimeError("Route objectives require a newly appended expert.")
+        features = current_features.float()
+        old_weights = torch.cat([
+            column.weight.float() for column in self.router.columns[:-1]
+        ], dim=0)
+        old_biases = torch.cat([
+            column.bias.float() for column in self.router.columns[:-1]
+        ], dim=0)
+        old_logits = F.linear(features, old_weights, old_biases)
+        second_old = old_logits.topk(k=2, dim=-1).values[:, -1]
+        new_column = self.router.columns[-1]
+        new_logits = F.linear(features, new_column.weight.float(),
+                              new_column.bias.float()).squeeze(-1)
+        activation_loss = F.relu(second_old + float(margin) - new_logits).mean()
+        preservation_loss = self.route_preservation_loss(
+            history_mean, history_variance, margin=margin, uncertainty=uncertainty
+        )
+        return activation_loss, preservation_loss
+
     def export_topology(self):
-        return {"version": 1, "d_model": self.d_model, "base_expert_count": self.base_expert_count,
-                "experts": [{"reduction": max(1, self.d_model // expert.c_fc.out_features),
-                             "birth_session": int(self.expert_birth_sessions[index])}
-                            for index, expert in enumerate(self.experts)]}
+        return {
+            "version": 2,
+            "d_model": self.d_model,
+            "base_expert_count": self.base_expert_count,
+            "top_k": self.top_k,
+            "experts": [
+                {
+                    "reduction": max(1, self.d_model // expert.c_fc.out_features),
+                    "birth_session": int(self.expert_birth_sessions[index]),
+                }
+                for index, expert in enumerate(self.experts)
+            ],
+        }
 
     def rebuild_topology(self, topology):
         if topology is None:
-            topology = {"d_model": self.d_model, "base_expert_count": self.base_expert_count,
-                        "experts": [{"reduction": self.default_reduction, "birth_session": 0}
-                                    for _ in range(self.base_expert_count)]}
+            topology = {
+                "version": 2,
+                "d_model": self.d_model,
+                "base_expert_count": self.base_expert_count,
+                "top_k": self.top_k,
+                "experts": [
+                    {"reduction": self.default_reduction, "birth_session": 0}
+                    for _ in range(self.base_expert_count)
+                ],
+            }
+        if int(topology.get("version", -1)) != 2:
+            raise ValueError("Unsupported MoE topology; rebuild from a unified Top-K checkpoint.")
         if int(topology.get("d_model", self.d_model)) != self.d_model:
             raise ValueError("MoE topology d_model mismatch.")
         if int(topology.get("base_expert_count", self.base_expert_count)) != self.base_expert_count:
             raise ValueError("MoE topology base expert count mismatch.")
+        if int(topology.get("top_k", self.top_k)) != self.top_k:
+            raise ValueError("MoE topology Top-K mismatch.")
         specs = list(topology.get("experts", []))
         if len(specs) < self.base_expert_count:
             raise ValueError("MoE topology has fewer experts than the base pool.")
-        self.experts, self.descriptors = nn.ModuleList(), nn.ModuleList()
-        self.router, self.expert_birth_sessions = ExpandableRouter(self.d_model), []
-        for spec in specs:
+        self.experts = nn.ModuleList()
+        self.router = ExpandableRouter(self.d_model)
+        self.expert_birth_sessions = []
+        for index, spec in enumerate(specs):
             reduction = int(spec.get("reduction", self.default_reduction))
             self.experts.append(BottleneckExpert(self.d_model, reduction))
-            self.descriptors.append(RepresentationDescriptor(
-                self.d_model, self.descriptor_dim, self.descriptor_eps))
-            self.router.add_column()
+            self.router.add_column(
+                init_bias=-5.0 if index >= self.base_expert_count else 0.0,
+                zero_weight=index >= self.base_expert_count,
+            )
             self.expert_birth_sessions.append(int(spec.get("birth_session", 0)))
-        device, dtype = self.residual_scale.device, self.residual_scale.dtype
-        self.experts.to(device=device, dtype=dtype)
-        self.router.to(device=device, dtype=dtype)
-        self.descriptors.to(device=device, dtype=torch.float32)
+        device = self.residual_scale.device
+        expert_dtype = next(self.experts[0].parameters()).dtype
+        router_dtype = next(self.router.columns[0].parameters()).dtype
+        self.experts.to(device=device, dtype=expert_dtype)
+        self.router.to(device=device, dtype=router_dtype)
         self.freeze_all()
 
     def remove_newest_expert(self):
         if self.num_experts <= self.base_expert_count:
             raise RuntimeError("Cannot remove a base expert.")
-        # ModuleList.pop() is unavailable in older PyTorch releases.
-        # Deleting the last index unregisters the temporary modules and
-        # preserves the indices/state_dict keys of historical experts.
         del self.experts[-1]
-        del self.descriptors[-1]
         del self.router.columns[-1]
         self.expert_birth_sessions.pop()
         self.freeze_all()
 
-    def forward(self, x, max_session=None):
+    def forward(self, x):
         if x.ndim != 3:
             raise ValueError("VisualMoEAdapter expects [tokens, batch, dim].")
         x_norm = self.layer_norm(x)
-        # The base mixture is never renormalised when incremental experts arrive.
-        base_logits, base_weights = self.router(x_norm[0], self.base_expert_count)
-        active = [index for index, birth in enumerate(self.expert_birth_sessions)
-                  if index >= self.base_expert_count and
-                  (max_session is None or birth <= max_session)]
-        gate_logits = [self.router.columns[index](x_norm[0]) for index in active]
-        weights = (torch.cat([base_weights] + [torch.sigmoid(value) for value in gate_logits], dim=-1)
-                   if gate_logits else base_weights)
-        logits = torch.cat([base_logits] + gate_logits, dim=-1) if gate_logits else base_logits
-        residual, norms = torch.zeros_like(x_norm), []
-        for column, expert_id in enumerate(list(range(self.base_expert_count)) + active):
-            weighted = self.experts[expert_id](x_norm) * weights[:, column].unsqueeze(0).unsqueeze(-1)
-            residual = residual + weighted
-            norms.append(weighted.detach().float().pow(2).mean().sqrt())
+        logits, probabilities, top_indices, top_weights, sparse_weights = self.router(
+            x_norm[0], top_k=self.top_k
+        )
+        residual = torch.zeros_like(x_norm)
+        residual_norms = x_norm.new_zeros(self.num_experts, dtype=torch.float32)
+        for expert_id, expert in enumerate(self.experts):
+            selected = top_indices.eq(expert_id)
+            rows = torch.nonzero(selected.any(dim=-1), as_tuple=False).flatten()
+            if rows.numel() == 0:
+                continue
+            weights = (selected[rows].to(top_weights.dtype) * top_weights[rows]).sum(dim=-1)
+            expert_input = x_norm.index_select(1, rows)
+            expert_output = expert(expert_input)
+            weighted_output = expert_output * weights.view(1, -1, 1)
+            residual = residual.index_add(1, rows, weighted_output)
+            residual_norms[expert_id] = weighted_output.detach().float().pow(2).mean().sqrt()
         residual = self.residual_scale.to(residual.dtype) * residual
-        return residual, {"logits": logits, "route_weights": weights,
-                          "top_k_indices": weights.argmax(dim=-1, keepdim=True),
-                          "cls_in": x_norm[0], "patch_mean_in": x_norm[1:].mean(dim=0),
-                          "expert_residual_norms": torch.stack(norms),
-                          "token_residual": residual.detach()}
+        return residual, {
+            "logits": logits,
+            "gate_probabilities": probabilities,
+            "route_weights": sparse_weights,
+            "top_k_indices": top_indices,
+            "top_k_weights": top_weights,
+            "cls_in": x_norm[0],
+            "patch_mean_in": x_norm[1:].mean(dim=0),
+            "expert_residual_norms": residual_norms,
+        }
 
 
 class ResidualAttentionBlock(nn.Module):
@@ -404,7 +437,7 @@ class ResidualAttentionBlock(nn.Module):
         self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
         return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
 
-    def forward(self, x: torch.Tensor, max_session=None, disable_moe=False):
+    def forward(self, x: torch.Tensor, disable_moe=False):
         x = x + self.attention(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         moe_aux = None
@@ -413,7 +446,7 @@ class ResidualAttentionBlock(nn.Module):
                 # Raw frozen-backbone block output before any adapter residual.
                 moe_aux = {"cls_in": x[0], "patch_mean_in": x[1:].mean(dim=0)}
             else:
-                moe_out, moe_aux = self.moe_adapter(x, max_session=max_session)
+                moe_out, moe_aux = self.moe_adapter(x, )
                 x = x + moe_out
         return x, moe_aux
 
@@ -424,10 +457,10 @@ class Transformer(nn.Module):
         self.layers = layers
         self.resblocks = nn.ModuleList([ResidualAttentionBlock(width, heads, attn_mask) for _ in range(layers)])
 
-    def forward(self, x: torch.Tensor, max_session=None, disable_moe=False):
+    def forward(self, x: torch.Tensor, disable_moe=False):
         moe_aux_list = []
         for block in self.resblocks:
-            x, aux = block(x, max_session=max_session, disable_moe=disable_moe)
+            x, aux = block(x, disable_moe=disable_moe)
             if aux is not None: moe_aux_list.append(aux)
         return x, moe_aux_list
 
@@ -446,7 +479,7 @@ class VisionTransformer(nn.Module):
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
 
     def forward(self, x: torch.Tensor, all_layer_outputs=False, return_moe_aux=False,
-                max_session=None, disable_moe=False):
+                disable_moe=False):
         x = self.conv1(x)  
         x = x.reshape(x.shape[0], x.shape[1], -1)  
         x = x.permute(0, 2, 1)  
@@ -457,7 +490,7 @@ class VisionTransformer(nn.Module):
         if not all_layer_outputs:
             x = x.permute(1, 0, 2)  
             x, moe_aux_list = self.transformer(
-                x, max_session=max_session, disable_moe=disable_moe
+                x, disable_moe=disable_moe
             )
             x = x.permute(1, 0, 2)  
             x = self.ln_post(x[:, 0, :])
@@ -468,7 +501,7 @@ class VisionTransformer(nn.Module):
             x = x.permute(1, 0, 2)  
             outputs, moe_aux_list = [], []
             for block in self.transformer.resblocks:
-                x, aux = block(x, max_session=max_session, disable_moe=disable_moe)
+                x, aux = block(x, disable_moe=disable_moe)
                 if aux is not None: moe_aux_list.append(aux)
                 cur_output = x.permute(1, 0, 2)
                 cur_output = self.ln_post(cur_output[:, 0, :])
@@ -530,14 +563,13 @@ class CLIP(nn.Module):
     def dtype(self):
         return self.visual.conv1.weight.dtype
 
-    def encode_image(self, image, return_moe_aux=False, max_session=None, disable_moe=False):
+    def encode_image(self, image, return_moe_aux=False, disable_moe=False):
         if not isinstance(self.visual, VisionTransformer):
             return self.visual(image.type(self.dtype))
         if return_moe_aux:
             return self.visual(image.type(self.dtype), return_moe_aux=True,
-                               max_session=max_session, disable_moe=disable_moe)
-        return self.visual(image.type(self.dtype), max_session=max_session,
-                           disable_moe=disable_moe)
+                               disable_moe=disable_moe)
+        return self.visual(image.type(self.dtype), disable_moe=disable_moe)
 
     def encode_text(self, text):
         x = self.token_embedding(text).type(self.dtype)
@@ -623,8 +655,7 @@ def build_model(state_dict: dict, cfg=None):
             "BASE_SCALE_INIT",
             getattr(moe_cfg, "RESIDUAL_SCALE_INIT", 1.0),
         )
-        descriptor_dim = getattr(moe_cfg, "DESCRIPTOR_DIM", 64)
-        descriptor_eps = getattr(moe_cfg, "DESCRIPTOR_EPS", 1e-4)
+        top_k = getattr(moe_cfg, "TOP_K", 2)
         for idx in moe_cfg.INSERT_BLOCKS:
             if idx < 0: idx = len(model.visual.transformer.resblocks) + idx
             block = model.visual.transformer.resblocks[idx]
@@ -633,8 +664,7 @@ def build_model(state_dict: dict, cfg=None):
                 num_experts=num_base_experts,
                 reduction=base_reduction,
                 residual_scale_init=base_scale_init,
-                descriptor_dim=descriptor_dim,
-                descriptor_eps=descriptor_eps,
+                top_k=top_k,
             )
         convert_weights(model)
     return model.eval()

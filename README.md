@@ -1,138 +1,58 @@
-# BiMC
+# Unified Dynamic-MoE FSCIL
 
-This is the official implementation of paper **Enhancing Few-Shot Class-Incremental Learning via Training-Free Bi-Level Modality Calibration (CVPR 2025)**.
+This branch implements one shared visual feature space for few-shot class-incremental learning (FSCIL), using a frozen CLIP ViT and incrementally expandable residual experts.
 
-## Abstract
+## Architecture
 
-Few-shot Class-Incremental Learning (FSCIL) challenges models to adapt to new classes with limited samples, presenting greater difficulties than traditional class-incremental learning. While existing approaches rely heavily on visual models and require additional training during base or incremental phases, we propose a training-free framework that leverages pre-trained visual-language models like CLIP. At the core of our approach is a novel Bi-level Modality Calibration (BiMC) strategy. Our framework initially performs intra-modal calibration, combining LLM-generated fine-grained category descriptions with visual prototypes from the base session to achieve precise classifier estimation. This is further complemented by inter-modal calibration that fuses pre-trained linguistic knowledge with task-specific visual priors to mitigate modality-specific biases. To enhance prediction robustness, we introduce additional metrics and strategies that maximize the utilization of limited data. Extensive experimental results demonstrate that our approach significantly outperforms existing methods.
+- The pretrained CLIP visual backbone is frozen.
+- Each configured middle/high ViT block owns one expandable pool of bottleneck residual experts.
+- Every expert in a block competes in one router. Inference computes only the selected Top-K experts (Top-2 by default); there is no Session-ID router, independent Sigmoid gate, or versioned encoder path.
+- A newly appended expert has a zero output projection and a dormant router column. Appending it therefore preserves the current function until the new route is trained.
+- After expansion, historical experts and router columns are frozen but remain eligible for routing. Only the newest expert and its router column are trainable.
+- Candidate expansion is evaluated by support-source leave-one-out (LOO) risk against the complete bank of historical and current class prototypes. Candidate layers are evaluated individually and then as conditional combinations; an expansion is accepted only when its measured gain exceeds its fold standard error.
+- Historical class-level layer-input means and diagonal variances are retained as compact statistics. A covariance-aware margin loss constrains each new router column to remain below the previous Top-2 routes over historical class regions, while a complementary activation loss makes the new route useful for current classes.
+- The final classifier uses one current-model visual feature space and one cumulative class-prototype bank. Historical prototypes are not recomputed by passing a mean token through a changed encoder.
 
-## Installation
+## Training flow
 
-### Dataset
+1. Train the base-session MoE against the base classes, with frozen CLIP features as a distillation target.
+2. Freeze the base experts and routers; store base visual prototypes and class-local layer statistics.
+3. For each incremental session, create source-exclusive support folds.
+4. Evaluate the unchanged model and temporary candidate expert sets using the same all-seen-class prototype classifier.
+5. Train accepted experts and route columns using all-seen-class LOO classification plus historical route-preservation objectives.
+6. Freeze the accepted experts, compute current-session visual/text prototypes, append class-local statistics, and evaluate every seen class through the same dynamic encoder.
+7. Save the model topology, weights, cumulative prototype states, support manifest, metrics, and RNG state.
 
-Please follow [CEC](https://github.com/icoz69/CEC-CVPR2021) to download *mini*-ImageNet, CUB-200 and CIFAR-100.
+## Run
 
-### Requirement
+Set the dataset root and text-description JSON path in the dataset configuration, then run:
 
-- `torch==1.13.1`
-- `torchvision==0.14.1`
-- `yacs==0.1.8` 
-- `tqdm==4.66.1`
-- `ftfy==6.1.1`
-- `regex==2023.10.3`
-- `scikit-learn==1.3.2`
-
-## Experiments
-
-First, remember to modify the data path `ROOT` in the `dataset` configuration file.
-
-~~~BASH
-# CIFAR BIMC
-python main.py --data_cfg ./configs/datasets/cifar100.yaml --train_cfg ./configs/trainers/bimc.yaml
-
-# CIFAR BIMC_Ensemble
-python main.py --data_cfg ./configs/datasets/cifar100.yaml --train_cfg ./configs/trainers/bimc_ensemble.yaml
-
-# MiniImagenet BIMC
-python main.py --data_cfg ./configs/datasets/miniimagenet.yaml --train_cfg ./configs/trainers/bimc.yaml
-
-# MiniImagenet BIMC_Ensemble
-python main.py --data_cfg ./configs/datasets/miniimagenet.yaml --train_cfg ./configs/trainers/bimc_ensemble.yaml
-
-# CUB200 BIMC
+~~~bash
 python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml
-
-# CUB200 BIMC_Ensemble
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc_ensemble.yaml
 ~~~
 
-### Dynamic FSCIL MoE runs
+For reproducible comparisons, reuse the same support manifest:
 
-The `bimc.yaml` configuration now auto-saves a dataset/seed-specific fixed
-support manifest alongside session checkpoints. Use the same manifest for
-comparisons. The CUB200 run is:
-
-~~~BASH
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --support_manifest checkpoints/fscil_moe/cub_seed1_support.json
+~~~bash
+python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --support_manifest checkpoints/unified_dynamic_moe/cub_seed1_support.json
 ~~~
 
-At each incremental session, each eligible block receives a temporary candidate
-expert. Five support folds compare its held-out, task-local fused classifier
-loss with the unchanged encoder; at most one candidate is retained if its
-gain exceeds one standard error. Training refreshes source-exclusive visual
-prototypes, updates only the new expert and router column, and freezes them
-afterward. Historical class weights and encoders retain their creation versions.
-The frozen base encoder supplies common-space task evidence. Its task offsets
-jointly minimize class-balanced task loss using source-exclusive support
-features from every observed class. Expert logits only rank classes within
-each task; no task identity is supplied at inference.
+A staged run can stop after a selected session:
 
-For staged development, reuse Session 0 and stop after Task 3 without changing
-the normal full-run default:
-
-~~~BASH
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --resume checkpoints/fscil_moe/session_00.pth --end_session 3
+~~~bash
+python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --end_session 3
 ~~~
 
-Resume from a checkpoint produced by this version (schema 9) with:
+Unified checkpoints use schema 12. Earlier APC, descriptor-router, and versioned-classifier checkpoints are intentionally rejected: their routing and prototype semantics are not equivalent and cannot be safely migrated.
 
-~~~BASH
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --resume checkpoints/fscil_moe/session_03.pth
+## Validation
+
+Run the CPU architecture tests:
+
+~~~bash
+python -m unittest -v tests.test_unified_dynamic_moe
 ~~~
 
-Base-only schema 7/8 checkpoints can be reused. Earlier incremental
-checkpoints cannot be resumed because their experts were optimized for a
-different classifier objective. Compare the complete 11-session accuracy list
-with the target using the same fixed support manifest; the support-only gate
-diagnostics are not a substitute for test accuracy. `TaskDiagnostic` reports
-the actual task selection rate and an oracle-task within-class upper bound;
-the latter uses test labels only for analysis, never for predictions.
+The tests cover function-preserving expansion, one sparse Top-K competition, actual skipping of unselected experts, incremental freeze policy, route-activation gradients, covariance-aware historical route constraints, topology round trips, and source-exclusive LOO prototypes.
 
-## Acknowledgment
-
-In this repository, we build our code based on the following excellent open-source projects. We sincerely thank all the authors for sharing their great work:
-
-- [LP-DiF](https://github.com/1170300714/LP-DiF)
-- [TEEN](https://github.com/wangkiw/TEEN)
-- [FeCAM](https://github.com/dipamgoswami/FeCAM)
-- [CuPL](https://github.com/sarahpratt/CuPL)
-- [AdaptCLIPZS](https://github.com/cvl-umass/AdaptCLIPZS)
-
-
-
-## Few-shot calibrated APC expansion decisions
-
-The default runner remains the Risk-Stable BiMC pipeline. APC follows the
-prototype-confusion rule in the method specification and uses only real data.
-
-At Session 0, the frozen pretrained visual encoder is run with every MoE
-residual bypassed. For each candidate visual block, one original-visual
-prototype is computed for every real base class. The nearest-neighbour cosine
-similarity of each base prototype to another base prototype is measured, and
-the configured quantile of that empirical distribution becomes the fixed
-threshold for that block.
-
-At each incremental session, APC uses the actual few-shot support set without
-resampling, class simulation, support splitting, or synthetic episodes. It
-computes each new class's original-visual prototype and its maximum cosine
-similarity to prototypes of classes seen before the current session. A block
-is APC-eligible exactly when the maximum confusion exceeds its fixed Session-0
-threshold. The new real support prototypes are then appended to the historical
-prototype bank. All APC features are extracted from the frozen pretrained
-visual encoder with every MoE residual bypassed, keeping the feature space
-comparable across sessions.
-
-Risk-Stable's original candidate training, five-fold held-out predictive-risk
-evaluation, one-standard-error acceptance, expert freezing, classifier
-construction, and bilevel inference remain in place. Candidate expert training
-is restricted to APC-eligible blocks; confusion alone cannot force an expert
-expansion if Risk-Stable rejects its predictive benefit. If APC identifies no
-eligible block, no expert is added and the original classifier path still
-learns the new class from its real support set.
-
-The APC state and fixed Session-0 thresholds are stored in schema-11
-checkpoints. Older checkpoints reconstruct the auxiliary prototype bank only
-from the real support sets in their completed sessions.
-
-APC settings are under `TRAINER.BiMC.APC`:
-`ENABLE` and `QUANTILE` (default 0.95).
+A passing unit suite is necessary but not sufficient. Full benchmark acceptance still requires the final trained checkpoint to report session-wise accuracy, AA, PD, base/novel accuracy, expert counts, per-expert route selection, and historical route-preservation values on the same support manifest and evaluation protocol.
