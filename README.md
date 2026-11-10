@@ -102,30 +102,37 @@ In this repository, we build our code based on the following excellent open-sour
 
 ## Few-shot calibrated APC expansion decisions
 
-The default FSCIL runner remains the Risk-Stable BiMC pipeline. APC is an
-optional, calibrated selector for expansion location; it does not replace
-the base objective, expert descriptors, five-fold candidate training,
-leave-one-source-out fused classifier, held-out predictive-risk acceptance,
-versioned prototypes, or bilevel task-gated inference.
+The default runner remains the Risk-Stable BiMC pipeline. APC follows the
+prototype-confusion rule in the method specification and uses only real data.
 
-At Session 0, APC builds an empirical null distribution from base-class
-support episodes using the same incremental shot count. Each pseudo-novel
-class is evaluated with leave-one-out (S-1)-shot prototypes, while its
-historical competitors use S-shot prototypes. Calibration is conditioned on
-the number of novel classes and the exact number of competing historical and
-current classes, and applies a Bonferroni-adjusted family-wise threshold
-across expandable blocks. All APC features are extracted in encoder version 0.
+At Session 0, the frozen pretrained visual encoder is run with every MoE
+residual bypassed. For each candidate visual block, one original-visual
+prototype is computed for every real base class. The nearest-neighbour cosine
+similarity of each base prototype to another base prototype is measured, and
+the configured quantile of that empirical distribution becomes the fixed
+threshold for that block.
 
-At each incremental task, APC evaluates five cross-fitted (S-1)-shot
-prototypes. Every expandable block still undergoes the original Risk-Stable
-five-fold candidate training and held-out predictive-risk evaluation. APC can
-only break a one-standard-error tie between risk-equivalent blocks; it cannot
-veto an otherwise accepted Risk-Stable candidate or override a materially
-better predictive-risk result. A committed session appends its full S-shot
-anchor prototypes to APC memory. The APC memory and calibration state are
-stored in schema-10 checkpoints; schema-9 checkpoints rebuild this auxiliary
-state from their fixed support manifest without retraining the model.
+At each incremental session, APC uses the actual few-shot support set without
+resampling, class simulation, support splitting, or synthetic episodes. It
+computes each new class's original-visual prototype and its maximum cosine
+similarity to prototypes of classes seen before the current session. A block
+is APC-eligible exactly when the maximum confusion exceeds its fixed Session-0
+threshold. The new real support prototypes are then appended to the historical
+prototype bank. All APC features are extracted from the frozen pretrained
+visual encoder with every MoE residual bypassed, keeping the feature space
+comparable across sessions.
 
-APC settings are under `TRAINER.BiMC.APC` in `configs/trainers/bimc.yaml`:
-`ENABLE`, `EPISODES`, `ALPHA`, and `SEED`. The default calibration uses
-512 episodes and family-wise alpha 0.05.
+Risk-Stable's original candidate training, five-fold held-out predictive-risk
+evaluation, one-standard-error acceptance, expert freezing, classifier
+construction, and bilevel inference remain in place. Candidate expert training
+is restricted to APC-eligible blocks; confusion alone cannot force an expert
+expansion if Risk-Stable rejects its predictive benefit. If APC identifies no
+eligible block, no expert is added and the original classifier path still
+learns the new class from its real support set.
+
+The APC state and fixed Session-0 thresholds are stored in schema-11
+checkpoints. Older checkpoints reconstruct the auxiliary prototype bank only
+from the real support sets in their completed sessions.
+
+APC settings are under `TRAINER.BiMC.APC`:
+`ENABLE` and `QUANTILE` (default 0.95).
