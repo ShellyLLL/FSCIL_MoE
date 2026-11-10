@@ -1,4 +1,4 @@
-"""Few-shot APC calibration invariants."""
+"""APC tests using only real class prototypes and real support samples."""
 import unittest
 import torch
 import torch.nn.functional as F
@@ -6,76 +6,47 @@ from utils.apc import build_few_shot_apc_reference, evaluate_few_shot_apc, updat
 
 
 class FewShotAPCTests(unittest.TestCase):
-    def _base_features(self):
-        generator = torch.Generator().manual_seed(91)
-        result = {}
-        labels = torch.arange(6).repeat_interleave(12)
-        for block in (8, 9):
-            centers = F.normalize(torch.randn(6, 16, generator=generator), dim=-1)
-            values = []
-            for class_id in range(6):
-                noise = 0.15 * torch.randn(12, 16, generator=generator)
-                values.append(F.normalize(centers[class_id] + noise, dim=-1))
-            result[block] = {"cls_in": torch.cat(values), "labels": labels.clone(),
-                             "source_ids": torch.arange(len(labels))}
-        return result
+    @staticmethod
+    def _features(vectors, labels, shots):
+        rows, targets = [], []
+        for vector, label in zip(vectors, labels):
+            for _ in range(shots):
+                rows.append(torch.tensor(vector, dtype=torch.float32))
+                targets.append(label)
+        return {"cls_in": torch.stack(rows), "labels": torch.tensor(targets)}
 
-    def test_calibration_matches_five_shot_and_competitor_count(self):
+    def test_threshold_comes_from_real_base_nearest_neighbours(self):
+        vectors = [[1., 0., 0.], [.8, .6, 0.], [0., 1., 0.]]
+        base = self._features(vectors, [0, 1, 2], 8)
+        state = build_few_shot_apc_reference({5: base}, [0, 1, 2], quantile=.5)
+        prototypes = F.normalize(torch.tensor(vectors), dim=-1)
+        similarities = prototypes @ prototypes.T
+        similarities.fill_diagonal_(float("-inf"))
+        expected = torch.quantile(similarities.max(dim=1).values, .5).item()
+        self.assertAlmostEqual(state["layers"]["5"]["threshold"], expected, places=6)
+        self.assertEqual(state["seen_class_ids"], [0, 1, 2])
+
+    def test_real_five_shot_support_controls_expansion(self):
+        vectors = [[1., 0., 0.], [.8, .6, 0.], [0., 1., 0.]]
         state = build_few_shot_apc_reference(
-            self._base_features(), list(range(6)),
-            [{"task_id": 1, "competitor_count": 7, "new_class_count": 2}],
-            shot=5, episodes=64, alpha=0.05, seed=12, device="cpu")
-        self.assertEqual(state["shot"], 5)
-        self.assertEqual(state["query_shot"], 4)
-        self.assertEqual(set(state["layers"]), {"8", "9"})
-        for layer in state["layers"].values():
-            calibration = layer["calibration"]["7:2"]
-            self.assertEqual(calibration["null_count"], 64)
-            self.assertTrue(torch.isfinite(torch.tensor(calibration["threshold"])))
+            {5: self._features(vectors, [0, 1, 2], 8)}, [0, 1, 2], quantile=.5)
+        confused = self._features([[.82, .57, 0.]], [3], 5)
+        decision = evaluate_few_shot_apc({5: confused}, state, [3], expected_shot=5)
+        self.assertEqual(decision["candidate_blocks"], [5])
+        self.assertEqual(decision["layers"]["5"]["nearest_seen_class_by_new_class"][3], 1)
+        separated = self._features([[0., 0., 1.]], [4], 5)
+        decision = evaluate_few_shot_apc({5: separated}, state, [4], expected_shot=5)
+        self.assertEqual(decision["candidate_blocks"], [])
 
-    def test_cross_fitted_queries_and_memory_commit(self):
-        state = build_few_shot_apc_reference(
-            self._base_features(), list(range(6)),
-            [{"task_id": 1, "competitor_count": 7, "new_class_count": 2}],
-            shot=5, episodes=64, alpha=0.05, seed=13, device="cpu")
-        folds = []
-        for _ in range(5):
-            fold = {}
-            for block in (8, 9):
-                rows, labels = [], []
-                for class_id in (6, 7):
-                    center = torch.zeros(16); center[class_id] = 1.0
-                    rows.append(F.normalize(center + 0.1 * torch.randn(4, 16), dim=-1))
-                    labels.extend([class_id] * 4)
-                fold[block] = {"cls_in": torch.cat(rows), "labels": torch.tensor(labels)}
-            folds.append(fold)
-        result = evaluate_few_shot_apc(folds, state, [6, 7], device="cpu")
-        self.assertEqual(set(result["layers"]), {"8", "9"})
-        for item in result["layers"].values():
-            self.assertEqual(item["competitor_count"], 7)
-            self.assertEqual(item["new_class_count"], 2)
-        full = {}
-        for block in (8, 9):
-            rows, labels = [], []
-            for class_id in (6, 7):
-                center = torch.zeros(16); center[class_id] = 1.0
-                rows.append(F.normalize(center + 0.1 * torch.randn(5, 16), dim=-1))
-                labels.extend([class_id] * 5)
-            full[block] = {"cls_in": torch.cat(rows), "labels": torch.tensor(labels)}
-        update_few_shot_apc_memory(state, full, [6, 7])
-        for layer in state["layers"].values():
-            self.assertEqual(set(layer["prototypes"]), {str(i) for i in range(8)})
-
-    def test_calibration_is_deterministic(self):
-        features = self._base_features()
-        specs = [{"task_id": 1, "competitor_count": 7, "new_class_count": 2}]
-        first = build_few_shot_apc_reference(features, list(range(6)), specs,
-            shot=5, episodes=64, alpha=0.05, seed=77, device="cpu")
-        second = build_few_shot_apc_reference(features, list(range(6)), specs,
-            shot=5, episodes=64, alpha=0.05, seed=77, device="cpu")
-        for block in ("8", "9"):
-            self.assertEqual(first["layers"][block]["thresholds"],
-                             second["layers"][block]["thresholds"])
+    def test_memory_commit_uses_actual_support_count(self):
+        base = self._features([[1., 0.], [0., 1.]], [0, 1], 6)
+        state = build_few_shot_apc_reference({2: base}, [0, 1], quantile=.9)
+        support = self._features([[0., 0., 1.]], [2], 5)
+        update_few_shot_apc_memory(state, {2: support}, [2], expected_shot=5)
+        self.assertEqual(state["seen_class_ids"], [0, 1, 2])
+        self.assertIn("2", state["layers"]["2"]["prototypes"])
+        with self.assertRaisesRegex(ValueError, "received 5 samples"):
+            update_few_shot_apc_memory(state, {2: support}, [3], expected_shot=4)
 
 
 if __name__ == "__main__":
