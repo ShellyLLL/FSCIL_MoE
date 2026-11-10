@@ -642,7 +642,8 @@ class Runner:
         return result
 
     def _apc_enabled(self):
-        return (bool(self._visual_moe_cfg().ENABLE) and
+        visual_cfg = getattr(self.cfg.TRAINER.BiMC, "VISUAL_MOE", None)
+        return (bool(_cfg_value(visual_cfg, "ENABLE", False)) and
                 bool(_cfg_value(getattr(self.cfg.TRAINER.BiMC, "APC", None), "ENABLE", False)))
 
     def _apc_task_specs(self):
