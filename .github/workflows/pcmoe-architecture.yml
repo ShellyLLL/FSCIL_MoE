@@ -1,26 +1,27 @@
-name: PC-MoE Architecture Tests
+name: Risk-Stable FSCIL with Few-Shot APC Tests
 
 on:
   push:
     branches:
       - feature/prototype-confusion-dynamic-moe-fscil
     paths:
-      - "models/prototype_confusion_moe.py"
-      - "engine/prototype_confusion_engine.py"
-      - "tests/test_prototype_confusion_moe.py"
+      - "models/bimc.py"
+      - "models/clip/model.py"
+      - "engine/engine.py"
+      - "utils/apc.py"
+      - "tests/test_risk_guided_moe.py"
+      - "tests/test_few_shot_apc.py"
       - "main.py"
       - "configs/trainers/bimc.yaml"
-      - "configs/datasets/*.yaml"
-      - "datasets/cub200.py"
       - ".github/workflows/pcmoe-architecture.yml"
   pull_request:
     branches:
       - feature/prototype-confusion-dynamic-moe-fscil
 
 jobs:
-  architecture-tests:
+  risk-stable-apc-tests:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -31,13 +32,17 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
           python -m pip install numpy pillow yacs ftfy regex tqdm scikit-learn packaging
-      - name: Compile PC-MoE modules
+      - name: Compile active modules
         run: |
-          python -m py_compile models/prototype_confusion_moe.py
-          python -m py_compile engine/prototype_confusion_engine.py
+          python -m py_compile models/bimc.py
+          python -m py_compile engine/engine.py
+          python -m py_compile utils/apc.py
           python -m py_compile main.py
-          python -m py_compile tests/test_prototype_confusion_moe.py
-      - name: Run architecture invariant tests
+          python -m py_compile tests/test_risk_guided_moe.py
+          python -m py_compile tests/test_few_shot_apc.py
+      - name: Run Risk-Stable and APC invariants
         env:
           PYTHONPATH: .
-        run: python -m unittest -v tests.test_prototype_confusion_moe
+        run: |
+          python -m unittest -v tests.test_risk_guided_moe
+          python -m unittest -v tests.test_few_shot_apc
