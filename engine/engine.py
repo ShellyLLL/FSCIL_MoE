@@ -364,7 +364,9 @@ class Runner:
         self._resume_completed_session = completed_session
         if hasattr(self.model_without_dp, "restore_fused_history"):
             self.model_without_dp.restore_fused_history(self._resume_state_dict_list)
-        if self.apc_state is None and self._apc_enabled():
+        if self._apc_enabled() and (
+            not isinstance(self.apc_state, dict) or int(self.apc_state.get("version", -1)) != 2
+        ):
             self._rebuild_apc_state(completed_session)
         self._restore_rng_state(payload.get("rng_state"))
         print(f"=> Resumed session {self._resume_completed_session} from {path}")
@@ -376,7 +378,7 @@ class Runner:
         directory.mkdir(parents=True, exist_ok=True)
         topology = self.model_without_dp.export_moe_topology()
         payload = {
-            "schema_version": 10,
+            "schema_version": 11,
             "completed_session": int(completed_session),
             "model_state": self._cpu_copy(self.model_without_dp.state_dict()),
             "moe_topology": topology,
@@ -813,11 +815,21 @@ class Runner:
         if not folds:
             return {"trained": False, "decisions": [], "expanded": [],
                     "encoder_version": previous_version, "apc": apc_result}
+        expandable_blocks = self.model_without_dp.expandable_blocks()
+        if self._apc_enabled():
+            if apc_result is None:
+                raise RuntimeError("APC is enabled but no real-support APC decision was supplied.")
+            eligible_blocks = set(int(value) for value in apc_result["candidate_blocks"])
+            expandable_blocks = [block for block in expandable_blocks if block in eligible_blocks]
+            if not expandable_blocks:
+                return {"trained": False, "decisions": [], "expanded": [],
+                        "encoder_version": previous_version, "apc": apc_result,
+                        "apc_selected_block": None}
         null_losses = [self._held_out_loss(val, fit_extract, class_index, text, description,
                                            previous_version, enable_visual_calibration)
                        for _, fit_extract, val in folds]
         decisions = []
-        for block_idx in self.model_without_dp.expandable_blocks():
+        for block_idx in expandable_blocks:
             adapter = self._adapter_by_block(block_idx)
             self.model_without_dp.add_expert(block_idx, task_id)
             initial_expert = copy.deepcopy(adapter.experts[-1].state_dict())
@@ -841,18 +853,10 @@ class Runner:
             print(f"=> [Candidate][Task {task_id}][B{block_idx}] "
                   f"gain={decisions[-1]['gain']:.5f} se={decisions[-1]['gain_se']:.5f}")
         best = max(decisions, key=lambda row: row["gain"], default=None)
-        # APC is a tie-breaker only: every layer still receives the original
-        # five-fold predictive-risk evaluation. It cannot override a materially
-        # better Risk-Stable candidate or veto a baseline candidate.
-        apc_blocks = set((apc_result or {}).get("candidate_blocks", []))
-        apc_selected = None
-        if best is not None and apc_blocks:
-            near_best = [row for row in decisions
-                         if row["gain"] >= best["gain"] - best["gain_se"]]
-            calibrated = [row for row in near_best if row["block_idx"] in apc_blocks]
-            if calibrated:
-                best = max(calibrated, key=lambda row: row["gain"])
-                apc_selected = int(best["block_idx"])
+        # APC decides layer eligibility; Risk-Stable retains its original
+        # five-fold predictive-risk acceptance among eligible layers.
+        apc_selected = (int(best["block_idx"])
+                        if best is not None and self._apc_enabled() else None)
         # One-standard-error selection favours the null model on five-shot noise.
         if best is None or best["gain"] <= best["gain_se"]:
             return {"trained": False, "decisions": decisions, "expanded": [],
@@ -1045,8 +1049,7 @@ class Runner:
                 enable_visual_calibration = bool(self.cfg.TRAINER.BiMC.VISION_CALIBRATION)
                 if use_moe:
                     self._routing_diagnostics(extract_loader, f"task{task_id}-before", current_task=task_id)
-                    apc_folds = self._support_folds(train_loader, extract_loader)
-                    apc_result = self._evaluate_apc_for_task(apc_folds, class_index)
+                    apc_result = self._evaluate_apc_for_task(extract_loader, class_index)
                     adaptation = self.train_incremental_task(
                         task_id, train_loader, extract_loader, class_index,
                         current_class_name, enable_visual_calibration, apc_result=apc_result,
