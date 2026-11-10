@@ -281,8 +281,9 @@ class PrototypeConfusionTests(unittest.TestCase):
             "sources": torch.tensor([100, 101, 102]),
             "layers": {2: torch.randn(3, 4)},
         }
-        with self.assertRaisesRegex(ValueError, "requires >=4 distinct source images"):
-            runner._split(cache, 1)
+        fit3, calibration3, risk3 = runner._split(cache, 1)
+        self.assertEqual((fit3["raw"].size(0), calibration3["raw"].size(0), risk3["raw"].size(0)),
+                         (2, 0, 1))
 
         cache = {
             "raw": torch.randn(4, 4),
@@ -476,7 +477,7 @@ class PrototypeConfusionTests(unittest.TestCase):
         self.assertEqual(set(after_state), set(before_state))
         for key in before_state:
             if key == "temperature":
-                torch.testing.assert_close(after_state[key], torch.tensor([0.12, 0.13]))
+                torch.testing.assert_close(after_state[key], torch.tensor([0.1, 0.1]))
             else:
                 torch.testing.assert_close(after_state[key], before_state[key])
         self.assertEqual(runner.class_ids, [10, 20])
@@ -592,7 +593,10 @@ class PrototypeConfusionTests(unittest.TestCase):
         self.assertEqual(runner.model.topology(), before_topology)
         after_state = runner.model.state_dict()
         for key in before_state:
-            torch.testing.assert_close(after_state[key], before_state[key])
+            if key == "temperature":
+                torch.testing.assert_close(after_state[key], torch.tensor([0.12, 0.13]))
+            else:
+                torch.testing.assert_close(after_state[key], before_state[key])
         self.assertEqual(runner.class_ids, [10, 20])
         self.assertEqual(runner.class_memory[20]["fit"]["kind"], "samples")
         self.assertEqual(runner.class_memory[20]["risk"]["kind"], "samples")

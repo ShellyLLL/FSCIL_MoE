@@ -373,6 +373,13 @@ class PrototypeConfusionRunner:
         cache = self._calibration_features()
         if cache is None:
             return self.visual_temperature, self.text_temperature
+        # Calibration must cover every class in the active classifier. In 1-3
+        # shot sessions, a source-disjoint calibration split is unavailable;
+        # keep the previously validated temperatures rather than calibrating
+        # against historical-only queries with novel classes acting as negatives.
+        active_ids = torch.as_tensor(bank["ids"], device=self.device, dtype=torch.long)
+        if not torch.isin(active_ids, cache["labels"]).all():
+            return self.visual_temperature, self.text_temperature
         with torch.no_grad():
             enhanced = self.model.compose(cache["raw"], cache["layers"], disabled_by_layer=disabled)
             visual = normalize(enhanced) @ bank["visual"].t()
@@ -659,6 +666,7 @@ class PrototypeConfusionRunner:
         topology_snapshot = copy.deepcopy(self.model.topology())
         memory_snapshot = copy.deepcopy(self.class_memory)
         class_ids_snapshot = list(self.class_ids)
+        temperature_snapshot = (float(self.visual_temperature), float(self.text_temperature))
         try:
             # New class fit/calibration/risk memories and text prototypes
             # are staged by run() before this transaction.  Class acquisition
@@ -921,6 +929,8 @@ class PrototypeConfusionRunner:
         except Exception:
             self.model.rebuild_topology(topology_snapshot)
             self.model.load_state_dict(model_snapshot, strict=True)
+            self.visual_temperature, self.text_temperature = temperature_snapshot
+            self.model.set_temperatures(*temperature_snapshot)
             self.model.freeze_all()
             self.class_memory = memory_snapshot
             self.class_ids = class_ids_snapshot
