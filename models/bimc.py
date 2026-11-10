@@ -362,8 +362,8 @@ class BiMC(nn.Module):
         return self
 
     @torch.no_grad()
-    def collect_blockwise_cls_features(self, loader, max_session=None):
-        """Collect block CLS features from a selected immutable encoder version."""
+    def collect_blockwise_cls_features(self, loader, max_session=None, disable_moe=False):
+        """Collect per-block CLS features; optionally bypass every MoE residual."""
         block_features, fallback_source_id = {}, 0
         moe_blocks = [idx for idx, block in enumerate(self.clip_model.visual.transformer.resblocks)
                       if getattr(block, "moe_adapter", None) is not None]
@@ -381,7 +381,8 @@ class BiMC(nn.Module):
                 if source_ids.numel() != labels.numel():
                     raise ValueError("support source ids must align with labels.")
                 _, aux_list = self.clip_model.encode_image(
-                    images, return_moe_aux=True, max_session=max_session
+                    images, return_moe_aux=True, max_session=max_session,
+                    disable_moe=disable_moe
                 )
                 if len(aux_list) != len(moe_blocks):
                     raise RuntimeError("MoE auxiliary outputs do not match inserted blocks.")
