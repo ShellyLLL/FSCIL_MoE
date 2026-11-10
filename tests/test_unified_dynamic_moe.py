@@ -73,7 +73,7 @@ class UnifiedMoEArchitectureTests(unittest.TestCase):
         high_variance = torch.ones_like(history)
         low = adapter.route_preservation_loss(history, low_variance)
         high = adapter.route_preservation_loss(history, high_variance)
-        self.assertGreaterEqual(float(high), float(low))
+        self.assertGreaterEqual(float(high.detach()), float(low.detach()))
 
     def test_topology_round_trip_preserves_predictions_and_birth_order(self):
         source = VisualMoEAdapter(8, num_experts=4, reduction=2, top_k=2).eval()
