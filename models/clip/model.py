@@ -404,13 +404,17 @@ class ResidualAttentionBlock(nn.Module):
         self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
         return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
 
-    def forward(self, x: torch.Tensor, max_session=None):
+    def forward(self, x: torch.Tensor, max_session=None, disable_moe=False):
         x = x + self.attention(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         moe_aux = None
         if self.moe_adapter is not None:
-            moe_out, moe_aux = self.moe_adapter(x, max_session=max_session)
-            x = x + moe_out
+            if disable_moe:
+                # Raw frozen-backbone block output before any adapter residual.
+                moe_aux = {"cls_in": x[0], "patch_mean_in": x[1:].mean(dim=0)}
+            else:
+                moe_out, moe_aux = self.moe_adapter(x, max_session=max_session)
+                x = x + moe_out
         return x, moe_aux
 
 class Transformer(nn.Module):
@@ -420,10 +424,10 @@ class Transformer(nn.Module):
         self.layers = layers
         self.resblocks = nn.ModuleList([ResidualAttentionBlock(width, heads, attn_mask) for _ in range(layers)])
 
-    def forward(self, x: torch.Tensor, max_session=None):
+    def forward(self, x: torch.Tensor, max_session=None, disable_moe=False):
         moe_aux_list = []
         for block in self.resblocks:
-            x, aux = block(x, max_session=max_session)
+            x, aux = block(x, max_session=max_session, disable_moe=disable_moe)
             if aux is not None: moe_aux_list.append(aux)
         return x, moe_aux_list
 
@@ -442,7 +446,7 @@ class VisionTransformer(nn.Module):
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
 
     def forward(self, x: torch.Tensor, all_layer_outputs=False, return_moe_aux=False,
-                max_session=None):
+                max_session=None, disable_moe=False):
         x = self.conv1(x)  
         x = x.reshape(x.shape[0], x.shape[1], -1)  
         x = x.permute(0, 2, 1)  
@@ -452,7 +456,9 @@ class VisionTransformer(nn.Module):
 
         if not all_layer_outputs:
             x = x.permute(1, 0, 2)  
-            x, moe_aux_list = self.transformer(x, max_session=max_session)
+            x, moe_aux_list = self.transformer(
+                x, max_session=max_session, disable_moe=disable_moe
+            )
             x = x.permute(1, 0, 2)  
             x = self.ln_post(x[:, 0, :])
             if self.proj is not None: x = x @ self.proj
@@ -462,7 +468,7 @@ class VisionTransformer(nn.Module):
             x = x.permute(1, 0, 2)  
             outputs, moe_aux_list = [], []
             for block in self.transformer.resblocks:
-                x, aux = block(x, max_session=max_session)
+                x, aux = block(x, max_session=max_session, disable_moe=disable_moe)
                 if aux is not None: moe_aux_list.append(aux)
                 cur_output = x.permute(1, 0, 2)
                 cur_output = self.ln_post(cur_output[:, 0, :])
@@ -524,13 +530,14 @@ class CLIP(nn.Module):
     def dtype(self):
         return self.visual.conv1.weight.dtype
 
-    def encode_image(self, image, return_moe_aux=False, max_session=None):
+    def encode_image(self, image, return_moe_aux=False, max_session=None, disable_moe=False):
         if not isinstance(self.visual, VisionTransformer):
             return self.visual(image.type(self.dtype))
         if return_moe_aux:
             return self.visual(image.type(self.dtype), return_moe_aux=True,
-                               max_session=max_session)
-        return self.visual(image.type(self.dtype), max_session=max_session)
+                               max_session=max_session, disable_moe=disable_moe)
+        return self.visual(image.type(self.dtype), max_session=max_session,
+                           disable_moe=disable_moe)
 
     def encode_text(self, text):
         x = self.token_embedding(text).type(self.dtype)
