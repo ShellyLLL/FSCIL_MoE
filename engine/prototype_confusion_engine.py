@@ -18,7 +18,7 @@ from models.prototype_confusion_moe import (
     normalize, prototype_confusion, source_exclusive_means,
 )
 
-APC_VERSION = "cardinality_corrected_nearest_v2"
+APC_VERSION = "cardinality_matched_empirical_tail_by_v1"
 
 
 def finalize_fscil_metrics(metrics, base_accuracy, is_final_session):
@@ -532,30 +532,46 @@ class PrototypeConfusionRunner:
                 result[layer][cid] = normalize(values.mean(0))
         return result
 
-    def _candidate_layers(self, apc):
-        """Propose layers only when aggregate class confusion exceeds the base reference."""
-        cfg = self.cfg.TRAINER.PCMOE.EXPANSION
-        threshold = float(cfg.APC_MIN_PERCENTILE)
-        ordered = sorted(apc, key=lambda layer: apc[layer]["mean"], reverse=True)
-        selected = [layer for layer in ordered if float(apc[layer]["mean"]) >= threshold]
-        return selected[:int(cfg.MAX_LAYERS_PER_SESSION)]
-
     @staticmethod
-    def _demand_classes_by_layer(apc, candidate_layers, threshold):
-        """Retain class-level APC demand for routing supervision and acceptance."""
-        demand = {}
-        for layer in candidate_layers:
-            scores = apc[int(layer)].get("score_by_class", {})
-            selected = sorted(
-                int(cid) for cid, score in scores.items()
-                if float(score) >= float(threshold)
-            )
-            if not selected:
-                raise RuntimeError(
-                    "Candidate layer {} has no class-level APC demand despite passing "
-                    "the aggregate capacity gate.".format(layer)
-                )
-            demand[int(layer)] = selected
+    def _apc_by_discoveries(apc, fdr_q):
+        """Benjamini-Yekutieli correction for dependent layer/class tests."""
+        tests = []
+        for layer, stats in apc.items():
+            for cid, value in stats.get("p_value_by_class", {}).items():
+                p_value = float(value)
+                if not np.isfinite(p_value) or not 0.0 <= p_value <= 1.0:
+                    raise ValueError("APC p-values must be finite and in [0,1].")
+                tests.append((p_value, int(layer), int(cid)))
+        if not tests:
+            return {}
+        tests.sort(key=lambda x: x[0])
+        m = len(tests)
+        harmonic = sum(1.0 / rank for rank in range(1, m + 1))
+        cutoff = None
+        for rank, (p_value, _, _) in enumerate(tests, start=1):
+            if p_value <= float(fdr_q) * rank / (m * harmonic):
+                cutoff = p_value
+        if cutoff is None:
+            return {}
+        discoveries = {}
+        for p_value, layer, cid in tests:
+            if p_value <= cutoff:
+                discoveries.setdefault(layer, []).append(cid)
+        return {layer: sorted(classes) for layer, classes in discoveries.items()}
+
+    def _candidate_layers(self, apc):
+        cfg = self.cfg.TRAINER.PCMOE.EXPANSION
+        discoveries = self._apc_by_discoveries(apc, float(cfg.APC_FDR_Q))
+        ordered = sorted(discoveries, key=lambda layer: min(
+            float(apc[layer]["p_value_by_class"][cid]) for cid in discoveries[layer]))
+        return ordered[:int(cfg.MAX_LAYERS_PER_SESSION)]
+
+    def _demand_classes_by_layer(self, apc, candidate_layers, fdr_q):
+        discoveries = self._apc_by_discoveries(apc, float(fdr_q))
+        demand = {int(layer): discoveries[int(layer)] for layer in candidate_layers
+                  if int(layer) in discoveries}
+        if len(demand) != len(candidate_layers):
+            raise RuntimeError("Candidate layer has no statistically supported APC demand.")
         return demand
 
     def _train_incremental(self, session, fit_new, new_ids, apc):
@@ -563,7 +579,7 @@ class PrototypeConfusionRunner:
         candidate_layers = self._candidate_layers(apc)
         new_ids = [int(x) for x in new_ids]
         demand_classes = self._demand_classes_by_layer(
-            apc, candidate_layers, cfg.EXPANSION.APC_MIN_PERCENTILE
+            apc, candidate_layers, cfg.EXPANSION.APC_FDR_Q
         ) if candidate_layers else {}
         if not candidate_layers:
             # No capacity request: still acquire the new classes with the
@@ -579,7 +595,7 @@ class PrototypeConfusionRunner:
                 "apc": apc, "candidate_layers": [], "demand_class_ids": {},
                 "baseline_all_class_risk": float(baseline_risk.item()),
                 "baseline_per_class_risk": per_class,
-                "risk_protocol": "historical class-risk centroids plus current-session held-out risk supports; not historical per-example empirical risk",
+                "risk_protocol": "historical class-risk centroids plus current-session held-out risk supports; prototype-risk surrogate, not historical per-example empirical risk",
             }
         old_ids = [int(x) for x in self.class_ids if int(x) not in new_ids]
         old_fit = self._memory_cache("fit", old_ids)
@@ -718,6 +734,18 @@ class PrototypeConfusionRunner:
                 default=0.0
             )
             risk_gain = float((baseline_risk - candidate_risk).item())
+            demand_per_class = sorted({
+                int(cid) for classes in demand_classes.values() for cid in classes
+            })
+            missing_demand = [cid for cid in demand_per_class
+                              if cid not in baseline_per_class or cid not in candidate_per_class]
+            if missing_demand:
+                raise RuntimeError("Demand classes missing from paired risk evaluation: {}".format(
+                    missing_demand))
+            demand_risk_gain = float(np.mean([
+                baseline_per_class[cid] - candidate_per_class[cid]
+                for cid in demand_per_class
+            ]))
 
             # Evaluate the *inference* router on source-disjoint risk examples.
             # The route-margin loss itself is never used as an acceptance proxy.
@@ -786,6 +814,7 @@ class PrototypeConfusionRunner:
             )
             accepted = (
                 risk_gain >= float(cfg.EXPANSION.MIN_RISK_GAIN)
+                and demand_risk_gain >= float(cfg.EXPANSION.MIN_DEMAND_RISK_GAIN)
                 and old_delta <= float(cfg.EXPANSION.MAX_OLD_CLASS_RISK_INCREASE)
                 and new_delta <= float(cfg.EXPANSION.MAX_NEW_CLASS_RISK_INCREASE)
                 and route_ok
@@ -795,7 +824,9 @@ class PrototypeConfusionRunner:
                 "demand_class_ids": demand_classes,
                 "baseline_all_class_risk": float(baseline_risk.item()),
                 "candidate_all_class_risk": float(candidate_risk.item()),
-                "risk_gain": risk_gain, "worst_old_class_risk_increase": float(old_delta),
+                "risk_gain": risk_gain, "demand_class_risk_gain": demand_risk_gain,
+                "demand_class_ids": demand_classes,
+                "worst_old_class_risk_increase": float(old_delta),
                 "worst_new_class_risk_increase": float(new_delta),
                 "route_checks": route_checks, "route_constraints_passed": route_ok,
                 "baseline_per_class_risk": baseline_per_class,
@@ -950,8 +981,10 @@ class PrototypeConfusionRunner:
 
             apc_parts = []
             for layer, stats in sorted(result.get("apc", {}).items(), key=lambda item: int(item[0])):
-                apc_parts.append("L{} mean={:.3f} p90={:.3f}".format(
-                    int(layer), float(stats.get("mean", 0.0)), float(stats.get("p90", 0.0))
+                apc_parts.append("L{} confusion_mean={:.3f} min_p={:.5f} K={}".format(
+                    int(layer), float(stats.get("mean", 0.0)),
+                    min(stats.get("p_value_by_class", {0: 1.0}).values()),
+                    int(stats.get("comparison_count", 0))
                 ))
             if apc_parts:
                 print("[PC-MoE][Session {:02d}] APC: {}".format(
@@ -1017,7 +1050,7 @@ class PrototypeConfusionRunner:
         directory = Path(self.cfg.TRAINER.PCMOE.CHECKPOINT.DIR)
         directory.mkdir(parents=True, exist_ok=True)
         payload = {
-            "schema_version": 4, "apc_version": APC_VERSION, "completed_session": int(session),
+            "schema_version": 5, "apc_version": APC_VERSION, "completed_session": int(session),
             "model": {k: v.detach().cpu() for k, v in self.model.state_dict().items()},
             "topology": self.model.topology(),
             "class_ids": list(self.class_ids), "class_memory": self.class_memory,
@@ -1046,11 +1079,11 @@ class PrototypeConfusionRunner:
         if not path:
             return
         payload = torch.load(path, map_location="cpu", weights_only=False)
-        if payload.get("schema_version") != 4 or payload.get("apc_version") != APC_VERSION:
+        if payload.get("schema_version") != 5 or payload.get("apc_version") != APC_VERSION:
             raise ValueError(
-                "Unsupported PC-MoE checkpoint/APC schema. This version requires schema 4 "
-                "with cardinality-corrected APC statistics and prototype-only historical memory. "
-                "Older checkpoints must be restarted from Session 0; they cannot be silently reused."
+                "Unsupported PC-MoE checkpoint/APC schema. This version requires schema 5 "
+                "with cardinality-matched empirical APC null distributions and prototype-only "
+                "historical memory. Older checkpoints must be restarted from Session 0."
             )
         apc_reference = payload.get("apc_reference")
         if not isinstance(apc_reference, dict) or not apc_reference:
@@ -1059,13 +1092,12 @@ class PrototypeConfusionRunner:
             if not isinstance(item, dict):
                 raise ValueError("Checkpoint APC reference for layer {} is malformed.".format(layer))
             pairwise = torch.as_tensor(item.get("pairwise_similarity", []))
-            base_max = torch.as_tensor(item.get("base_max_percentile", []))
             base_count = int(item.get("base_class_count", 0))
-            if (base_count < 3 or pairwise.numel() != base_count * (base_count - 1) // 2
-                    or base_max.numel() != base_count
+            if (base_count < 3 or tuple(pairwise.shape) != (base_count, base_count)
                     or not torch.isfinite(pairwise).all()
-                    or not torch.isfinite(base_max).all()):
-                raise ValueError("Checkpoint APC reference for layer {} is inconsistent.".format(layer))
+                    or not torch.allclose(pairwise, pairwise.t(), atol=1e-5, rtol=1e-5)
+                    or not torch.allclose(pairwise.diag(), torch.ones(base_count), atol=1e-4)):
+                raise ValueError("Checkpoint APC pairwise geometry for layer {} is inconsistent.".format(layer))
         memory = payload.get("class_memory", {})
         for cid, fields in memory.items():
             for field, part in fields.items():

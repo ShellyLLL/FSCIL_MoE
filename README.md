@@ -98,12 +98,16 @@ router over the complete old/new expert pool; no task-specific router or
 task-ID inference branch is used.
 
 Prototype confusion (APC) compares each novel class's nearest old/within-new
-prototype similarity with a frozen base-session layer-wise reference. The raw
-nearest-neighbour maximum is corrected for the number of competing classes
-using the empirical pairwise-similarity CDF and the order-statistic factor
-F(s)^m before ranking against the base-class maxima. This avoids interpreting
-the natural growth of a maximum over more classes as increased confusion.
-APC only proposes candidate layers; it does not itself authorize capacity.
+prototype similarity with a frozen base-session layer-wise reference. For each
+session, it constructs an empirical null distribution of maximum similarities
+using base classes as pseudo-queries facing the same number K of competitors.
+Competitors are sampled without replacement when possible and with replacement
+when K exceeds the base-class pool. The finite-sample upper-tail empirical
+p-value is computed for every layer/class pair. A Benjamini-Yekutieli correction
+controls false discoveries under arbitrary dependence among these tests.
+APC proposes capacity-demanding layer/class pairs; it does not authorize
+capacity by itself. The calibration relies on approximate exchangeability of
+base and novel class geometry and is not a distribution-free guarantee.
 Each appended gate is initialized strictly below the historical Top-k boundary,
 so historical Top-k membership and Softmax weights are exactly preserved at
 birth. During incremental training, APC demand is retained at class level: only
@@ -165,14 +169,16 @@ Architecture invariant tests (not FSCIL performance experiments):
 python -m unittest tests.test_prototype_confusion_moe
 ~~~
 
-Session checkpoints use schema 4 and include the cardinality-corrected APC
-reference, expert topology/weights,
+Session checkpoints use schema 5 and include the base pairwise-similarity
+geometry used to construct cardinality-matched empirical APC nulls, expert topology/weights,
 prototype-only class fit/calibration/risk memories (one centroid per class
 and feature space, with no old per-example features or source IDs), text and
 description prototypes,
 temperatures, APC reference distributions, support manifest, diagnostics and
-random states. Each session also reports all-seen-class task accuracy (AA) and
-base-class accuracy drop (PD).
+random states. Each session reports all-seen-class accuracy and macro task-average
+accuracy (AA). Final Acc and PD are reported only at the final real FSCIL session.
+Expansion acceptance additionally requires risk reduction on APC-demanded
+classes. Historical risk is a prototype-risk surrogate, not old-example empirical risk.
 
 ## Acknowledgment
 

@@ -77,14 +77,35 @@ def source_exclusive_means(features, labels, source_ids, class_ids, query_indice
     return torch.stack(banks_by_source)[inverse]
 
 
+def _cardinality_matched_null_maxima(pairwise_similarity, competitor_count,
+                                          resamples=512, seed=0):
+    """Empirical null maxima for exactly K competitors, sampled from base classes."""
+    pairwise = torch.as_tensor(pairwise_similarity, dtype=torch.float32).cpu()
+    if pairwise.ndim != 2 or pairwise.size(0) != pairwise.size(1):
+        raise ValueError("APC pairwise reference must be a square matrix.")
+    base_count = int(pairwise.size(0))
+    if base_count < 3 or competitor_count < 1 or resamples < 32:
+        raise ValueError("APC requires >=3 base classes, K>=1 and >=32 resamples.")
+    if not torch.isfinite(pairwise).all():
+        raise ValueError("APC pairwise reference contains non-finite values.")
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(int(seed) + 104729 * int(competitor_count))
+    maxima = []
+    for anchor in range(base_count):
+        competitors = torch.cat((pairwise[anchor, :anchor], pairwise[anchor, anchor + 1:]))
+        if competitor_count <= base_count - 1:
+            keys = torch.rand(int(resamples), base_count - 1, generator=generator)
+            indices = keys.argsort(dim=1)[:, :int(competitor_count)]
+        else:
+            indices = torch.randint(0, base_count - 1,
+                (int(resamples), int(competitor_count)), generator=generator)
+        maxima.append(competitors[indices].max(dim=1).values)
+    return torch.cat(maxima, dim=0).sort().values
+
+
 def prototype_confusion(layer_features, labels, new_class_ids,
                         historical_layer_prototypes, apc_reference):
-    """Cardinality-corrected prototype confusion against the frozen base reference.
-
-    The raw nearest-neighbour maximum is biased upward as the number of seen
-    classes grows. Map it through the empirical base pairwise-similarity CDF
-    and apply the order-statistic correction F(s)^m for m competitors.
-    """
+    """Class/layer empirical upper-tail p-values at matched competitor cardinality."""
     output = {}
     for layer, values in layer_features.items():
         new_proto, _ = class_means(values, labels, new_class_ids)
@@ -93,58 +114,53 @@ def prototype_confusion(layer_features, labels, new_class_ids,
             raise ValueError("APC requires non-empty historical class prototypes.")
         reference = apc_reference[int(layer)]
         if not isinstance(reference, dict) or not {
-            "pairwise_similarity", "base_max_percentile", "base_class_count"
+            "pairwise_similarity", "base_class_count"
         }.issubset(reference):
-            raise ValueError("APC reference is incompatible; rebuild it from the base session.")
-        pairwise = torch.as_tensor(reference["pairwise_similarity"], device=values.device).float().reshape(-1).sort().values
-        base_max = torch.as_tensor(reference["base_max_percentile"], device=values.device).float().reshape(-1).sort().values
+            raise ValueError("APC reference is incompatible; rebuild it from Session 0.")
+        pairwise = torch.as_tensor(reference["pairwise_similarity"]).float().cpu()
         base_count = int(reference["base_class_count"])
-        if pairwise.numel() == 0 or base_max.numel() != base_count or base_count < 3:
-            raise ValueError("APC reference statistics are empty or inconsistent.")
+        if pairwise.shape != (base_count, base_count) or base_count < 3:
+            raise ValueError("APC pairwise reference shape/count is inconsistent.")
         similarities = new_proto @ history.t()
         if new_proto.size(0) > 1:
             within = new_proto @ new_proto.t()
             within.fill_diagonal_(float("-inf"))
             similarities = torch.cat([similarities, within], dim=1)
-        nearest_similarity = similarities.max(dim=1).values
-        comparison_count = int(history.size(0) + new_proto.size(0) - 1)
-        if comparison_count < 1:
-            raise ValueError("APC requires at least one competing class prototype.")
-        pairwise_cdf = torch.searchsorted(pairwise, nearest_similarity.contiguous(), right=True).float() / float(pairwise.numel())
-        cardinality_adjusted = pairwise_cdf.clamp(0.0, 1.0).pow(comparison_count)
-        percentile = torch.searchsorted(base_max, cardinality_adjusted.contiguous(), right=True).float() / float(base_max.numel())
+        nearest = similarities.max(dim=1).values.detach().float().cpu()
+        k = int(history.size(0) + new_proto.size(0) - 1)
+        null_maxima = _cardinality_matched_null_maxima(
+            pairwise, k, resamples=512, seed=1701 + int(layer))
+        p_values = torch.stack([
+            (1.0 + (null_maxima >= score).sum().float()) /
+            (1.0 + float(null_maxima.numel())) for score in nearest
+        ])
+        scores = 1.0 - p_values
         output[int(layer)] = {
             "class_ids": [int(cid) for cid in new_class_ids],
-            "score_by_class": {int(cid): float(percentile[i].item()) for i, cid in enumerate(new_class_ids)},
-            "scores": percentile.detach(),
-            "mean": float(percentile.mean().item()),
-            "p90": float(torch.quantile(percentile, 0.90).item()),
-            "nearest_similarity": nearest_similarity.detach(),
-            "pairwise_cdf": pairwise_cdf.detach(),
-            "cardinality_adjusted_cdf": cardinality_adjusted.detach(),
-            "comparison_count": comparison_count,
+            "score_by_class": {int(cid): float(scores[i].item())
+                               for i, cid in enumerate(new_class_ids)},
+            "p_value_by_class": {int(cid): float(p_values[i].item())
+                                 for i, cid in enumerate(new_class_ids)},
+            "scores": scores, "p_values": p_values,
+            "mean": float(scores.mean().item()),
+            "p90": float(torch.quantile(scores, 0.90).item()),
+            "nearest_similarity": nearest,
+            "null_max_mean": float(null_maxima.mean().item()),
+            "null_max_std": float(null_maxima.std(unbiased=False).item()),
+            "comparison_count": k, "null_sample_count": int(null_maxima.numel()),
         }
     return output
 
 
 def make_apc_reference(layer_prototypes):
-    """Freeze pairwise-similarity CDFs and corrected base maxima at Session 0."""
+    """Freeze base-class pairwise geometry for per-session cardinality matching."""
     reference = {}
     for layer, prototypes in layer_prototypes.items():
         p = normalize(prototypes)
         if p.ndim != 2 or p.size(0) < 3:
             raise ValueError("APC base reference requires at least three class prototypes.")
-        similarity = p @ p.t()
-        upper = torch.triu_indices(p.size(0), p.size(0), offset=1, device=p.device)
-        pairwise = similarity[upper[0], upper[1]].sort().values
-        leave_one_out = similarity.clone()
-        leave_one_out.fill_diagonal_(float("-inf"))
-        nearest = leave_one_out.max(dim=1).values
-        pairwise_cdf = torch.searchsorted(pairwise, nearest.contiguous(), right=True).float() / float(pairwise.numel())
-        base_max_percentile = pairwise_cdf.clamp(0.0, 1.0).pow(p.size(0) - 1)
         reference[int(layer)] = {
-            "pairwise_similarity": pairwise.detach(),
-            "base_max_percentile": base_max_percentile.sort().values.detach(),
+            "pairwise_similarity": (p @ p.t()).clamp(-1.0, 1.0).detach().cpu(),
             "base_class_count": int(p.size(0)),
         }
     return reference

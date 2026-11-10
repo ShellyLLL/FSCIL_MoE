@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from models.prototype_confusion_moe import (
     UnifiedTopKRouter, DynamicLayerMoE, source_exclusive_means,
     prototype_confusion, make_apc_reference, balanced_risk,
+    _cardinality_matched_null_maxima,
 )
 from engine.prototype_confusion_engine import PrototypeConfusionRunner, finalize_fscil_metrics
 
@@ -29,7 +30,7 @@ class PrototypeConfusionTests(unittest.TestCase):
             self.assertGreaterEqual(item['mean'], 0.0)
             self.assertLessEqual(item['mean'], 1.0)
 
-    def test_apc_corrects_for_the_number_of_competing_old_classes(self):
+    def test_apc_uses_empirical_null_with_exact_competitor_cardinality(self):
         base = F.normalize(torch.tensor([
             [1., 0.], [0.8, 0.6], [0., 1.], [-0.8, 0.6],
             [-1., 0.], [0., -1.], [0.6, -0.8], [-0.6, -0.8],
@@ -45,10 +46,21 @@ class PrototypeConfusionTests(unittest.TestCase):
         large = prototype_confusion(new_features, labels, [10], large_history, reference)[2]
         self.assertEqual(small["comparison_count"], 2)
         self.assertEqual(large["comparison_count"], 4)
-        self.assertLess(
-            float(large["cardinality_adjusted_cdf"][0]),
-            float(small["cardinality_adjusted_cdf"][0])
-        )
+        self.assertEqual(small["null_sample_count"], 8 * 512)
+        self.assertIn(10, small["p_value_by_class"])
+        self.assertTrue(0.0 < small["p_value_by_class"][10] <= 1.0)
+
+    def test_empirical_null_maxima_shift_with_competitor_cardinality(self):
+        pairwise = torch.tensor([
+            [1.0, 0.1, 0.2, 0.3], [0.1, 1.0, 0.4, 0.5],
+            [0.2, 0.4, 1.0, 0.6], [0.3, 0.5, 0.6, 1.0],
+        ])
+        k1 = _cardinality_matched_null_maxima(pairwise, 1, 256, seed=9)
+        k3 = _cardinality_matched_null_maxima(pairwise, 3, 256, seed=9)
+        self.assertGreaterEqual(float(k3.mean()), float(k1.mean()))
+        self.assertEqual(k1.numel(), k3.numel())
+
+
 
     def test_source_exclusion_removes_all_views_of_same_source(self):
         features = F.normalize(torch.tensor([
@@ -301,10 +313,15 @@ class PrototypeConfusionTests(unittest.TestCase):
         self.assertEqual(final["PD"], 12.0)
         self.assertAlmostEqual(final["AA"], 190.0 / 3.0)
 
-    def test_apc_demand_is_preserved_per_class(self):
-        apc = {2: {"mean": 0.85, "score_by_class": {10: 0.95, 11: 0.72, 12: 0.91}}}
-        demand = PrototypeConfusionRunner._demand_classes_by_layer(apc, [2], 0.8)
-        self.assertEqual(demand, {2: [10, 12]})
+    def test_apc_by_correction_controls_dependent_layer_class_tests(self):
+        apc = {2: {"p_value_by_class": {10: 0.0001, 11: 0.40}},
+               5: {"p_value_by_class": {10: 0.0002, 12: 0.60}}}
+        self.assertEqual(PrototypeConfusionRunner._apc_by_discoveries(apc, 0.10),
+                         {2: [10], 5: [10]})
+
+    def test_apc_by_correction_rejects_non_significant_confusion(self):
+        apc = {2: {"p_value_by_class": {10: 0.20, 11: 0.40}}}
+        self.assertEqual(PrototypeConfusionRunner._apc_by_discoveries(apc, 0.10), {})
 
     def test_temperature_fitting_runs_and_respects_configured_bounds(self):
         runner = PrototypeConfusionRunner.__new__(PrototypeConfusionRunner)
@@ -412,7 +429,7 @@ class PrototypeConfusionTests(unittest.TestCase):
                         "LAMBDA_TEXT": 0.5
                     })(),
                     "EXPANSION": type("ExpansionCfg", (), {
-                        "APC_MIN_PERCENTILE": 0.8, "MAX_LAYERS_PER_SESSION": 1
+                        "APC_FDR_Q": 0.10, "MAX_LAYERS_PER_SESSION": 1
                     })()
                 })()
             })()
@@ -430,7 +447,7 @@ class PrototypeConfusionTests(unittest.TestCase):
         runner._fit_bank_and_temperatures = fail_after_candidate_training
         with self.assertRaisesRegex(RuntimeError, "injected failure"):
             runner._train_incremental(
-                1, fit_new, [20], {2: {"mean": 0.95, "score_by_class": {20: 0.95}}}
+                1, fit_new, [20], {2: {"mean": 0.95, "score_by_class": {20: 0.95}, "p_value_by_class": {20: 0.0001}}}
             )
         self.assertEqual(runner.model.topology(), before_topology)
         after_state = runner.model.state_dict()
@@ -519,10 +536,11 @@ class PrototypeConfusionTests(unittest.TestCase):
                     })(),
                     "CALIBRATION": type("CalibrationCfg", (), {"LAMBDA_TEXT": 0.5})(),
                     "EXPANSION": type("ExpansionCfg", (), {
-                        "APC_MIN_PERCENTILE": 0.8, "MAX_LAYERS_PER_SESSION": 1,
+                        "APC_FDR_Q": 0.10, "MAX_LAYERS_PER_SESSION": 1,
                         "MIN_RISK_GAIN": 0.001,
                         "MAX_OLD_CLASS_RISK_INCREASE": 0.01,
-                        "MAX_NEW_CLASS_RISK_INCREASE": 0.01
+                        "MAX_NEW_CLASS_RISK_INCREASE": 0.01,
+                        "MIN_DEMAND_RISK_GAIN": 0.001
                     })()
                 })()
             })()
@@ -538,7 +556,7 @@ class PrototypeConfusionTests(unittest.TestCase):
         runner._risk = lambda *args, **kwargs: (
             torch.tensor(1.0), {10: 1.0, 20: 1.0}
         )
-        result = runner._train_incremental(1, fit_new, [20], {2: {"mean": 0.95, "score_by_class": {20: 0.95}}})
+        result = runner._train_incremental(1, fit_new, [20], {2: {"mean": 0.95, "score_by_class": {20: 0.95}, "p_value_by_class": {20: 0.0001}}})
         self.assertFalse(result["accepted"])
         self.assertFalse(result["route_constraints_passed"])
         self.assertEqual(runner.model.topology(), before_topology)
@@ -598,8 +616,9 @@ class PrototypeConfusionTests(unittest.TestCase):
             runner.description_prototypes = {10: torch.tensor([1., 0.])}
             runner.text_consistency = {10: torch.tensor(0.9)}
             runner.apc_reference = {2: {
-                "pairwise_similarity": torch.tensor([0.1, 0.2, 0.3]),
-                "base_max_percentile": torch.tensor([0.2, 0.4, 0.8]),
+                "pairwise_similarity": torch.tensor([
+                    [1.0, 0.1, 0.2], [0.1, 1.0, 0.3], [0.2, 0.3, 1.0]
+                ]),
                 "base_class_count": 3,
             }}
             runner.base_layer_prototypes = {2: {10: torch.tensor([0.5, 0.5])}}
