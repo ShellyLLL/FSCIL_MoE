@@ -45,8 +45,10 @@ class FewShotAPCTests(unittest.TestCase):
         update_few_shot_apc_memory(state, {2: support}, [2], expected_shot=5)
         self.assertEqual(state["seen_class_ids"], [0, 1, 2])
         self.assertIn("2", state["layers"]["2"]["prototypes"])
+        wrong_shot = {"cls_in": support["cls_in"].clone(),
+                      "labels": torch.full_like(support["labels"], 3)}
         with self.assertRaisesRegex(ValueError, "received 5 samples"):
-            update_few_shot_apc_memory(state, {2: support}, [3], expected_shot=4)
+            update_few_shot_apc_memory(state, {2: wrong_shot}, [3], expected_shot=4)
 
 
 if __name__ == "__main__":
