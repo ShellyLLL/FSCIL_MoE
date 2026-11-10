@@ -108,9 +108,7 @@ def extend_cfg(cfg):
 
     cfg.TRAINER.BiMC.APC = CN()
     cfg.TRAINER.BiMC.APC.ENABLE = True
-    cfg.TRAINER.BiMC.APC.EPISODES = 512
-    cfg.TRAINER.BiMC.APC.ALPHA = 0.05
-    cfg.TRAINER.BiMC.APC.SEED = -1
+    cfg.TRAINER.BiMC.APC.QUANTILE = 0.95
 
 def setup_cfg(dataset_cfg_file, method_cfg_file, opts=None):
     cfg = CN()
