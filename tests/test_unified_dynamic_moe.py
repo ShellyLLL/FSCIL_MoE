@@ -79,10 +79,15 @@ class UnifiedMoEArchitectureTests(unittest.TestCase):
             handles.append(expert.register_forward_hook(
                 lambda module, args, output, i=index: calls.__setitem__(i, calls[i] + 1)
             ))
-        adapter(torch.randn(5, 3, 8))
+        _, aux = adapter(torch.randn(5, 3, 8))
         for handle in handles:
             handle.remove()
-        self.assertEqual(sum(value > 0 for value in calls), 2)
+        selected_experts = set(aux["top_k_indices"].reshape(-1).tolist())
+        self.assertEqual(
+            {index for index, count in enumerate(calls) if count > 0},
+            selected_experts,
+        )
+        self.assertTrue(all(calls[index] <= 1 for index in selected_experts))
 
     def test_new_route_initialization_and_optimizer_activation_preserve_history(self):
         adapter = VisualMoEAdapter(8, num_experts=4, reduction=2, top_k=2)

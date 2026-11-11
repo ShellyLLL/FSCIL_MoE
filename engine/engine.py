@@ -528,7 +528,6 @@ class Runner:
         return result
 
     @torch.no_grad()
-    @torch.no_grad()
     def _expansion_candidates(self, extract_loader, class_index, old_state):
         """Use frozen-backbone layer confusion to nominate layers for risk testing."""
         current = self.model_without_dp.build_raw_layer_prototypes(
