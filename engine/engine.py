@@ -397,11 +397,15 @@ class Runner:
         return optim.AdamW([{ "params": moe_params, "lr": base_lr }], weight_decay=wd,
                            betas=tuple(_cfg_value(optim_cfg, "BETAS", (0.9, 0.999))))
 
-    def _train_descriptor(self, adapter, expert_id, values, epochs):
+    def _train_descriptor(self, adapter, expert_id, values, epochs, sample_weights=None):
         """Fit the SEMA linear AE on the full local representation distribution."""
         descriptor = adapter.descriptors[int(expert_id)]
         descriptor.float()
         values = values.detach().float()
+        weights = (torch.ones(values.size(0), device=values.device) if sample_weights is None
+                   else torch.as_tensor(sample_weights, device=values.device).float().reshape(-1))
+        if weights.numel() != values.size(0) or not bool((weights.sum() > 0).item()):
+            raise ValueError("AE sample weights must align with features and have positive mass.")
         if values.ndim != 2 or values.size(0) < 3:
             raise ValueError("AE fitting requires at least three CLS representations.")
         for parameter in descriptor.parameters():
@@ -418,7 +422,9 @@ class Runner:
             for indices in permutation.split(max(3, min(256, values.size(0)))):
                 optimizer.zero_grad(set_to_none=True)
                 reconstruction = descriptor(values[indices])
-                loss = F.mse_loss(reconstruction, values[indices])
+                per_sample = (reconstruction - values[indices]).square().mean(dim=-1)
+                batch_weights = weights[indices]
+                loss = (per_sample * batch_weights).sum() / batch_weights.sum().clamp_min(1e-8)
                 if not bool(torch.isfinite(loss).item()):
                     raise FloatingPointError("Non-finite AE reconstruction loss.")
                 loss.backward()
@@ -442,8 +448,11 @@ class Runner:
             # CLS input is exactly the local representation seen by that layer.
             features = self.model_without_dp.collect_blockwise_cls_features(extract_loader)
             values = features[block_idx]["cls_in"].to(self.device)
+            with torch.no_grad():
+                _, responsibilities = adapter.router(values)
             for expert_id in range(adapter.num_experts):
-                loss = self._train_descriptor(adapter, expert_id, values, epochs)
+                loss = self._train_descriptor(
+                    adapter, expert_id, values, epochs, responsibilities[:, expert_id])
                 descriptor = adapter.descriptors[expert_id]
                 print(f"=> [SEMA-AE][B{block_idx}][E{expert_id}] loss={loss:.6f} "
                       f"reference_n={int(descriptor.error_count.item())} "
@@ -560,6 +569,7 @@ class Runner:
             features = self.model_without_dp.extract_img_feature(images)
         features = F.normalize(features.float(), dim=-1)
         prototypes = bank["global_full"].unsqueeze(0).expand(images.size(0), -1, -1).clone()
+        prototypes[:, int(bank["old_class_count"]):] = bank["novel_full"].unsqueeze(0)
         if source_ids is not None:
             source_ids = torch.as_tensor(source_ids, device=images.device).reshape(-1)
             match = source_ids[:, None].eq(bank["source_ids"][None, :])
@@ -571,9 +581,6 @@ class Runner:
             novel_columns = own - int(bank["old_class_count"])
             if (novel_columns < 0).any():
                 raise RuntimeError("Incremental query target unexpectedly maps to an old class.")
-            prototypes[torch.arange(images.size(0), device=images.device)[:, None],
-                       (int(bank["old_class_count"]) + torch.arange(
-                           bank["classes"].numel(), device=images.device))[None, :]] = bank["novel_full"][None, :, :]
             prototypes[torch.arange(images.size(0), device=images.device), own] = novel_loo[
                 torch.arange(images.size(0), device=images.device), novel_columns
             ]
@@ -676,13 +683,9 @@ class Runner:
                         anchor_mean, anchor_var,
                         residual_weight=float(getattr(
                             self.cfg.TRAINER.BiMC.INCREMENTAL, "OLD_RESIDUAL_WEIGHT", 1.0)))
-                    gate_penalty = torch.sigmoid(adapter.router.columns[-1](
-                        adapter.layer_norm(adapter.experts[-1].c_fc.weight.new_zeros(
-                            (1, adapter.d_model))))).square().mean() * 0.0
                     loss = (classification
                             + float(getattr(self.cfg.TRAINER.BiMC.INCREMENTAL,
-                                            "OLD_SUPPRESSION_WEIGHT", 1.0)) * old_suppression
-                            + gate_penalty)
+                                            "OLD_SUPPRESSION_WEIGHT", 1.0)) * old_suppression)
                     if not bool(torch.isfinite(loss).item()):
                         raise FloatingPointError("Non-finite global prototype incremental loss.")
                     loss.backward()
