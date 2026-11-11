@@ -416,17 +416,13 @@ class Runner:
         return optim.AdamW([{ "params": moe_params, "lr": base_lr }], weight_decay=wd,
                            betas=tuple(_cfg_value(optim_cfg, "BETAS", (0.9, 0.999))))
 
-    def _train_descriptor(self, adapter, expert_id, values, responsibilities, epochs):
+    def _train_descriptor(self, adapter, expert_id, values, epochs):
+        """Fit the SEMA linear AE on the full local representation distribution."""
         descriptor = adapter.descriptors[int(expert_id)]
         descriptor.float()
-        values, responsibilities = values.detach(), responsibilities.detach().float()
-        count = values.size(0)
-        if count == 0:
-            raise RuntimeError("descriptor training received no features.")
-        order = torch.randperm(count, device=values.device)
-        split = max(1, min(count - 1, int(round(count * 0.8)))) if count > 1 else 1
-        train_idx = order[:split]
-        calibration_idx = order[split:] if split < count else order
+        values = values.detach().float()
+        if values.ndim != 2 or values.size(0) < 3:
+            raise ValueError("AE fitting requires at least three CLS representations.")
         for parameter in descriptor.parameters():
             parameter.requires_grad = True
         descriptor.train()
@@ -435,44 +431,173 @@ class Runner:
             lr=float(_cfg_value(self.cfg.TRAINER.BiMC.OPTIM, "LR_DESCRIPTOR", 1e-3)),
             weight_decay=0.0,
         )
-        for _ in range(max(1, int(epochs))):
-            optimizer.zero_grad(set_to_none=True)
-            errors = descriptor.reconstruction_error(values[train_idx])
-            weights = responsibilities[train_idx]
-            loss = (weights * errors).sum() / weights.sum().clamp_min(1e-8)
-            loss.backward()
-            optimizer.step()
+        epochs = max(1, int(epochs))
+        for _ in range(epochs):
+            permutation = torch.randperm(values.size(0), device=values.device)
+            for indices in permutation.split(max(3, min(256, values.size(0)))):
+                optimizer.zero_grad(set_to_none=True)
+                reconstruction = descriptor(values[indices])
+                loss = F.mse_loss(reconstruction, values[indices])
+                if not bool(torch.isfinite(loss).item()):
+                    raise FloatingPointError("Non-finite AE reconstruction loss.")
+                loss.backward()
+                optimizer.step()
         descriptor.eval()
         with torch.no_grad():
-            errors = descriptor.reconstruction_error(values[calibration_idx])
-            adapter.update_descriptor_stats(
-                errors, expert_id, responsibilities[calibration_idx],
-                fit_sample_count=train_idx.numel(),
-            )
+            errors = descriptor.reconstruction_error(values)
+            adapter.update_descriptor_stats(errors, expert_id)
         for parameter in descriptor.parameters():
             parameter.requires_grad = False
             parameter.grad = None
+        if not descriptor.is_ready():
+            raise RuntimeError("AE descriptor did not reach its minimum reference-buffer size.")
         return float(loss.item())
 
     def _train_base_descriptors(self, extract_loader):
         epochs = int(_cfg_value(self.cfg.TRAINER.BiMC.OPTIM, "BASE_DESCRIPTOR_EPOCHS", 8))
-        features_by_block = self.model_without_dp.collect_blockwise_cls_features(extract_loader)
-        print(f"\n========== Train Base Representation Descriptors ({epochs} epochs) ==========")
+        print(f"\n========== Fit Base SEMA Representation Descriptors ({epochs} epochs) ==========")
         for block_idx, adapter in self._moe_adapters():
-            values = features_by_block[block_idx]["cls_in"].to(self.device)
-            with torch.no_grad():
-                _, responsibilities = adapter.router(values)
+            # Recollect per layer after previous descriptors are frozen; the
+            # CLS input is exactly the local representation seen by that layer.
+            features = self.model_without_dp.collect_blockwise_cls_features(extract_loader)
+            values = features[block_idx]["cls_in"].to(self.device)
             for expert_id in range(adapter.num_experts):
-                loss = self._train_descriptor(
-                    adapter, expert_id, values, responsibilities[:, expert_id], epochs
-                )
+                loss = self._train_descriptor(adapter, expert_id, values, epochs)
                 descriptor = adapter.descriptors[expert_id]
-                print(
-                    f"=> [Descriptor][B{block_idx}][E{expert_id}] loss={loss:.6f} "
-                    f"mean={descriptor.mean.item():.6f} std={descriptor.std.item():.6f}"
-                )
+                print(f"=> [SEMA-AE][B{block_idx}][E{expert_id}] loss={loss:.6f} "
+                      f"reference_n={int(descriptor.error_count.item())} "
+                      f"mean={descriptor.error_mean.item():.6f} std={descriptor.error_std.item():.6f}")
             adapter.assert_descriptors_ready()
             adapter.freeze_all()
+
+    def _collect_class_anchors(self, loader):
+        """Compact per-class, per-layer Gaussian anchors; no old images are retained."""
+        feature_map = self.model_without_dp.collect_blockwise_cls_features(loader)
+        anchors = {}
+        for block_idx, item in feature_map.items():
+            values = item["cls_in"].float()
+            labels = item["labels"].long()
+            means, variances, class_ids = [], [], []
+            for class_id in torch.unique(labels, sorted=True):
+                group = values[labels.eq(class_id)]
+                means.append(group.mean(0))
+                variances.append(group.var(0, unbiased=False).clamp_min(1e-6))
+                class_ids.append(int(class_id))
+            anchors[int(block_idx)] = {
+                "class_ids": torch.tensor(class_ids, dtype=torch.long),
+                "mean": torch.stack(means).cpu().half(),
+                "var": torch.stack(variances).cpu().half(),
+            }
+        return anchors
+
+    def _all_old_anchors(self, old_states, block_idx):
+        means, variances = [], []
+        for state in old_states:
+            bank = state.get("anchor_by_block", {}).get(int(block_idx))
+            if bank is not None:
+                means.append(torch.as_tensor(bank["mean"], device=self.device).float())
+                variances.append(torch.as_tensor(bank["var"], device=self.device).float())
+        if not means:
+            return None, None
+        return torch.cat(means, dim=0), torch.cat(variances, dim=0)
+
+    def _semantic_visual_calibration(self, visual, semantic, old_states):
+        """Use semantic similarity to transfer reliable old visual directions."""
+        visual = F.normalize(visual.float(), dim=-1)
+        semantic = F.normalize(semantic.float(), dim=-1)
+        if not old_states:
+            return visual
+        old_visual = torch.cat([
+            F.normalize(torch.as_tensor(state["image_proto"], device=self.device).float(), dim=-1)
+            for state in old_states
+        ], dim=0)
+        old_semantic = []
+        lambda_t = (float(self.cfg.TRAINER.BiMC.LAMBDA_T)
+                    if self.cfg.TRAINER.BiMC.TEXT_CALIBRATION else 0.0)
+        for state in old_states:
+            text = torch.as_tensor(state["text_features"], device=self.device).float()
+            desc = torch.as_tensor(state.get("description_proto", text), device=self.device).float()
+            old_semantic.append(F.normalize((1.0 - lambda_t) * text + lambda_t * desc, dim=-1))
+        old_semantic = torch.cat(old_semantic, dim=0)
+        tau = float(getattr(self.cfg.TRAINER.BiMC, "TAU", 16.0))
+        weights = torch.softmax(tau * semantic @ old_semantic.t(), dim=-1)
+        transferred = F.normalize(weights @ old_visual, dim=-1)
+        strength = float(getattr(self.cfg.TRAINER.BiMC, "SEMANTIC_VISUAL_CALIBRATION", 0.1))
+        return F.normalize((1.0 - strength) * visual + strength * transferred, dim=-1)
+
+    def _build_incremental_bank(self, loader, class_index, text, description, old_states):
+        """Build source-exclusive novel prototypes and one global old+new bank."""
+        cache = self.model_without_dp.build_leave_one_out_prototypes(loader, class_index)
+        classes = cache["classes"].to(self.device)
+        labels = cache["labels"].to(self.device)
+        sources = cache["source_ids"].to(self.device)
+        features = cache["features"].to(self.device).float()
+        full_visual = F.normalize(torch.stack([
+            features[labels.eq(cls)].mean(0) for cls in classes
+        ]), dim=-1)
+        loo_visual = cache["loo_visual_prototypes"].to(self.device).float()
+        semantic = F.normalize(
+            (1.0 - (float(self.cfg.TRAINER.BiMC.LAMBDA_T)
+                    if self.cfg.TRAINER.BiMC.TEXT_CALIBRATION else 0.0)) * text.float()
+            + (float(self.cfg.TRAINER.BiMC.LAMBDA_T)
+               if self.cfg.TRAINER.BiMC.TEXT_CALIBRATION else 0.0) * description.float(),
+            dim=-1,
+        )
+        full_calibrated = self._semantic_visual_calibration(full_visual, semantic, old_states)
+        loo_calibrated = torch.stack([
+            self._semantic_visual_calibration(row, semantic, old_states)
+            for row in loo_visual
+        ])
+        beta = float(self.cfg.DATASET.BETA)
+        novel_full = F.normalize(beta * semantic + (1.0 - beta) * full_calibrated, dim=-1)
+        novel_loo = F.normalize(beta * semantic.unsqueeze(0) +
+                                (1.0 - beta) * loo_calibrated, dim=-1)
+        old_fused = []
+        old_ids = []
+        for state in old_states:
+            old_fused.append(F.normalize(torch.as_tensor(
+                state["fused_proto"], device=self.device).float(), dim=-1))
+            old_ids.append(torch.as_tensor(state["class_ids"], device=self.device).long())
+        old_fused = torch.cat(old_fused, dim=0) if old_fused else novel_full.new_empty((0, novel_full.size(-1)))
+        old_ids = torch.cat(old_ids, dim=0) if old_ids else classes.new_empty(0)
+        global_full = torch.cat([old_fused, novel_full], dim=0)
+        global_ids = torch.cat([old_ids, classes], dim=0)
+        if torch.unique(global_ids).numel() != global_ids.numel():
+            raise ValueError("Global prototype classifier contains duplicate class ids.")
+        return {
+            "classes": classes, "labels": labels, "source_ids": sources,
+            "visual_full": full_calibrated, "visual_loo": loo_calibrated,
+            "novel_full": novel_full, "novel_loo": novel_loo,
+            "global_full": global_full, "global_ids": global_ids,
+            "old_class_count": old_ids.numel(),
+        }
+
+    def _global_incremental_logits(self, images, labels, source_ids, bank, scale):
+        if torch.is_grad_enabled():
+            features, _ = self.model_without_dp.extract_img_feature_train(images)
+        else:
+            features = self.model_without_dp.extract_img_feature(images)
+        features = F.normalize(features.float(), dim=-1)
+        prototypes = bank["global_full"].unsqueeze(0).expand(images.size(0), -1, -1).clone()
+        if source_ids is not None:
+            source_ids = torch.as_tensor(source_ids, device=images.device).reshape(-1)
+            match = source_ids[:, None].eq(bank["source_ids"][None, :])
+            if not bool(match.any(dim=1).all().item()):
+                raise KeyError("Training query source is absent from the LOO support bank.")
+            rows = match.long().argmax(dim=1)
+            own = self._targets_to_columns(labels, {"class_ids": bank["global_ids"]})
+            novel_loo = bank["novel_loo"][rows]
+            novel_columns = own - int(bank["old_class_count"])
+            if (novel_columns < 0).any():
+                raise RuntimeError("Incremental query target unexpectedly maps to an old class.")
+            prototypes[torch.arange(images.size(0), device=images.device)[:, None],
+                       (int(bank["old_class_count"]) + torch.arange(
+                           bank["classes"].numel(), device=images.device))[None, :]] = bank["novel_full"][None, :, :]
+            prototypes[torch.arange(images.size(0), device=images.device), own] = novel_loo[
+                torch.arange(images.size(0), device=images.device), novel_columns
+            ]
+        logits = float(scale) * torch.einsum("bd,bcd->bc", features, prototypes)
+        return logits, self._targets_to_columns(labels, {"class_ids": bank["global_ids"]})
 
     def train_base_task(self, task_stat, train_loader, extract_loader):
         optim_cfg = self.cfg.TRAINER.BiMC.OPTIM
@@ -484,13 +609,11 @@ class Runner:
         num_experts = int(_cfg_value(self._visual_moe_cfg(), "NUM_BASE_EXPERTS", 4))
         optimizer = self.build_base_optimizer()
         scheduler = CosineAnnealingLR(optimizer, T_max=max(1, epochs))
-
-        print(f"\n========== Start Base Training Task 0 (Epochs: {epochs}) ==========")
+        print(f"\n========== Start Unified Base MoE Training ({epochs} epochs) ==========")
         for epoch in range(epochs):
             self.model.train()
             totals = {"loss": 0.0, "ce": 0.0, "kd": 0.0, "lb": 0.0, "n": 0}
-            pbar = tqdm(train_loader, desc=f"Base Epoch {epoch + 1}/{epochs}")
-            for batch in pbar:
+            for batch in tqdm(train_loader, desc=f"Base Epoch {epoch + 1}/{epochs}"):
                 images, labels = self.parse_batch(batch)
                 targets = self._targets_to_columns(labels, task_stat)
                 optimizer.zero_grad(set_to_none=True)
@@ -500,108 +623,111 @@ class Runner:
                 loss_ce = F.cross_entropy(logits, targets)
                 loss_kd = 1.0 - F.cosine_similarity(img_feat, teacher_feat, dim=-1).mean()
                 loss_lb = compute_load_balance_loss(moe_aux, num_experts).to(images.device)
-                loss = ce_weight * loss_ce + lb_weight * loss_lb + kd_weight * loss_kd
+                loss = ce_weight * loss_ce + kd_weight * loss_kd + lb_weight * loss_lb
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(
-                    [parameter for parameter in self.model_without_dp.parameters() if parameter.requires_grad],
-                    max_norm=1.0,
-                )
+                    [p for p in self.model_without_dp.parameters() if p.requires_grad], 1.0)
                 optimizer.step()
-                totals["loss"] += float(loss.item()); totals["ce"] += float(loss_ce.item())
-                totals["kd"] += float(loss_kd.item()); totals["lb"] += float(loss_lb.item()); totals["n"] += 1
-                pbar.set_postfix({"Loss": f"{loss.item():.3f}", "CE": f"{loss_ce.item():.3f}"})
+                totals["loss"] += float(loss.item())
+                totals["ce"] += float(loss_ce.item())
+                totals["kd"] += float(loss_kd.item())
+                totals["lb"] += float(loss_lb.item())
+                totals["n"] += 1
             scheduler.step()
-            divisor = max(1, totals["n"])
-            print(
-                "=> [Base][Epoch {}/{}] loss={:.4f} ce={:.4f} kd={:.4f} lb={:.4f}".format(
-                    epoch + 1, epochs, totals["loss"] / divisor, totals["ce"] / divisor,
-                    totals["kd"] / divisor, totals["lb"] / divisor,
-                )
-            )
-
+            n = max(1, totals["n"])
+            print(f"=> [Base][{epoch+1}/{epochs}] loss={totals['loss']/n:.4f} "
+                  f"ce={totals['ce']/n:.4f} kd={totals['kd']/n:.4f} lb={totals['lb']/n:.4f}")
         for _, adapter in self._moe_adapters():
             adapter.freeze_all()
         self._train_base_descriptors(extract_loader)
 
-    # ------------------------------------------------------------------
-    # Support-risk-guided expansion
-    # ------------------------------------------------------------------
-    def _current_encoder_version(self):
-        return max((birth for _, adapter in self._moe_adapters()
-                    for birth in adapter.expert_birth_sessions), default=0)
+    def train_incremental_task(self, task_id, train_loader, extract_loader, class_index,
+                               current_class_name, old_states):
+        """SEMA-ordered layerwise expansion followed by global-prototype training."""
+        text, description = self._text_prototypes(current_class_name, class_index)
+        optim_cfg = self.cfg.TRAINER.BiMC.OPTIM
+        epochs = int(self.cfg.TRAINER.BiMC.INCREMENTAL.EPOCHS)
+        scale = float(self.cfg.TRAINER.BiMC.INCREMENTAL.LOGIT_SCALE)
+        threshold = float(getattr(self._visual_moe_cfg(), "EXPANSION_Z_THRESHOLD", 1.0))
+        ae_epochs = int(_cfg_value(optim_cfg, "INCREMENTAL_DESCRIPTOR_EPOCHS", 5))
+        decisions, expanded, histories = [], [], {}
+        for _, adapter in self._moe_adapters():
+            adapter.freeze_all()
 
-    @torch.no_grad()
-    def _support_bank(self, loader, class_index, text_features, description_proto,
-                      version, calibrate=True):
-        """Build both leave-one-source-out and full-shot deployment classifiers."""
-        model = self.model_without_dp
-        current = model.build_leave_one_out_prototypes(loader, class_index, max_session=version)
-        reference = (current if version == 0 else
-                     model.build_leave_one_out_prototypes(loader, class_index, max_session=0))
-        if not torch.equal(current["source_ids"], reference["source_ids"]):
-            raise RuntimeError("Current and reference support source orders differ.")
-        labels, classes = current["labels"], current["classes"]
-        current_features, reference_features = current["features"], reference["features"]
-        visual_full = F.normalize(torch.stack([
-            current_features[labels.eq(cls)].mean(0) for cls in classes
-        ]), dim=-1)
-        reference_full = F.normalize(torch.stack([
-            reference_features[labels.eq(cls)].mean(0) for cls in classes
-        ]), dim=-1)
-        visual_loo = current["loo_visual_prototypes"]
-        if calibrate:
-            visual_full = model.calibrate_incremental_visual(visual_full.to(self.device),
-                                                               reference_full.to(self.device))
-            visual_loo = model.calibrate_incremental_visual(visual_loo.to(self.device),
-                                                              reference["loo_visual_prototypes"].to(self.device))
-        lambda_t = (float(self.cfg.TRAINER.BiMC.LAMBDA_T)
-                    if self.cfg.TRAINER.BiMC.TEXT_CALIBRATION else 0.0)
-        text = F.normalize((1.0 - lambda_t) * text_features
-                           + lambda_t * description_proto, dim=-1)
-        beta = float(self.cfg.DATASET.BETA)
-        current["visual_full"] = visual_full.to(self.device)
-        current["visual_loo"] = visual_loo.to(self.device)
-        current["fused_full"] = F.normalize(beta * text + (1.0 - beta) * current["visual_full"], dim=-1)
-        current["fused_loo"] = F.normalize(beta * text[None, :, :] +
-                                            (1.0 - beta) * current["visual_loo"], dim=-1)
-        if not bool(current["loo_valid"].all().item()):
-            raise ValueError("Every training query needs another source in its class.")
-        return current
+        # Scan shallow-to-deep. Recollect features after each accepted layer
+        # because an upstream expansion changes all downstream representations.
+        for block_idx in self.model_without_dp.expandable_blocks():
+            features = self.model_without_dp.collect_blockwise_cls_features(extract_loader)
+            decision = self.model_without_dp.plan_layer_expansion(
+                block_idx, features, class_index, threshold)
+            decisions.append({
+                "block_idx": int(block_idx), "expand": bool(decision.expand),
+                "descriptor_scores": dict(decision.class_scores),
+                "uncovered_classes": list(decision.uncovered_classes),
+            })
+            if not decision.expand:
+                continue
 
-    def _versioned_scores(self, images, prototypes, versions, scale):
-        """Score each class using the encoder which created its prototype."""
-        versions = torch.as_tensor(versions, device=images.device, dtype=torch.long)
-        output = images.new_empty((images.size(0), prototypes.size(0)))
-        for version in torch.unique(versions).tolist():
-            mask = versions.eq(version)
-            with torch.no_grad():
-                features = self.model_without_dp.extract_img_feature(images, max_session=version)
-            part = scale * F.normalize(features.float(), dim=-1) @ F.normalize(
-                prototypes[mask].to(images.device).float(), dim=-1).t()
-            output[:, mask] = part
-        return output
+            adapter = self._adapter_by_block(block_idx)
+            expert_id = self.model_without_dp.add_expert(block_idx, task_id)
+            adapter.set_newest_trainable()
+            anchor_mean, anchor_var = self._all_old_anchors(old_states, block_idx)
+            optimizer = optim.AdamW([
+                {"params": adapter.experts[-1].parameters(),
+                 "lr": float(optim_cfg.LR_INCREMENTAL_EXPERT)},
+                {"params": adapter.router.columns[-1].parameters(),
+                 "lr": float(optim_cfg.LR_INCREMENTAL_ROUTER)},
+            ], weight_decay=float(optim_cfg.WEIGHT_DECAY))
+            loss_history = []
+            for epoch in range(epochs):
+                bank = self._build_incremental_bank(
+                    extract_loader, class_index, text, description, old_states)
+                self.model.train()
+                total, count = 0.0, 0
+                for batch in train_loader:
+                    images, labels = self.parse_batch(batch)
+                    source_ids = self._batch_source_ids(batch, labels.numel(), labels.device)
+                    optimizer.zero_grad(set_to_none=True)
+                    logits, targets = self._global_incremental_logits(
+                        images, labels, source_ids, bank, scale)
+                    classification = F.cross_entropy(logits, targets)
+                    old_suppression = adapter.old_anchor_suppression_loss(
+                        anchor_mean, anchor_var,
+                        residual_weight=float(getattr(
+                            self.cfg.TRAINER.BiMC.INCREMENTAL, "OLD_RESIDUAL_WEIGHT", 1.0)))
+                    gate_penalty = torch.sigmoid(adapter.router.columns[-1](
+                        adapter.layer_norm(adapter.experts[-1].c_fc.weight.new_zeros(
+                            (1, adapter.d_model))))).square().mean() * 0.0
+                    loss = (classification
+                            + float(getattr(self.cfg.TRAINER.BiMC.INCREMENTAL,
+                                            "OLD_SUPPRESSION_WEIGHT", 1.0)) * old_suppression
+                            + gate_penalty)
+                    if not bool(torch.isfinite(loss).item()):
+                        raise FloatingPointError("Non-finite global prototype incremental loss.")
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(adapter.newest_parameters(), 1.0)
+                    optimizer.step()
+                    total += float(loss.item()) * labels.numel()
+                    count += labels.numel()
+                loss_history.append(total / max(1, count))
+            adapter.freeze_all()
 
-    def _incremental_logits(self, images, labels, source_ids, support_bank,
-                            version, scale, leave_one_out=True):
-        """Rank novel classes as they are ranked in the deployed task classifier."""
-        if leave_one_out:
-            cache_sources = torch.as_tensor(support_bank["source_ids"], device=source_ids.device)
-            matches = source_ids.reshape(-1, 1).eq(cache_sources.reshape(1, -1))
-            if not bool(matches.any(dim=1).all().item()):
-                raise KeyError("Training source is absent from its leave-one-out bank.")
-            rows = matches.long().argmax(dim=1)
-            new_prototypes = support_bank["fused_loo"][rows]
-        else:
-            new_prototypes = support_bank["fused_full"].unsqueeze(0).expand(images.size(0), -1, -1)
-        if torch.is_grad_enabled():
-            features, _ = self.model_without_dp.extract_img_feature_train(
-                images, max_session=version)
-        else:
-            features = self.model_without_dp.extract_img_feature(
-                images, max_session=version)
-        features = F.normalize(features.float(), dim=-1)
-        logits = scale * torch.einsum("bd,bcd->bc", features, new_prototypes.float())
-        return logits, self._targets_to_columns(labels, {"class_ids": support_bank["classes"]})
+            # The descriptor is paired with the newly learned expert and is
+            # fitted only after that expert's local representation is final.
+            new_features = self.model_without_dp.collect_blockwise_cls_features(extract_loader)
+            local_values = new_features[block_idx]["cls_in"].to(self.device)
+            ae_loss = self._train_descriptor(adapter, expert_id, local_values, ae_epochs)
+            adapter.freeze_all()
+            histories[block_idx] = {
+                "expert_id": int(expert_id), "loss": loss_history, "ae_loss": ae_loss,
+                "old_anchor_gate_mean": adapter.old_anchor_response(anchor_mean, anchor_var),
+            }
+            expanded.append({"block_idx": int(block_idx), "expert_id": int(expert_id)})
+
+        for _, adapter in self._moe_adapters():
+            adapter.freeze_all()
+        return {"trained": bool(expanded), "decisions": decisions, "expanded": expanded,
+                "training": histories, "encoder_version": 0}
 
     def _text_prototypes(self, class_names, class_index):
         model = self.model_without_dp
