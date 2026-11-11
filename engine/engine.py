@@ -419,6 +419,14 @@ class Runner:
         descriptor.eval()
         with torch.no_grad():
             errors = descriptor.reconstruction_error(values)
+            if sample_weights is not None:
+                probabilities = weights.clamp_min(0)
+                if not bool((probabilities.sum() > 0).item()):
+                    raise ValueError("AE responsibility distribution has zero mass.")
+                reference_count = min(adapter.descriptor_buffer_size, errors.numel())
+                selected = torch.multinomial(
+                    probabilities / probabilities.sum(), reference_count, replacement=True)
+                errors = errors[selected]
             adapter.update_descriptor_stats(errors, expert_id)
         for parameter in descriptor.parameters():
             parameter.requires_grad = False
