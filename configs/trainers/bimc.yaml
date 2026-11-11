@@ -31,6 +31,7 @@ TRAINER:
     TAU: 16
     TEXT_CALIBRATION: True
     LAMBDA_T: 0.5
+    SEMANTIC_VISUAL_CALIBRATION: 0.1
 
     FREEZE_TEXT_ENCODER: True
     FREEZE_VISUAL_BACKBONE: True
@@ -51,11 +52,8 @@ TRAINER:
     INCREMENTAL:
       EPOCHS: 6
       LOGIT_SCALE: 100.0
-      # Regularize the change in current-support image features relative to the
-      # frozen previous model. Also included in candidate held-out selection.
       OLD_SUPPRESSION_WEIGHT: 1.0
       OLD_RESIDUAL_WEIGHT: 1.0
-      SEMANTIC_VISUAL_CALIBRATION: 0.1
 
     CHECKPOINT:
       ENABLE: True
