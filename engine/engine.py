@@ -447,7 +447,7 @@ class Runner:
             # Recollect per layer after previous descriptors are frozen; the
             # CLS input is exactly the local representation seen by that layer.
             features = self.model_without_dp.collect_blockwise_cls_features(extract_loader)
-            values = features[block_idx]["cls_in"].to(self.device)
+            values = features[block_idx]["ae_in"].to(self.device)
             with torch.no_grad():
                 _, responsibilities = adapter.router(values)
             for expert_id in range(adapter.num_experts):
@@ -699,7 +699,7 @@ class Runner:
             # The descriptor is paired with the newly learned expert and is
             # fitted only after that expert's local representation is final.
             new_features = self.model_without_dp.collect_blockwise_cls_features(extract_loader)
-            local_values = new_features[block_idx]["cls_in"].to(self.device)
+            local_values = new_features[block_idx]["ae_in"].to(self.device)
             ae_loss = self._train_descriptor(adapter, expert_id, local_values, ae_epochs)
             adapter.freeze_all()
             histories[block_idx] = {
