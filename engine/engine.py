@@ -448,8 +448,9 @@ class Runner:
             # CLS input is exactly the local representation seen by that layer.
             features = self.model_without_dp.collect_blockwise_cls_features(extract_loader)
             values = features[block_idx]["ae_in"].to(self.device)
+            router_values = features[block_idx]["cls_in"].to(self.device)
             with torch.no_grad():
-                _, responsibilities = adapter.router(values)
+                _, responsibilities = adapter.router(adapter.layer_norm(router_values))
             for expert_id in range(adapter.num_experts):
                 loss = self._train_descriptor(
                     adapter, expert_id, values, epochs, responsibilities[:, expert_id])
