@@ -808,9 +808,17 @@ class Runner:
                 torch.cuda.synchronize()
             elapsed = time.perf_counter() - start_time
             print(f"+++++++++++ session {task_id}, time: {elapsed:.3f}s ++++++++++++++++")
+            task_history = self.task_acc_list + [acc["task_acc"]]
+            forgetting = []
+            for old_task in range(task_id + 1):
+                best = max(float(task_history[session][old_task])
+                           for session in range(old_task, task_id + 1))
+                current = float(task_history[task_id][old_task])
+                forgetting.append(best - current)
+            acc["performance_drop"] = float(np.mean(forgetting)) if forgetting else 0.0
             print(f"=> Session [{task_id}], AA={acc['mean_acc']:.3f}, "
                   f"Base={acc['base_avg_acc']:.2f}, Novel={acc['inc_avg_acc']:.2f}, "
-                  f"H={acc['harmonic_acc']:.2f}, PD={acc.get('performance_drop', 0.0):.3f}")
+                  f"H={acc['harmonic_acc']:.2f}, PD={acc['performance_drop']:.3f}")
             self.acc_list.append(round(acc["mean_acc"], 3))
             self.task_acc_list.append(acc["task_acc"])
             self.session_diagnostics.append({
