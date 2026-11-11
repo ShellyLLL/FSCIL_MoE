@@ -420,7 +420,8 @@ class VisualMoEAdapter(nn.Module):
         residual = self.residual_scale.to(residual.dtype) * residual
         return residual, {"logits": logits, "route_weights": weights,
                           "top_k_indices": weights.argmax(dim=-1, keepdim=True),
-                          "cls_in": x_norm[0], "patch_mean_in": x_norm[1:].mean(dim=0),
+                          "cls_in": x_norm[0], "ae_in": x_norm.mean(dim=0),
+                          "patch_mean_in": x_norm[1:].mean(dim=0),
                           "expert_residual_norms": torch.stack(norms),
                           "token_residual": residual.detach()}
 
