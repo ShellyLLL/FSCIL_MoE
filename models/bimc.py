@@ -405,7 +405,7 @@ class BiMC(nn.Module):
         return block_features
 
     @torch.no_grad()
-    def build_leave_one_out_prototypes(self, loader, class_index=None, max_session=None):
+    def build_leave_one_out_prototypes(self, loader, class_index=None):
         """Collect a support cache with stable source ids and per-query LOO means.
 
         ``loo_visual_prototypes[i, j]`` is class ``j``'s support mean after
@@ -424,8 +424,7 @@ class BiMC(nn.Module):
                 if sid.numel() != y.numel():
                     raise ValueError("support source ids must align with labels.")
                 next_id += y.numel()
-                features.append(F.normalize(self.clip_model.encode_image(
-                    images, max_session=max_session), dim=-1).detach().cpu())
+                features.append(F.normalize(self.clip_model.encode_image(images), dim=-1).detach().cpu())
                 labels.append(y.detach().cpu())
                 source_ids.append(sid.detach().cpu())
         finally:
@@ -460,32 +459,40 @@ class BiMC(nn.Module):
                 if getattr(block, "moe_adapter", None) is not None]
 
     @torch.no_grad()
-    def plan_layer_expansion(self, block_idx, loader, class_index, threshold=None):
-        """Decide one layer solely from class-aggregated descriptor coverage."""
+    def plan_layer_expansion(self, block_idx, features, class_index, threshold=None):
+        """SEMA expansion rule: every existing AE must flag the current class set."""
         block_idx = int(block_idx)
         threshold = float(getattr(
             self.cfg.TRAINER.BiMC.VISUAL_MOE, "EXPANSION_Z_THRESHOLD", 1.0
         ) if threshold is None else threshold)
-        features = self.collect_blockwise_cls_features(loader).get(block_idx)
-        if features is None:
+        if block_idx not in features:
             raise KeyError(f"Block {block_idx} did not produce support features.")
         adapter = self.clip_model.visual.transformer.resblocks[block_idx].moe_adapter
         adapter.assert_descriptors_ready()
-        values, labels = features["cls_in"].to(self.device), features["labels"].to(self.device)
+        values = features[block_idx]["cls_in"].to(self.device)
+        labels = features[block_idx]["labels"].to(self.device)
         scores = adapter.descriptor_scores(values)
-        class_scores = {
-            int(class_id.item()): float(scores[labels.eq(class_id)].mean(dim=0).min().item())
-            for class_id in torch.unique(labels, sorted=True)
-        }
         expected = sorted(int(value) for value in class_index)
-        if sorted(class_scores) != expected:
-            raise RuntimeError(f"Block {block_idx} received classes {sorted(class_scores)}, expected {expected}.")
-        uncovered = [class_id for class_id, score in class_scores.items() if score > threshold]
-        for class_id, score in class_scores.items():
-            state = "uncovered" if class_id in uncovered else "covered"
-            print(f"=> [Coverage][B{block_idx}] class={class_id} score={score:.4f} {state}")
-        decision = LayerExpansionDecision(block_idx, bool(uncovered), class_scores, uncovered)
-        print(f"=> [Coverage][B{block_idx}] decision={'EXPAND' if decision.expand else 'REUSE'}")
+        observed = sorted(int(value) for value in torch.unique(labels, sorted=True).tolist())
+        if observed != expected:
+            raise RuntimeError(f"Block {block_idx} received classes {observed}, expected {expected}.")
+        # FSCIL sessions are class-balanced by construction. Average within
+        # class first so every class contributes equally to the layer decision.
+        per_class = torch.stack([
+            scores[labels.eq(class_id)].mean(dim=0)
+            for class_id in torch.unique(labels, sorted=True)
+        ])
+        descriptor_z = per_class.mean(dim=0)
+        per_class_summary = {
+            int(class_id): float(per_class[row].min().item())
+            for row, class_id in enumerate(torch.unique(labels, sorted=True).tolist())
+        }
+        expand = bool(torch.all(descriptor_z > threshold).item())
+        decision = LayerExpansionDecision(block_idx, expand, per_class_summary,
+                                          [cid for cid, score in per_class_summary.items()
+                                           if score > threshold])
+        print(f"=> [SEMA-AE][B{block_idx}] z_by_descriptor={descriptor_z.tolist()} "
+              f"threshold={threshold:.3f} decision={'EXPAND' if expand else 'REUSE'}")
         return decision
 
     def add_expert(self, block_idx, session_id):
@@ -617,9 +624,8 @@ class BiMC(nn.Module):
                 del block._temp_moe
         return teacher_features
 
-    def extract_img_feature_train(self, images, max_session=None):
-        return self.clip_model.encode_image(images.to(self.device), return_moe_aux=True,
-                                            max_session=max_session)
+    def extract_img_feature_train(self, images):
+        return self.clip_model.encode_image(images.to(self.device), return_moe_aux=True)
 
     def forward_train(self, images, task_stat, beta, compute_teacher=False):
         img_feat, moe_aux = self.extract_img_feature_train(images)
@@ -659,12 +665,11 @@ class BiMC(nn.Module):
         return F.normalize(torch.stack(clip_weights, dim=0), dim=-1), torch.cat(all_targets, dim=0)
 
     @torch.no_grad()
-    def inference_all_img_feature(self, loader, max_session=None):
+    def inference_all_img_feature(self, loader):
         all_features, all_labels = [], []
         for batch in loader:
             images, labels = self.parse_batch(batch)
-            features = F.normalize(self.clip_model.encode_image(
-                images, max_session=max_session), dim=-1)
+            features = F.normalize(self.clip_model.encode_image(images), dim=-1)
             all_features.append(features)
             all_labels.append(labels)
 
@@ -709,22 +714,14 @@ class BiMC(nn.Module):
 
     @torch.no_grad()
     def build_task_statistics(self, class_names, loader, class_index,
-                              calibrate_novel_vision_proto=False, encoder_version=None):
+                              calibrate_novel_vision_proto=False):
         cls_begin_index = class_index[0]
         text_features, _ = self.inference_text_feature(class_names, self.template, cls_begin_index)
         _, _, description_proto = self.inference_all_description_feature(class_names, self.cfg.DATASET.GPT_PATH, cls_begin_index)
-        images_features, anchor_labels, images_proto = self.inference_all_img_feature(
-            loader, max_session=encoder_version)
+        images_features, anchor_labels, images_proto = self.inference_all_img_feature(loader)
         anchor_features = images_features
         anchor_proto = images_proto
-        if cls_begin_index != 0:
-            if encoder_version != 0:
-                anchor_features, anchor_labels, anchor_proto = self.inference_all_img_feature(
-                    loader, max_session=0)
-            if calibrate_novel_vision_proto:
-                images_proto = self.calibrate_incremental_visual(images_proto, anchor_proto)
-                anchor_proto = self.soft_calibration(self.base_vision_prototype, anchor_proto)
-        else:
+        if cls_begin_index == 0:
             self.base_vision_prototype = images_proto
         lambda_t = self.cfg.TRAINER.BiMC.LAMBDA_T if self.cfg.TRAINER.BiMC.TEXT_CALIBRATION else 0.0
         calibrated_text = F.normalize((1 - lambda_t) * text_features + lambda_t * description_proto, dim=-1)
@@ -764,7 +761,7 @@ class BiMC(nn.Module):
             "anchor_features": anchor_features.detach().to(device="cpu", dtype=torch.float16),
             "anchor_labels": anchor_labels.detach().cpu(),
             "anchor_source_ids": source_ids,
-            "encoder_version": 0 if encoder_version is None else int(encoder_version),
+            "encoder_version": 0,
         }
 
     @torch.no_grad()
@@ -779,8 +776,8 @@ class BiMC(nn.Module):
         return 100.0 * img_feat @ fused_proto.t()
 
     @torch.no_grad()
-    def extract_img_feature(self, images, max_session=None):
-        return self.clip_model.encode_image(images.to(self.device), max_session=max_session)
+    def extract_img_feature(self, images):
+        return self.clip_model.encode_image(images.to(self.device))
 
     def parse_batch(self, batch):
         # NumPy-backed FSCIL datasets can yield int32 labels on Windows.  Keep
