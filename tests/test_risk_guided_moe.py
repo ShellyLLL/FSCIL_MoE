@@ -92,7 +92,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             descriptor.update_reference(torch.tensor([0.1, 0.11, 0.09, 0.1]))
         adapter.descriptor_scores = lambda x, require_ready=True: torch.full(
             (x.size(0), 2), 2.0)
-        features = {0: {"cls_in": torch.randn(4, 8),
+        features = {0: {"cls_in": torch.randn(4, 8), "ae_in": torch.randn(4, 8),
                         "labels": torch.tensor([2, 2, 3, 3])}}
         decision = model.plan_layer_expansion(0, features, [2, 3])
         self.assertTrue(decision.expand)
