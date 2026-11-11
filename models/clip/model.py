@@ -135,57 +135,70 @@ class QuickGELU(nn.Module):
 
 
 class RepresentationDescriptor(nn.Module):
-    """FP32 reconstruction descriptor for one expert's local input distribution."""
+    """SEMA-style linear AE with a rolling reconstruction-error reference."""
 
-    def __init__(self, d_model, descriptor_dim=64, eps=1e-4):
+    def __init__(self, d_model, descriptor_dim=64, eps=1e-4, buffer_size=500):
         super().__init__()
-        self.d_model, self.eps = int(d_model), float(eps)
+        self.d_model = int(d_model)
         self.descriptor_dim = max(1, min(int(descriptor_dim), self.d_model))
+        self.eps, self.buffer_size = float(eps), int(buffer_size)
         self.encoder = nn.Linear(self.d_model, self.descriptor_dim)
-        self.activation = QuickGELU()
         self.decoder = nn.Linear(self.descriptor_dim, self.d_model)
-        self.register_buffer("mean", torch.tensor(0.0, dtype=torch.float32))
-        self.register_buffer("std", torch.tensor(1.0, dtype=torch.float32))
-        self.register_buffer("fit_sample_count", torch.tensor(0, dtype=torch.long))
-        self.register_buffer("calibration_sample_count", torch.tensor(0, dtype=torch.long))
-
-    def _reconstruct_fp32(self, x):
-        encoded = F.linear(x.float(), self.encoder.weight.float(), self.encoder.bias.float())
-        return F.linear(self.activation(encoded), self.decoder.weight.float(), self.decoder.bias.float())
+        nn.init.kaiming_uniform_(self.encoder.weight, a=5 ** 0.5)
+        nn.init.zeros_(self.encoder.bias)
+        nn.init.kaiming_uniform_(self.decoder.weight, a=5 ** 0.5)
+        nn.init.zeros_(self.decoder.bias)
+        self.register_buffer("error_history", torch.zeros(self.buffer_size, dtype=torch.float32))
+        self.register_buffer("error_count", torch.zeros((), dtype=torch.long))
+        self.register_buffer("error_cursor", torch.zeros((), dtype=torch.long))
+        self.register_buffer("error_mean", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("error_std", torch.ones((), dtype=torch.float32))
 
     def forward(self, x):
-        return self._reconstruct_fp32(x).to(dtype=x.dtype)
+        value = x.float()
+        encoded = F.linear(value, self.encoder.weight.float(), self.encoder.bias.float())
+        return F.linear(encoded, self.decoder.weight.float(), self.decoder.bias.float())
 
     def reconstruction_error(self, x):
-        values = x.detach().float()
-        return (self._reconstruct_fp32(values) - values).pow(2).mean(dim=-1)
+        value = x.detach().float()
+        return (self.forward(value) - value).square().mean(dim=-1)
 
     @torch.no_grad()
-    def update_stats(self, errors, responsibilities=None, fit_sample_count=None):
-        errors = torch.as_tensor(errors, device=self.mean.device, dtype=torch.float32).reshape(-1)
-        finite = torch.isfinite(errors)
-        errors = errors[finite]
+    def update_reference(self, errors):
+        errors = torch.as_tensor(errors, device=self.error_history.device,
+                                 dtype=torch.float32).reshape(-1)
+        errors = errors[torch.isfinite(errors)]
         if errors.numel() == 0:
-            raise ValueError("descriptor calibration requires finite errors.")
-        weights = torch.ones_like(errors) if responsibilities is None else torch.as_tensor(
-            responsibilities, device=self.mean.device, dtype=torch.float32
-        ).reshape(-1)[finite].clamp_min(0)
-        mass = weights.sum()
-        if not bool(mass.gt(0).item()):
-            raise ValueError("descriptor responsibilities require positive mass.")
-        mean = (weights * errors).sum() / mass
-        variance = (weights * (errors - mean).square()).sum() / mass
-        self.mean.copy_(mean)
-        self.std.copy_(variance.sqrt().clamp_min(max(self.eps, abs(float(mean.item())) * self.eps)))
-        self.fit_sample_count.fill_(errors.numel() if fit_sample_count is None else int(fit_sample_count))
-        self.calibration_sample_count.fill_(errors.numel())
-        return self.mean, self.std
+            raise ValueError("AE reference update requires finite errors.")
+        n = errors.numel()
+        if n >= self.buffer_size:
+            self.error_history.copy_(errors[-self.buffer_size:])
+            self.error_count.fill_(self.buffer_size)
+            self.error_cursor.zero_()
+        else:
+            cursor = int(self.error_cursor.item())
+            positions = (torch.arange(n, device=errors.device) + cursor) % self.buffer_size
+            self.error_history[positions] = errors
+            self.error_count.fill_(min(self.buffer_size, int(self.error_count.item()) + n))
+            self.error_cursor.fill_((cursor + n) % self.buffer_size)
+        count = int(self.error_count.item())
+        # Once the ring is full every slot is valid; before that valid entries
+        # are contiguous because the cursor has not wrapped.
+        reference = self.error_history if count == self.buffer_size else self.error_history[:count]
+        mean = reference.mean()
+        std = reference.std(unbiased=True) if count > 1 else mean.new_zeros(())
+        self.error_mean.copy_(mean)
+        self.error_std.copy_(std.clamp_min(self.eps))
+        return self.error_mean, self.error_std
 
     def standardized_score(self, x):
-        return (self.reconstruction_error(x) - self.mean) / self.std.clamp_min(self.eps)
+        if int(self.error_count.item()) < 3:
+            raise RuntimeError("AE descriptor has fewer than three reference errors.")
+        return ((self.reconstruction_error(x) - self.error_mean) /
+                self.error_std.clamp_min(self.eps)).abs()
 
     def is_ready(self):
-        return int(self.fit_sample_count.item()) > 0 and int(self.calibration_sample_count.item()) > 0
+        return int(self.error_count.item()) >= 3
 
 
 class ExpandableRouter(nn.Module):
@@ -197,10 +210,10 @@ class ExpandableRouter(nn.Module):
         for _ in range(int(num_columns)):
             self.add_column()
 
-    def add_column(self):
+    def add_column(self, bias_init=0.0):
         column = nn.Linear(self.dim, 1)
         nn.init.normal_(column.weight, std=0.02)
-        nn.init.zeros_(column.bias)
+        nn.init.constant_(column.bias, float(bias_init))
         self.columns.append(column)
         return len(self.columns) - 1
 
@@ -230,17 +243,20 @@ class VisualMoEAdapter(nn.Module):
     """Unified expert pool, descriptors and expandable soft router."""
 
     def __init__(self, d_model, num_experts=4, reduction=4, residual_scale_init=1.0,
-                 descriptor_dim=64, descriptor_eps=1e-4):
+                 descriptor_dim=64, descriptor_eps=1e-4, descriptor_buffer_size=500,
+                 incremental_gate_bias_init=-1.0):
         super().__init__()
         self.d_model, self.base_expert_count = int(d_model), int(num_experts)
         self.default_reduction, self.descriptor_dim = int(reduction), int(descriptor_dim)
         self.descriptor_eps = float(descriptor_eps)
+        self.descriptor_buffer_size = int(descriptor_buffer_size)
+        self.incremental_gate_bias_init = float(incremental_gate_bias_init)
         self.layer_norm = LayerNorm(self.d_model)
         self.residual_scale = nn.Parameter(torch.ones(1) * float(residual_scale_init))
         self.experts = nn.ModuleList([BottleneckExpert(self.d_model, reduction)
                                       for _ in range(self.base_expert_count)])
         self.descriptors = nn.ModuleList([
-            RepresentationDescriptor(self.d_model, descriptor_dim, descriptor_eps)
+            RepresentationDescriptor(self.d_model, descriptor_dim, descriptor_eps, descriptor_buffer_size)
             for _ in range(self.base_expert_count)
         ])
         self.router = ExpandableRouter(self.d_model, self.base_expert_count)
@@ -265,11 +281,32 @@ class VisualMoEAdapter(nn.Module):
             self.assert_descriptors_ready()
         return torch.stack([descriptor.standardized_score(x) for descriptor in self.descriptors], dim=-1)
 
+    def expansion_statistics(self, x):
+        scores = self.descriptor_scores(x, require_ready=True)
+        return scores, scores.mean(dim=0)
+
     @torch.no_grad()
-    def update_descriptor_stats(self, errors, expert_id, responsibilities=None, fit_sample_count=None):
-        return self.descriptors[int(expert_id)].update_stats(
-            errors, responsibilities=responsibilities, fit_sample_count=fit_sample_count
-        )
+    def update_descriptor_stats(self, errors, expert_id):
+        return self.descriptors[int(expert_id)].update_reference(errors)
+
+    def old_anchor_suppression_loss(self, anchor_mean, anchor_var, residual_weight=1.0):
+        if anchor_mean is None or anchor_mean.numel() == 0:
+            return self.residual_scale.new_zeros(())
+        mean = anchor_mean.to(device=self.residual_scale.device, dtype=torch.float32)
+        var = anchor_var.to(device=mean.device, dtype=torch.float32).clamp_min(1e-6)
+        anchors = torch.cat([mean, mean + var.sqrt(), mean - var.sqrt()], dim=0)
+        gate = torch.sigmoid(self.router.columns[-1](anchors))
+        residual = self.experts[-1](anchors)
+        return gate.square().mean() + float(residual_weight) * (gate * residual).square().mean()
+
+    @torch.no_grad()
+    def old_anchor_response(self, anchor_mean, anchor_var):
+        if anchor_mean is None or anchor_mean.numel() == 0:
+            return 0.0
+        mean = anchor_mean.to(device=self.residual_scale.device, dtype=torch.float32)
+        var = anchor_var.to(device=mean.device, dtype=torch.float32).clamp_min(1e-6)
+        anchors = torch.cat([mean, mean + var.sqrt(), mean - var.sqrt()], dim=0)
+        return float(torch.sigmoid(self.router.columns[-1](anchors)).mean().item())
 
     def freeze_all(self):
         for parameter in self.parameters():
@@ -289,14 +326,17 @@ class VisualMoEAdapter(nn.Module):
                 parameter.requires_grad = True
         self.train()
 
-    def add_expert(self, session_id, reduction=None):
+    def add_expert(self, session_id, reduction=None, gate_bias_init=None):
         self.freeze_all()
         reduction = self.default_reduction if reduction is None else int(reduction)
         self.experts.append(BottleneckExpert(self.d_model, reduction, zero_init_up=True).to(
             device=self.residual_scale.device, dtype=self.residual_scale.dtype))
         self.descriptors.append(RepresentationDescriptor(
-            self.d_model, self.descriptor_dim, self.descriptor_eps).to(device=self.residual_scale.device))
-        self.router.add_column()
+            self.d_model, self.descriptor_dim, self.descriptor_eps, self.descriptor_buffer_size
+        ).to(device=self.residual_scale.device))
+        self.router.add_column(
+            self.incremental_gate_bias_init if gate_bias_init is None else float(gate_bias_init)
+        )
         self.router.columns[-1].to(device=self.residual_scale.device, dtype=self.residual_scale.dtype)
         self.expert_birth_sessions.append(int(session_id))
         self.set_newest_trainable()
@@ -316,7 +356,7 @@ class VisualMoEAdapter(nn.Module):
                 yield name, parameter
 
     def export_topology(self):
-        return {"version": 1, "d_model": self.d_model, "base_expert_count": self.base_expert_count,
+        return {"version": 2, "d_model": self.d_model, "base_expert_count": self.base_expert_count,
                 "experts": [{"reduction": max(1, self.d_model // expert.c_fc.out_features),
                              "birth_session": int(self.expert_birth_sessions[index])}
                             for index, expert in enumerate(self.experts)]}
@@ -339,7 +379,7 @@ class VisualMoEAdapter(nn.Module):
             reduction = int(spec.get("reduction", self.default_reduction))
             self.experts.append(BottleneckExpert(self.d_model, reduction))
             self.descriptors.append(RepresentationDescriptor(
-                self.d_model, self.descriptor_dim, self.descriptor_eps))
+                self.d_model, self.descriptor_dim, self.descriptor_eps, self.descriptor_buffer_size))
             self.router.add_column()
             self.expert_birth_sessions.append(int(spec.get("birth_session", 0)))
         device, dtype = self.residual_scale.device, self.residual_scale.dtype
@@ -360,21 +400,20 @@ class VisualMoEAdapter(nn.Module):
         self.expert_birth_sessions.pop()
         self.freeze_all()
 
-    def forward(self, x, max_session=None):
+    def forward(self, x):
         if x.ndim != 3:
             raise ValueError("VisualMoEAdapter expects [tokens, batch, dim].")
         x_norm = self.layer_norm(x)
         # The base mixture is never renormalised when incremental experts arrive.
         base_logits, base_weights = self.router(x_norm[0], self.base_expert_count)
-        active = [index for index, birth in enumerate(self.expert_birth_sessions)
-                  if index >= self.base_expert_count and
-                  (max_session is None or birth <= max_session)]
-        gate_logits = [self.router.columns[index](x_norm[0]) for index in active]
-        weights = (torch.cat([base_weights] + [torch.sigmoid(value) for value in gate_logits], dim=-1)
-                   if gate_logits else base_weights)
+        incremental_ids = list(range(self.base_expert_count, self.num_experts))
+        gate_logits = [self.router.columns[index](x_norm[0]) for index in incremental_ids]
+        incremental_gates = [torch.sigmoid(value) for value in gate_logits]
+        weights = torch.cat([base_weights] + incremental_gates, dim=-1) if incremental_gates else base_weights
         logits = torch.cat([base_logits] + gate_logits, dim=-1) if gate_logits else base_logits
         residual, norms = torch.zeros_like(x_norm), []
-        for column, expert_id in enumerate(list(range(self.base_expert_count)) + active):
+        expert_ids = list(range(self.base_expert_count)) + incremental_ids
+        for column, expert_id in enumerate(expert_ids):
             weighted = self.experts[expert_id](x_norm) * weights[:, column].unsqueeze(0).unsqueeze(-1)
             residual = residual + weighted
             norms.append(weighted.detach().float().pow(2).mean().sqrt())
@@ -404,12 +443,12 @@ class ResidualAttentionBlock(nn.Module):
         self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
         return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
 
-    def forward(self, x: torch.Tensor, max_session=None):
+    def forward(self, x: torch.Tensor):
         x = x + self.attention(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         moe_aux = None
         if self.moe_adapter is not None:
-            moe_out, moe_aux = self.moe_adapter(x, max_session=max_session)
+            moe_out, moe_aux = self.moe_adapter(x)
             x = x + moe_out
         return x, moe_aux
 
@@ -420,10 +459,10 @@ class Transformer(nn.Module):
         self.layers = layers
         self.resblocks = nn.ModuleList([ResidualAttentionBlock(width, heads, attn_mask) for _ in range(layers)])
 
-    def forward(self, x: torch.Tensor, max_session=None):
+    def forward(self, x: torch.Tensor):
         moe_aux_list = []
         for block in self.resblocks:
-            x, aux = block(x, max_session=max_session)
+            x, aux = block(x)
             if aux is not None: moe_aux_list.append(aux)
         return x, moe_aux_list
 
@@ -441,8 +480,7 @@ class VisionTransformer(nn.Module):
         self.ln_post = LayerNorm(width)
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
 
-    def forward(self, x: torch.Tensor, all_layer_outputs=False, return_moe_aux=False,
-                max_session=None):
+    def forward(self, x: torch.Tensor, all_layer_outputs=False, return_moe_aux=False):
         x = self.conv1(x)  
         x = x.reshape(x.shape[0], x.shape[1], -1)  
         x = x.permute(0, 2, 1)  
@@ -452,7 +490,7 @@ class VisionTransformer(nn.Module):
 
         if not all_layer_outputs:
             x = x.permute(1, 0, 2)  
-            x, moe_aux_list = self.transformer(x, max_session=max_session)
+            x, moe_aux_list = self.transformer(x)
             x = x.permute(1, 0, 2)  
             x = self.ln_post(x[:, 0, :])
             if self.proj is not None: x = x @ self.proj
@@ -462,7 +500,7 @@ class VisionTransformer(nn.Module):
             x = x.permute(1, 0, 2)  
             outputs, moe_aux_list = [], []
             for block in self.transformer.resblocks:
-                x, aux = block(x, max_session=max_session)
+                x, aux = block(x)
                 if aux is not None: moe_aux_list.append(aux)
                 cur_output = x.permute(1, 0, 2)
                 cur_output = self.ln_post(cur_output[:, 0, :])
@@ -524,13 +562,12 @@ class CLIP(nn.Module):
     def dtype(self):
         return self.visual.conv1.weight.dtype
 
-    def encode_image(self, image, return_moe_aux=False, max_session=None):
+    def encode_image(self, image, return_moe_aux=False):
         if not isinstance(self.visual, VisionTransformer):
             return self.visual(image.type(self.dtype))
         if return_moe_aux:
-            return self.visual(image.type(self.dtype), return_moe_aux=True,
-                               max_session=max_session)
-        return self.visual(image.type(self.dtype), max_session=max_session)
+            return self.visual(image.type(self.dtype), return_moe_aux=True)
+        return self.visual(image.type(self.dtype))
 
     def encode_text(self, text):
         x = self.token_embedding(text).type(self.dtype)
@@ -618,6 +655,8 @@ def build_model(state_dict: dict, cfg=None):
         )
         descriptor_dim = getattr(moe_cfg, "DESCRIPTOR_DIM", 64)
         descriptor_eps = getattr(moe_cfg, "DESCRIPTOR_EPS", 1e-4)
+        descriptor_buffer_size = getattr(moe_cfg, "DESCRIPTOR_BUFFER_SIZE", 500)
+        incremental_gate_bias_init = getattr(moe_cfg, "INCREMENTAL_GATE_BIAS_INIT", -1.0)
         for idx in moe_cfg.INSERT_BLOCKS:
             if idx < 0: idx = len(model.visual.transformer.resblocks) + idx
             block = model.visual.transformer.resblocks[idx]
@@ -628,6 +667,8 @@ def build_model(state_dict: dict, cfg=None):
                 residual_scale_init=base_scale_init,
                 descriptor_dim=descriptor_dim,
                 descriptor_eps=descriptor_eps,
+                descriptor_buffer_size=descriptor_buffer_size,
+                incremental_gate_bias_init=incremental_gate_bias_init,
             )
         convert_weights(model)
     return model.eval()
