@@ -816,10 +816,12 @@ class Runner:
                 current = float(task_history[task_id][old_task])
                 forgetting.append(best - current)
             acc["performance_drop"] = float(np.mean(forgetting)) if forgetting else 0.0
-            print(f"=> Session [{task_id}], AA={acc['mean_acc']:.3f}, "
-                  f"Base={acc['base_avg_acc']:.2f}, Novel={acc['inc_avg_acc']:.2f}, "
-                  f"H={acc['harmonic_acc']:.2f}, PD={acc['performance_drop']:.3f}")
             self.acc_list.append(round(acc["mean_acc"], 3))
+            acc["average_accuracy"] = float(np.mean(self.acc_list))
+            print(f"=> Session [{task_id}], AA={acc['average_accuracy']:.3f}, "
+                  f"Current={acc['mean_acc']:.3f}, Base={acc['base_avg_acc']:.2f}, "
+                  f"Novel={acc['inc_avg_acc']:.2f}, H={acc['harmonic_acc']:.2f}, "
+                  f"PD={acc['performance_drop']:.3f}")
             self.task_acc_list.append(acc["task_acc"])
             self.session_diagnostics.append({
                 "session": int(task_id),
