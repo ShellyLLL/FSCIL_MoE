@@ -450,7 +450,7 @@ class Runner:
             values = features[block_idx]["ae_in"].to(self.device)
             router_values = features[block_idx]["cls_in"].to(self.device)
             with torch.no_grad():
-                _, responsibilities = adapter.router(adapter.layer_norm(router_values))
+                _, responsibilities = adapter.router(router_values)
             for expert_id in range(adapter.num_experts):
                 loss = self._train_descriptor(
                     adapter, expert_id, values, epochs, responsibilities[:, expert_id])
