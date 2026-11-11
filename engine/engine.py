@@ -721,6 +721,32 @@ class Runner:
         return text.detach(), description.detach()
 
 
+    def _build_and_refine_task_state(self, current_class_name, extract_loader, class_index,
+                                     old_states):
+        """Build the new class state in the one current encoder feature space."""
+        state = self.model_without_dp.build_task_statistics(
+            current_class_name, extract_loader, class_index,
+            calibrate_novel_vision_proto=False,
+        )
+        text = state["text_features"].to(self.device).float()
+        desc = state["description_proto"].to(self.device).float()
+        lambda_t = (float(self.cfg.TRAINER.BiMC.LAMBDA_T)
+                    if self.cfg.TRAINER.BiMC.TEXT_CALIBRATION else 0.0)
+        semantic = F.normalize((1.0 - lambda_t) * text + lambda_t * desc, dim=-1)
+        visual = self._semantic_visual_calibration(
+            state["image_proto"].to(self.device), semantic, old_states)
+        beta = float(self.cfg.DATASET.BETA)
+        fused = F.normalize(beta * semantic + (1.0 - beta) * visual, dim=-1)
+        state["image_proto"] = visual.detach()
+        state["fused_proto"] = fused.detach()
+        state["initial_fused_proto"] = fused.detach()
+        state["semantic_proto"] = semantic.detach()
+        state["class_ids"] = torch.as_tensor(class_index, device=self.device, dtype=torch.long)
+        state["class_index"] = state["class_ids"]
+        state["encoder_version"] = 0
+        state["anchor_by_block"] = self._collect_class_anchors(extract_loader)
+        return state
+
     def run(self):
         configured_end = int(_cfg_value(self.cfg.TRAINER.BiMC, "END_SESSION", -1))
         end_task = self.data_manager.num_tasks - 1 if configured_end < 0 else min(
