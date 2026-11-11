@@ -46,47 +46,64 @@ python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/t
 python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc_ensemble.yaml
 ~~~
 
-### Dynamic FSCIL MoE runs
+### Unified AE-driven dynamic FSCIL MoE
 
-The `bimc.yaml` configuration now auto-saves a dataset/seed-specific fixed
-support manifest alongside session checkpoints. Use the same manifest for
-comparisons. The CUB200 run is:
+This branch implements a single current visual feature space. It intentionally
+does not support resuming checkpoints produced by the earlier versioned/task-
+gated architecture. Unified checkpoints use schema 10.
 
-~~~BASH
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --support_manifest checkpoints/fscil_moe/cub_seed1_support.json
+The incremental procedure is:
+
+1. Extract the CLS input representation at each configured visual block.
+2. Score each layer with the reconstruction-error Z-scores of every deployed
+   linear AE descriptor. Each descriptor keeps a rolling 500-error reference.
+3. Expand a layer only when the class-balanced mean absolute Z-score is above
+   the configured threshold for **every** existing descriptor. Scan blocks in
+   ascending order and recollect deeper-layer features after an upstream layer
+   has been expanded and trained.
+4. Add at most one residual expert per layer per session. Its up-projection is
+   zero-initialized. Freeze the CLIP backbone, all historical experts and all
+   historical router columns; train only the new expert and its independent
+   sigmoid router column.
+5. Suppress the new expert's router response and residual on stored old-class,
+   per-layer Gaussian anchors. No historical images or historical encoder
+   versions are used.
+6. Fit the new expert's paired AE on its final local representation distribution,
+   then freeze it and its 500-error reference buffer.
+7. Build current-session visual prototypes with source-exclusive leave-one-out
+   support means. Use calibrated text semantics to retrieve related old visual
+   prototype directions and align the new visual prototypes. Fuse calibrated
+   visual and textual prototypes into one global classifier over every seen
+   class.
+8. Evaluate all seen classes using one current CLIP+MoE forward path and that
+   single global prototype bank. No task gate, version-specific feature
+   extraction, or task-specific classifier branch participates in prediction.
+
+The SEMA implementation is the reference for the linear AE, MSE
+reconstruction objective, rolling reconstruction-error records and absolute
+Z-score outlier rule. The BiMC paper supplies the textual intra-modal
+calibration and visual/textual prototype fusion motivation. The semantic
+similarity transfer from old visual prototypes is the FSCIL-specific alignment
+design used in this branch; it is not claimed to be a verbatim reproduction of
+BiMC's visual calibration equation.
+
+Run tests:
+
+~~~bash
+python -m unittest tests.test_risk_guided_moe -v
 ~~~
 
-At each incremental session, each eligible block receives a temporary candidate
-expert. Five support folds compare its held-out, task-local fused classifier
-loss with the unchanged encoder; at most one candidate is retained if its
-gain exceeds one standard error. Training refreshes source-exclusive visual
-prototypes, updates only the new expert and router column, and freezes them
-afterward. Historical class weights and encoders retain their creation versions.
-The frozen base encoder supplies common-space task evidence. Its task offsets
-jointly minimize class-balanced task loss using source-exclusive support
-features from every observed class. Expert logits only rank classes within
-each task; no task identity is supplied at inference.
+Run a full experiment using the standard configuration:
 
-For staged development, reuse Session 0 and stop after Task 3 without changing
-the normal full-run default:
-
-~~~BASH
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --resume checkpoints/fscil_moe/session_00.pth --end_session 3
+~~~bash
+python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml
 ~~~
 
-Resume from a checkpoint produced by this version (schema 9) with:
-
-~~~BASH
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --resume checkpoints/fscil_moe/session_03.pth
-~~~
-
-Base-only schema 7/8 checkpoints can be reused. Earlier incremental
-checkpoints cannot be resumed because their experts were optimized for a
-different classifier objective. Compare the complete 11-session accuracy list
-with the target using the same fixed support manifest; the support-only gate
-diagnostics are not a substitute for test accuracy. `TaskDiagnostic` reports
-the actual task selection rate and an oracle-task within-class upper bound;
-the latter uses test labels only for analysis, never for predictions.
+The support manifest remains fixed across comparisons. Checkpoints save the
+complete expert topology, AE reference buffers, per-class/per-layer old-class
+anchors, global prototype states, diagnostics and RNG state. Do not resume
+schema 6-9 checkpoints: their versioned feature paths and task gates are
+incompatible with the unified feature space.
 
 ## Acknowledgment
 
@@ -97,4 +114,6 @@ In this repository, we build our code based on the following excellent open-sour
 - [FeCAM](https://github.com/dipamgoswami/FeCAM)
 - [CuPL](https://github.com/sarahpratt/CuPL)
 - [AdaptCLIPZS](https://github.com/cvl-umass/AdaptCLIPZS)
+- [SEMA-CL](https://github.com/huiyiwang01/SEMA-CL), for the linear AE descriptor and reconstruction-error outlier detection
+- [MoE-Adapters4CL](https://github.com/JiazuoYu/MoE-Adapters4CL), for dynamic expert routing design
 
