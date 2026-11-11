@@ -1,6 +1,7 @@
 """Architecture invariants for the unified sparse dynamic FSCIL MoE."""
 
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -12,11 +13,35 @@ from models.bimc import BiMC, build_loo_cache_from_embeddings
 from models.clip.model import VisualMoEAdapter
 from engine.engine import Runner
 from utils.evaluator import AccuracyEvaluator
+from main import setup_cfg
 
 
 class UnifiedMoEArchitectureTests(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(17)
+
+    def test_bimc_yaml_merges_against_complete_yacs_schema(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        trainer_cfg = repo_root / "configs" / "trainers" / "bimc.yaml"
+        dataset_cfgs = [
+            repo_root / "configs" / "datasets" / "cifar100.yaml",
+            repo_root / "configs" / "datasets" / "cub200.yaml",
+            repo_root / "configs" / "datasets" / "miniimagenet.yaml",
+        ]
+        for dataset_cfg in dataset_cfgs:
+            with self.subTest(dataset=dataset_cfg.stem):
+                cfg = setup_cfg(str(dataset_cfg), str(trainer_cfg))
+                visual_moe = cfg.TRAINER.BiMC.VISUAL_MOE
+                self.assertAlmostEqual(visual_moe.ROUTE_INIT_GAP, 0.02)
+                self.assertAlmostEqual(visual_moe.ROUTE_INIT_TARGET_GAP, 0.5)
+                self.assertAlmostEqual(visual_moe.ROUTE_INIT_MAX_WEIGHT_NORM, 2.0)
+                self.assertAlmostEqual(visual_moe.EXPANSION_QUANTILE, 0.95)
+                self.assertAlmostEqual(visual_moe.EXPANSION_CONFIDENCE_Z, 1.0)
+                self.assertAlmostEqual(visual_moe.EXPANSION_MIN_GAIN, 0.001)
+                self.assertAlmostEqual(
+                    cfg.TRAINER.BiMC.OPTIM.LR_INCREMENTAL_ROUTER, 1.0e-2
+                )
+                self.assertTrue(cfg.is_frozen())
 
     def test_runner_initializes_evaluator_with_global_session_partition(self):
         class FakeDatasetManager:
