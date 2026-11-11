@@ -115,8 +115,8 @@ class BiMC(nn.Module):
         return self
 
     @torch.no_grad()
-    def collect_blockwise_cls_features(self, loader):
-        """Collect each inserted adapter's actual input features and source labels."""
+    def collect_blockwise_cls_features(self, loader, disable_moe=False):
+        """Collect adapter-layer CLS inputs with or without the learned MoE path."""
         block_features = {}
         fallback_source_id = 0
         moe_blocks = [
@@ -141,7 +141,9 @@ class BiMC(nn.Module):
                 fallback_source_id += labels.numel()
                 if source_ids.numel() != labels.numel():
                     raise ValueError("Support source ids must align with labels.")
-                _, aux_list = self.clip_model.encode_image(images, return_moe_aux=True)
+                _, aux_list = self.clip_model.encode_image(
+                    images, return_moe_aux=True, disable_moe=disable_moe
+                )
                 if len(aux_list) != len(moe_blocks):
                     raise RuntimeError("MoE auxiliary outputs do not match inserted blocks.")
                 for block_idx, aux in zip(moe_blocks, aux_list):
@@ -187,6 +189,46 @@ class BiMC(nn.Module):
                 "count": torch.as_tensor(counts, dtype=torch.long),
             }
         return statistics
+
+    @torch.no_grad()
+    def build_raw_layer_prototypes(self, loader, class_index):
+        """Build per-class layer prototypes from frozen ViT features with all MoE disabled."""
+        features = self.collect_blockwise_cls_features(loader, disable_moe=True)
+        class_ids = torch.as_tensor(class_index, dtype=torch.long).reshape(-1)
+        prototypes = {}
+        for block_idx, item in features.items():
+            values = item["cls_in"].float()
+            labels = item["labels"].long()
+            rows = []
+            for class_id in class_ids:
+                selected = values[labels.eq(class_id)]
+                if selected.numel() == 0:
+                    raise ValueError(
+                        f"Raw frozen-backbone block {block_idx} has no samples for class {int(class_id)}."
+                    )
+                rows.append(F.normalize(selected.mean(dim=0), dim=-1))
+            prototypes[str(block_idx)] = {
+                "class_ids": class_ids.clone(),
+                "prototypes": torch.stack(rows).cpu(),
+            }
+        return prototypes
+
+    @staticmethod
+    def build_expansion_thresholds(raw_layer_prototypes, quantile=0.95):
+        """Calibrate fixed per-layer nearest-neighbor confusion thresholds from base classes."""
+        quantile = float(quantile)
+        if not 0.0 < quantile < 1.0:
+            raise ValueError("Expansion quantile must be strictly between zero and one.")
+        thresholds = {}
+        for block_key, item in raw_layer_prototypes.items():
+            prototypes = F.normalize(torch.as_tensor(item["prototypes"]).float(), dim=-1)
+            if prototypes.size(0) < 2:
+                raise ValueError("At least two base classes are required to calibrate expansion thresholds.")
+            similarities = prototypes @ prototypes.t()
+            similarities.fill_diagonal_(float("-inf"))
+            nearest = similarities.max(dim=-1).values
+            thresholds[str(block_key)] = float(torch.quantile(nearest, quantile).item())
+        return thresholds
 
     @torch.no_grad()
     def build_leave_one_out_prototypes(self, loader, class_index=None):
@@ -289,7 +331,18 @@ class BiMC(nn.Module):
         teacher_features = self.extract_teacher_features(images) if compute_teacher else None
         image_features_norm = F.normalize(image_features.float(), dim=-1)
         fused_proto = F.normalize(task_stat["fused_proto"].to(self.device).float(), dim=-1)
-        logits = self.clip_model.logit_scale.exp() * image_features_norm @ fused_proto.t()
+        lambda_t = (
+            float(self.cfg.TRAINER.BiMC.LAMBDA_T)
+            if self.cfg.TRAINER.BiMC.TEXT_CALIBRATION else 0.0
+        )
+        # Use a frozen semantic classifier during base MoE training. Visual
+        # prototypes are recomputed after training, avoiding stale classifier rows.
+        text_proto = F.normalize(
+            (1.0 - lambda_t) * task_stat["text_features"].to(self.device).float()
+            + lambda_t * task_stat["description_proto"].to(self.device).float(),
+            dim=-1,
+        )
+        logits = self.clip_model.logit_scale.exp() * image_features_norm @ text_proto.t()
         return logits, image_features, teacher_features, moe_aux
 
     @torch.no_grad()
@@ -364,7 +417,8 @@ class BiMC(nn.Module):
 
     @torch.no_grad()
     def build_task_statistics(self, class_names, loader, class_index,
-                              calibrate_novel_vision_proto=False):
+                              calibrate_novel_vision_proto=False,
+                              is_base_session=False):
         class_ids = torch.as_tensor(class_index, device=self.device, dtype=torch.long).reshape(-1)
         if class_ids.numel() != len(class_names):
             raise ValueError("Class names and global class ids must have the same length.")
@@ -378,12 +432,14 @@ class BiMC(nn.Module):
             loader, class_ids
         )
         if calibrate_novel_vision_proto:
+            if is_base_session:
+                raise ValueError("The base session must not use novel-class visual calibration.")
             if self.base_vision_prototype is None:
                 raise RuntimeError("Base visual prototypes must be built before visual calibration.")
             image_proto = self.soft_calibration(self.base_vision_prototype, raw_image_proto)
         else:
             image_proto = raw_image_proto
-            if int(class_ids.min().item()) == 0:
+            if is_base_session:
                 self.base_vision_prototype = raw_image_proto.detach().clone()
 
         lambda_t = (
@@ -398,6 +454,17 @@ class BiMC(nn.Module):
             beta * calibrated_text + (1.0 - beta) * image_proto, dim=-1
         )
         layer_stats = self.build_layer_statistics(loader, class_ids.detach().cpu())
+        raw_layer_prototypes = self.build_raw_layer_prototypes(
+            loader, class_ids.detach().cpu()
+        )
+        expansion_thresholds = None
+        if is_base_session:
+            quantile = float(getattr(
+                self.cfg.TRAINER.BiMC.VISUAL_MOE, "EXPANSION_QUANTILE", 0.95
+            ))
+            expansion_thresholds = self.build_expansion_thresholds(
+                raw_layer_prototypes, quantile=quantile
+            )
         return {
             "class_ids": class_ids,
             "class_index": class_ids,
@@ -407,6 +474,8 @@ class BiMC(nn.Module):
             "image_proto": image_proto.detach(),
             "fused_proto": fused_proto.detach(),
             "layer_stats": layer_stats,
+            "raw_layer_prototypes": raw_layer_prototypes,
+            "expansion_thresholds": expansion_thresholds,
             "sample_count": int(image_features.size(0)),
         }
 

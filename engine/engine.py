@@ -43,7 +43,7 @@ def _cfg_value(node, name, default):
 class Runner:
     """FSCIL with one shared feature space and incrementally expanded sparse MoE."""
 
-    CHECKPOINT_SCHEMA = 12
+    CHECKPOINT_SCHEMA = 13
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -156,6 +156,46 @@ class Runner:
                 "count": torch.cat(counts, dim=0)[order],
             }
         merged["layer_stats"] = merged_stats
+
+        raw_block_sets = [
+            set(state.get("raw_layer_prototypes", {}).keys()) for state in state_list
+        ]
+        if not raw_block_sets or any(
+            block_set != raw_block_sets[0] for block_set in raw_block_sets[1:]
+        ):
+            raise ValueError("All sessions must store raw frozen-backbone prototypes for the same MoE blocks.")
+        merged_raw = {}
+        for block_key in sorted(raw_block_sets[0], key=int):
+            rows, raw_ids = [], []
+            for state, ids in zip(state_list, per_state_ids):
+                item = state["raw_layer_prototypes"][block_key]
+                local_ids = torch.as_tensor(item["class_ids"], dtype=torch.long).reshape(-1)
+                if not torch.equal(local_ids.cpu(), ids.cpu()):
+                    raise ValueError(f"Raw layer {block_key} prototypes do not align with class_ids.")
+                value = torch.as_tensor(item["prototypes"], device=self.device).float()
+                if value.ndim != 2 or value.size(0) != ids.numel():
+                    raise ValueError(f"Raw layer {block_key} prototype rows are invalid.")
+                rows.append(value)
+                raw_ids.append(local_ids.to(self.device))
+            merged_raw[block_key] = {
+                "class_ids": torch.cat(raw_ids)[order],
+                "prototypes": torch.cat(rows, dim=0)[order],
+            }
+        merged["raw_layer_prototypes"] = merged_raw
+
+        thresholds = state_list[0].get("expansion_thresholds")
+        if not isinstance(thresholds, dict) or not thresholds:
+            raise ValueError("The base session must provide fixed per-layer expansion thresholds.")
+        normalized_thresholds = {
+            str(key): float(value) for key, value in thresholds.items()
+        }
+        for state in state_list[1:]:
+            other = state.get("expansion_thresholds")
+            if other is not None and {
+                str(key): float(value) for key, value in other.items()
+            } != normalized_thresholds:
+                raise ValueError("Expansion thresholds must remain fixed after the base session.")
+        merged["expansion_thresholds"] = normalized_thresholds
         return merged
 
     @staticmethod
@@ -488,6 +528,46 @@ class Runner:
         return result
 
     @torch.no_grad()
+    @torch.no_grad()
+    def _expansion_candidates(self, extract_loader, class_index, old_state):
+        """Use frozen-backbone layer confusion to nominate layers for risk testing."""
+        current = self.model_without_dp.build_raw_layer_prototypes(
+            extract_loader, class_index
+        )
+        old = old_state.get("raw_layer_prototypes")
+        thresholds = old_state.get("expansion_thresholds")
+        if not isinstance(old, dict) or not isinstance(thresholds, dict):
+            raise KeyError("Historical raw layer prototypes and base expansion thresholds are required.")
+        candidate_blocks, diagnostics = [], {}
+        for block_idx in self.model_without_dp.expandable_blocks():
+            key = str(block_idx)
+            if key not in current or key not in old or key not in thresholds:
+                raise KeyError(f"Expansion controller is missing frozen-backbone statistics for block {block_idx}.")
+            current_proto = F.normalize(current[key]["prototypes"].to(self.device).float(), dim=-1)
+            old_proto = F.normalize(old[key]["prototypes"].to(self.device).float(), dim=-1)
+            similarities = current_proto @ old_proto.t()
+            max_similarity, nearest_index = similarities.max(dim=-1)
+            threshold = float(thresholds[key])
+            triggered = max_similarity > threshold
+            current_ids = current[key]["class_ids"].to(self.device).long()
+            triggered_ids = current_ids[triggered]
+            diagnostics[block_idx] = {
+                "threshold": threshold,
+                "max_similarity": float(max_similarity.max().item()),
+                "class_max_similarity": max_similarity.detach().cpu(),
+                "nearest_old_class_ids": old[key]["class_ids"][nearest_index.cpu()],
+                "triggered_class_ids": triggered_ids.detach().cpu(),
+                "triggered": bool(triggered.any().item()),
+            }
+            print(
+                f"=> [ExpansionTrigger][B{block_idx}] max_similarity="
+                f"{diagnostics[block_idx]['max_similarity']:.5f} "
+                f"threshold={threshold:.5f} triggered={int(triggered.sum().item())}/{len(triggered)}"
+            )
+            if bool(triggered.any().item()):
+                candidate_blocks.append(int(block_idx))
+        return candidate_blocks, diagnostics
+
     def _support_bank(self, loader, class_index, text_features, description_proto,
                       old_state):
         """Build query-exclusive novel prototypes and append the historical class bank."""
@@ -593,25 +673,57 @@ class Runner:
 
     def _train_candidate_set(self, task_id, block_indices, train_loader, extract_loader,
                              class_index, text, description, old_state):
-        """Train only the newest experts/route columns for this candidate set."""
+        """Train newest experts and router columns against a refreshed all-class LOO bank."""
         optim_cfg = self.cfg.TRAINER.BiMC.OPTIM
         incremental_cfg = self.cfg.TRAINER.BiMC.INCREMENTAL
-        parameters = []
+        visual_cfg = self._visual_moe_cfg()
+        route_inputs = self.model_without_dp.collect_blockwise_cls_features(
+            extract_loader, disable_moe=False
+        )
+        expert_parameters, router_parameters, optimizer_groups = [], [], []
+        route_initialization = {}
         for block_idx in block_indices:
             adapter = self._adapter_by_block(block_idx)
             adapter.set_newest_trainable()
-            parameters.extend(adapter.newest_parameters())
+            stats = old_state["layer_stats"].get(str(block_idx))
+            if stats is None or block_idx not in route_inputs:
+                raise KeyError(f"Current or historical route features are missing for block {block_idx}.")
+            route_initialization[block_idx] = adapter.initialize_new_route(
+                route_inputs[block_idx]["cls_in"],
+                stats["mean"].to(self.device),
+                stats["variance"].to(self.device),
+                margin=float(_cfg_value(visual_cfg, "ROUTE_MARGIN", 0.1)),
+                uncertainty=float(_cfg_value(visual_cfg, "ROUTE_UNCERTAINTY", 1.0)),
+                init_gap=float(_cfg_value(visual_cfg, "ROUTE_INIT_GAP", 0.02)),
+                target_gap=float(_cfg_value(visual_cfg, "ROUTE_INIT_TARGET_GAP", 0.5)),
+                max_weight_norm=float(_cfg_value(visual_cfg, "ROUTE_INIT_MAX_WEIGHT_NORM", 2.0)),
+            )
+            expert_params = list(adapter.experts[-1].parameters())
+            router_params = list(adapter.router.columns[-1].parameters())
+            expert_parameters.extend(expert_params)
+            router_parameters.extend(router_params)
+            optimizer_groups.extend([
+                {"params": expert_params, "lr": float(optim_cfg.LR_INCREMENTAL_EXPERT)},
+                {"params": router_params, "lr": float(_cfg_value(
+                    optim_cfg, "LR_INCREMENTAL_ROUTER", optim_cfg.LR_INCREMENTAL_EXPERT
+                ))},
+            ])
+            print(
+                f"=> [RouteInit][Task {task_id}][B{block_idx}] "
+                f"bias={route_initialization[block_idx]['bias']:.5f} "
+                f"current_gap={route_initialization[block_idx]['current_min_gap']:.5f} "
+                f"history_gap={route_initialization[block_idx]['history_min_robust_gap']:.5f} "
+                f"feasible={route_initialization[block_idx]['activation_feasible_at_init']}"
+            )
+        parameters = expert_parameters + router_parameters
+        if not parameters:
+            raise RuntimeError("Candidate training has no newly created expert parameters.")
         optimizer = optim.AdamW(
-            parameters,
-            lr=float(optim_cfg.LR_INCREMENTAL_EXPERT),
-            weight_decay=float(optim_cfg.WEIGHT_DECAY),
+            optimizer_groups, weight_decay=float(optim_cfg.WEIGHT_DECAY)
         )
         scale = float(incremental_cfg.LOGIT_SCALE)
         history = []
         for epoch in range(int(incremental_cfg.EPOCHS)):
-            support_bank = self._support_bank(
-                extract_loader, class_index, text, description, old_state
-            )
             self.model.train()
             total_loss, total_ce, total_route, count = 0.0, 0.0, 0.0, 0
             progress = tqdm(
@@ -620,6 +732,11 @@ class Runner:
                 leave=False,
             )
             for batch in progress:
+                # Rebuild LOO prototypes after every update so the classifier
+                # always reflects the current shared visual encoder.
+                support_bank = self._support_bank(
+                    extract_loader, class_index, text, description, old_state
+                )
                 images, labels = self.parse_batch(batch)
                 source_ids = self._batch_source_ids(batch, labels.numel(), labels.device)
                 optimizer.zero_grad(set_to_none=True)
@@ -655,16 +772,16 @@ class Runner:
             })
         for block_idx in block_indices:
             self._adapter_by_block(block_idx).freeze_all()
-        return history
+        return {"epochs": history, "route_initialization": route_initialization}
 
     @torch.no_grad()
-    def _held_out_loss(self, validation_loader, support_loader, class_index,
-                       text, description, old_state):
+    def _held_out_losses(self, validation_loader, support_loader, class_index,
+                         text, description, old_state):
         self.model.eval()
         support_bank = self._support_bank(
             support_loader, class_index, text, description, old_state
         )
-        total, count = 0.0, 0
+        losses = []
         scale = float(self.cfg.TRAINER.BiMC.INCREMENTAL.LOGIT_SCALE)
         for batch in validation_loader:
             images, labels = self.parse_batch(batch)
@@ -672,10 +789,16 @@ class Runner:
                 images, labels, None, support_bank, old_state, scale,
                 leave_one_out=False,
             )
-            loss = F.cross_entropy(logits, targets, reduction="sum")
-            total += float(loss.item())
-            count += labels.numel()
-        return total / max(1, count)
+            losses.append(F.cross_entropy(logits, targets, reduction="none").cpu().numpy())
+        return np.concatenate(losses) if losses else np.empty(0, dtype=np.float64)
+
+    @torch.no_grad()
+    def _held_out_loss(self, validation_loader, support_loader, class_index,
+                       text, description, old_state):
+        losses = self._held_out_losses(
+            validation_loader, support_loader, class_index, text, description, old_state
+        )
+        return float(losses.mean()) if losses.size else float("inf")
 
     def _candidate_preservation(self, block_indices, old_state):
         visual_cfg = self._visual_moe_cfg()
@@ -693,6 +816,50 @@ class Runner:
             violations[int(block_idx)] = float(violation.detach().item())
         return violations
 
+    @torch.no_grad()
+    def _candidate_route_usage(self, loader, block_indices):
+        """Measure whether each new expert is selected and contributes nonzero residual."""
+        was_training = self.model.training
+        self.model.eval()
+        totals = {
+            int(block_idx): {"selected": 0, "assignments": 0, "weight": 0.0,
+                             "residual": 0.0, "samples": 0}
+            for block_idx in block_indices
+        }
+        try:
+            for batch in loader:
+                images, _ = self.parse_batch(batch)
+                _, aux_list = self.model_without_dp.extract_img_feature_train(images)
+                aux_by_block = dict(zip(self.model_without_dp.expandable_blocks(), aux_list))
+                for block_idx in block_indices:
+                    adapter = self._adapter_by_block(block_idx)
+                    aux = aux_by_block[block_idx]
+                    expert_id = adapter.num_experts - 1
+                    indices = aux["top_k_indices"]
+                    weights = aux["route_weights"][:, expert_id]
+                    item = totals[int(block_idx)]
+                    item["selected"] += int(indices.eq(expert_id).sum().item())
+                    item["assignments"] += int(indices.numel())
+                    item["weight"] += float(weights.sum().item())
+                    item["residual"] += float(
+                        aux["expert_residual_norms"][expert_id].item()
+                    ) * images.size(0)
+                    item["samples"] += images.size(0)
+        finally:
+            self.model.train(was_training)
+        result = {}
+        for block_idx, item in totals.items():
+            selected_rate = item["selected"] / max(1, item["assignments"])
+            mean_weight = item["weight"] / max(1, item["samples"])
+            residual_norm = item["residual"] / max(1, item["samples"])
+            result[block_idx] = {
+                "selected_rate": float(selected_rate),
+                "mean_weight": float(mean_weight),
+                "residual_norm": float(residual_norm),
+                "active": bool(item["selected"] > 0 and residual_norm > 1e-8),
+            }
+        return result
+
     @staticmethod
     def _gain_summary(gains):
         values = np.asarray(gains, dtype=np.float64)
@@ -704,99 +871,122 @@ class Runner:
         return float(values.mean()), standard_error
 
     def _evaluate_candidate_set(self, task_id, block_indices, folds, class_index,
-                                text, description, old_state, baseline_losses):
-        losses = []
+                                text, description, old_state):
+        """Cross-fit a temporary candidate set and return per-query all-class losses."""
+        fold_losses = []
         tolerance = float(_cfg_value(
             self._visual_moe_cfg(), "ROUTE_PRESERVATION_TOLERANCE", 0.05
         ))
         for fit_train, fit_extract, validation in folds:
-            for block_idx in block_indices:
-                self.model_without_dp.add_expert(block_idx, task_id)
+            added_blocks = []
             try:
+                for block_idx in block_indices:
+                    self.model_without_dp.add_expert(block_idx, task_id)
+                    added_blocks.append(block_idx)
                 self._train_candidate_set(
                     task_id, block_indices, fit_train, fit_extract, class_index,
                     text, description, old_state,
                 )
-                validation_loss = self._held_out_loss(
+                route_usage = self._candidate_route_usage(fit_extract, block_indices)
+                validation_losses = self._held_out_losses(
                     validation, fit_extract, class_index, text, description, old_state
                 )
                 preservation = self._candidate_preservation(block_indices, old_state)
-                if any(value > tolerance for value in preservation.values()):
-                    validation_loss = float("inf")
-                losses.append(validation_loss)
+                invalid_route = any(not item["active"] for item in route_usage.values())
+                invalid_preservation = any(
+                    value > tolerance for value in preservation.values()
+                )
+                if invalid_route or invalid_preservation:
+                    validation_losses = np.full_like(validation_losses, float("inf"))
+                fold_losses.append(validation_losses)
             finally:
-                for block_idx in reversed(block_indices):
+                for block_idx in reversed(added_blocks):
                     self._adapter_by_block(block_idx).remove_newest_expert()
-        return np.asarray(losses, dtype=np.float64)
+        return np.concatenate(fold_losses) if fold_losses else np.empty(0, dtype=np.float64)
 
     def train_incremental_task(self, task_id, train_loader, extract_loader,
                                class_index, current_class_names, old_state):
-        """Greedily add only layer experts that improve joint all-seen-class risk."""
+        """Gate expansion by raw-layer confusion, then verify it by cross-fitted risk."""
         text, description = self._text_prototypes(current_class_names, class_index)
-        folds = self._support_folds(train_loader, extract_loader)
         for _, adapter in self._moe_adapters():
             adapter.freeze_all()
-        if not folds:
-            print("=> [Expansion] fewer than three support sources per class; reuse current experts.")
-            return {"trained": False, "selected_blocks": [], "decisions": []}
 
-        baseline_losses = np.asarray([
-            self._held_out_loss(
+        candidate_blocks, expansion_signals = self._expansion_candidates(
+            extract_loader, class_index, old_state
+        )
+        if not candidate_blocks:
+            return {
+                "trained": False, "reason": "no_layer_confusion",
+                "selected_blocks": [], "decisions": [],
+                "expansion_signals": expansion_signals,
+            }
+
+        folds = self._support_folds(train_loader, extract_loader)
+        if not folds:
+            print("=> [Expansion] insufficient independent support sources for cross-fitted risk.")
+            return {
+                "trained": False, "reason": "insufficient_support_folds",
+                "selected_blocks": [], "decisions": [],
+                "expansion_signals": expansion_signals,
+            }
+
+        baseline_losses = np.concatenate([
+            self._held_out_losses(
                 validation, fit_extract, class_index, text, description, old_state
             )
             for _, fit_extract, validation in folds
-        ], dtype=np.float64)
-        candidate_blocks = self.model_without_dp.expandable_blocks()
-        if not candidate_blocks:
-            return {"trained": False, "selected_blocks": [], "decisions": []}
-
-        single_results = {}
-        decisions = []
+        ])
+        single_results, decisions = {}, []
+        confidence_z = float(_cfg_value(
+            self._visual_moe_cfg(), "EXPANSION_CONFIDENCE_Z", 1.0
+        ))
+        minimum_gain = float(_cfg_value(
+            self._visual_moe_cfg(), "EXPANSION_MIN_GAIN", 1e-3
+        ))
         for block_idx in candidate_blocks:
             candidate_losses = self._evaluate_candidate_set(
-                task_id, [block_idx], folds, class_index, text, description,
-                old_state, baseline_losses,
+                task_id, [block_idx], folds, class_index, text, description, old_state
             )
             gains = baseline_losses - candidate_losses
             mean_gain, gain_se = self._gain_summary(gains)
+            lower_bound = mean_gain - confidence_z * gain_se
             single_results[block_idx] = {
-                "losses": candidate_losses,
-                "gain": mean_gain,
-                "gain_se": gain_se,
+                "losses": candidate_losses, "gain": mean_gain,
+                "gain_se": gain_se, "lower_bound": lower_bound,
             }
             decisions.append({
-                "blocks": [int(block_idx)],
-                "gain": mean_gain,
-                "gain_se": gain_se,
+                "blocks": [int(block_idx)], "gain": mean_gain,
+                "gain_se": gain_se, "lower_confidence_bound": lower_bound,
             })
             print(
                 f"=> [ExpansionCandidate][Task {task_id}][B{block_idx}] "
-                f"all-class gain={mean_gain:.5f} se={gain_se:.5f}"
+                f"all-class gain={mean_gain:.5f} se={gain_se:.5f} "
+                f"LCB={lower_bound:.5f}"
             )
 
         ordered_blocks = sorted(
             candidate_blocks,
-            key=lambda block: single_results[block]["gain"],
+            key=lambda block: single_results[block]["lower_bound"],
             reverse=True,
         )
-        selected_blocks = []
-        selected_losses = baseline_losses
+        selected_blocks, selected_losses = [], baseline_losses
         for block_idx in ordered_blocks:
             candidate_set = selected_blocks + [block_idx]
-            if not selected_blocks:
-                candidate_losses = single_results[block_idx]["losses"]
-            else:
-                candidate_losses = self._evaluate_candidate_set(
-                    task_id, candidate_set, folds, class_index, text, description,
-                    old_state, selected_losses,
+            candidate_losses = (
+                single_results[block_idx]["losses"] if not selected_blocks
+                else self._evaluate_candidate_set(
+                    task_id, candidate_set, folds, class_index, text, description, old_state
                 )
+            )
             gains = selected_losses - candidate_losses
             mean_gain, gain_se = self._gain_summary(gains)
-            accepted = bool(np.isfinite(mean_gain) and mean_gain > gain_se)
+            lower_bound = mean_gain - confidence_z * gain_se
+            accepted = bool(np.isfinite(lower_bound) and lower_bound > minimum_gain)
             decisions.append({
                 "blocks": [int(value) for value in candidate_set],
                 "conditional_gain": mean_gain,
                 "conditional_gain_se": gain_se,
+                "conditional_lower_bound": lower_bound,
                 "accepted": accepted,
             })
             if accepted:
@@ -804,29 +994,34 @@ class Runner:
                 selected_losses = candidate_losses
                 print(
                     f"=> [ExpansionAccepted][Task {task_id}] blocks={selected_blocks} "
-                    f"conditional_gain={mean_gain:.5f} se={gain_se:.5f}"
+                    f"conditional_gain={mean_gain:.5f} LCB={lower_bound:.5f}"
                 )
             else:
                 print(
                     f"=> [ExpansionRejected][Task {task_id}] blocks={candidate_set} "
-                    f"conditional_gain={mean_gain:.5f} se={gain_se:.5f}"
+                    f"conditional_gain={mean_gain:.5f} LCB={lower_bound:.5f}"
                 )
 
         if not selected_blocks:
             return {
-                "trained": False,
-                "selected_blocks": [],
-                "decisions": decisions,
+                "trained": False, "reason": "no_positive_cross_fitted_gain",
+                "selected_blocks": [], "decisions": decisions,
                 "baseline_loo_loss": float(baseline_losses.mean()),
+                "expansion_signals": expansion_signals,
             }
 
-        for block_idx in selected_blocks:
-            self.model_without_dp.add_expert(block_idx, task_id)
+        added_blocks = []
         try:
+            for block_idx in selected_blocks:
+                self.model_without_dp.add_expert(block_idx, task_id)
+                added_blocks.append(block_idx)
             final_training = self._train_candidate_set(
                 task_id, selected_blocks, train_loader, extract_loader,
                 class_index, text, description, old_state,
             )
+            route_usage = self._candidate_route_usage(extract_loader, selected_blocks)
+            if any(not item["active"] for item in route_usage.values()):
+                raise RuntimeError(f"Final training left a selected expert inactive: {route_usage}")
             preservation = self._candidate_preservation(selected_blocks, old_state)
             tolerance = float(_cfg_value(
                 self._visual_moe_cfg(), "ROUTE_PRESERVATION_TOLERANCE", 0.05
@@ -837,11 +1032,10 @@ class Runner:
                     f"{preservation}. Refusing to commit an unstable expert set."
                 )
         except Exception:
-            # Expansion is transactional: a failed final fit must not leave a
-            # partially trained topology in the live model or next checkpoint.
-            for block_idx in reversed(selected_blocks):
+            for block_idx in reversed(added_blocks):
                 self._adapter_by_block(block_idx).remove_newest_expert()
             raise
+
         expanded = [
             {
                 "block_idx": int(block_idx),
@@ -854,12 +1048,16 @@ class Runner:
             "selected_blocks": [int(value) for value in selected_blocks],
             "expanded": expanded,
             "decisions": decisions,
+            "expansion_signals": expansion_signals,
             "baseline_loo_loss": float(baseline_losses.mean()),
             "selected_loo_loss": float(selected_losses.mean()),
             "route_preservation": preservation,
+            "route_usage": route_usage,
             "training": final_training,
         }
 
+    # ------------------------------------------------------------------
+    # Unified inference and complete FSCIL run
     # ------------------------------------------------------------------
     # Unified inference and complete FSCIL run
     # ------------------------------------------------------------------
@@ -959,6 +1157,7 @@ class Runner:
                 task_state = self.model_without_dp.build_task_statistics(
                     class_names, extract_loader, class_index,
                     calibrate_novel_vision_proto=False,
+                    is_base_session=True,
                 )
                 if use_moe:
                     self.train_base_task(task_state, train_loader)
@@ -966,6 +1165,7 @@ class Runner:
                     task_state = self.model_without_dp.build_task_statistics(
                         class_names, extract_loader, class_index,
                         calibrate_novel_vision_proto=False,
+                        is_base_session=True,
                     )
             else:
                 old_state = self.merge_dicts(state_list)
@@ -980,6 +1180,7 @@ class Runner:
                     calibrate_novel_vision_proto=bool(
                         self.cfg.TRAINER.BiMC.VISION_CALIBRATION
                     ),
+                    is_base_session=False,
                 )
 
             task_state["creation_session"] = int(task_id)

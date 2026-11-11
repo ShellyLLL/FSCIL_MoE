@@ -9,19 +9,21 @@ This branch implements one shared visual feature space for few-shot class-increm
 - Every expert in a block competes in one router. Inference computes only the selected Top-K experts (Top-2 by default); there is no Session-ID router, independent Sigmoid gate, or versioned encoder path.
 - A newly appended expert has a zero output projection and a dormant router column. Appending it therefore preserves the current function until the new route is trained.
 - After expansion, historical experts and router columns are frozen but remain eligible for routing. Only the newest expert and its router column are trainable.
-- Candidate expansion is evaluated by support-source leave-one-out (LOO) risk against the complete bank of historical and current class prototypes. Candidate layers are evaluated individually and then as conditional combinations; an expansion is accepted only when its measured gain exceeds its fold standard error.
-- Historical class-level layer-input means and diagonal variances are retained as compact statistics. A covariance-aware margin loss constrains each new router column to remain below the previous Top-2 routes over historical class regions, while a complementary activation loss makes the new route useful for current classes.
+- The expansion controller compares per-class features from the frozen ViT (all adapters disabled) against fixed base-session nearest-neighbor similarity thresholds at each inserted layer. Only layers whose current classes exceed their calibrated base threshold become expansion candidates.
+- Each nominated layer must also pass source-exclusive, cross-fitted LOO risk evaluation against the complete bank of historical and current class prototypes. Candidate layers are evaluated individually and as conditional combinations; acceptance requires a positive one-sided lower confidence bound above a configured minimum risk reduction.
+- Historical class-level inputs to the actual routers are stored separately from frozen-backbone expansion prototypes. New routes are initialized from the current-vs-history feature shift, kept dormant at initialization, and trained with a dedicated router learning rate. A diagonal-variance margin objective constrains new routes over historical support regions; this is an empirical support-statistic constraint, not a distribution-free guarantee.
 - The final classifier uses one current-model visual feature space and one cumulative class-prototype bank. Historical prototypes are not recomputed by passing a mean token through a changed encoder.
 
 ## Training flow
 
-1. Train the base-session MoE against the base classes, with frozen CLIP features as a distillation target.
-2. Freeze the base experts and routers; store base visual prototypes and class-local layer statistics.
-3. For each incremental session, create source-exclusive support folds.
-4. Evaluate the unchanged model and temporary candidate expert sets using the same all-seen-class prototype classifier.
-5. Train accepted experts and route columns using all-seen-class LOO classification plus historical route-preservation objectives.
-6. Freeze the accepted experts, compute current-session visual/text prototypes, append class-local statistics, and evaluate every seen class through the same dynamic encoder.
-7. Save the model topology, weights, cumulative prototype states, support manifest, metrics, and RNG state.
+1. Train the base-session MoE against the frozen text/description classifier and distill toward frozen CLIP visual features; recompute visual prototypes only after training.
+2. Freeze the base experts and routers; store enhanced base visual prototypes, actual-router support statistics, frozen-backbone layer prototypes, and fixed per-layer expansion thresholds.
+3. For each incremental session, compare raw frozen-backbone layer prototypes with all historical classes and nominate only layers exceeding their base-calibrated confusion threshold.
+4. Create source-exclusive support folds and evaluate temporary experts with the same all-seen-class LOO prototype classifier.
+5. Initialize each new route from current-vs-history layer features, then train only the newest expert and router column with separate learning rates. Refresh LOO support prototypes after every optimizer update.
+6. Commit only experts that are active on current support, preserve historical routing statistics, and reduce cross-fitted all-class risk; otherwise roll back the temporary topology.
+7. Freeze accepted experts, compute current-session visual/text prototypes, append raw and adapted layer statistics, and evaluate every seen class through the same dynamic encoder.
+8. Save the model topology, weights, cumulative prototype states, fixed expansion thresholds, support manifest, metrics, and RNG state.
 
 ## Run
 

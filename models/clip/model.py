@@ -253,6 +253,88 @@ class VisualMoEAdapter(nn.Module):
     def newest_parameters(self):
         return list(self.experts[-1].parameters()) + list(self.router.columns[-1].parameters())
 
+    @torch.no_grad()
+    def initialize_new_route(self, current_features, history_mean, history_variance,
+                              margin=0.1, uncertainty=1.0, init_gap=0.02,
+                              target_gap=0.5, max_weight_norm=2.0):
+        """Initialize a dormant route near a support-derived, history-safe boundary."""
+        if self.num_experts <= self.base_expert_count:
+            raise RuntimeError("Route initialization requires a newly appended expert.")
+        current = torch.as_tensor(
+            current_features, device=self.residual_scale.device, dtype=torch.float32
+        ).reshape(-1, self.d_model)
+        history = torch.as_tensor(
+            history_mean, device=current.device, dtype=torch.float32
+        ).reshape(-1, self.d_model)
+        variance = torch.as_tensor(
+            history_variance, device=current.device, dtype=torch.float32
+        ).reshape_as(history).clamp_min(0.0)
+        if current.size(0) == 0 or history.size(0) == 0:
+            raise ValueError("Current and historical route features must be non-empty.")
+
+        old_weights = torch.cat(
+            [column.weight.float() for column in self.router.columns[:-1]], dim=0
+        )
+        old_biases = torch.cat(
+            [column.bias.float() for column in self.router.columns[:-1]], dim=0
+        )
+        if old_weights.size(0) < 2:
+            raise RuntimeError("History-safe route initialization requires at least two old experts.")
+
+        direction = current.mean(dim=0) - history.mean(dim=0)
+        direction_norm_sq = direction.square().sum()
+        if float(direction_norm_sq.item()) <= 1e-12:
+            weight = torch.zeros_like(direction)
+        else:
+            weight = direction * (float(target_gap) / direction_norm_sq)
+            weight_norm = weight.norm()
+            if float(weight_norm.item()) > float(max_weight_norm):
+                weight = weight * (float(max_weight_norm) / weight_norm.clamp_min(1e-12))
+
+        current_old_logits = F.linear(current, old_weights, old_biases)
+        current_second_old = current_old_logits.topk(k=2, dim=-1).values[:, -1]
+        current_no_bias = F.linear(current, weight.unsqueeze(0), None).squeeze(-1)
+        current_bias_limit = (current_second_old - current_no_bias).min() - float(init_gap)
+
+        history_old_logits = F.linear(history, old_weights, old_biases)
+        history_top2 = history_old_logits.topk(k=2, dim=-1).indices
+        selected_old_logits = history_old_logits.gather(1, history_top2)
+        selected_old_weights = old_weights[history_top2]
+        delta_weight = weight.view(1, 1, -1) - selected_old_weights
+        difference_std = torch.sqrt(
+            (variance[:, None, :] * delta_weight.square()).sum(dim=-1).clamp_min(0.0)
+        )
+        history_no_bias = F.linear(history, weight.unsqueeze(0), None).squeeze(-1)
+        history_bias_limit = (
+            selected_old_logits - history_no_bias[:, None]
+            - float(margin) - float(uncertainty) * difference_std
+        ).min()
+
+        bias = torch.minimum(current_bias_limit, history_bias_limit)
+        new_column = self.router.columns[-1]
+        new_column.weight.copy_(weight.view_as(new_column.weight))
+        new_column.bias.fill_(float(bias.item()))
+
+        current_gap = current_second_old - F.linear(
+            current, new_column.weight.float(), new_column.bias.float()
+        ).squeeze(-1)
+        history_gap = (
+            selected_old_logits - F.linear(
+                history, new_column.weight.float(), new_column.bias.float()
+            ).squeeze(-1)[:, None]
+            - float(uncertainty) * difference_std
+        )
+        activation_bias_needed = torch.quantile(
+            current_second_old - current_no_bias, 0.5
+        ) + float(margin)
+        return {
+            "bias": float(new_column.bias.detach().item()),
+            "weight_norm": float(new_column.weight.detach().float().norm().item()),
+            "current_min_gap": float(current_gap.min().item()),
+            "history_min_robust_gap": float(history_gap.min().item()),
+            "activation_feasible_at_init": bool(history_bias_limit > activation_bias_needed),
+        }
+
     def historical_named_parameters(self):
         newest = self.num_experts - 1
         prefixes = (f"experts.{newest}.", f"router.columns.{newest}.")
@@ -262,12 +344,10 @@ class VisualMoEAdapter(nn.Module):
 
     def route_preservation_loss(self, history_mean, history_variance,
                                 margin=0.1, uncertainty=1.0):
-        """Bound new-route activation over stored class-local feature statistics.
+        """Penalize new-route activation over stored class-local feature statistics.
 
-        Router columns are linear. For each historical class, the new logit
-        must remain below both experts that won the old Top-2 competition at
-        that class mean. The diagonal covariance supplies a conservative
-        uncertainty term without retaining historical images.
+        The uncertainty term uses a diagonal-Gaussian approximation to historical
+        support covariance; it is an empirical constraint, not a distribution-free guarantee.
         """
         if self.num_experts <= self.base_expert_count:
             return self.residual_scale.new_zeros((), dtype=torch.float32)
@@ -389,7 +469,8 @@ class VisualMoEAdapter(nn.Module):
     def forward(self, x):
         if x.ndim != 3:
             raise ValueError("VisualMoEAdapter expects [tokens, batch, dim].")
-        x_norm = self.layer_norm(x)
+        # Keep the adapter path in FP32 even when the frozen CLIP backbone is FP16.
+        x_norm = self.layer_norm(x.float())
         logits, probabilities, top_indices, top_weights, sparse_weights = self.router(
             x_norm[0], top_k=self.top_k
         )
@@ -406,8 +487,8 @@ class VisualMoEAdapter(nn.Module):
             weighted_output = expert_output * weights.view(1, -1, 1)
             residual = residual.index_add(1, rows, weighted_output)
             residual_norms[expert_id] = weighted_output.detach().float().pow(2).mean().sqrt()
-        residual = self.residual_scale.to(residual.dtype) * residual
-        return residual, {
+        residual = self.residual_scale.float() * residual
+        return residual.to(dtype=x.dtype), {
             "logits": logits,
             "gate_probabilities": probabilities,
             "route_weights": sparse_weights,
@@ -659,12 +740,13 @@ def build_model(state_dict: dict, cfg=None):
         for idx in moe_cfg.INSERT_BLOCKS:
             if idx < 0: idx = len(model.visual.transformer.resblocks) + idx
             block = model.visual.transformer.resblocks[idx]
+            # Pretrained CLIP weights were converted before adapter insertion.
+            # Keep all expert and router parameters in FP32 for stable few-shot updates.
             block.moe_adapter = VisualMoEAdapter(
                 d_model=d_model,
                 num_experts=num_base_experts,
                 reduction=base_reduction,
                 residual_scale_init=base_scale_init,
                 top_k=top_k,
-            )
-        convert_weights(model)
+            ).float()
     return model.eval()

@@ -8,7 +8,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from models.bimc import build_loo_cache_from_embeddings
+from models.bimc import BiMC, build_loo_cache_from_embeddings
 from models.clip.model import VisualMoEAdapter
 from engine.engine import Runner
 from utils.evaluator import AccuracyEvaluator
@@ -84,8 +84,12 @@ class UnifiedMoEArchitectureTests(unittest.TestCase):
             handle.remove()
         self.assertEqual(sum(value > 0 for value in calls), 2)
 
-    def test_new_route_can_activate_without_unfreezing_history(self):
+    def test_new_route_initialization_and_optimizer_activation_preserve_history(self):
         adapter = VisualMoEAdapter(8, num_experts=4, reduction=2, top_k=2)
+        with torch.no_grad():
+            for column in adapter.router.columns:
+                column.weight.zero_()
+                column.bias.zero_()
         adapter.add_expert(session_id=1, reduction=2)
         old_parameters = [
             parameter for name, parameter in adapter.named_parameters()
@@ -93,18 +97,44 @@ class UnifiedMoEArchitectureTests(unittest.TestCase):
                                 "router.columns.0.", "router.columns.1.",
                                 "router.columns.2.", "router.columns.3."))
         ]
-        new_column = adapter.router.columns[-1]
-        current = torch.randn(6, 8)
-        history = torch.randn(5, 8)
-        activation, preservation = adapter.route_objective(
-            current, history, torch.ones_like(history) * 0.01
+        current = torch.zeros(32, 8)
+        current[:, 0] = 0.5
+        history = torch.zeros(6, 8)
+        history[:, 0] = -0.5
+        variance = torch.zeros_like(history)
+        init = adapter.initialize_new_route(
+            current, history, variance, margin=0.1, uncertainty=0.0,
+            init_gap=0.02, target_gap=0.5, max_weight_norm=2.0,
         )
-        (activation + preservation).backward()
-        self.assertIsNotNone(new_column.bias.grad)
+        _, _, initial_indices, _, _ = adapter.router(current, top_k=2)
+        self.assertFalse((initial_indices == 4).any())
+        self.assertGreaterEqual(init["current_min_gap"], 0.02 - 1e-6)
+        optimizer = torch.optim.AdamW(
+            adapter.newest_parameters(), lr=0.05, weight_decay=0.0
+        )
+        for _ in range(8):
+            optimizer.zero_grad(set_to_none=True)
+            activation, preservation = adapter.route_objective(
+                current, history, variance, margin=0.1, uncertainty=0.0
+            )
+            (activation + preservation).backward()
+            optimizer.step()
+        _, _, current_indices, _, _ = adapter.router(current, top_k=2)
+        _, _, history_indices, _, _ = adapter.router(history, top_k=2)
+        self.assertTrue((current_indices == 4).any())
+        self.assertFalse((history_indices == 4).any())
         self.assertTrue(all(not parameter.requires_grad for parameter in old_parameters))
         self.assertTrue(all(parameter.grad is None for parameter in old_parameters))
 
-    def test_history_route_constraint_uses_class_covariance(self):
+    def test_adapter_keeps_fp32_parameters_with_half_precision_backbone_inputs(self):
+        adapter = VisualMoEAdapter(8, num_experts=4, reduction=2, top_k=2).float().eval()
+        inputs = torch.randn(5, 3, 8, dtype=torch.float16)
+        residual, aux = adapter(inputs)
+        self.assertEqual(residual.dtype, torch.float16)
+        self.assertTrue(all(parameter.dtype == torch.float32 for parameter in adapter.parameters()))
+        self.assertEqual(aux["logits"].dtype, torch.float32)
+
+    def test_history_route_constraint_uses_diagonal_support_uncertainty(self):
         adapter = VisualMoEAdapter(8, num_experts=4, reduction=2, top_k=2)
         adapter.add_expert(session_id=1, reduction=2)
         history = torch.randn(6, 8)
@@ -135,6 +165,17 @@ class UnifiedMoEArchitectureTests(unittest.TestCase):
         self.assertTrue(all(not p.requires_grad for p in adapter.router.columns[:-1].parameters()))
         self.assertTrue(all(p.requires_grad for p in adapter.experts[-1].parameters()))
         self.assertTrue(all(p.requires_grad for p in adapter.router.columns[-1].parameters()))
+
+    def test_base_expansion_thresholds_use_nearest_neighbor_quantile(self):
+        prototypes = F.normalize(torch.tensor([
+            [1.0, 0.0], [0.8, 0.6], [-1.0, 0.0], [0.0, 1.0]
+        ]), dim=-1)
+        thresholds = BiMC.build_expansion_thresholds(
+            {"-1": {"class_ids": torch.arange(4), "prototypes": prototypes}},
+            quantile=0.75,
+        )
+        self.assertIn("-1", thresholds)
+        self.assertTrue(-1.0 <= thresholds["-1"] <= 1.0)
 
     def test_loo_prototypes_exclude_all_views_of_query_source(self):
         features = F.normalize(torch.tensor([
