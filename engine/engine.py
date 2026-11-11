@@ -322,19 +322,6 @@ class Runner:
         self.model_without_dp.base_vision_prototype = (
             None if base_proto is None else base_proto.to(self.device)
         )
-        if schema in (6, 7):
-            base_loader = self.data_manager.get_dataloader(
-                0, source="train", mode="test", accumulate_past=False)
-            features, labels, _ = self.model_without_dp.inference_all_img_feature(
-                base_loader)
-            base_state = payload["task_states"][0]
-            base_state["anchor_fused_proto"] = base_state["fused_proto"]
-            base_state["anchor_features"] = features.detach().cpu().half()
-            base_state["anchor_labels"] = labels.detach().cpu()
-            sources = getattr(getattr(base_loader, "dataset", None), "source_ids", None)
-            base_state["anchor_source_ids"] = (torch.arange(len(labels)) if sources is None else
-                                               torch.as_tensor(sources, dtype=torch.long).cpu())
-            base_state["creation_session"] = 0
         self._resume_state_dict_list = payload.get("task_states", [])
         self.acc_list = payload.get("acc_list", [])
         self.task_acc_list = payload.get("task_acc_list", [])
@@ -444,8 +431,9 @@ class Runner:
         epochs = int(_cfg_value(self.cfg.TRAINER.BiMC.OPTIM, "BASE_DESCRIPTOR_EPOCHS", 8))
         print(f"\n========== Fit Base SEMA Representation Descriptors ({epochs} epochs) ==========")
         for block_idx, adapter in self._moe_adapters():
-            # Recollect per layer after previous descriptors are frozen; the
-            # CLS input is exactly the local representation seen by that layer.
+            # Recollect per layer after previous descriptors are frozen. AE
+            # descriptors see the mean-token local representation; the router
+            # responsibilities are computed from the CLS token input.
             features = self.model_without_dp.collect_blockwise_cls_features(extract_loader)
             values = features[block_idx]["ae_in"].to(self.device)
             router_values = features[block_idx]["cls_in"].to(self.device)
