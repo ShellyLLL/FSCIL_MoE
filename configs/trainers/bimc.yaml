@@ -57,7 +57,7 @@ TRAINER:
 
     CHECKPOINT:
       ENABLE: True
-      DIR: "checkpoints/fscil_risk_stable"
+      DIR: "checkpoints/fscil_ae_unified"
       RESUME: ""
       SAVE_EVERY_SESSION: True
 
