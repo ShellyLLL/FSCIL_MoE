@@ -37,7 +37,7 @@ def _cfg_value(node, name, default):
 
 
 class Runner:
-    """FSCIL runner with predictive-risk expansion and versioned prototypes."""
+    """FSCIL runner with SEMA-style AE expansion and one global prototype space."""
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -507,6 +507,8 @@ class Runner:
     def _build_incremental_bank(self, loader, class_index, text, description, old_states):
         """Build source-exclusive novel prototypes and one global old+new bank."""
         cache = self.model_without_dp.build_leave_one_out_prototypes(loader, class_index)
+        if not bool(cache["loo_valid"].all().item()):
+            raise ValueError("Every incremental training source needs another same-class source for LOO.")
         classes = cache["classes"].to(self.device)
         labels = cache["labels"].to(self.device)
         sources = cache["source_ids"].to(self.device)
