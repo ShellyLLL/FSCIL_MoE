@@ -54,7 +54,7 @@ gated architecture. Unified checkpoints use schema 10.
 
 The incremental procedure is:
 
-1. Extract the CLS input representation at each configured visual block.
+1. Extract the mean-token representation at each configured visual block for the AE, matching SEMA's token-mean reconstruction input. Retain the CLS representation separately for the expert router and old-class response anchors.
 2. Score each layer with the reconstruction-error Z-scores of every deployed
    linear AE descriptor. Each descriptor keeps a rolling 500-error reference.
 3. Expand a layer only when the class-balanced mean absolute Z-score is above
