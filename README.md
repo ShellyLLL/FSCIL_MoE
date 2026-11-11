@@ -99,11 +99,15 @@ Run a full experiment using the standard configuration:
 python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml
 ~~~
 
-The support manifest remains fixed across comparisons. Checkpoints save the
-complete expert topology, AE reference buffers, per-class/per-layer old-class
-anchors, global prototype states, diagnostics and RNG state. Do not resume
-schema 6-9 checkpoints: their versioned feature paths and task gates are
-incompatible with the unified feature space.
+The support manifest remains fixed across comparisons. AA is the mean of the
+per-session overall accuracies observed so far. PD is average forgetting in
+percentage points: for each task, take its best observed task accuracy from
+the task's introduction through the current session, subtract its current
+accuracy, then average across tasks. Checkpoints save the complete expert
+topology, AE reference buffers, per-class/per-layer old-class anchors, global
+prototype states, diagnostics and RNG state. Do not resume schema 6-9
+checkpoints: their versioned feature paths and task gates are incompatible
+with the unified feature space.
 
 ## Acknowledgment
 
