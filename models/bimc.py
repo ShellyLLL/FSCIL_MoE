@@ -388,9 +388,13 @@ class BiMC(nn.Module):
                     if cls_in is None or cls_in.ndim != 2:
                         raise RuntimeError(f"Block {block_idx} has invalid CLS features.")
                     item = block_features.setdefault(block_idx, {
-                        "cls_in": [], "patch_mean_in": [], "labels": [], "source_ids": []
+                        "cls_in": [], "ae_in": [], "patch_mean_in": [], "labels": [], "source_ids": []
                     })
                     item["cls_in"].append(cls_in.detach().cpu())
+                    ae_in = aux.get("ae_in")
+                    if ae_in is None or ae_in.ndim != 2:
+                        raise RuntimeError(f"Block {block_idx} has invalid mean-token AE features.")
+                    item["ae_in"].append(ae_in.detach().cpu())
                     if aux.get("patch_mean_in") is not None:
                         item["patch_mean_in"].append(aux["patch_mean_in"].detach().cpu())
                     item["labels"].append(labels.detach().cpu())
@@ -398,7 +402,8 @@ class BiMC(nn.Module):
         finally:
             self.train(was_training)
         for item in block_features.values():
-            item["cls_in"], item["labels"] = torch.cat(item["cls_in"]), torch.cat(item["labels"])
+            item["cls_in"], item["ae_in"], item["labels"] = (
+                torch.cat(item["cls_in"]), torch.cat(item["ae_in"]), torch.cat(item["labels"]))
             item["source_ids"] = torch.cat(item["source_ids"])
             item["patch_mean_in"] = (torch.cat(item["patch_mean_in"]) if item["patch_mean_in"]
                                      else item["cls_in"].new_empty(0, item["cls_in"].size(-1)))
@@ -469,7 +474,7 @@ class BiMC(nn.Module):
             raise KeyError(f"Block {block_idx} did not produce support features.")
         adapter = self.clip_model.visual.transformer.resblocks[block_idx].moe_adapter
         adapter.assert_descriptors_ready()
-        values = features[block_idx]["cls_in"].to(self.device)
+        values = features[block_idx]["ae_in"].to(self.device)
         labels = features[block_idx]["labels"].to(self.device)
         scores = adapter.descriptor_scores(values)
         expected = sorted(int(value) for value in class_index)
