@@ -1,17 +1,56 @@
 """Architecture invariants for the unified sparse dynamic FSCIL MoE."""
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
 from models.bimc import build_loo_cache_from_embeddings
 from models.clip.model import VisualMoEAdapter
+from engine.engine import Runner
+from utils.evaluator import AccuracyEvaluator
 
 
 class UnifiedMoEArchitectureTests(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(17)
+
+    def test_runner_initializes_evaluator_with_global_session_partition(self):
+        class FakeDatasetManager:
+            def __init__(self, cfg):
+                self.template = []
+                self.class_index_in_task = [
+                    np.asarray([0, 1]),
+                    np.asarray([2]),
+                ]
+
+        class FakeModel(torch.nn.Module):
+            def __init__(self, *args):
+                super().__init__()
+
+        cfg = SimpleNamespace(
+            DEVICE=SimpleNamespace(DEVICE_NAME="cpu"),
+            TRAINER=SimpleNamespace(BiMC=SimpleNamespace()),
+        )
+        with patch("engine.engine.DatasetManager", FakeDatasetManager):
+            with patch("engine.engine.BiMC", FakeModel):
+                with patch("engine.engine.torch.cuda.device_count", return_value=0):
+                    runner = Runner(cfg)
+
+        self.assertIsInstance(runner.evaluator, AccuracyEvaluator)
+        logits = torch.tensor([
+            [4.0, 0.0, 0.0],
+            [0.0, 0.0, 4.0],
+        ])
+        targets = torch.tensor([0, 2])
+        result = runner.evaluator.calc_accuracy(
+            logits, targets, task_id=1, class_ids=torch.tensor([0, 1, 2])
+        )
+        self.assertEqual(result["mean_acc"], 100.0)
+        self.assertEqual(result["task_acc"], [100.0, 100.0])
 
     def test_new_expert_is_function_preserving_until_activated(self):
         adapter = VisualMoEAdapter(8, num_experts=4, reduction=2, top_k=2).eval()

@@ -48,6 +48,9 @@ class Runner:
     def __init__(self, cfg):
         self.cfg = cfg
         self.data_manager = DatasetManager(cfg)
+        # The evaluator must use the dataset manager's global class-to-session
+        # partition so metrics and error-flow analysis map logits to FSCIL labels.
+        self.evaluator = AccuracyEvaluator(self.data_manager.class_index_in_task)
         self.device = cfg.DEVICE.DEVICE_NAME
         self.model = BiMC(cfg, self.data_manager.template, self.device)
         if torch.cuda.device_count() > 1:
