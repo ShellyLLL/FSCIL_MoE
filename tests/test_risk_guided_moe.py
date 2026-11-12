@@ -1,5 +1,6 @@
 """Unit tests for the AE-driven, single-feature-space FSCIL architecture."""
 
+import tempfile
 import unittest
 from types import SimpleNamespace
 
@@ -551,6 +552,61 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         self.assertFalse(any(p.requires_grad for p in adapter.experts[:-1].parameters()))
         self.assertFalse(any(p.requires_grad for p in adapter.router.columns[:-1].parameters()))
         self.assertTrue(all(not p.requires_grad for p in adapter.parameters()))
+
+    def test_checkpoint_roundtrip_restores_thresholds_priors_and_reference_prototypes(self):
+        runner, model = build_lifecycle_runner()
+        with tempfile.TemporaryDirectory() as directory:
+            runner.cfg.TRAINER.BiMC.CHECKPOINT = SimpleNamespace(
+                ENABLE=True, DIR=directory, RESUME="", SAVE_EVERY_SESSION=True
+            )
+            runner.data_manager = SimpleNamespace(
+                get_support_manifest=lambda: {"seed": 7, "support_ids": [1, 2, 3]}
+            )
+            runner.acc_list = [50.0]
+            runner.task_acc_list = [[50.0]]
+            runner.session_diagnostics = [{"session": 0}]
+            runner.expansion_thresholds = {0: 1.25, 1: 1.5}
+            runner.descriptor_error_priors = {
+                0: {"mean": 0.02, "std": 0.01},
+                1: {"mean": 0.03, "std": 0.02},
+            }
+            model.base_vision_prototype = torch.tensor([[1.0, 0.0, 0.0, 0.0,
+                                                         0.0, 0.0, 0.0, 0.0]])
+            prototype = torch.tensor([[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]])
+            state = {
+                "class_ids": torch.tensor([0]),
+                "image_proto": prototype.clone(),
+                "reference_image_proto": prototype.clone(),
+                "text_features": prototype.clone(),
+                "description_proto": prototype.clone(),
+                "final_proto": prototype.clone(),
+                "creation_session": 0,
+            }
+            checkpoint_path = runner.save_checkpoint(0, [state])
+            payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+            self.assertEqual(payload["schema_version"], 15)
+            self.assertEqual(payload["expansion_thresholds"], {0: 1.25, 1: 1.5})
+            self.assertEqual(payload["descriptor_error_priors"][0]["mean"], 0.02)
+            self.assertIn("reference_image_proto", payload["task_states"][0])
+
+            restored, restored_model = build_lifecycle_runner()
+            restored.cfg.TRAINER.BiMC.CHECKPOINT = SimpleNamespace(
+                ENABLE=True, DIR=directory, RESUME=str(checkpoint_path),
+                SAVE_EVERY_SESSION=True
+            )
+            restored.data_manager = SimpleNamespace(
+                load_support_manifest=lambda manifest: self.assertEqual(
+                    manifest, {"seed": 7, "support_ids": [1, 2, 3]}
+                )
+            )
+            restored._load_resume_checkpoint_if_requested()
+            self.assertEqual(restored._resume_completed_session, 0)
+            self.assertEqual(restored.expansion_thresholds, {0: 1.25, 1: 1.5})
+            self.assertEqual(restored.descriptor_error_priors, runner.descriptor_error_priors)
+            self.assertEqual(len(restored._resume_state_dict_list), 1)
+            torch.testing.assert_close(
+                restored_model.base_vision_prototype, model.base_vision_prototype
+            )
 
     def test_topology_roundtrip_preserves_experts_and_descriptors(self):
         torch.manual_seed(11)
