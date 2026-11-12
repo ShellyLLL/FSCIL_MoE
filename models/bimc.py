@@ -17,52 +17,6 @@ class LayerExpansionDecision:
     uncovered_classes: List[int]
 
 
-def compute_loo_classification_metrics(queries, per_query_prototypes, query_class_ids,
-                                       prototype_class_ids):
-    """Classify each query against its own query-exclusive prototype bank.
-
-    Args:
-        queries: ``[N, D]`` query representations.
-        per_query_prototypes: ``[N, C, D]``.  For FSCIL support LOO this has a
-            four-shot prototype for the query's own class and normal class
-            prototypes for every other current/history class.
-        query_class_ids: global labels, shape ``[N]``.
-        prototype_class_ids: global labels for the C columns.
-
-    The return value contains cosine margins rather than temperature-dependent
-    logits, so the same value can be used for threshold calibration and early
-    stopping.  Class ids, not prototype positions, determine the positive
-    column.
-    """
-    if queries.ndim != 2 or per_query_prototypes.ndim != 3:
-        raise ValueError("queries must be [N,D] and per_query_prototypes must be [N,C,D].")
-    if queries.size(0) != per_query_prototypes.size(0) or queries.size(1) != per_query_prototypes.size(2):
-        raise ValueError("query and per-query prototype dimensions must align.")
-    ids = torch.as_tensor(prototype_class_ids, device=queries.device, dtype=torch.long).reshape(-1)
-    labels = torch.as_tensor(query_class_ids, device=queries.device, dtype=torch.long).reshape(-1)
-    if labels.numel() != queries.size(0) or ids.numel() != per_query_prototypes.size(1):
-        raise ValueError("global class ids must align with query/prototype dimensions.")
-    positive = labels[:, None].eq(ids[None, :])
-    if not positive.any(dim=1).all():
-        missing = labels[~positive.any(dim=1)].unique().tolist()
-        raise ValueError(f"LOO prototype bank misses query class ids: {missing}")
-    q = F.normalize(queries.float(), dim=-1)
-    proto = F.normalize(per_query_prototypes.float().to(queries.device), dim=-1)
-    logits = torch.einsum("nd,ncd->nc", q, proto)
-    true_score = logits.masked_fill(~positive, float("-inf")).max(dim=1).values
-    competitor = logits.masked_fill(positive, float("-inf")).max(dim=1).values
-    competitor = torch.where(torch.isfinite(competitor), competitor, true_score.new_full(true_score.shape, -1.0))
-    pred = ids[logits.argmax(dim=1)]
-    return {
-        "logits": logits,
-        "predictions": pred,
-        "accuracy": pred.eq(labels).float().mean(),
-        "margins": true_score - competitor,
-        "true_scores": true_score,
-        "competitor_scores": competitor,
-    }
-
-
 def build_loo_cache_from_embeddings(features, labels, source_ids, class_index=None):
     """Build source-exclusive visual prototypes from already encoded features."""
     feature = F.normalize(torch.as_tensor(features).detach(), dim=-1)
@@ -96,195 +50,6 @@ def build_loo_cache_from_embeddings(features, labels, source_ids, class_index=No
     }
 
 
-def refine_conflict_aware_fused_prototypes(
-    current_prototypes, current_class_ids, history_prototypes=None,
-    history_class_ids=None, strength=0.25, margin=0.05,
-):
-    """Repel only current classes that collide with a different historical class.
-
-    The update is deterministic, normalised and leaves novel classes unchanged
-    when there is no historical competitor.  It is intentionally a standalone
-    helper so callers can unit-test it without constructing CLIP.
-    """
-    current = F.normalize(current_prototypes, dim=-1)
-    if history_prototypes is None or torch.as_tensor(history_prototypes).numel() == 0:
-        return current
-    hist = F.normalize(torch.as_tensor(history_prototypes, device=current.device, dtype=current.dtype), dim=-1)
-    cids = torch.as_tensor(current_class_ids, device=current.device).reshape(-1)
-    hids = torch.as_tensor(history_class_ids, device=current.device).reshape(-1)
-    sim = current @ hist.t()
-    sim = sim.masked_fill(cids[:, None].eq(hids[None, :]), float("-inf"))
-    best, best_idx = sim.max(dim=1)
-    active = torch.isfinite(best) & (best > float(margin))
-    if active.any():
-        repel = hist[best_idx[active]]
-        weight = float(strength) * ((best[active] - float(margin)) / max(1e-6, 1.0 - float(margin))).clamp(0, 1)
-        current = current.clone()
-        current[active] = F.normalize(current[active] - weight[:, None] * repel, dim=-1)
-    return current
-
-
-def optimize_query_exclusive_fused_prototypes(
-    loo_current_fused, query_features, query_class_ids, current_class_ids,
-    history_fused=None, history_class_ids=None, epochs=30, lr=1e-2,
-    old_protect_weight=1.0, anchor_weight=1.0, old_protect_margin=0.70,
-    initial_global=None, return_metrics=False,
-):
-    """Optimize only current-class fused prototype residuals.
-
-    ``loo_current_fused`` is ``[N, C_new, D]`` and is already query-exclusive.
-    A single residual per new class is shared across all LOO banks, which keeps
-    the update compact while avoiding the accidental full-shot self prototype
-    often seen in FSCIL prototype refinement.
-    """
-    if loo_current_fused.ndim != 3 or query_features.ndim != 2:
-        raise ValueError("loo_current_fused must be [N,C,D] and query_features [N,D].")
-    n, c, d = loo_current_fused.shape
-    if query_features.shape != (n, d):
-        raise ValueError("query_features must align with LOO fused prototype dimensions.")
-    current_ids = torch.as_tensor(current_class_ids, device=query_features.device, dtype=torch.long).reshape(-1)
-    labels = torch.as_tensor(query_class_ids, device=query_features.device, dtype=torch.long).reshape(-1)
-    if current_ids.numel() != c or labels.numel() != n:
-        raise ValueError("current/query class ids do not align with prototype tensors.")
-
-    base = F.normalize(loo_current_fused.detach().to(query_features.device).float(), dim=-1)
-    if initial_global is None:
-        initial = F.normalize(base.mean(dim=0), dim=-1)
-    else:
-        initial = F.normalize(
-            torch.as_tensor(initial_global, device=query_features.device, dtype=base.dtype), dim=-1
-        )
-        if initial.shape != (c, d):
-            raise ValueError("initial_global must have shape [num_current_classes, feature_dim].")
-    if history_fused is None:
-        history = base.new_empty((0, d))
-        history_ids = current_ids.new_empty(0)
-    else:
-        history = F.normalize(torch.as_tensor(history_fused, device=base.device, dtype=base.dtype), dim=-1)
-        history_ids = torch.as_tensor(history_class_ids, device=base.device, dtype=torch.long).reshape(-1)
-        if history.size(0) != history_ids.numel():
-            raise ValueError("history prototype ids must align with history prototypes.")
-
-    delta = torch.zeros_like(initial, requires_grad=True)
-    optimizer = torch.optim.Adam([delta], lr=float(lr))
-    q = F.normalize(query_features.detach().to(base.device).float(), dim=-1)
-    all_ids = torch.cat([history_ids, current_ids], dim=0)
-    target_cols = torch.nonzero(labels[:, None].eq(all_ids[None, :]), as_tuple=False)
-    if target_cols.size(0) != n:
-        raise ValueError("every refinement query must have exactly one class column.")
-    target_cols = target_cols[:, 1]
-
-    @torch.no_grad()
-    def loo_metrics_for(delta_value):
-        current = F.normalize(base + delta_value[None, :, :], dim=-1)
-        bank = torch.cat([history[None, :, :].expand(n, -1, -1), current], dim=1)
-        return compute_loo_classification_metrics(q, bank, labels, all_ids)
-
-    # The baseline is the actual task-level fused bank (when supplied), not
-    # an average of LOO means.  This guarantees prototype refinement cannot
-    # silently replace a working incremental classifier with a worse last
-    # optimizer step merely because its regularised loss decreased.
-    best_delta = torch.zeros_like(initial)
-    best_metrics = loo_metrics_for(best_delta)
-    best_accuracy = float(best_metrics["accuracy"].item())
-    best_margin = float(best_metrics["margins"].mean().item())
-    best_epoch = 0
-
-    for epoch in range(max(0, int(epochs))):
-        optimizer.zero_grad(set_to_none=True)
-        current = F.normalize(base + delta[None, :, :], dim=-1)
-        bank = torch.cat([history[None, :, :].expand(n, -1, -1), current], dim=1)
-        logits = 10.0 * torch.einsum("nd,ncd->nc", q, bank)
-        loss_loo = F.cross_entropy(logits, target_cols)
-
-        # A low-temperature old classification term alone can still saturate
-        # when a stored prototype self-similarity is 1.  Add an explicit cosine
-        # margin against new prototypes so colliding new classes keep gradients.
-        current_global = F.normalize(initial + delta, dim=-1)
-        if history.numel():
-            old_logits = 10.0 * history @ torch.cat([history, current_global], dim=0).t()
-            old_targets = torch.arange(history.size(0), device=history.device)
-            loss_old_ce = F.cross_entropy(old_logits, old_targets)
-            collision = F.relu(history @ current_global.t() - float(old_protect_margin)).pow(2).mean()
-            loss_old = loss_old_ce + collision
-        else:
-            loss_old = loss_loo.new_zeros(())
-        loss_anchor = 1.0 - F.cosine_similarity(current_global, initial, dim=-1).mean()
-        loss = loss_loo + float(old_protect_weight) * loss_old + float(anchor_weight) * loss_anchor
-        if not torch.isfinite(loss):
-            break
-        loss.backward()
-        optimizer.step()
-        if not torch.isfinite(delta).all():
-            with torch.no_grad():
-                delta.copy_(best_delta)
-            break
-        candidate_metrics = loo_metrics_for(delta.detach())
-        candidate_accuracy = float(candidate_metrics["accuracy"].item())
-        candidate_margin = float(candidate_metrics["margins"].mean().item())
-        if (candidate_accuracy > best_accuracy + 1e-8 or
-                (abs(candidate_accuracy - best_accuracy) <= 1e-8
-                 and candidate_margin > best_margin + 1e-8)):
-            best_delta = delta.detach().clone()
-            best_metrics = candidate_metrics
-            best_accuracy, best_margin, best_epoch = candidate_accuracy, candidate_margin, epoch + 1
-
-    result = F.normalize(initial + best_delta, dim=-1)
-    if not return_metrics:
-        return result
-    return result, {
-        "pre_loo_accuracy": float(loo_metrics_for(torch.zeros_like(initial))["accuracy"].item()),
-        "pre_loo_margin": float(loo_metrics_for(torch.zeros_like(initial))["margins"].mean().item()),
-        "post_loo_accuracy": best_accuracy,
-        "post_loo_margin": best_margin,
-        "selected_epoch": int(best_epoch),
-    }
-
-
-def loo_fused_prototypes_for_queries(support_cache, query_source_ids, old_state,
-                                     class_names=None, beta=0.5, lambda_t=0.0):
-    """Construct per-query all-class fused banks without support-source leakage.
-
-    ``support_cache`` is produced by :meth:`build_leave_one_out_prototypes` and
-    should additionally contain current ``text_features`` and optionally
-    ``description_proto``. ``old_state`` may be an engine merged state dict;
-    its ``image_proto``, ``text_features``, ``description_proto`` and
-    ``class_index`` entries are appended as the historical bank. ``class_names``
-    is accepted for engine-call compatibility and is not used for positional ids.
-    """
-    del class_names
-    source = torch.as_tensor(query_source_ids).reshape(-1)
-    support_sources = torch.as_tensor(support_cache["source_ids"]).reshape(-1)
-    rows = []
-    text = support_cache.get("text_features")
-    desc = support_cache.get("description_proto", text)
-    if text is None:
-        raise ValueError("support_cache needs text_features to construct fused prototypes.")
-    text = torch.as_tensor(text)
-    desc = torch.as_tensor(desc, device=text.device, dtype=text.dtype)
-    current_text = F.normalize((1.0 - float(lambda_t)) * text + float(lambda_t) * desc, dim=-1)
-    old_img = old_state.get("image_proto") if old_state is not None else None
-    old_explicit_fused = old_state.get("fused_proto") if old_state is not None else None
-    if old_explicit_fused is not None:
-        old_fused = F.normalize(torch.as_tensor(old_explicit_fused, device=text.device, dtype=text.dtype), dim=-1)
-    elif old_img is not None:
-        old_img = torch.as_tensor(old_img, device=text.device, dtype=text.dtype)
-        old_text = torch.as_tensor(old_state.get("text_features", old_img), device=text.device, dtype=text.dtype)
-        old_desc = torch.as_tensor(old_state.get("description_proto", old_text), device=text.device, dtype=text.dtype)
-        old_fused = F.normalize(float(beta) * F.normalize((1-float(lambda_t))*old_text + float(lambda_t)*old_desc, dim=-1)
-                                 + (1-float(beta)) * F.normalize(old_img, dim=-1), dim=-1)
-    else:
-        old_fused = text.new_empty((0, text.size(-1)))
-    for sid in source:
-        hit = torch.nonzero(support_sources.eq(sid), as_tuple=False).flatten()
-        if hit.numel() == 0:
-            raise KeyError("query source id is absent from support_cache")
-        current = support_cache["loo_visual_prototypes"][hit[0]].to(text.device, text.dtype)
-        fused = F.normalize(float(beta) * current_text + (1.0 - float(beta)) * current, dim=-1)
-        rows.append(torch.cat([old_fused, fused], dim=0))
-    return torch.stack(rows, dim=0)
-
-
 def load_clip_to_cpu(cfg):
     backbone_name = cfg.MODEL.BACKBONE.NAME
     url = clip._MODELS[backbone_name]
@@ -314,10 +79,6 @@ class BiMC(nn.Module):
         self.description_proto = None
         self.vision_proto = None
         self.base_vision_prototype = None
-        # Runtime cache for conflict-aware fused refinement.  Adapter coverage
-        # banks remain the checkpointed source of truth for visual planning.
-        self._fused_history_prototypes = None
-        self._fused_history_class_ids = None
         self._apply_freeze_policy()
 
     def _apply_freeze_policy(self):
@@ -444,20 +205,6 @@ class BiMC(nn.Module):
         ids = state.get("class_ids", state.get("class_index", []))
         return torch.as_tensor(ids, dtype=torch.long, device=device).reshape(-1)
 
-    def fuse_prototypes(self, state):
-        """Return the classifier prototypes in a state, preserving class ids."""
-        if state is None:
-            return None
-        fused = state.get("fused_proto")
-        if fused is not None:
-            return F.normalize(torch.as_tensor(fused, device=self.device), dim=-1)
-        image = torch.as_tensor(state["image_proto"], device=self.device)
-        text = torch.as_tensor(state["text_features"], device=self.device)
-        description = torch.as_tensor(state.get("description_proto", text), device=self.device)
-        lambda_t = self.cfg.TRAINER.BiMC.LAMBDA_T if self.cfg.TRAINER.BiMC.TEXT_CALIBRATION else 0.0
-        calibrated_text = F.normalize((1.0 - lambda_t) * text + lambda_t * description, dim=-1)
-        return F.normalize(self.cfg.DATASET.BETA * calibrated_text + (1.0 - self.cfg.DATASET.BETA) * image, dim=-1)
-
     def expandable_blocks(self):
         return [index for index, block in enumerate(self.clip_model.visual.transformer.resblocks)
                 if getattr(block, "moe_adapter", None) is not None]
@@ -519,104 +266,6 @@ class BiMC(nn.Module):
             adapter = getattr(block, "moe_adapter", None)
             if adapter is not None:
                 adapter.rebuild_topology(topology.get(str(index), topology.get(index)))
-
-    def refine_new_fused_prototypes(self, old_classifier_state, task_stat, loader):
-        """Apply query-exclusive residual refinement to only the current classes."""
-        refinement = getattr(self.cfg.TRAINER.BiMC, "PROTOTYPE_REFINEMENT", None)
-        if refinement is None or not bool(getattr(refinement, "ENABLE", False)):
-            return task_stat
-        current_ids = self._state_class_ids(task_stat, self.device)
-        if current_ids.numel() == 0:
-            current_ids = torch.as_tensor(task_stat["class_index"], device=self.device, dtype=torch.long)
-        # LOO caches use globally sorted ids.  Preserve row/id alignment even
-        # for an externally supplied non-contiguous or reordered task list.
-        task_stat = dict(task_stat)
-        state_ids = self._state_class_ids(task_stat, self.device)
-        row_matches = current_ids[:, None].eq(state_ids[None, :])
-        if row_matches.shape != (current_ids.numel(), state_ids.numel()) or not row_matches.sum(dim=1).eq(1).all():
-            raise ValueError("Current task prototype rows must map one-to-one to global class ids.")
-        row_order = row_matches.to(dtype=torch.long).argmax(dim=1)
-        for key in (
-            "description_proto", "text_features", "image_proto",
-            "initial_fused_proto", "fused_proto",
-        ):
-            value = task_stat.get(key)
-            if value is not None and torch.as_tensor(value).ndim >= 1:
-                value = torch.as_tensor(value)
-                if value.size(0) == state_ids.numel():
-                    task_stat[key] = value[row_order.to(value.device)]
-        task_stat["class_ids"] = current_ids
-        task_stat["class_index"] = current_ids
-        initial_global = task_stat.get("fused_proto")
-        if initial_global is None:
-            initial_global = self.fuse_prototypes(task_stat)
-        cache = self.build_leave_one_out_prototypes(loader, current_ids.detach().cpu().tolist())
-        cache["text_features"] = task_stat["text_features"].detach()
-        cache["description_proto"] = task_stat["description_proto"].detach()
-        lambda_t = self.cfg.TRAINER.BiMC.LAMBDA_T if self.cfg.TRAINER.BiMC.TEXT_CALIBRATION else 0.0
-        per_query = loo_fused_prototypes_for_queries(
-            cache, cache["source_ids"], old_classifier_state or {},
-            beta=self.cfg.DATASET.BETA, lambda_t=lambda_t,
-        ).to(self.device)
-        old_fused = self.fuse_prototypes(old_classifier_state)
-        if old_fused is None:
-            old_fused = per_query.new_empty((0, per_query.size(-1)))
-        old_ids = self._state_class_ids(old_classifier_state, self.device)
-        loo_current = per_query[:, old_fused.size(0):, :]
-        refined, refinement_metrics = optimize_query_exclusive_fused_prototypes(
-            loo_current,
-            cache["features"].to(self.device), cache["labels"].to(self.device), current_ids,
-            history_fused=old_fused, history_class_ids=old_ids,
-            epochs=getattr(refinement, "EPOCHS", 30),
-            lr=getattr(refinement, "LR", 1e-2),
-            old_protect_weight=getattr(refinement, "OLD_PROTECT_WEIGHT", 1.0),
-            anchor_weight=getattr(refinement, "ANCHOR_WEIGHT", 1.0),
-            old_protect_margin=getattr(refinement, "OLD_PROTECT_MARGIN", 0.70),
-            initial_global=initial_global,
-            return_metrics=True,
-        )
-        refined = refined.to(task_stat["image_proto"].dtype)
-        task_stat["initial_fused_proto"] = F.normalize(
-            torch.as_tensor(initial_global, device=refined.device, dtype=refined.dtype), dim=-1
-        ).detach()
-        task_stat["fused_proto"] = refined
-        task_stat["prototype_refinement"] = refinement_metrics
-        print(
-            "=> [PrototypeRefine] LOO acc {:.3f}->{:.3f}, margin {:.5f}->{:.5f}, selected_epoch={}".format(
-                refinement_metrics["pre_loo_accuracy"], refinement_metrics["post_loo_accuracy"],
-                refinement_metrics["pre_loo_margin"], refinement_metrics["post_loo_margin"],
-                refinement_metrics["selected_epoch"],
-            )
-        )
-        # ``build_task_statistics`` updates the legacy conflict cache before
-        # this residual refinement runs.  Keep that cache coherent as well so
-        # an optional non-zero legacy conflict setting never reintroduces the
-        # pre-refinement current prototypes in the following session.
-        history = getattr(self, "_fused_history_prototypes", None)
-        history_ids = getattr(self, "_fused_history_class_ids", None)
-        if history is None or history_ids is None:
-            self._fused_history_prototypes = refined.detach()
-            self._fused_history_class_ids = current_ids.detach()
-        else:
-            history_ids = history_ids.to(current_ids.device)
-            keep = (history_ids[:, None] != current_ids[None, :]).all(dim=1)
-            self._fused_history_prototypes = torch.cat([history[keep].to(refined.device), refined.detach()], dim=0)
-            self._fused_history_class_ids = torch.cat([history_ids[keep], current_ids.detach()], dim=0)
-        return task_stat
-
-    @torch.no_grad()
-    def restore_fused_history(self, state_dict_list):
-        """Restore the optional legacy fused-history cache after checkpoint load."""
-        if not state_dict_list:
-            self._fused_history_prototypes = None
-            self._fused_history_class_ids = None
-            return
-        fused, ids = [], []
-        for state in state_dict_list:
-            fused.append(self.fuse_prototypes(state).detach())
-            ids.append(self._state_class_ids(state, self.device))
-        self._fused_history_prototypes = torch.cat(fused, dim=0)
-        self._fused_history_class_ids = torch.cat(ids, dim=0)
 
     @torch.no_grad()
     def extract_teacher_features(self, images):
@@ -755,8 +404,7 @@ class BiMC(nn.Module):
         }
 
     @torch.no_grad()
-    def forward_ours(self, images, image_proto, description_proto=None,
-                     text_features=None, beta=None, fused_proto=None):
+    def forward_ours(self, images, image_proto):
         """Compatibility inference entry point; classification is visual-only."""
         img_feat = F.normalize(self.extract_img_feature(images), dim=-1)
         visual_proto = F.normalize(torch.as_tensor(image_proto, device=self.device), dim=-1)
