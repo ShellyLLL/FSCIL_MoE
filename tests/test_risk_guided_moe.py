@@ -248,6 +248,29 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         self.assertEqual(tuple(adapted.shape), tuple(reference.shape))
         self.assertEqual(tuple(aux[0]["cls_in"].shape), (images.size(0), 8))
 
+    def test_base_ae_and_expansion_threshold_use_disjoint_heldout_sources(self):
+        torch.manual_seed(233)
+        runner, model = build_lifecycle_runner()
+        supports = [
+            lifecycle_batch(0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 5000),
+            lifecycle_batch(1, torch.tensor([0., 1., 0., 0., 0., 0., 0., 0.]), 5010),
+            lifecycle_batch(2, torch.tensor([0., 0., 1., 0., 0., 0., 0., 0.]), 5020),
+        ]
+        runner._train_base_descriptors(supports)
+        self.assertEqual(set(runner._base_calibration_features), {0, 1})
+        for block_idx, adapter in runner._moe_adapters():
+            holdout = runner._base_calibration_features[block_idx]
+            self.assertEqual(holdout["labels"].numel(), 3)
+            self.assertEqual(set(holdout["labels"].tolist()), {0, 1, 2})
+            self.assertTrue(all(
+                int(descriptor.error_count.item()) == 3
+                for descriptor in adapter.descriptors
+            ))
+        runner._calibrate_expansion_thresholds(supports)
+        self.assertEqual(set(runner.expansion_thresholds), {0, 1})
+        self.assertTrue(all(torch.isfinite(torch.tensor(value))
+                            for value in runner.expansion_thresholds.values()))
+
     def test_low_rank_ae_is_centered_tied_weight_and_orthogonal(self):
         torch.manual_seed(227)
         descriptor = RepresentationDescriptor(12, descriptor_dim=3, buffer_size=8)
