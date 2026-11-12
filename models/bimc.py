@@ -221,7 +221,6 @@ class BiMC(nn.Module):
             raise RuntimeError("Adapted/reference LOO support caches lost sample alignment.")
         adapted_cache["reference_features"] = torch.cat(reference_features)
         adapted_cache["loo_reference_prototypes"] = reference_cache["loo_visual_prototypes"]
-        adapted_cache["reference_visual_prototypes"] = reference_cache["visual_prototypes"]
         return adapted_cache
 
     @staticmethod
