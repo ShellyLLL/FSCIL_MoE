@@ -157,13 +157,16 @@ def lifecycle_batch(class_id, feature, source_start, augmented=False, seed=0):
 def make_lifecycle_state(runner, model, class_id, support, creation_session):
     anchors = runner._collect_class_anchors([support])
     with torch.no_grad():
-        prototype = F.normalize(
-            model.extract_img_feature(support["image"]).mean(0, keepdim=True), dim=-1
+        adapted, _, reference = model.extract_img_feature_train(
+            support["image"], return_reference=True
         )
+        prototype = F.normalize(adapted.mean(0, keepdim=True), dim=-1)
+        reference_prototype = F.normalize(reference.mean(0, keepdim=True), dim=-1)
     semantic = F.normalize(torch.eye(8)[[class_id]], dim=-1)
     return {
         "class_ids": torch.tensor([class_id]),
         "image_proto": prototype,
+        "reference_image_proto": reference_prototype,
         "text_features": semantic,
         "description_proto": semantic,
         "anchor_by_block": anchors,
@@ -567,6 +570,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             TEXT_CALIBRATION=False, LAMBDA_T=0.0, VISION_CALIBRATION=True,
             LAMBDA_I=0.8, TAU=16.0)))
         base = {"image_proto": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+                "reference_image_proto": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
                 "text_features": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
                 "description_proto": torch.tensor([[1.0, 0.0], [0.0, 1.0]])}
         old_incremental = {"image_proto": torch.tensor([[0.0, -1.0]]),
@@ -695,12 +699,15 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         runner._train_base_descriptors([base_support])
         base_anchors = runner._collect_class_anchors([base_support])
         with torch.no_grad():
-            base_proto = F.normalize(
-                model.extract_img_feature(base_support["image"]).mean(0, keepdim=True), dim=-1
+            base_adapted, _, base_reference = model.extract_img_feature_train(
+                base_support["image"], return_reference=True
             )
+            base_proto = F.normalize(base_adapted.mean(0, keepdim=True), dim=-1)
+            base_reference_proto = F.normalize(base_reference.mean(0, keepdim=True), dim=-1)
         base_state = {
             "class_ids": torch.tensor([0]),
             "image_proto": base_proto,
+            "reference_image_proto": base_reference_proto,
             "text_features": F.normalize(torch.eye(8)[[0]], dim=-1),
             "description_proto": F.normalize(torch.eye(8)[[0]], dim=-1),
             "anchor_by_block": base_anchors,

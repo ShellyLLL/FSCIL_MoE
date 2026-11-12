@@ -597,7 +597,7 @@ class Runner:
         if not old_states:
             return visual
         base_visual = F.normalize(
-            torch.as_tensor(old_states[0]["image_proto"], device=self.device).float(), dim=-1
+            torch.as_tensor(old_states[0]["reference_image_proto"], device=self.device).float(), dim=-1
         )
         tau = float(getattr(self.cfg.TRAINER.BiMC, "TAU", 16.0))
         weights = torch.softmax(tau * reference @ base_visual.t(), dim=-1)
