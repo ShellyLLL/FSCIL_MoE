@@ -24,6 +24,16 @@ def build_loo_cache_from_embeddings(features, labels, source_ids, class_index=No
     source = torch.as_tensor(source_ids, device=feature.device).reshape(-1)
     if feature.ndim != 2 or feature.size(0) != target.numel() or source.numel() != target.numel():
         raise ValueError("features, labels and source_ids must align for visual LOO.")
+    if not torch.isfinite(feature).all():
+        raise ValueError("visual LOO features must be finite.")
+    # A source may own multiple augmented views, but it cannot identify
+    # different semantic classes: otherwise query-exclusive LOO is ambiguous.
+    for source_id in torch.unique(source, sorted=True):
+        source_labels = torch.unique(target[source.eq(source_id)])
+        if source_labels.numel() != 1:
+            raise ValueError(
+                f"source id {int(source_id)} is associated with multiple classes."
+            )
     classes = (
         torch.unique(target, sorted=True)
         if class_index is None
