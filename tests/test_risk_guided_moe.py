@@ -133,6 +133,9 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         nn.Module.__init__(model)
         model.clip_model = TinyVisualCLIP()
         model.device = torch.device("cpu")
+        model.cfg = SimpleNamespace(TRAINER=SimpleNamespace(BiMC=SimpleNamespace(
+            VISUAL_MOE=SimpleNamespace(ENABLE=True)
+        )))
         model.parse_batch = lambda batch: (batch["images"], batch["labels"])
         captured = {0: [], 1: []}
         hooks = []
