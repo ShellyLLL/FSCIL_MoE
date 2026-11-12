@@ -194,10 +194,10 @@ class RepresentationDescriptor(nn.Module):
     def standardized_score(self, x):
         if int(self.error_count.item()) < 3:
             raise RuntimeError("AE descriptor has fewer than three reference errors.")
-        # SEMA uses a two-sided outlier score: unusually low and high
-        # reconstruction errors are both deviations from the reference.
+        # SEMA expansion is triggered by unusually HIGH reconstruction
+        # errors. Keep the signed z-score; low errors indicate good coverage.
         return ((self.reconstruction_error(x) - self.error_mean) /
-                self.error_std.clamp_min(self.eps)).abs()
+                self.error_std.clamp_min(self.eps))
 
     def is_ready(self):
         return int(self.error_count.item()) >= 3
