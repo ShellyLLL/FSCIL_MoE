@@ -804,7 +804,14 @@ class Runner:
         optim_cfg = self.cfg.TRAINER.BiMC.OPTIM
         epochs = int(self.cfg.TRAINER.BiMC.INCREMENTAL.EPOCHS)
         scale = float(self.cfg.TRAINER.BiMC.INCREMENTAL.LOGIT_SCALE)
-        fallback_threshold = float(getattr(self._visual_moe_cfg(), "EXPANSION_Z_THRESHOLD", 1.0))
+        calibrated_thresholds = getattr(self, "expansion_thresholds", None)
+        expected_blocks = {int(block) for block in self.model_without_dp.expandable_blocks()}
+        if not isinstance(calibrated_thresholds, dict) or set(calibrated_thresholds) != expected_blocks:
+            raise RuntimeError(
+                "Incremental expansion requires Base-calibrated thresholds for every MoE block."
+            )
+        if not all(np.isfinite(float(value)) for value in calibrated_thresholds.values()):
+            raise ValueError("Calibrated expansion thresholds must be finite.")
         ae_epochs = int(_cfg_value(optim_cfg, "INCREMENTAL_DESCRIPTOR_EPOCHS", 5))
         decisions, expanded, histories = [], [], {}
         for _, adapter in self._moe_adapters():
@@ -813,7 +820,7 @@ class Runner:
         # Train shallow-to-deep: upstream experts alter downstream adapted inputs.\n        # Expansion decisions still use the independent frozen-reference stream.
         for block_idx in self.model_without_dp.expandable_blocks():
             features = self.model_without_dp.collect_blockwise_cls_features(extract_loader)
-            threshold = float(getattr(self, "expansion_thresholds", {}).get(int(block_idx), fallback_threshold))
+            threshold = float(calibrated_thresholds[int(block_idx)])
             decision = self.model_without_dp.plan_layer_expansion(
                 block_idx, features, class_index, threshold)
             decisions.append({

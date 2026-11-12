@@ -130,6 +130,7 @@ def build_lifecycle_runner():
     runner = Runner.__new__(Runner)
     runner.cfg = cfg
     runner.device = torch.device("cpu")
+    runner.expansion_thresholds = {0: 1.0, 1: 1.0}
     runner.model = model
     runner.model_without_dp = model
     runner._text_prototypes = lambda _names, class_index: (
