@@ -897,10 +897,6 @@ class Runner:
         )
         text = state["text_features"].to(self.device).float()
         desc = state["description_proto"].to(self.device).float()
-        lambda_t = (
-            float(self.cfg.TRAINER.BiMC.LAMBDA_T)
-            if self.cfg.TRAINER.BiMC.TEXT_CALIBRATION else 0.0
-        )
         semantic = self._text_intra_modal_calibration(text, desc)
         visual = self._visual_intra_modal_calibration(
             state["image_proto"].to(self.device), old_states
@@ -954,7 +950,6 @@ class Runner:
                         calibrate_novel_vision_proto=False)
                     state["class_ids"] = torch.as_tensor(class_index, device=self.device, dtype=torch.long)
                     state["class_index"] = state["class_ids"]
-                base_semantic = self.model_without_dp._state_class_ids(state, device=self.device)
                 text = state["text_features"].to(self.device).float()
                 description = state["description_proto"].to(self.device).float()
                 semantic = self._text_intra_modal_calibration(text, description)

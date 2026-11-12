@@ -490,7 +490,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         changed_old["description_proto"] = torch.tensor([[-1.0, 0.0]])
         second = runner._visual_intra_modal_calibration(visual, [base, changed_old])
         torch.testing.assert_close(first, second)
-        self.assertGreater(first[0, 0].item(), first[0, 1].item())
+        self.assertGreater(first[0, 1].item(), first[0, 0].item())
 
     def test_bilevel_calibration_fuses_visual_textual_modalities(self):
         runner = Runner.__new__(Runner)
@@ -523,7 +523,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         self.assertIsNone(teacher)
         self.assertEqual(int(logits.argmax(dim=1).item()), 0)
 
-    def test_merge_dicts_builds_visual_bank_without_fused_prototypes(self):
+    def test_merge_dicts_builds_global_calibrated_prototype_bank(self):
         runner = Runner.__new__(Runner)
         runner.device = "cpu"
         states = [
@@ -531,19 +531,19 @@ class UnifiedDynamicMoETests(unittest.TestCase):
              "image_proto": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
              "text_features": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
              "description_proto": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
-             "fused_proto": torch.tensor([[0.0, 1.0], [1.0, 0.0]])},
+             "final_proto": torch.tensor([[0.8, 0.6], [0.6, 0.8]])},
             {"class_ids": torch.tensor([2]),
              "image_proto": torch.tensor([[-1.0, 0.0]]),
              "text_features": torch.tensor([[-1.0, 0.0]]),
              "description_proto": torch.tensor([[-1.0, 0.0]]),
-             "fused_proto": torch.tensor([[0.0, -1.0]])},
+             "final_proto": torch.tensor([[-0.8, 0.6]])},
         ]
         merged = runner.merge_dicts(states)
         self.assertEqual(merged["class_ids"].tolist(), [0, 1, 2])
-        self.assertNotIn("fused_proto", merged)
+        self.assertIn("final_proto", merged)
         torch.testing.assert_close(
-            merged["image_proto"],
-            torch.tensor([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]])
+            merged["final_proto"],
+            torch.tensor([[0.8, 0.6], [0.6, 0.8], [-0.8, 0.6]])
         )
 
     def test_uncovered_batch_selection_keeps_images_labels_and_source_ids_aligned(self):
