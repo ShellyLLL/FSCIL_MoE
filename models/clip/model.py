@@ -135,57 +135,110 @@ class QuickGELU(nn.Module):
 
 
 class RepresentationDescriptor(nn.Module):
-    """FP32 reconstruction descriptor for one expert's local input distribution."""
-
-    def __init__(self, d_model, descriptor_dim=64, eps=1e-4):
+    """Centered tied-weight low-rank linear AE with a rolling error reference."""
+    def __init__(self, d_model, descriptor_dim=64, eps=1e-4, buffer_size=500):
         super().__init__()
-        self.d_model, self.eps = int(d_model), float(eps)
+        self.d_model = int(d_model)
         self.descriptor_dim = max(1, min(int(descriptor_dim), self.d_model))
-        self.encoder = nn.Linear(self.d_model, self.descriptor_dim)
-        self.activation = QuickGELU()
-        self.decoder = nn.Linear(self.descriptor_dim, self.d_model)
-        self.register_buffer("mean", torch.tensor(0.0, dtype=torch.float32))
-        self.register_buffer("std", torch.tensor(1.0, dtype=torch.float32))
-        self.register_buffer("fit_sample_count", torch.tensor(0, dtype=torch.long))
-        self.register_buffer("calibration_sample_count", torch.tensor(0, dtype=torch.long))
-
-    def _reconstruct_fp32(self, x):
-        encoded = F.linear(x.float(), self.encoder.weight.float(), self.encoder.bias.float())
-        return F.linear(self.activation(encoded), self.decoder.weight.float(), self.decoder.bias.float())
-
-    def forward(self, x):
-        return self._reconstruct_fp32(x).to(dtype=x.dtype)
-
-    def reconstruction_error(self, x):
-        values = x.detach().float()
-        return (self._reconstruct_fp32(values) - values).pow(2).mean(dim=-1)
+        self.eps, self.buffer_size = float(eps), int(buffer_size)
+        if self.eps <= 0 or self.buffer_size < 3:
+            raise ValueError("AE eps must be positive and buffer_size must be at least three.")
+        basis, _ = torch.linalg.qr(torch.randn(self.d_model, self.descriptor_dim), mode="reduced")
+        self.basis = nn.Parameter(basis)
+        self.register_buffer("center", torch.zeros(self.d_model, dtype=torch.float32))
+        self.register_buffer("error_history", torch.zeros(self.buffer_size, dtype=torch.float32))
+        self.register_buffer("error_count", torch.zeros((), dtype=torch.long))
+        self.register_buffer("error_cursor", torch.zeros((), dtype=torch.long))
+        self.register_buffer("error_mean", torch.zeros((), dtype=torch.float32))
+        self.register_buffer("error_std", torch.ones((), dtype=torch.float32))
 
     @torch.no_grad()
-    def update_stats(self, errors, responsibilities=None, fit_sample_count=None):
-        errors = torch.as_tensor(errors, device=self.mean.device, dtype=torch.float32).reshape(-1)
-        finite = torch.isfinite(errors)
-        errors = errors[finite]
-        if errors.numel() == 0:
-            raise ValueError("descriptor calibration requires finite errors.")
-        weights = torch.ones_like(errors) if responsibilities is None else torch.as_tensor(
-            responsibilities, device=self.mean.device, dtype=torch.float32
-        ).reshape(-1)[finite].clamp_min(0)
-        mass = weights.sum()
-        if not bool(mass.gt(0).item()):
-            raise ValueError("descriptor responsibilities require positive mass.")
-        mean = (weights * errors).sum() / mass
-        variance = (weights * (errors - mean).square()).sum() / mass
-        self.mean.copy_(mean)
-        self.std.copy_(variance.sqrt().clamp_min(max(self.eps, abs(float(mean.item())) * self.eps)))
-        self.fit_sample_count.fill_(errors.numel() if fit_sample_count is None else int(fit_sample_count))
-        self.calibration_sample_count.fill_(errors.numel())
-        return self.mean, self.std
+    def set_center(self, values, weights=None):
+        values = torch.as_tensor(values, device=self.center.device, dtype=torch.float32)
+        if values.ndim != 2 or values.size(1) != self.d_model or not torch.isfinite(values).all():
+            raise ValueError("AE center requires finite [samples, d_model] representations.")
+        if weights is None:
+            center = values.mean(dim=0)
+        else:
+            weights = torch.as_tensor(weights, device=values.device, dtype=torch.float32).reshape(-1)
+            if weights.numel() != values.size(0) or (weights < 0).any() or weights.sum() <= 0:
+                raise ValueError("AE center weights must be non-negative with positive mass.")
+            center = (values * weights[:, None]).sum(0) / weights.sum()
+        self.center.copy_(center)
+
+    def forward(self, x):
+        centered = x.float() - self.center
+        basis = self.basis.float()
+        return self.center + (centered @ basis) @ basis.t()
+
+    def orthogonality_loss(self):
+        basis = self.basis.float()
+        gram = basis.t() @ basis
+        identity = torch.eye(self.descriptor_dim, device=basis.device, dtype=basis.dtype)
+        return (gram - identity).square().mean()
+
+    def reconstruction_error(self, x):
+        value = x.detach().float()
+        if not torch.isfinite(value).all():
+            raise FloatingPointError("AE input contains non-finite representations.")
+        errors = (self.forward(value) - value).square().mean(dim=-1)
+        if not torch.isfinite(errors).all():
+            raise FloatingPointError("AE reconstruction errors are non-finite.")
+        return errors
+
+    @torch.no_grad()
+    def update_reference(self, errors):
+        errors = torch.as_tensor(errors, device=self.error_history.device, dtype=torch.float32).reshape(-1)
+        if errors.numel() == 0 or not torch.isfinite(errors).all():
+            raise ValueError("AE reference update requires non-empty finite errors.")
+        n = errors.numel()
+        if n >= self.buffer_size:
+            self.error_history.copy_(errors[-self.buffer_size:])
+            self.error_count.fill_(self.buffer_size)
+            self.error_cursor.zero_()
+        else:
+            cursor = int(self.error_cursor.item())
+            positions = (torch.arange(n, device=errors.device) + cursor) % self.buffer_size
+            self.error_history[positions] = errors
+            self.error_count.fill_(min(self.buffer_size, int(self.error_count.item()) + n))
+            self.error_cursor.fill_((cursor + n) % self.buffer_size)
+        count = int(self.error_count.item())
+        reference = self.error_history if count == self.buffer_size else self.error_history[:count]
+        mean = reference.mean()
+        std = reference.std(unbiased=True) if count > 1 else mean.new_zeros(())
+        self.error_mean.copy_(mean)
+        self.error_std.copy_(std.clamp_min(self.eps))
+        return self.error_mean, self.error_std
+
+    @torch.no_grad()
+    def shrink_reference(self, prior_mean, prior_std, prior_strength):
+        """Empirical-Bayes moment shrinkage of few-shot AE error statistics."""
+        prior_mean = torch.as_tensor(prior_mean, device=self.error_mean.device, dtype=torch.float32)
+        prior_std = torch.as_tensor(prior_std, device=self.error_std.device, dtype=torch.float32)
+        strength = float(prior_strength)
+        count = int(self.error_count.item())
+        if count < 3 or not torch.isfinite(prior_mean) or not torch.isfinite(prior_std):
+            raise ValueError("AE shrinkage requires calibrated local and finite prior statistics.")
+        if prior_std <= 0 or not np.isfinite(strength) or strength <= 0:
+            raise ValueError("AE prior std and shrinkage strength must be positive.")
+        local_mean, local_std = self.error_mean.clone(), self.error_std.clone()
+        weight = float(count) / (float(count) + strength)
+        mean = weight * local_mean + (1.0 - weight) * prior_mean
+        variance = (
+            weight * (local_std.square() + (local_mean - mean).square())
+            + (1.0 - weight) * (prior_std.square() + (prior_mean - mean).square())
+        )
+        self.error_mean.copy_(mean)
+        self.error_std.copy_(variance.clamp_min(self.eps ** 2).sqrt())
+        return self.error_mean, self.error_std
 
     def standardized_score(self, x):
-        return (self.reconstruction_error(x) - self.mean) / self.std.clamp_min(self.eps)
+        if int(self.error_count.item()) < 3:
+            raise RuntimeError("AE descriptor has fewer than three reference errors.")
+        return (self.reconstruction_error(x) - self.error_mean) / self.error_std.clamp_min(self.eps)
 
     def is_ready(self):
-        return int(self.fit_sample_count.item()) > 0 and int(self.calibration_sample_count.item()) > 0
+        return int(self.error_count.item()) >= 3
 
 
 class ExpandableRouter(nn.Module):
@@ -197,17 +250,18 @@ class ExpandableRouter(nn.Module):
         for _ in range(int(num_columns)):
             self.add_column()
 
-    def add_column(self):
+    def add_column(self, bias_init=0.0):
         column = nn.Linear(self.dim, 1)
         nn.init.normal_(column.weight, std=0.02)
-        nn.init.zeros_(column.bias)
+        nn.init.constant_(column.bias, float(bias_init))
         self.columns.append(column)
         return len(self.columns) - 1
 
-    def forward(self, x):
+    def forward(self, x, num_columns=None):
         if not self.columns:
             raise RuntimeError("ExpandableRouter requires at least one column.")
-        logits = torch.cat([column(x) for column in self.columns], dim=-1)
+        selected = self.columns if num_columns is None else self.columns[:int(num_columns)]
+        logits = torch.cat([column(x) for column in selected], dim=-1)
         return logits, torch.softmax(logits, dim=-1)
 
 
@@ -229,17 +283,20 @@ class VisualMoEAdapter(nn.Module):
     """Unified expert pool, descriptors and expandable soft router."""
 
     def __init__(self, d_model, num_experts=4, reduction=4, residual_scale_init=1.0,
-                 descriptor_dim=64, descriptor_eps=1e-4):
+                 descriptor_dim=64, descriptor_eps=1e-4, descriptor_buffer_size=500,
+                 incremental_gate_bias_init=-1.0):
         super().__init__()
         self.d_model, self.base_expert_count = int(d_model), int(num_experts)
         self.default_reduction, self.descriptor_dim = int(reduction), int(descriptor_dim)
         self.descriptor_eps = float(descriptor_eps)
+        self.descriptor_buffer_size = int(descriptor_buffer_size)
+        self.incremental_gate_bias_init = float(incremental_gate_bias_init)
         self.layer_norm = LayerNorm(self.d_model)
         self.residual_scale = nn.Parameter(torch.ones(1) * float(residual_scale_init))
         self.experts = nn.ModuleList([BottleneckExpert(self.d_model, reduction)
                                       for _ in range(self.base_expert_count)])
         self.descriptors = nn.ModuleList([
-            RepresentationDescriptor(self.d_model, descriptor_dim, descriptor_eps)
+            RepresentationDescriptor(self.d_model, descriptor_dim, descriptor_eps, descriptor_buffer_size)
             for _ in range(self.base_expert_count)
         ])
         self.router = ExpandableRouter(self.d_model, self.base_expert_count)
@@ -264,11 +321,32 @@ class VisualMoEAdapter(nn.Module):
             self.assert_descriptors_ready()
         return torch.stack([descriptor.standardized_score(x) for descriptor in self.descriptors], dim=-1)
 
+    def expansion_statistics(self, x):
+        scores = self.descriptor_scores(x, require_ready=True)
+        return scores, scores.mean(dim=0)
+
     @torch.no_grad()
-    def update_descriptor_stats(self, errors, expert_id, responsibilities=None, fit_sample_count=None):
-        return self.descriptors[int(expert_id)].update_stats(
-            errors, responsibilities=responsibilities, fit_sample_count=fit_sample_count
-        )
+    def update_descriptor_stats(self, errors, expert_id):
+        return self.descriptors[int(expert_id)].update_reference(errors)
+
+    def old_anchor_suppression_loss(self, anchor_mean, anchor_var, residual_weight=1.0):
+        if anchor_mean is None or anchor_mean.numel() == 0:
+            return self.residual_scale.new_zeros(())
+        mean = anchor_mean.to(device=self.residual_scale.device, dtype=torch.float32)
+        var = anchor_var.to(device=mean.device, dtype=torch.float32).clamp_min(1e-6)
+        anchors = torch.cat([mean, mean + var.sqrt(), mean - var.sqrt()], dim=0)
+        gate = torch.sigmoid(self.router.columns[-1](anchors))
+        residual = self.experts[-1](anchors)
+        return gate.square().mean() + float(residual_weight) * (gate * residual).square().mean()
+
+    @torch.no_grad()
+    def old_anchor_response(self, anchor_mean, anchor_var):
+        if anchor_mean is None or anchor_mean.numel() == 0:
+            return 0.0
+        mean = anchor_mean.to(device=self.residual_scale.device, dtype=torch.float32)
+        var = anchor_var.to(device=mean.device, dtype=torch.float32).clamp_min(1e-6)
+        anchors = torch.cat([mean, mean + var.sqrt(), mean - var.sqrt()], dim=0)
+        return float(torch.sigmoid(self.router.columns[-1](anchors)).mean().item())
 
     def freeze_all(self):
         for parameter in self.parameters():
@@ -288,14 +366,17 @@ class VisualMoEAdapter(nn.Module):
                 parameter.requires_grad = True
         self.train()
 
-    def add_expert(self, session_id, reduction=None):
+    def add_expert(self, session_id, reduction=None, gate_bias_init=None):
         self.freeze_all()
         reduction = self.default_reduction if reduction is None else int(reduction)
         self.experts.append(BottleneckExpert(self.d_model, reduction, zero_init_up=True).to(
             device=self.residual_scale.device, dtype=self.residual_scale.dtype))
         self.descriptors.append(RepresentationDescriptor(
-            self.d_model, self.descriptor_dim, self.descriptor_eps).to(device=self.residual_scale.device))
-        self.router.add_column()
+            self.d_model, self.descriptor_dim, self.descriptor_eps, self.descriptor_buffer_size
+        ).to(device=self.residual_scale.device))
+        self.router.add_column(
+            self.incremental_gate_bias_init if gate_bias_init is None else float(gate_bias_init)
+        )
         self.router.columns[-1].to(device=self.residual_scale.device, dtype=self.residual_scale.dtype)
         self.expert_birth_sessions.append(int(session_id))
         self.set_newest_trainable()
@@ -315,7 +396,7 @@ class VisualMoEAdapter(nn.Module):
                 yield name, parameter
 
     def export_topology(self):
-        return {"version": 1, "d_model": self.d_model, "base_expert_count": self.base_expert_count,
+        return {"version": 2, "d_model": self.d_model, "base_expert_count": self.base_expert_count,
                 "experts": [{"reduction": max(1, self.d_model // expert.c_fc.out_features),
                              "birth_session": int(self.expert_birth_sessions[index])}
                             for index, expert in enumerate(self.experts)]}
@@ -325,6 +406,10 @@ class VisualMoEAdapter(nn.Module):
             topology = {"d_model": self.d_model, "base_expert_count": self.base_expert_count,
                         "experts": [{"reduction": self.default_reduction, "birth_session": 0}
                                     for _ in range(self.base_expert_count)]}
+        if not isinstance(topology, dict):
+            raise ValueError("MoE topology must be a mapping.")
+        if int(topology.get("version", 2)) != 2:
+            raise ValueError("Unsupported MoE topology version.")
         if int(topology.get("d_model", self.d_model)) != self.d_model:
             raise ValueError("MoE topology d_model mismatch.")
         if int(topology.get("base_expert_count", self.base_expert_count)) != self.base_expert_count:
@@ -332,13 +417,25 @@ class VisualMoEAdapter(nn.Module):
         specs = list(topology.get("experts", []))
         if len(specs) < self.base_expert_count:
             raise ValueError("MoE topology has fewer experts than the base pool.")
+        for index, spec in enumerate(specs):
+            if not isinstance(spec, dict):
+                raise ValueError(f"MoE topology expert {index} must be a mapping.")
+            reduction = spec.get("reduction", self.default_reduction)
+            birth_session = spec.get("birth_session", 0)
+            if isinstance(reduction, bool) or int(reduction) < 1:
+                raise ValueError(f"MoE topology expert {index} has invalid reduction.")
+            if isinstance(birth_session, bool) or int(birth_session) < 0:
+                raise ValueError(f"MoE topology expert {index} has invalid birth session.")
+            if index < self.base_expert_count and int(birth_session) != 0:
+                raise ValueError("Base experts must have birth_session=0.")
+        # Validate the complete topology before mutating live modules.
         self.experts, self.descriptors = nn.ModuleList(), nn.ModuleList()
         self.router, self.expert_birth_sessions = ExpandableRouter(self.d_model), []
         for spec in specs:
             reduction = int(spec.get("reduction", self.default_reduction))
             self.experts.append(BottleneckExpert(self.d_model, reduction))
             self.descriptors.append(RepresentationDescriptor(
-                self.d_model, self.descriptor_dim, self.descriptor_eps))
+                self.d_model, self.descriptor_dim, self.descriptor_eps, self.descriptor_buffer_size))
             self.router.add_column()
             self.expert_birth_sessions.append(int(spec.get("birth_session", 0)))
         device, dtype = self.residual_scale.device, self.residual_scale.dtype
@@ -347,21 +444,51 @@ class VisualMoEAdapter(nn.Module):
         self.descriptors.to(device=device, dtype=torch.float32)
         self.freeze_all()
 
-    def forward(self, x):
+    def remove_newest_expert(self):
+        if self.num_experts <= self.base_expert_count:
+            raise RuntimeError("Cannot remove a base expert.")
+        # ModuleList.pop() is unavailable in older PyTorch releases.
+        # Deleting the last index unregisters the temporary modules and
+        # preserves the indices/state_dict keys of historical experts.
+        del self.experts[-1]
+        del self.descriptors[-1]
+        del self.router.columns[-1]
+        self.expert_birth_sessions.pop()
+        self.freeze_all()
+
+    def forward(self, x, route_input=None):
         if x.ndim != 3:
             raise ValueError("VisualMoEAdapter expects [tokens, batch, dim].")
         x_norm = self.layer_norm(x)
-        logits, weights = self.router(x_norm[0])
-        residual, norms = torch.zeros_like(x_norm), []
-        for expert_id, expert in enumerate(self.experts):
-            weighted = expert(x_norm) * weights[:, expert_id].unsqueeze(0).unsqueeze(-1)
+        # Expert functions consume the dynamically adapted token stream.  The
+        # router and its paired AE consume the frozen reference stream.
+        route_features = (
+            x_norm[0] if route_input is None
+            else self.layer_norm(route_input)
+        )
+        # The base mixture is never renormalised when incremental experts arrive.
+        base_logits, base_weights = self.router(route_features, self.base_expert_count)
+        incremental_ids = list(range(self.base_expert_count, self.num_experts))
+        gate_logits = [self.router.columns[index](route_features) for index in incremental_ids]
+        incremental_gates = [torch.sigmoid(value) for value in gate_logits]
+        weights = torch.cat([base_weights] + incremental_gates, dim=-1) if incremental_gates else base_weights
+        logits = torch.cat([base_logits] + gate_logits, dim=-1) if gate_logits else base_logits
+        residual, norms, output_energies = torch.zeros_like(x_norm), [], []
+        expert_ids = list(range(self.base_expert_count)) + incremental_ids
+        for column, expert_id in enumerate(expert_ids):
+            expert_output = self.experts[expert_id](x_norm)
+            weighted = expert_output * weights[:, column].unsqueeze(0).unsqueeze(-1)
             residual = residual + weighted
             norms.append(weighted.detach().float().pow(2).mean().sqrt())
+            # Keep the un-gated functional output energy differentiable. This
+            # regularizes expert magnitude independently of route sparsity.
+            output_energies.append(expert_output.float().pow(2).mean())
         residual = self.residual_scale.to(residual.dtype) * residual
         return residual, {"logits": logits, "route_weights": weights,
                           "top_k_indices": weights.argmax(dim=-1, keepdim=True),
-                          "cls_in": x_norm[0], "patch_mean_in": x_norm[1:].mean(dim=0),
+                          "cls_in": route_features,
                           "expert_residual_norms": torch.stack(norms),
+                          "expert_output_energy": torch.stack(output_energies),
                           "token_residual": residual.detach()}
 
 
@@ -392,6 +519,24 @@ class ResidualAttentionBlock(nn.Module):
             x = x + moe_out
         return x, moe_aux
 
+    def forward_dual(self, adapted_x: torch.Tensor, reference_x: torch.Tensor):
+        """Advance adapted and frozen-reference streams through one ViT block."""
+        # The reference stream is the original frozen CLIP path.  It never
+        # receives adapter residuals and never builds a backbone autograd graph.
+        with torch.no_grad():
+            reference_x = reference_x + self.attention(self.ln_1(reference_x))
+            reference_x = reference_x + self.mlp(self.ln_2(reference_x))
+
+        adapted_x = adapted_x + self.attention(self.ln_1(adapted_x))
+        adapted_x = adapted_x + self.mlp(self.ln_2(adapted_x))
+        moe_aux = None
+        if self.moe_adapter is not None:
+            moe_out, moe_aux = self.moe_adapter(
+                adapted_x, route_input=reference_x[0]
+            )
+            adapted_x = adapted_x + moe_out
+        return adapted_x, reference_x, moe_aux
+
 class Transformer(nn.Module):
     def __init__(self, width: int, layers: int, heads: int, attn_mask: torch.Tensor = None):
         super().__init__()
@@ -420,34 +565,103 @@ class VisionTransformer(nn.Module):
         self.ln_post = LayerNorm(width)
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
 
-    def forward(self, x: torch.Tensor, all_layer_outputs=False, return_moe_aux=False):
-        x = self.conv1(x)  
-        x = x.reshape(x.shape[0], x.shape[1], -1)  
-        x = x.permute(0, 2, 1)  
-        x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1) 
+    def forward(self, x: torch.Tensor, all_layer_outputs=False,
+                return_moe_aux=False, return_reference=False):
+        x = self.conv1(x)
+        x = x.reshape(x.shape[0], x.shape[1], -1)
+        x = x.permute(0, 2, 1)
+        x = torch.cat([
+            self.class_embedding.to(x.dtype) + torch.zeros(
+                x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device
+            ),
+            x,
+        ], dim=1)
         x = x + self.positional_embedding.to(x.dtype)
         x = self.ln_pre(x)
 
-        if not all_layer_outputs:
-            x = x.permute(1, 0, 2)  
-            x, moe_aux_list = self.transformer(x)
-            x = x.permute(1, 0, 2)  
-            x = self.ln_post(x[:, 0, :])
-            if self.proj is not None: x = x @ self.proj
-            if return_moe_aux: return x, moe_aux_list
-            return x
-        else:
-            x = x.permute(1, 0, 2)  
-            outputs, moe_aux_list = [], []
+        has_moe = any(block.moe_adapter is not None for block in self.transformer.resblocks)
+        if has_moe:
+            adapted_x = x.permute(1, 0, 2)
+            reference_x = adapted_x.detach()
+            moe_aux_list, adapted_outputs, reference_outputs = [], [], []
             for block in self.transformer.resblocks:
-                x, aux = block(x)
-                if aux is not None: moe_aux_list.append(aux)
-                cur_output = x.permute(1, 0, 2)
-                cur_output = self.ln_post(cur_output[:, 0, :])
-                if self.proj is not None: cur_output = cur_output @ self.proj
-                outputs.append(cur_output)
-            if return_moe_aux: return outputs, moe_aux_list
-            return outputs
+                adapted_x, reference_x, aux = block.forward_dual(adapted_x, reference_x)
+                if aux is not None:
+                    moe_aux_list.append(aux)
+                if all_layer_outputs:
+                    adapted_tokens = adapted_x.permute(1, 0, 2)
+                    reference_tokens = reference_x.permute(1, 0, 2)
+                    adapted_feature = self.ln_post(adapted_tokens[:, 0, :])
+                    with torch.no_grad():
+                        reference_feature = self.ln_post(reference_tokens[:, 0, :])
+                        if self.proj is not None:
+                            reference_feature = reference_feature @ self.proj
+                    if self.proj is not None:
+                        adapted_feature = adapted_feature @ self.proj
+                    adapted_outputs.append(adapted_feature)
+                    reference_outputs.append(reference_feature)
+
+            if all_layer_outputs:
+                if return_reference:
+                    if return_moe_aux:
+                        return adapted_outputs, reference_outputs, moe_aux_list
+                    return adapted_outputs, reference_outputs
+                if return_moe_aux:
+                    return adapted_outputs, moe_aux_list
+                return adapted_outputs
+
+            adapted_tokens = adapted_x.permute(1, 0, 2)
+            reference_tokens = reference_x.permute(1, 0, 2)
+            adapted_feature = self.ln_post(adapted_tokens[:, 0, :])
+            with torch.no_grad():
+                reference_feature = self.ln_post(reference_tokens[:, 0, :])
+                if self.proj is not None:
+                    reference_feature = reference_feature @ self.proj
+            if self.proj is not None:
+                adapted_feature = adapted_feature @ self.proj
+            if return_reference:
+                if return_moe_aux:
+                    return adapted_feature, reference_feature, moe_aux_list
+                return adapted_feature, reference_feature
+            if return_moe_aux:
+                return adapted_feature, moe_aux_list
+            return adapted_feature
+
+        # Preserve the original single-pass CLIP path when no visual adapters
+        # are installed; reference and adapted representations are identical.
+        if not all_layer_outputs:
+            tokens = x.permute(1, 0, 2)
+            tokens, moe_aux_list = self.transformer(tokens)
+            tokens = tokens.permute(1, 0, 2)
+            feature = self.ln_post(tokens[:, 0, :])
+            if self.proj is not None:
+                feature = feature @ self.proj
+            if return_reference:
+                if return_moe_aux:
+                    return feature, feature, moe_aux_list
+                return feature, feature
+            if return_moe_aux:
+                return feature, moe_aux_list
+            return feature
+
+        tokens = x.permute(1, 0, 2)
+        outputs, moe_aux_list = [], []
+        for block in self.transformer.resblocks:
+            tokens, aux = block(tokens)
+            if aux is not None:
+                moe_aux_list.append(aux)
+            current = tokens.permute(1, 0, 2)
+            current = self.ln_post(current[:, 0, :])
+            if self.proj is not None:
+                current = current @ self.proj
+            outputs.append(current)
+        if return_reference:
+            if return_moe_aux:
+                return outputs, outputs, moe_aux_list
+            return outputs, outputs
+        if return_moe_aux:
+            return outputs, moe_aux_list
+        return outputs
 
 class CLIP(nn.Module):
     def __init__(self, embed_dim: int, image_resolution: int, vision_layers: Union[Tuple[int, int, int, int], int], vision_width: int, vision_patch_size: int, context_length: int, vocab_size: int, transformer_width: int, transformer_heads: int, transformer_layers: int):
@@ -502,9 +716,19 @@ class CLIP(nn.Module):
     def dtype(self):
         return self.visual.conv1.weight.dtype
 
-    def encode_image(self, image, return_moe_aux=False):
-        if return_moe_aux: return self.visual(image.type(self.dtype), return_moe_aux=True)
-        return self.visual(image.type(self.dtype))
+    def encode_image(self, image, return_moe_aux=False, return_reference=False):
+        if not isinstance(self.visual, VisionTransformer):
+            feature = self.visual(image.type(self.dtype))
+            if return_reference:
+                if return_moe_aux:
+                    return feature, feature, []
+                return feature, feature
+            return (feature, []) if return_moe_aux else feature
+        return self.visual(
+            image.type(self.dtype),
+            return_moe_aux=return_moe_aux,
+            return_reference=return_reference,
+        )
 
     def encode_text(self, text):
         x = self.token_embedding(text).type(self.dtype)
@@ -592,6 +816,8 @@ def build_model(state_dict: dict, cfg=None):
         )
         descriptor_dim = getattr(moe_cfg, "DESCRIPTOR_DIM", 64)
         descriptor_eps = getattr(moe_cfg, "DESCRIPTOR_EPS", 1e-4)
+        descriptor_buffer_size = getattr(moe_cfg, "DESCRIPTOR_BUFFER_SIZE", 500)
+        incremental_gate_bias_init = getattr(moe_cfg, "INCREMENTAL_GATE_BIAS_INIT", -1.0)
         for idx in moe_cfg.INSERT_BLOCKS:
             if idx < 0: idx = len(model.visual.transformer.resblocks) + idx
             block = model.visual.transformer.resblocks[idx]
@@ -602,6 +828,8 @@ def build_model(state_dict: dict, cfg=None):
                 residual_scale_init=base_scale_init,
                 descriptor_dim=descriptor_dim,
                 descriptor_eps=descriptor_eps,
+                descriptor_buffer_size=descriptor_buffer_size,
+                incremental_gate_bias_init=incremental_gate_bias_init,
             )
         convert_weights(model)
     return model.eval()

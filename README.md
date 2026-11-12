@@ -46,56 +46,68 @@ python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/t
 python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc_ensemble.yaml
 ~~~
 
-### Dynamic FSCIL MoE runs
+### Unified AE-driven dynamic FSCIL MoE
 
-The `bimc.yaml` configuration now auto-saves a dataset/seed-specific fixed
-support manifest, alongside session checkpoints, query-exclusive LOO training
-and demand-driven dynamic experts. For reproducible comparisons across model
-variants, explicitly reuse one manifest and run a no-expansion baseline:
+This branch implements a single current visual feature space. It intentionally
+does not support resuming checkpoints produced by the earlier versioned/task-
+gated architecture. Unified checkpoints use schema 14.
 
-~~~BASH
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --support_manifest checkpoints/fscil_moe/cub_seed1_support.json --expansion_mode none
+The incremental procedure is:
+
+1. Run a frozen-reference ViT stream alongside the adapted stream. The reference stream never receives adapter residuals and supplies stable per-layer CLS features for routing, AE descriptors, expansion decisions, and old-class anchors.
+2. Score each layer with the reconstruction-error Z-scores of every deployed
+   linear AE descriptor. Each descriptor is a centered, tied-weight, low-rank linear AE and keeps a rolling 500-error reference. Incremental error moments are shrunk toward a per-layer Base prior using the support count, with the prior strength fixed in configuration.
+3. Expand a layer only when the class-balanced mean absolute Z-score is above
+   the configured threshold for **every** existing descriptor. Scan blocks in
+   ascending order and recollect deeper-layer features after an upstream layer
+   has been expanded and trained.
+4. Add at most one residual expert per layer per session. Its up-projection is
+   zero-initialized. Freeze the CLIP backbone, all historical experts and all
+   historical router columns; train only the new expert and its independent
+   sigmoid router column.
+5. Suppress the new expert's router response and residual on stored old-class,
+   per-layer Gaussian anchors. No historical images or historical encoder
+   versions are used.
+6. Fit the new expert's paired AE on its final local representation distribution,
+   then freeze it and its 500-error reference buffer.
+7. Build current-session visual prototypes with source-exclusive leave-one-out
+   support means. Use calibrated text semantics to retrieve related old visual
+   prototype directions and align the new visual prototypes. Fuse calibrated
+   visual and textual prototypes into one global classifier over every seen
+   class.
+8. Evaluate all seen classes using one current CLIP+MoE forward path and that
+   single global prototype bank. No task gate, version-specific feature
+   extraction, or task-specific classifier branch participates in prediction.
+
+The SEMA implementation is the reference for the linear AE, MSE
+reconstruction objective, rolling reconstruction-error records and absolute
+Z-score outlier rule. The BiMC paper supplies the textual intra-modal
+calibration and visual/textual prototype fusion motivation. The semantic
+similarity transfer from old visual prototypes is the FSCIL-specific alignment
+design used in this branch; it is not claimed to be a verbatim reproduction of
+BiMC's visual calibration equation.
+
+Run tests:
+
+~~~bash
+python -m unittest tests.test_risk_guided_moe -v
 ~~~
 
-The default `auto` mode computes each layer's discriminative coverage deficit:
-only samples with a negative all-seen visual LOO margin and descriptor coverage
-excess contribute expansion evidence. The largest positive eligible layer adds
-one Linear Gate, Expert and Scale. Training uses one softmax over `NULL` and all
-dynamic experts, refreshed query-exclusive visual prototypes each epoch, and only
-visual classification plus historical-path invariance losses. Deployment uses the
-same logits with hard Top-1 routing. A candidate is retained only when its hard
-deployment LOO objective plus historical invariance is lower than the pre-candidate
-objective; otherwise the exact pre-expansion state is restored. Force/session/block
-overrides are intentionally unavailable in the production path.
-The explicit full-auto CUB200 command is:
+Run a full experiment using the standard configuration:
 
-~~~BASH
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --expansion_mode auto
+~~~bash
+python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml
 ~~~
 
-For staged development, reuse Session 0 and stop after Task 3 without changing
-the normal full-run default:
-
-~~~BASH
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --resume checkpoints/fscil_moe/session_00.pth --expansion_mode auto --end_session 3
-~~~
-
-Resume from a checkpoint produced by this safety-bounded version with:
-
-~~~BASH
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --resume checkpoints/fscil_moe/session_03.pth
-~~~
-
-Legacy dynamic-expert checkpoint schemas are intentionally rejected when they
-predate the current logit-NULL routing and transactional safety contract.
-
-Each completed session also records per-expert/null routing and a deterministic
-support-proxy leave-one-expert-out diagnostic (`accuracy_gain` and
-`margin_gain`). It masks the selected residual without re-routing to another
-expert, so the reported value is that expert's direct marginal contribution.
-Historical experts additionally receive a support-only forward-interference
-report. Accuracy targets are kept outside runtime; use
-`python tools/report_regression.py --accuracies ...` after a run.
+The support manifest remains fixed across comparisons. AA is the mean of the
+per-session overall accuracies observed so far. PD is average forgetting in
+percentage points: for each task, take its best observed task accuracy from
+the task's introduction through the current session, subtract its current
+accuracy, then average across tasks. Checkpoints save the complete expert
+topology, AE reference buffers, per-class/per-layer old-class anchors, global
+prototype states, diagnostics and RNG state. Do not resume schema 6-9
+checkpoints: their versioned feature paths and task gates are incompatible
+with the unified feature space.
 
 ## Acknowledgment
 
@@ -106,6 +118,6 @@ In this repository, we build our code based on the following excellent open-sour
 - [FeCAM](https://github.com/dipamgoswami/FeCAM)
 - [CuPL](https://github.com/sarahpratt/CuPL)
 - [AdaptCLIPZS](https://github.com/cvl-umass/AdaptCLIPZS)
-
-
+- [SEMA-CL](https://github.com/huiyiwang01/SEMA-CL), for the linear AE descriptor and reconstruction-error outlier detection
+- [MoE-Adapters4CL](https://github.com/JiazuoYu/MoE-Adapters4CL), for dynamic expert routing design
 

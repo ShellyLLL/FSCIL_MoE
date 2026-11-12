@@ -1,6 +1,6 @@
 DATASET:
   NAME: "CUB200"
-  ROOT: "data/CUB_200_2011"
+  ROOT: "/data/lx/fscil/data/CUB_200_2011"
   GPT_PATH: "description/modified_cub200_output.json"
   NUM_CLASSES: 200
   NUM_INIT_CLS: 100
