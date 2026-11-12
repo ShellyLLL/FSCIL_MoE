@@ -189,6 +189,25 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         self.assertGreater(float(logits.grad[0]), 0.0)
         self.assertLess(float(logits.grad[1]), 0.0)
 
+    def test_reference_stream_matches_unmodified_frozen_clip_vit(self):
+        torch.manual_seed(229)
+        model = TinyVisualCLIP().eval()
+        images = torch.randn(4, 3, 8, 8)
+        with torch.no_grad():
+            _, reference, _ = model.visual(
+                images, return_moe_aux=True, return_reference=True
+            )
+            adapters = []
+            for block in model.visual.transformer.resblocks:
+                adapters.append(block.moe_adapter)
+                block.moe_adapter = None
+            try:
+                baseline = model.visual(images)
+            finally:
+                for block, adapter in zip(model.visual.transformer.resblocks, adapters):
+                    block.moe_adapter = adapter
+        torch.testing.assert_close(reference, baseline, rtol=0, atol=0)
+
     def test_dual_path_reference_is_unchanged_by_adapter_updates(self):
         torch.manual_seed(211)
         model = TinyVisualCLIP().eval()
