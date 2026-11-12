@@ -427,7 +427,9 @@ class BiMC(nn.Module):
         reference_images_proto = reference_images_proto[class_rows]
 
         if cls_begin_index == 0:
-            self.base_vision_prototype = images_proto.detach().clone()
+            # This bank is consumed by reference-space calibration, not by the
+            # adapted classifier; keep it in the frozen-reference embedding space.
+            self.base_vision_prototype = reference_images_proto.detach().clone()
 
         source_ids = getattr(getattr(loader, "dataset", None), "source_ids", None)
         source_ids = (
