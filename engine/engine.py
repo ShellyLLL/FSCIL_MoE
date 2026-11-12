@@ -283,16 +283,16 @@ class Runner:
             raise ValueError("Resume checkpoint must contain a dictionary payload.")
         required = (
             "schema_version", "completed_session", "model_state", "task_states",
-            "support_manifest", "moe_topology",
+            "support_manifest", "moe_topology", "expansion_thresholds",
         )
         missing = [key for key in required if key not in payload]
         if missing:
             raise ValueError(f"Resume checkpoint is missing required fields: {missing}")
         schema = int(payload["schema_version"])
-        if schema != 12:
+        if schema != 13:
             raise ValueError(
-                "This branch uses dual-path low-rank-AE checkpoint schema (12); "
-                "older single-path checkpoints are incompatible."
+                "This branch uses calibrated dual-path BiMC checkpoint schema (13); "
+                "older single-path or pre-fusion checkpoints are incompatible."
             )
         if not isinstance(payload["model_state"], dict):
             raise TypeError("Resume checkpoint model_state must be a state_dict mapping.")
@@ -319,6 +319,37 @@ class Runner:
         self.model_without_dp.load_state_dict(payload["model_state"], strict=True)
         for _, adapter in self._moe_adapters():
             adapter.freeze_all()
+        thresholds = payload.get("expansion_thresholds")
+        if not isinstance(thresholds, dict):
+            raise TypeError("Checkpoint expansion_thresholds must be a mapping.")
+        self.expansion_thresholds = {
+            int(key): float(value) for key, value in thresholds.items()
+        }
+        if not all(np.isfinite(value) for value in self.expansion_thresholds.values()):
+            raise ValueError("Checkpoint expansion thresholds must be finite.")
+        if bool(self._visual_moe_cfg().ENABLE):
+            expected_blocks = {int(block) for block in self.model_without_dp.expandable_blocks()}
+            if set(self.expansion_thresholds) != expected_blocks:
+                raise ValueError(
+                    "Checkpoint expansion thresholds do not cover the deployed MoE blocks: "
+                    f"{set(self.expansion_thresholds)} versus {expected_blocks}."
+                )
+        for session_index, state in enumerate(payload["task_states"]):
+            required_state = ("class_ids", "image_proto", "text_features",
+                              "description_proto", "final_proto")
+            missing_state = [key for key in required_state if key not in state]
+            if missing_state:
+                raise ValueError(
+                    f"Checkpoint task state {session_index} is missing calibrated fields: {missing_state}"
+                )
+            class_ids = torch.as_tensor(state["class_ids"], dtype=torch.long).reshape(-1)
+            if any(torch.as_tensor(state[key]).size(0) != class_ids.numel()
+                   for key in ("image_proto", "text_features", "description_proto", "final_proto")):
+                raise ValueError(
+                    f"Checkpoint task state {session_index} has prototype/class-id row mismatch."
+                )
+            if not torch.isfinite(torch.as_tensor(state["final_proto"]).float()).all():
+                raise ValueError(f"Checkpoint task state {session_index} has non-finite final prototypes.")
         manifest = payload.get("support_manifest")
         if manifest is None:
             raise ValueError("Resume checkpoint support_manifest must not be null.")
@@ -331,9 +362,7 @@ class Runner:
         self.acc_list = payload.get("acc_list", [])
         self.task_acc_list = payload.get("task_acc_list", [])
         self.session_diagnostics = diagnostics
-        self.expansion_thresholds = {
-            int(key): float(value) for key, value in payload.get("expansion_thresholds", {}).items()
-        }
+        # Thresholds were validated and installed before restoring support data.
         self._resume_completed_session = completed_session
         self._restore_rng_state(payload.get("rng_state"))
         print(f"=> Resumed session {self._resume_completed_session} from {path}")
@@ -345,7 +374,7 @@ class Runner:
         directory.mkdir(parents=True, exist_ok=True)
         topology = self.model_without_dp.export_moe_topology()
         payload = {
-            "schema_version": 12,
+            "schema_version": 13,
             "completed_session": int(completed_session),
             "model_state": self._cpu_copy(self.model_without_dp.state_dict()),
             "moe_topology": topology,
