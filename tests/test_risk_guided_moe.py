@@ -176,6 +176,17 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             torch.tensor([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]])
         )
 
+    def test_uncovered_batch_selection_keeps_images_labels_and_source_ids_aligned(self):
+        images = torch.arange(4).float().unsqueeze(1)
+        labels = torch.tensor([2, 3, 4, 3])
+        source_ids = torch.tensor([10, 11, 12, 13])
+        selected_images, selected_labels, selected_sources = Runner._select_uncovered_batch(
+            images, labels, source_ids, [3]
+        )
+        self.assertEqual(selected_images.squeeze(1).tolist(), [1.0, 3.0])
+        self.assertEqual(selected_labels.tolist(), [3, 3])
+        self.assertEqual(selected_sources.tolist(), [11, 13])
+
     def test_global_incremental_logits_use_one_current_encoder_and_global_columns(self):
         runner = Runner.__new__(Runner)
         class Encoder:
