@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models.clip.model import RepresentationDescriptor, VisualMoEAdapter, VisionTransformer
-from models.bimc import BiMC
+from models.bimc import BiMC, build_loo_cache_from_embeddings
 from engine.engine import Runner
 
 
@@ -137,6 +137,32 @@ def lifecycle_batch(class_id, feature, source_start, augmented=False, seed=0):
         "label": torch.full((count,), int(class_id), dtype=torch.long),
         "source_ids": torch.arange(source_start, source_start + count),
     }
+
+
+def make_lifecycle_state(runner, model, class_id, support, creation_session):
+    anchors = runner._collect_class_anchors([support])
+    with torch.no_grad():
+        prototype = F.normalize(
+            model.extract_img_feature(support["image"]).mean(0, keepdim=True), dim=-1
+        )
+    semantic = F.normalize(torch.eye(8)[[class_id]], dim=-1)
+    return {
+        "class_ids": torch.tensor([class_id]),
+        "image_proto": prototype,
+        "text_features": semantic,
+        "description_proto": semantic,
+        "anchor_by_block": anchors,
+        "creation_session": int(creation_session),
+    }
+
+
+def lifecycle_route_snapshot(model, images):
+    model.eval()
+    with torch.no_grad():
+        features, aux = model.extract_img_feature_train(images)
+    return features.detach().clone(), [
+        item["route_weights"].detach().clone() for item in aux
+    ]
 
 
 class UnifiedDynamicMoETests(unittest.TestCase):
@@ -668,6 +694,261 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             torch.testing.assert_close(restored["cls_in"], expected["cls_in"], rtol=0, atol=0)
         for _, adapter in restored_runner._moe_adapters():
             adapter.assert_descriptors_ready()
+
+
+
+    def test_long_sequence_base_plus_four_incremental_sessions(self):
+        torch.manual_seed(101)
+        runner, model = build_lifecycle_runner()
+        model.eval()
+        base_support = lifecycle_batch(
+            0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 1000
+        )
+        runner._train_base_descriptors([base_support])
+        states = [make_lifecycle_state(runner, model, 0, base_support, 0)]
+
+        expected_counts = [2, 3, 4, 5, 6]
+        self.assertEqual(
+            [adapter.num_experts for _, adapter in runner._moe_adapters()],
+            [expected_counts[0], expected_counts[0]],
+        )
+        for session_id in range(1, 5):
+            feature = torch.zeros(8)
+            feature[session_id] = 1.0
+            support = lifecycle_batch(session_id, feature, 1000 + session_id * 10)
+            train = lifecycle_batch(
+                session_id, feature, 1000 + session_id * 10,
+                augmented=True, seed=100 + session_id,
+            )
+            result = runner.train_incremental_task(
+                session_id, [train], [support], [session_id],
+                [f"class_{session_id}"], states,
+            )
+            self.assertTrue(result["trained"])
+            self.assertEqual(
+                [entry["uncovered_classes"] for entry in result["expanded"]],
+                [[session_id], [session_id]],
+            )
+            self.assertEqual(
+                [adapter.num_experts for _, adapter in runner._moe_adapters()],
+                [expected_counts[session_id], expected_counts[session_id]],
+            )
+            self.assertEqual(
+                [adapter.expert_birth_sessions[-1] for _, adapter in runner._moe_adapters()],
+                [session_id, session_id],
+            )
+            for block in model.expandable_blocks():
+                features = model.collect_blockwise_cls_features([support])
+                decision = model.plan_layer_expansion(block, features, [session_id])
+                self.assertFalse(decision.expand)
+                self.assertEqual(decision.uncovered_classes, [])
+            states.append(make_lifecycle_state(
+                runner, model, session_id, support, session_id
+            ))
+
+        for _, adapter in runner._moe_adapters():
+            self.assertEqual(adapter.num_experts, 6)
+            self.assertEqual(adapter.expert_birth_sessions, [0, 0, 1, 2, 3, 4])
+            adapter.assert_descriptors_ready()
+            self.assertTrue(all(not parameter.requires_grad for parameter in adapter.parameters()))
+
+    def test_quantifies_old_feature_accuracy_and_routing_retention(self):
+        torch.manual_seed(109)
+        runner, model = build_lifecycle_runner()
+        model.eval()
+        base_support = lifecycle_batch(
+            0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 2000
+        )
+        runner._train_base_descriptors([base_support])
+        base_state = make_lifecycle_state(runner, model, 0, base_support, 0)
+
+        session1_support = lifecycle_batch(
+            1, torch.tensor([0., 1., 0., 0., 0., 0., 0., 0.]), 2010
+        )
+        session1_train = lifecycle_batch(
+            1, torch.tensor([0., 1., 0., 0., 0., 0., 0., 0.]), 2010,
+            augmented=True, seed=111,
+        )
+        runner.train_incremental_task(
+            1, [session1_train], [session1_support], [1], ["class_1"], [base_state]
+        )
+        session1_state = make_lifecycle_state(runner, model, 1, session1_support, 1)
+
+        old_images = torch.cat([base_support["image"], session1_support["image"]], dim=0)
+        old_labels = torch.tensor([0] * 4 + [1] * 4)
+        old_prototypes = torch.cat([
+            base_state["image_proto"], session1_state["image_proto"]
+        ], dim=0)
+        before_features, before_routes = lifecycle_route_snapshot(model, old_images)
+        before_accuracy = int(
+            (F.normalize(before_features, dim=-1) @ old_prototypes.t())
+            .argmax(dim=-1).eq(old_labels).sum().item()
+        )
+
+        session2_support = lifecycle_batch(
+            2, torch.tensor([0., 0., 1., 0., 0., 0., 0., 0.]), 2020
+        )
+        session2_train = lifecycle_batch(
+            2, torch.tensor([0., 0., 1., 0., 0., 0., 0., 0.]), 2020,
+            augmented=True, seed=113,
+        )
+        runner.train_incremental_task(
+            2, [session2_train], [session2_support], [2], ["class_2"],
+            [base_state, session1_state],
+        )
+        after_features, after_routes = lifecycle_route_snapshot(model, old_images)
+        after_accuracy = int(
+            (F.normalize(after_features, dim=-1) @ old_prototypes.t())
+            .argmax(dim=-1).eq(old_labels).sum().item()
+        )
+        per_sample_cosine = F.cosine_similarity(
+            before_features.float(), after_features.float(), dim=-1
+        )
+        feature_cosine = float(per_sample_cosine.mean().item())
+        route_deltas, newest_old_responses = [], []
+        for (_, adapter), before, after in zip(
+            runner._moe_adapters(), before_routes, after_routes
+        ):
+            historical_count = before.size(-1)
+            route_deltas.append(float(
+                (before - after[:, :historical_count]).abs().mean().item()
+            ))
+            newest_old_responses.append(float(after[:, -1].mean().item()))
+
+        self.assertEqual(before_accuracy, 8)
+        self.assertEqual(after_accuracy, before_accuracy)
+        self.assertTrue(torch.isfinite(per_sample_cosine).all())
+        self.assertGreaterEqual(feature_cosine, 0.98)
+        self.assertTrue(all(torch.isfinite(torch.tensor(route_deltas))))
+        self.assertLess(max(route_deltas), 0.10)
+        self.assertLess(max(newest_old_responses), 0.30)
+        print(
+            "[RETENTION] old_feature_cosine=%.6f old_accuracy=%d/%d "
+            "historical_route_mean_abs_delta=%s newest_expert_old_response=%s"
+            % (feature_cosine, after_accuracy, old_labels.numel(),
+               [round(value, 6) for value in route_deltas],
+               [round(value, 6) for value in newest_old_responses])
+        )
+
+    def test_extreme_nonfinite_reconstruction_scores_are_rejected(self):
+        runner, model = build_lifecycle_runner()
+        for _, adapter in runner._moe_adapters():
+            for descriptor in adapter.descriptors:
+                descriptor.update_reference(torch.tensor([0.1, 0.11, 0.09, 0.1]))
+        extreme = torch.full((4, 8), 1e20)
+        features = {0: {
+            "cls_in": extreme,
+            "labels": torch.tensor([7, 7, 7, 7]),
+        }}
+        with self.assertRaises((FloatingPointError, ValueError)):
+            model.plan_layer_expansion(0, features, [7])
+
+    def test_duplicate_source_ids_are_query_exclusive_and_cross_class_collisions_fail(self):
+        feature = torch.tensor([
+            [1., 0.], [1., 0.], [0., 1.], [-1., 0.],
+        ])
+        labels = torch.tensor([4, 4, 4, 4])
+        source_ids = torch.tensor([10, 10, 11, 12])
+        cache = build_loo_cache_from_embeddings(feature, labels, source_ids, [4])
+        # Both augmented views of source 10 must be excluded for either query
+        # belonging to source 10; only sources 11 and 12 remain.
+        expected = F.normalize(torch.tensor([[0., 1.]]) + torch.tensor([[-1., 0.]]), dim=-1)
+        torch.testing.assert_close(
+            cache["loo_visual_prototypes"][0, 0], expected[0], rtol=0, atol=1e-6
+        )
+        collision_labels = torch.tensor([4, 5, 4, 5])
+        collision_sources = torch.tensor([10, 10, 11, 12])
+        with self.assertRaisesRegex(ValueError, "source id.*multiple classes"):
+            build_loo_cache_from_embeddings(
+                torch.randn(4, 2), collision_labels, collision_sources, [4, 5]
+            )
+
+    def test_insufficient_class_support_rolls_back_all_session_experts(self):
+        torch.manual_seed(127)
+        runner, model = build_lifecycle_runner()
+        base_support = lifecycle_batch(
+            0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 3000
+        )
+        runner._train_base_descriptors([base_support])
+        # A single source cannot produce a query-exclusive same-class prototype.
+        one_source = {
+            "image": torch.tensor([[0., 1., 0., 0., 0., 0., 0., 0.]]),
+            "label": torch.tensor([1]),
+            "source_ids": torch.tensor([3010]),
+        }
+        with self.assertRaisesRegex(ValueError, "another same-class source"):
+            runner.train_incremental_task(
+                1, [one_source], [one_source], [1], ["class_1"],
+                [make_lifecycle_state(runner, model, 0, base_support, 0)],
+            )
+        self.assertEqual(
+            [adapter.num_experts for _, adapter in runner._moe_adapters()], [2, 2]
+        )
+        for _, adapter in runner._moe_adapters():
+            adapter.assert_descriptors_ready()
+            self.assertTrue(all(not parameter.requires_grad for parameter in adapter.parameters()))
+
+    def test_ae_calibration_failure_rolls_back_expansions_across_all_blocks(self):
+        torch.manual_seed(131)
+        runner, model = build_lifecycle_runner()
+        base_support = lifecycle_batch(
+            0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 4000
+        )
+        runner._train_base_descriptors([base_support])
+        base_state = make_lifecycle_state(runner, model, 0, base_support, 0)
+        support = lifecycle_batch(
+            1, torch.tensor([0., 1., 0., 0., 0., 0., 0., 0.]), 4010
+        )
+        train = lifecycle_batch(
+            1, torch.tensor([0., 1., 0., 0., 0., 0., 0., 0.]), 4010,
+            augmented=True, seed=137,
+        )
+        original_fit = runner._train_descriptor
+        calls = {"count": 0}
+
+        def fail_second_layer(adapter, expert_id, values, epochs, sample_weights=None):
+            calls["count"] += 1
+            if calls["count"] == 2:
+                raise RuntimeError("injected AE calibration failure")
+            return original_fit(adapter, expert_id, values, epochs, sample_weights)
+
+        runner._train_descriptor = fail_second_layer
+        try:
+            with self.assertRaisesRegex(RuntimeError, "injected AE calibration failure"):
+                runner.train_incremental_task(
+                    1, [train], [support], [1], ["class_1"], [base_state]
+                )
+        finally:
+            runner._train_descriptor = original_fit
+        self.assertEqual(calls["count"], 2)
+        self.assertEqual(
+            [adapter.num_experts for _, adapter in runner._moe_adapters()], [2, 2]
+        )
+        for _, adapter in runner._moe_adapters():
+            adapter.assert_descriptors_ready()
+            self.assertTrue(all(not parameter.requires_grad for parameter in adapter.parameters()))
+
+    def test_topology_rebuild_rejects_invalid_specs_without_mutating_live_adapter(self):
+        adapter = VisualMoEAdapter(8, num_experts=2, reduction=2)
+        before = adapter.export_topology()
+        invalid_topologies = [
+            {**before, "version": 999},
+            {**before, "experts": before["experts"][:1]},
+            {**before, "experts": [
+                before["experts"][0], before["experts"][1],
+                {"reduction": 0, "birth_session": 2},
+            ]},
+            {**before, "experts": [
+                before["experts"][0], before["experts"][1],
+                {"reduction": 2, "birth_session": -1},
+            ]},
+        ]
+        for topology in invalid_topologies:
+            with self.subTest(topology=topology):
+                with self.assertRaises(ValueError):
+                    adapter.rebuild_topology(topology)
+                self.assertEqual(adapter.export_topology(), before)
+                self.assertEqual(adapter.num_experts, 2)
 
 
 
