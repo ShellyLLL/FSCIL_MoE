@@ -134,7 +134,7 @@ class BiMC(nn.Module):
 
     @torch.no_grad()
     def collect_blockwise_cls_features(self, loader):
-        """Collect current-path CLS inputs, labels and stable support source ids."""
+        """Collect frozen-reference router CLS inputs, labels and stable support source ids."""
         block_features, fallback_source_id = {}, 0
         moe_blocks = [
             idx for idx, block in enumerate(self.clip_model.visual.transformer.resblocks)

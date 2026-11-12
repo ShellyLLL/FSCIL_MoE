@@ -334,22 +334,31 @@ class Runner:
                     "Checkpoint expansion thresholds do not cover the deployed MoE blocks: "
                     f"{set(self.expansion_thresholds)} versus {expected_blocks}."
                 )
+        checkpoint_class_ids = []
         for session_index, state in enumerate(payload["task_states"]):
-            required_state = ("class_ids", "image_proto", "text_features",
-                              "description_proto", "final_proto", "reference_image_proto")
+            required_state = ("class_ids", "image_proto", "reference_image_proto",
+                              "text_features", "description_proto", "final_proto")
             missing_state = [key for key in required_state if key not in state]
             if missing_state:
                 raise ValueError(
                     f"Checkpoint task state {session_index} is missing calibrated fields: {missing_state}"
                 )
             class_ids = torch.as_tensor(state["class_ids"], dtype=torch.long).reshape(-1)
-            if any(torch.as_tensor(state[key]).size(0) != class_ids.numel()
-                   for key in ("image_proto", "reference_image_proto", "text_features", "description_proto", "final_proto")):
-                raise ValueError(
-                    f"Checkpoint task state {session_index} has prototype/class-id row mismatch."
-                )
-            if not torch.isfinite(torch.as_tensor(state["final_proto"]).float()).all():
-                raise ValueError(f"Checkpoint task state {session_index} has non-finite final prototypes.")
+            checkpoint_class_ids.append(class_ids)
+            for key in ("image_proto", "reference_image_proto", "text_features",
+                        "description_proto", "final_proto"):
+                prototype = torch.as_tensor(state[key]).float()
+                if prototype.ndim != 2 or prototype.size(0) != class_ids.numel():
+                    raise ValueError(
+                        f"Checkpoint task state {session_index} has invalid {key}/class-id alignment."
+                    )
+                if not torch.isfinite(prototype).all():
+                    raise ValueError(
+                        f"Checkpoint task state {session_index} has non-finite {key}."
+                    )
+        all_checkpoint_ids = torch.cat(checkpoint_class_ids)
+        if torch.unique(all_checkpoint_ids).numel() != all_checkpoint_ids.numel():
+            raise ValueError("Checkpoint task states contain duplicate global class ids.")
         manifest = payload.get("support_manifest")
         if manifest is None:
             raise ValueError("Resume checkpoint support_manifest must not be null.")
@@ -801,7 +810,7 @@ class Runner:
         for _, adapter in self._moe_adapters():
             adapter.freeze_all()
 
-        # Scan shallow-to-deep; upstream expansion changes downstream CLS inputs.
+        # Train shallow-to-deep: upstream experts alter downstream adapted inputs.\n        # Expansion decisions still use the independent frozen-reference stream.
         for block_idx in self.model_without_dp.expandable_blocks():
             features = self.model_without_dp.collect_blockwise_cls_features(extract_loader)
             threshold = float(getattr(self, "expansion_thresholds", {}).get(int(block_idx), fallback_threshold))
