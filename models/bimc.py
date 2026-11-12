@@ -422,7 +422,9 @@ class BiMC(nn.Module):
         matches = class_ids[:, None].eq(observed_ids[None, :])
         if not matches.sum(dim=1).eq(1).all() or class_ids.numel() != images_proto.size(0):
             raise ValueError("Visual support prototypes do not align one-to-one with session class ids.")
-        images_proto = images_proto[matches.long().argmax(dim=1)]
+        class_rows = matches.long().argmax(dim=1)
+        images_proto = images_proto[class_rows]
+        reference_images_proto = reference_images_proto[class_rows]
 
         if cls_begin_index == 0:
             self.base_vision_prototype = images_proto.detach().clone()
