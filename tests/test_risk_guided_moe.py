@@ -119,7 +119,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         runner.device = "cpu"
         runner.cfg = SimpleNamespace(TRAINER=SimpleNamespace(BiMC=SimpleNamespace(
             TEXT_CALIBRATION=False, LAMBDA_T=0.0, VISION_CALIBRATION=True,
-            LAMBDA_I=0.5, TAU=16.0)))
+            LAMBDA_I=0.8, TAU=16.0)))
         base = {"image_proto": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
                 "text_features": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
                 "description_proto": torch.tensor([[1.0, 0.0], [0.0, 1.0]])}
