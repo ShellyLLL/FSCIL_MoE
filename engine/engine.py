@@ -755,31 +755,57 @@ class Runner:
                 self.model.train()
                 total, count = 0.0, 0
                 for batch in train_loader:
-                    images, labels = self.parse_batch(batch)
-                    source_ids = self._batch_source_ids(batch, labels.numel(), labels.device)
-                    images, labels, source_ids = self._select_uncovered_batch(
-                        images, labels, source_ids, uncovered_classes)
-                    if labels.numel() == 0:
-                        continue
+                    all_images, all_labels = self.parse_batch(batch)
+                    all_source_ids = self._batch_source_ids(
+                        batch, all_labels.numel(), all_labels.device
+                    )
+                    selected_mask = torch.isin(all_labels, uncovered_classes)
+                    images = all_images[selected_mask]
+                    labels = all_labels[selected_mask]
+                    source_ids = all_source_ids[selected_mask]
 
                     optimizer.zero_grad(set_to_none=True)
-                    logits, targets = self._global_incremental_logits(
-                        images, labels, source_ids, bank, scale)
-                    classification = F.cross_entropy(logits, targets)
+                    # Route responsibility is supervised on every current-session
+                    # class: uncovered classes are positive, covered classes negative.
+                    _, route_aux = self.model_without_dp.extract_img_feature_train(all_images)
+                    aux_by_block = {
+                        block: aux for (block, _), aux in zip(self._moe_adapters(), route_aux)
+                    }
+                    route_logits = aux_by_block[int(block_idx)]["logits"][:, -1]
+                    route_targets = selected_mask.to(dtype=route_logits.dtype)
+                    route_responsibility = F.binary_cross_entropy_with_logits(
+                        route_logits, route_targets
+                    )
+                    route_sparse = torch.sigmoid(route_logits).mean()
+                    if labels.numel() > 0:
+                        logits, targets = self._global_incremental_logits(
+                            images, labels, source_ids, bank, scale)
+                        classification = F.cross_entropy(logits, targets)
+                    else:
+                        classification = route_responsibility.new_zeros(())
                     old_suppression = adapter.old_anchor_suppression_loss(
                         anchor_mean, anchor_var,
                         residual_weight=float(getattr(
                             self.cfg.TRAINER.BiMC.INCREMENTAL, "OLD_RESIDUAL_WEIGHT", 1.0)))
-                    loss = (classification
-                            + float(getattr(self.cfg.TRAINER.BiMC.INCREMENTAL,
-                                            "OLD_SUPPRESSION_WEIGHT", 1.0)) * old_suppression)
+                    adapter_penalty = torch.stack([
+                        parameter.float().square().mean()
+                        for parameter in adapter.experts[-1].parameters()
+                    ]).mean()
+                    incremental_cfg = self.cfg.TRAINER.BiMC.INCREMENTAL
+                    loss = (
+                        classification
+                        + float(getattr(incremental_cfg, "ROUTE_WEIGHT", 1.0)) * route_responsibility
+                        + float(getattr(incremental_cfg, "OLD_SUPPRESSION_WEIGHT", 1.0)) * old_suppression
+                        + float(getattr(incremental_cfg, "SPARSE_WEIGHT", 0.01)) * route_sparse
+                        + float(getattr(incremental_cfg, "ADAPTER_WEIGHT", 1e-4)) * adapter_penalty
+                    )
                     if not bool(torch.isfinite(loss).item()):
                         raise FloatingPointError("Non-finite global visual-prototype incremental loss.")
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(adapter.newest_parameters(), 1.0)
                     optimizer.step()
-                    total += float(loss.item()) * labels.numel()
-                    count += labels.numel()
+                    total += float(loss.item()) * max(1, all_labels.numel())
+                    count += all_labels.numel()
                     selected_samples += labels.numel()
 
                 if count == 0:

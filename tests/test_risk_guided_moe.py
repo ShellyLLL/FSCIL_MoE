@@ -181,6 +181,14 @@ def lifecycle_route_snapshot(model, images):
 
 
 class UnifiedDynamicMoETests(unittest.TestCase):
+    def test_incremental_route_responsibility_has_positive_and_negative_targets(self):
+        logits = torch.tensor([-1.0, 1.0], requires_grad=True)
+        targets = torch.tensor([0.0, 1.0])
+        loss = F.binary_cross_entropy_with_logits(logits, targets)
+        loss.backward()
+        self.assertLess(float(logits.grad[0]), 0.0)
+        self.assertGreater(float(logits.grad[1]), 0.0)
+
     def test_dual_path_reference_is_unchanged_by_adapter_updates(self):
         torch.manual_seed(211)
         model = TinyVisualCLIP().eval()
