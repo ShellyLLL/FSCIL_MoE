@@ -53,6 +53,7 @@ class Runner:
         self.model_without_dp = self.model.module if self.is_distributed else self.model
         self.acc_list, self.task_acc_list = [], []
         self.session_diagnostics = []
+        self.expansion_thresholds = {}
         self.evaluator = AccuracyEvaluator(self.data_manager.class_index_in_task)
         self._resume_completed_session = -1
         self._resume_state_dict_list = []
@@ -287,10 +288,10 @@ class Runner:
         if missing:
             raise ValueError(f"Resume checkpoint is missing required fields: {missing}")
         schema = int(payload["schema_version"])
-        if schema != 11:
+        if schema != 12:
             raise ValueError(
-                "This branch uses Base-guided visual-prototype checkpoint schema (11); "
-                "legacy fused-prototype checkpoints must not be resumed."
+                "This branch uses dual-path low-rank-AE checkpoint schema (12); "
+                "older single-path checkpoints are incompatible."
             )
         if not isinstance(payload["model_state"], dict):
             raise TypeError("Resume checkpoint model_state must be a state_dict mapping.")
@@ -329,6 +330,9 @@ class Runner:
         self.acc_list = payload.get("acc_list", [])
         self.task_acc_list = payload.get("task_acc_list", [])
         self.session_diagnostics = diagnostics
+        self.expansion_thresholds = {
+            int(key): float(value) for key, value in payload.get("expansion_thresholds", {}).items()
+        }
         self._resume_completed_session = completed_session
         self._restore_rng_state(payload.get("rng_state"))
         print(f"=> Resumed session {self._resume_completed_session} from {path}")
@@ -340,7 +344,7 @@ class Runner:
         directory.mkdir(parents=True, exist_ok=True)
         topology = self.model_without_dp.export_moe_topology()
         payload = {
-            "schema_version": 11,
+            "schema_version": 12,
             "completed_session": int(completed_session),
             "model_state": self._cpu_copy(self.model_without_dp.state_dict()),
             "moe_topology": topology,
@@ -350,6 +354,7 @@ class Runner:
             "acc_list": list(self.acc_list),
             "task_acc_list": copy.deepcopy(self.task_acc_list),
             "session_diagnostics": self._cpu_copy(self.session_diagnostics),
+            "expansion_thresholds": {int(key): float(value) for key, value in self.expansion_thresholds.items()},
             "rng_state": self._rng_state(),
             "config": self.cfg.dump() if hasattr(self.cfg, "dump") else str(self.cfg),
         }
@@ -396,6 +401,7 @@ class Runner:
             raise ValueError("AE sample weights must align with features and have positive mass.")
         if values.ndim != 2 or values.size(0) < 3:
             raise ValueError("AE fitting requires at least three CLS representations.")
+        descriptor.set_center(values, weights)
         for parameter in descriptor.parameters():
             parameter.requires_grad = True
         descriptor.train()
@@ -412,7 +418,10 @@ class Runner:
                 reconstruction = descriptor(values[indices])
                 per_sample = (reconstruction - values[indices]).square().mean(dim=-1)
                 batch_weights = weights[indices]
-                loss = (per_sample * batch_weights).sum() / batch_weights.sum().clamp_min(1e-8)
+                reconstruction_loss = (
+                    (per_sample * batch_weights).sum() / batch_weights.sum().clamp_min(1e-8)
+                )
+                loss = reconstruction_loss + 1e-3 * descriptor.orthogonality_loss()
                 if not bool(torch.isfinite(loss).item()):
                     raise FloatingPointError("Non-finite AE reconstruction loss.")
                 loss.backward()
@@ -454,6 +463,31 @@ class Runner:
                       f"mean={descriptor.error_mean.item():.6f} std={descriptor.error_std.item():.6f}")
             adapter.assert_descriptors_ready()
             adapter.freeze_all()
+
+    @torch.no_grad()
+    def _calibrate_expansion_thresholds(self, extract_loader):
+        """Calibrate per-layer known-class false-expansion thresholds on held-out Base sources."""
+        alpha = float(getattr(self._visual_moe_cfg(), "EXPANSION_FALSE_POSITIVE_RATE", 0.05))
+        if not 0.0 < alpha < 1.0:
+            raise ValueError("EXPANSION_FALSE_POSITIVE_RATE must be in (0, 1).")
+        feature_map = self.model_without_dp.collect_blockwise_cls_features(extract_loader)
+        thresholds = {}
+        for block_idx, adapter in self._moe_adapters():
+            item = feature_map[block_idx]
+            values, labels = item["cls_in"].to(self.device), item["labels"].to(self.device)
+            sample_best = adapter.descriptor_scores(values).min(dim=1).values
+            class_scores = torch.stack([
+                sample_best[labels.eq(class_id)].median()
+                for class_id in torch.unique(labels, sorted=True)
+            ])
+            if class_scores.numel() < 2 or not torch.isfinite(class_scores).all():
+                raise RuntimeError(f"Block {block_idx} has insufficient finite Base classes for threshold calibration.")
+            threshold = torch.quantile(class_scores.float(), 1.0 - alpha)
+            thresholds[int(block_idx)] = float(threshold.item())
+            print(f"=> [ExpansionCalibration][B{block_idx}] alpha={alpha:.3f} threshold={threshold.item():.4f}")
+        if set(thresholds) != {int(block) for block, _ in self._moe_adapters()}:
+            raise RuntimeError("Expansion threshold calibration did not cover every MoE block.")
+        self.expansion_thresholds = thresholds
 
     def _collect_class_anchors(self, loader):
         """Compact per-class, per-layer Gaussian anchors; no old images are retained."""
@@ -646,6 +680,7 @@ class Runner:
         for _, adapter in self._moe_adapters():
             adapter.freeze_all()
         self._train_base_descriptors(extract_loader)
+        self._calibrate_expansion_thresholds(extract_loader)
 
     def train_incremental_task(self, task_id, train_loader, extract_loader, class_index,
                                current_class_name, old_states):
@@ -677,7 +712,7 @@ class Runner:
         optim_cfg = self.cfg.TRAINER.BiMC.OPTIM
         epochs = int(self.cfg.TRAINER.BiMC.INCREMENTAL.EPOCHS)
         scale = float(self.cfg.TRAINER.BiMC.INCREMENTAL.LOGIT_SCALE)
-        threshold = float(getattr(self._visual_moe_cfg(), "EXPANSION_Z_THRESHOLD", 1.0))
+        fallback_threshold = float(getattr(self._visual_moe_cfg(), "EXPANSION_Z_THRESHOLD", 1.0))
         ae_epochs = int(_cfg_value(optim_cfg, "INCREMENTAL_DESCRIPTOR_EPOCHS", 5))
         decisions, expanded, histories = [], [], {}
         for _, adapter in self._moe_adapters():
@@ -686,6 +721,7 @@ class Runner:
         # Scan shallow-to-deep; upstream expansion changes downstream CLS inputs.
         for block_idx in self.model_without_dp.expandable_blocks():
             features = self.model_without_dp.collect_blockwise_cls_features(extract_loader)
+            threshold = float(self.expansion_thresholds.get(int(block_idx), fallback_threshold))
             decision = self.model_without_dp.plan_layer_expansion(
                 block_idx, features, class_index, threshold)
             decisions.append({

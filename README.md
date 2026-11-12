@@ -50,13 +50,13 @@ python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/t
 
 This branch implements a single current visual feature space. It intentionally
 does not support resuming checkpoints produced by the earlier versioned/task-
-gated architecture. Unified checkpoints use schema 10.
+gated architecture. Unified checkpoints use schema 12.
 
 The incremental procedure is:
 
-1. Extract the mean-token representation at each configured visual block for the AE, matching SEMA's token-mean reconstruction input. Retain the CLS representation separately for the expert router and old-class response anchors.
+1. Run a frozen-reference ViT stream alongside the adapted stream. The reference stream never receives adapter residuals and supplies stable per-layer CLS features for routing, AE descriptors, expansion decisions, and old-class anchors.
 2. Score each layer with the reconstruction-error Z-scores of every deployed
-   linear AE descriptor. Each descriptor keeps a rolling 500-error reference.
+   linear AE descriptor. Each descriptor is a centered, tied-weight, low-rank linear AE and keeps a rolling 500-error reference.
 3. Expand a layer only when the class-balanced mean absolute Z-score is above
    the configured threshold for **every** existing descriptor. Scan blocks in
    ascending order and recollect deeper-layer features after an upstream layer

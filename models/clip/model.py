@@ -135,29 +135,47 @@ class QuickGELU(nn.Module):
 
 
 class RepresentationDescriptor(nn.Module):
-    """SEMA-style linear AE with a rolling reconstruction-error reference."""
-
+    """Centered tied-weight low-rank linear AE with a rolling error reference."""
     def __init__(self, d_model, descriptor_dim=64, eps=1e-4, buffer_size=500):
         super().__init__()
         self.d_model = int(d_model)
         self.descriptor_dim = max(1, min(int(descriptor_dim), self.d_model))
         self.eps, self.buffer_size = float(eps), int(buffer_size)
-        self.encoder = nn.Linear(self.d_model, self.descriptor_dim)
-        self.decoder = nn.Linear(self.descriptor_dim, self.d_model)
-        nn.init.kaiming_uniform_(self.encoder.weight, a=5 ** 0.5)
-        nn.init.zeros_(self.encoder.bias)
-        nn.init.kaiming_uniform_(self.decoder.weight, a=5 ** 0.5)
-        nn.init.zeros_(self.decoder.bias)
+        if self.eps <= 0 or self.buffer_size < 3:
+            raise ValueError("AE eps must be positive and buffer_size must be at least three.")
+        basis, _ = torch.linalg.qr(torch.randn(self.d_model, self.descriptor_dim), mode="reduced")
+        self.basis = nn.Parameter(basis)
+        self.register_buffer("center", torch.zeros(self.d_model, dtype=torch.float32))
         self.register_buffer("error_history", torch.zeros(self.buffer_size, dtype=torch.float32))
         self.register_buffer("error_count", torch.zeros((), dtype=torch.long))
         self.register_buffer("error_cursor", torch.zeros((), dtype=torch.long))
         self.register_buffer("error_mean", torch.zeros((), dtype=torch.float32))
         self.register_buffer("error_std", torch.ones((), dtype=torch.float32))
 
+    @torch.no_grad()
+    def set_center(self, values, weights=None):
+        values = torch.as_tensor(values, device=self.center.device, dtype=torch.float32)
+        if values.ndim != 2 or values.size(1) != self.d_model or not torch.isfinite(values).all():
+            raise ValueError("AE center requires finite [samples, d_model] representations.")
+        if weights is None:
+            center = values.mean(dim=0)
+        else:
+            weights = torch.as_tensor(weights, device=values.device, dtype=torch.float32).reshape(-1)
+            if weights.numel() != values.size(0) or (weights < 0).any() or weights.sum() <= 0:
+                raise ValueError("AE center weights must be non-negative with positive mass.")
+            center = (values * weights[:, None]).sum(0) / weights.sum()
+        self.center.copy_(center)
+
     def forward(self, x):
-        value = x.float()
-        encoded = F.linear(value, self.encoder.weight.float(), self.encoder.bias.float())
-        return F.linear(encoded, self.decoder.weight.float(), self.decoder.bias.float())
+        centered = x.float() - self.center
+        basis = self.basis.float()
+        return self.center + (centered @ basis) @ basis.t()
+
+    def orthogonality_loss(self):
+        basis = self.basis.float()
+        gram = basis.t() @ basis
+        identity = torch.eye(self.descriptor_dim, device=basis.device, dtype=basis.dtype)
+        return (gram - identity).square().mean()
 
     def reconstruction_error(self, x):
         value = x.detach().float()
@@ -170,11 +188,9 @@ class RepresentationDescriptor(nn.Module):
 
     @torch.no_grad()
     def update_reference(self, errors):
-        errors = torch.as_tensor(errors, device=self.error_history.device,
-                                 dtype=torch.float32).reshape(-1)
-        errors = errors[torch.isfinite(errors)]
-        if errors.numel() == 0:
-            raise ValueError("AE reference update requires finite errors.")
+        errors = torch.as_tensor(errors, device=self.error_history.device, dtype=torch.float32).reshape(-1)
+        if errors.numel() == 0 or not torch.isfinite(errors).all():
+            raise ValueError("AE reference update requires non-empty finite errors.")
         n = errors.numel()
         if n >= self.buffer_size:
             self.error_history.copy_(errors[-self.buffer_size:])
@@ -187,8 +203,6 @@ class RepresentationDescriptor(nn.Module):
             self.error_count.fill_(min(self.buffer_size, int(self.error_count.item()) + n))
             self.error_cursor.fill_((cursor + n) % self.buffer_size)
         count = int(self.error_count.item())
-        # Once the ring is full every slot is valid; before that valid entries
-        # are contiguous because the cursor has not wrapped.
         reference = self.error_history if count == self.buffer_size else self.error_history[:count]
         mean = reference.mean()
         std = reference.std(unbiased=True) if count > 1 else mean.new_zeros(())
@@ -199,10 +213,7 @@ class RepresentationDescriptor(nn.Module):
     def standardized_score(self, x):
         if int(self.error_count.item()) < 3:
             raise RuntimeError("AE descriptor has fewer than three reference errors.")
-        # SEMA expansion is triggered by unusually HIGH reconstruction
-        # errors. Keep the signed z-score; low errors indicate good coverage.
-        return ((self.reconstruction_error(x) - self.error_mean) /
-                self.error_std.clamp_min(self.eps))
+        return (self.reconstruction_error(x) - self.error_mean) / self.error_std.clamp_min(self.eps)
 
     def is_ready(self):
         return int(self.error_count.item()) >= 3

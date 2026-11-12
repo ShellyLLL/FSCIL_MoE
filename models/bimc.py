@@ -241,10 +241,10 @@ class BiMC(nn.Module):
             raise RuntimeError(f"Block {block_idx} received classes {observed}, expected {expected}.")
 
         class_ids = torch.unique(labels, sorted=True)
-        per_class = torch.stack([
-            scores[labels.eq(class_id)].mean(dim=0) for class_id in class_ids
+        sample_best_z = scores.min(dim=1).values
+        class_min_z = torch.stack([
+            sample_best_z[labels.eq(class_id)].median() for class_id in class_ids
         ])
-        class_min_z = per_class.min(dim=1).values
         class_scores = {
             int(class_id): float(class_min_z[row].item())
             for row, class_id in enumerate(class_ids.tolist())
