@@ -7,9 +7,26 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.clip.model import RepresentationDescriptor, VisualMoEAdapter
+from models.clip.model import RepresentationDescriptor, VisualMoEAdapter, VisionTransformer
 from models.bimc import BiMC
 from engine.engine import Runner
+
+
+class TinyVisualCLIP(nn.Module):
+    """Small real ViT used to test the production CLS/Router feature path."""
+
+    def __init__(self):
+        super().__init__()
+        self.visual = VisionTransformer(
+            input_resolution=8, patch_size=4, width=8, layers=2, heads=2, output_dim=6
+        )
+        for block in self.visual.transformer.resblocks:
+            block.moe_adapter = VisualMoEAdapter(
+                8, num_experts=2, reduction=2, descriptor_dim=4, descriptor_buffer_size=16
+            )
+
+    def encode_image(self, images, return_moe_aux=False):
+        return self.visual(images, return_moe_aux=return_moe_aux)
 
 
 class UnifiedDynamicMoETests(unittest.TestCase):
@@ -29,6 +46,22 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         torch.testing.assert_close(descriptor.error_history, errors[-500:])
         self.assertTrue(torch.isfinite(descriptor.standardized_score(values[:7])).all())
 
+    def test_descriptor_reference_ring_buffer_wraps_without_stale_statistics(self):
+        descriptor = RepresentationDescriptor(4, descriptor_dim=2, buffer_size=5)
+        descriptor.update_reference(torch.tensor([1., 2., 3.]))
+        descriptor.update_reference(torch.tensor([4., 5., 6., 7.]))
+        self.assertEqual(int(descriptor.error_count.item()), 5)
+        torch.testing.assert_close(
+            descriptor.error_history.sort().values, torch.tensor([3., 4., 5., 6., 7.])
+        )
+        torch.testing.assert_close(descriptor.error_mean, torch.tensor(5.0))
+        torch.testing.assert_close(descriptor.error_std, torch.tensor(2.5).sqrt())
+        descriptor.update_reference(torch.tensor([8., 9.]))
+        torch.testing.assert_close(
+            descriptor.error_history.sort().values, torch.tensor([5., 6., 7., 8., 9.])
+        )
+        torch.testing.assert_close(descriptor.error_mean, torch.tensor(7.0))
+
     def test_descriptor_expansion_score_is_signed_and_high_error_only(self):
         descriptor = RepresentationDescriptor(8, descriptor_dim=3, buffer_size=8)
         descriptor.update_reference(torch.tensor([1.0, 2.0, 3.0]))
@@ -40,20 +73,112 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         self.assertLess(float(scores[0]), 0.0)
         self.assertGreater(float(scores[2]), 0.0)
 
+    def test_router_and_descriptor_share_the_exact_layer_normalized_cls_input(self):
+        torch.manual_seed(13)
+        adapter = VisualMoEAdapter(8, num_experts=2, reduction=2,
+                                   descriptor_dim=4, descriptor_buffer_size=8).eval()
+        tokens = torch.randn(5, 3, 8)
+        captured = []
+        handle = adapter.router.register_forward_pre_hook(
+            lambda _module, args: captured.append(args[0].detach().clone())
+        )
+        try:
+            _, aux = adapter(tokens)
+        finally:
+            handle.remove()
+        expected_cls = adapter.layer_norm(tokens)[0]
+        self.assertEqual(len(captured), 1)
+        torch.testing.assert_close(captured[0], expected_cls)
+        torch.testing.assert_close(aux["cls_in"], expected_cls)
+        self.assertEqual(tuple(aux["cls_in"].shape), (tokens.size(1), tokens.size(2)))
+        self.assertFalse(torch.allclose(aux["cls_in"], adapter.layer_norm(tokens).mean(dim=0)))
+
     def test_incremental_expert_append_preserves_function_at_initialization(self):
         torch.manual_seed(5)
         adapter = VisualMoEAdapter(8, num_experts=3, reduction=2,
                                    descriptor_dim=4, descriptor_buffer_size=500).eval()
         x = torch.randn(6, 5, 8)
-        before, _ = adapter(x)
+        before, before_aux = adapter(x)
         expert_id = adapter.add_expert(session_id=1, reduction=4)
         after, aux = adapter(x)
         self.assertEqual(expert_id, 3)
         torch.testing.assert_close(before, after, rtol=0, atol=0)
+        torch.testing.assert_close(
+            before_aux["route_weights"], aux["route_weights"][:, :adapter.base_expert_count],
+            rtol=0, atol=0
+        )
         base_weights = aux["route_weights"][:, :adapter.base_expert_count]
         inc_weights = aux["route_weights"][:, adapter.base_expert_count:]
         torch.testing.assert_close(base_weights.sum(-1), torch.ones(x.size(1)))
         self.assertTrue(((inc_weights > 0) & (inc_weights < 1)).all())
+
+    def test_incremental_append_only_unfreezes_new_expert_and_new_router_column(self):
+        adapter = VisualMoEAdapter(8, num_experts=2, reduction=2)
+        adapter.add_expert(session_id=3, reduction=4)
+        self.assertTrue(all(not p.requires_grad for p in adapter.experts[:-1].parameters()))
+        self.assertTrue(all(p.requires_grad for p in adapter.experts[-1].parameters()))
+        self.assertTrue(all(not p.requires_grad for p in adapter.router.columns[:-1].parameters()))
+        self.assertTrue(all(p.requires_grad for p in adapter.router.columns[-1].parameters()))
+        self.assertTrue(all(not p.requires_grad for d in adapter.descriptors for p in d.parameters()))
+        self.assertEqual(adapter.expert_birth_sessions, [0, 0, 3])
+
+    def test_descriptor_scores_reject_uncalibrated_deployed_experts(self):
+        adapter = VisualMoEAdapter(8, num_experts=2, reduction=2)
+        with self.assertRaisesRegex(RuntimeError, "uncalibrated descriptors"):
+            adapter.descriptor_scores(torch.randn(3, 8))
+
+    def test_blockwise_collection_uses_exact_router_cls_and_preserves_sample_identity(self):
+        torch.manual_seed(17)
+        model = BiMC.__new__(BiMC)
+        nn.Module.__init__(model)
+        model.clip_model = TinyVisualCLIP()
+        model.device = torch.device("cpu")
+        model.parse_batch = lambda batch: (batch["images"], batch["labels"])
+        captured = {0: [], 1: []}
+        hooks = []
+        for index, block in enumerate(model.clip_model.visual.transformer.resblocks):
+            hooks.append(block.moe_adapter.router.register_forward_pre_hook(
+                lambda _module, args, i=index: captured[i].append(args[0].detach().cpu().clone())
+            ))
+        batches = [
+            {"images": torch.randn(2, 3, 8, 8), "labels": torch.tensor([4, 5]),
+             "source_ids": torch.tensor([101, 102])},
+            {"images": torch.randn(1, 3, 8, 8), "labels": torch.tensor([5]),
+             "source_ids": torch.tensor([103])},
+        ]
+        try:
+            features = model.collect_blockwise_cls_features(batches)
+        finally:
+            for hook in hooks:
+                hook.remove()
+        self.assertEqual(sorted(features), [0, 1])
+        for block_idx in (0, 1):
+            torch.testing.assert_close(
+                features[block_idx]["cls_in"], torch.cat(captured[block_idx], dim=0)
+            )
+            self.assertEqual(features[block_idx]["labels"].tolist(), [4, 5, 5])
+            self.assertEqual(features[block_idx]["source_ids"].tolist(), [101, 102, 103])
+
+    def test_base_freeze_policy_only_opens_adapters_and_keeps_backbone_eval(self):
+        model = BiMC.__new__(BiMC)
+        nn.Module.__init__(model)
+        model.clip_model = TinyVisualCLIP()
+        model.device = torch.device("cpu")
+        model.cfg = SimpleNamespace(TRAINER=SimpleNamespace(BiMC=SimpleNamespace(
+            VISUAL_MOE=SimpleNamespace(ENABLE=True)
+        )))
+        model._apply_freeze_policy()
+        trainable = [name for name, parameter in model.clip_model.named_parameters()
+                     if parameter.requires_grad]
+        self.assertTrue(trainable)
+        self.assertTrue(all("moe_adapter" in name and ".descriptors." not in name
+                            for name in trainable))
+        self.assertFalse(model.clip_model.visual.proj.requires_grad)
+        model.train()
+        self.assertFalse(model.clip_model.training)
+        for block in model.clip_model.visual.transformer.resblocks:
+            self.assertTrue(block.moe_adapter.training)
+            self.assertFalse(any(p.requires_grad for p in block.moe_adapter.descriptors.parameters()))
 
     def test_new_expert_changes_current_unified_path_but_old_modules_are_frozen(self):
         torch.manual_seed(7)
