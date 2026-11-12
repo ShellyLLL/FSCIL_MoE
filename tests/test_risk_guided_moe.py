@@ -181,6 +181,40 @@ def lifecycle_route_snapshot(model, images):
 
 
 class UnifiedDynamicMoETests(unittest.TestCase):
+    def test_incremental_session_trains_positive_and_negative_route_responsibilities(self):
+        torch.manual_seed(239)
+        runner, model = build_lifecycle_runner()
+        model.eval()
+        base_support = lifecycle_batch(
+            0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 6000
+        )
+        runner._train_base_descriptors([base_support])
+        base_state = make_lifecycle_state(runner, model, 0, base_support, 0)
+
+        covered_support = lifecycle_batch(
+            1, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 6010
+        )
+        novel_support = lifecycle_batch(
+            2, torch.tensor([0., 1., 0., 0., 0., 0., 0., 0.]), 6020
+        )
+        support = [covered_support, novel_support]
+        train = [covered_support, novel_support]
+        result = runner.train_incremental_task(
+            1, train, support, [1, 2], ["covered_new_class", "uncovered_new_class"],
+            [base_state],
+        )
+        self.assertEqual(
+            [item["uncovered_classes"] for item in result["expanded"]], [[2], [2]]
+        )
+        for block_idx, adapter in runner._moe_adapters():
+            features = model.collect_blockwise_cls_features(support)[block_idx]
+            gates = torch.sigmoid(adapter.router.columns[-1](features["cls_in"]))
+            labels = features["labels"]
+            covered_gate = gates[labels.eq(1)].mean()
+            novel_gate = gates[labels.eq(2)].mean()
+            self.assertGreater(float(novel_gate), float(covered_gate))
+            self.assertLess(float(covered_gate), 0.5)
+
     def test_incremental_route_responsibility_has_positive_and_negative_targets(self):
         logits = torch.tensor([-1.0, 1.0], requires_grad=True)
         targets = torch.tensor([0.0, 1.0])
