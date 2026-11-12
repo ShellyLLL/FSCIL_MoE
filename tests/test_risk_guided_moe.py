@@ -29,12 +29,16 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         torch.testing.assert_close(descriptor.error_history, errors[-500:])
         self.assertTrue(torch.isfinite(descriptor.standardized_score(values[:7])).all())
 
-    def test_descriptor_outlier_score_uses_absolute_standardized_error(self):
+    def test_descriptor_expansion_score_is_signed_and_high_error_only(self):
         descriptor = RepresentationDescriptor(8, descriptor_dim=3, buffer_size=8)
         descriptor.update_reference(torch.tensor([1.0, 2.0, 3.0]))
         descriptor.reconstruction_error = lambda x: torch.tensor([0.0, 2.0, 4.0])
         scores = descriptor.standardized_score(torch.zeros(3, 8))
-        torch.testing.assert_close(scores, torch.tensor([2.0, 0.0, 2.0]))
+        torch.testing.assert_close(scores, torch.tensor([-2.0, 0.0, 2.0]))
+        # An unusually low reconstruction error is evidence of coverage,
+        # not a novelty signal that should trigger expert expansion.
+        self.assertLess(float(scores[0]), 0.0)
+        self.assertGreater(float(scores[2]), 0.0)
 
     def test_incremental_expert_append_preserves_function_at_initialization(self):
         torch.manual_seed(5)
