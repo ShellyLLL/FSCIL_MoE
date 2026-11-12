@@ -131,6 +131,7 @@ def build_lifecycle_runner():
     runner.cfg = cfg
     runner.device = torch.device("cpu")
     runner.expansion_thresholds = {0: 1.0, 1: 1.0}
+    runner.descriptor_error_priors = {}
     runner.model = model
     runner.model_without_dp = model
     runner._text_prototypes = lambda _names, class_index: (
