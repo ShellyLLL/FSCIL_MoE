@@ -336,7 +336,7 @@ class Runner:
                 )
         for session_index, state in enumerate(payload["task_states"]):
             required_state = ("class_ids", "image_proto", "text_features",
-                              "description_proto", "final_proto")
+                              "description_proto", "final_proto", "reference_image_proto")
             missing_state = [key for key in required_state if key not in state]
             if missing_state:
                 raise ValueError(
@@ -344,7 +344,7 @@ class Runner:
                 )
             class_ids = torch.as_tensor(state["class_ids"], dtype=torch.long).reshape(-1)
             if any(torch.as_tensor(state[key]).size(0) != class_ids.numel()
-                   for key in ("image_proto", "text_features", "description_proto", "final_proto")):
+                   for key in ("image_proto", "reference_image_proto", "text_features", "description_proto", "final_proto")):
                 raise ValueError(
                     f"Checkpoint task state {session_index} has prototype/class-id row mismatch."
                 )
@@ -588,22 +588,28 @@ class Runner:
             return None, None
         return torch.cat(means, dim=0), torch.cat(variances, dim=0)
 
-    def _visual_intra_modal_calibration(self, visual, old_states):
-        """Calibrate novel visual prototypes using only fixed Base visual directions."""
+    def _visual_intra_modal_calibration(self, visual, reference, old_states):
+        """Calibrate in the frozen Base space, then transport the adapted support shift."""
         visual = F.normalize(visual.float(), dim=-1)
+        reference = F.normalize(reference.float(), dim=-1)
+        if visual.shape != reference.shape:
+            raise ValueError("Adapted and reference visual prototypes must have identical shapes.")
         if not old_states:
             return visual
         base_visual = F.normalize(
             torch.as_tensor(old_states[0]["image_proto"], device=self.device).float(), dim=-1
         )
         tau = float(getattr(self.cfg.TRAINER.BiMC, "TAU", 16.0))
-        weights = torch.softmax(tau * visual @ base_visual.t(), dim=-1)
-        guided_visual = F.normalize(weights @ base_visual, dim=-1)
+        weights = torch.softmax(tau * reference @ base_visual.t(), dim=-1)
+        guided_reference = F.normalize(weights @ base_visual, dim=-1)
         lambda_i = (
             float(self.cfg.TRAINER.BiMC.LAMBDA_I)
             if bool(getattr(self.cfg.TRAINER.BiMC, "VISION_CALIBRATION", True)) else 0.0
         )
-        return F.normalize((1.0 - lambda_i) * visual + lambda_i * guided_visual, dim=-1)
+        calibrated_reference = F.normalize(
+            (1.0 - lambda_i) * reference + lambda_i * guided_reference, dim=-1
+        )
+        return F.normalize(calibrated_reference + visual - reference, dim=-1)
 
     def _text_intra_modal_calibration(self, text, description):
         """Fuse prompt and generated-description prototypes within text modality."""
@@ -644,6 +650,11 @@ class Runner:
             features[labels.eq(cls)].mean(0) for cls in classes
         ]), dim=-1)
         loo_visual = cache["loo_visual_prototypes"].to(self.device).float()
+        reference_features = cache["reference_features"].to(self.device).float()
+        reference_full = F.normalize(torch.stack([
+            reference_features[labels.eq(cls)].mean(0) for cls in classes
+        ]), dim=-1)
+        loo_reference = cache["loo_reference_prototypes"].to(self.device).float()
 
         semantic = self._text_intra_modal_calibration(text, description)
         requested_ids = torch.as_tensor(class_index, device=self.device, dtype=torch.long).reshape(-1)
@@ -652,10 +663,12 @@ class Runner:
             raise ValueError("Incremental semantic and visual class ids do not align.")
         semantic = semantic[matches.long().argmax(dim=1)]
 
-        novel_visual_full = self._visual_intra_modal_calibration(full_visual, old_states)
+        novel_visual_full = self._visual_intra_modal_calibration(
+            full_visual, reference_full, old_states
+        )
         novel_visual_loo = torch.stack([
-            self._visual_intra_modal_calibration(row, old_states)
-            for row in loo_visual
+            self._visual_intra_modal_calibration(current, reference, old_states)
+            for current, reference in zip(loo_visual, loo_reference)
         ])
         novel_full = self._inter_modal_fusion(novel_visual_full, semantic)
         novel_loo = torch.stack([
@@ -949,7 +962,9 @@ class Runner:
         desc = state["description_proto"].to(self.device).float()
         semantic = self._text_intra_modal_calibration(text, desc)
         visual = self._visual_intra_modal_calibration(
-            state["image_proto"].to(self.device), old_states
+            state["image_proto"].to(self.device),
+            state["reference_image_proto"].to(self.device),
+            old_states,
         )
         state["image_proto"] = visual.detach()
         state["final_proto"] = self._inter_modal_fusion(visual, semantic).detach()

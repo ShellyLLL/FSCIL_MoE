@@ -187,7 +187,7 @@ class BiMC(nn.Module):
         removing all views having query ``i``'s source id.  This prevents a
         query from winning merely because its own augmented view is in support.
         """
-        features, labels, source_ids = [], [], []
+        features, reference_features, labels, source_ids = [], [], [], []
         next_id = 0
         was_training = self.training
         self.eval()
@@ -199,14 +199,30 @@ class BiMC(nn.Module):
                 if sid.numel() != y.numel():
                     raise ValueError("support source ids must align with labels.")
                 next_id += y.numel()
-                features.append(F.normalize(self.clip_model.encode_image(images), dim=-1).detach().cpu())
+                adapted, reference = self.clip_model.encode_image(
+                    images, return_reference=True
+                )
+                features.append(F.normalize(adapted, dim=-1).detach().cpu())
+                reference_features.append(F.normalize(reference, dim=-1).detach().cpu())
                 labels.append(y.detach().cpu())
                 source_ids.append(sid.detach().cpu())
         finally:
             self.train(was_training)
-        return build_loo_cache_from_embeddings(
-            torch.cat(features), torch.cat(labels).long(), torch.cat(source_ids), class_index
+        labels, source_ids = torch.cat(labels).long(), torch.cat(source_ids)
+        adapted_cache = build_loo_cache_from_embeddings(
+            torch.cat(features), labels, source_ids, class_index
         )
+        reference_cache = build_loo_cache_from_embeddings(
+            torch.cat(reference_features), labels, source_ids, class_index
+        )
+        if not torch.equal(adapted_cache["classes"], reference_cache["classes"]) or not torch.equal(
+            adapted_cache["source_ids"], reference_cache["source_ids"]
+        ):
+            raise RuntimeError("Adapted/reference LOO support caches lost sample alignment.")
+        adapted_cache["reference_features"] = torch.cat(reference_features)
+        adapted_cache["loo_reference_prototypes"] = reference_cache["loo_visual_prototypes"]
+        adapted_cache["reference_visual_prototypes"] = reference_cache["visual_prototypes"]
+        return adapted_cache
 
     @staticmethod
     def _state_class_ids(state, device=None):
@@ -329,17 +345,29 @@ class BiMC(nn.Module):
 
     @torch.no_grad()
     def inference_all_img_feature(self, loader):
-        all_features, all_labels = [], []
+        all_features, all_reference_features, all_labels = [], [], []
         for batch in loader:
             images, labels = self.parse_batch(batch)
-            features = F.normalize(self.clip_model.encode_image(images), dim=-1)
-            all_features.append(features)
+            features, reference = self.clip_model.encode_image(
+                images, return_reference=True
+            )
+            all_features.append(F.normalize(features, dim=-1))
+            all_reference_features.append(F.normalize(reference, dim=-1))
             all_labels.append(labels)
 
         all_features = torch.cat(all_features, dim=0)
+        all_reference_features = torch.cat(all_reference_features, dim=0)
         all_labels = torch.cat(all_labels, dim=0)
         prototypes = [all_features[all_labels == c].mean(dim=0) for c in torch.unique(all_labels)]
-        return all_features, all_labels, F.normalize(torch.stack(prototypes, dim=0), dim=-1)
+        reference_prototypes = [
+            all_reference_features[all_labels == c].mean(dim=0)
+            for c in torch.unique(all_labels)
+        ]
+        return (
+            all_features, all_labels,
+            F.normalize(torch.stack(prototypes, dim=0), dim=-1),
+            F.normalize(torch.stack(reference_prototypes, dim=0), dim=-1),
+        )
 
     @torch.no_grad()
     def inference_all_description_feature(self, class_names, gpt_path, cls_begin_index):
@@ -386,7 +414,7 @@ class BiMC(nn.Module):
         _, _, description_proto = self.inference_all_description_feature(
             class_names, self.cfg.DATASET.GPT_PATH, cls_begin_index
         )
-        images_features, anchor_labels, images_proto = self.inference_all_img_feature(loader)
+        images_features, anchor_labels, images_proto, reference_images_proto = self.inference_all_img_feature(loader)
 
         class_ids = torch.as_tensor(
             class_index, device=images_proto.device, dtype=torch.long
@@ -412,6 +440,7 @@ class BiMC(nn.Module):
             "description_proto": description_proto,
             "text_features": text_features,
             "image_proto": images_proto,
+            "reference_image_proto": reference_images_proto,
             "class_index": class_index,
             "class_ids": class_ids,
             "sample_cnt": len(images_features),

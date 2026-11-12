@@ -574,12 +574,12 @@ class UnifiedDynamicMoETests(unittest.TestCase):
                            "description_proto": torch.tensor([[0.0, -1.0]])}
         visual = torch.tensor([[0.0, 1.0]])
         semantic = torch.tensor([[1.0, 0.0]])
-        first = runner._visual_intra_modal_calibration(visual, [base, old_incremental])
+        first = runner._visual_intra_modal_calibration(visual, visual, [base, old_incremental])
         changed_old = dict(old_incremental)
         changed_old["image_proto"] = torch.tensor([[-1.0, 0.0]])
         changed_old["text_features"] = torch.tensor([[-1.0, 0.0]])
         changed_old["description_proto"] = torch.tensor([[-1.0, 0.0]])
-        second = runner._visual_intra_modal_calibration(visual, [base, changed_old])
+        second = runner._visual_intra_modal_calibration(visual, visual, [base, changed_old])
         torch.testing.assert_close(first, second)
         self.assertGreater(first[0, 1].item(), first[0, 0].item())
 
