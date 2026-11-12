@@ -451,17 +451,22 @@ class VisualMoEAdapter(nn.Module):
         incremental_gates = [torch.sigmoid(value) for value in gate_logits]
         weights = torch.cat([base_weights] + incremental_gates, dim=-1) if incremental_gates else base_weights
         logits = torch.cat([base_logits] + gate_logits, dim=-1) if gate_logits else base_logits
-        residual, norms = torch.zeros_like(x_norm), []
+        residual, norms, output_energies = torch.zeros_like(x_norm), [], []
         expert_ids = list(range(self.base_expert_count)) + incremental_ids
         for column, expert_id in enumerate(expert_ids):
-            weighted = self.experts[expert_id](x_norm) * weights[:, column].unsqueeze(0).unsqueeze(-1)
+            expert_output = self.experts[expert_id](x_norm)
+            weighted = expert_output * weights[:, column].unsqueeze(0).unsqueeze(-1)
             residual = residual + weighted
             norms.append(weighted.detach().float().pow(2).mean().sqrt())
+            # Keep the un-gated functional output energy differentiable. This
+            # regularizes expert magnitude independently of route sparsity.
+            output_energies.append(expert_output.float().pow(2).mean())
         residual = self.residual_scale.to(residual.dtype) * residual
         return residual, {"logits": logits, "route_weights": weights,
                           "top_k_indices": weights.argmax(dim=-1, keepdim=True),
                           "cls_in": route_features,
                           "expert_residual_norms": torch.stack(norms),
+                          "expert_output_energy": torch.stack(output_energies),
                           "token_residual": residual.detach()}
 
 

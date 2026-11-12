@@ -899,10 +899,9 @@ class Runner:
                         anchor_mean, anchor_var,
                         residual_weight=float(getattr(
                             self.cfg.TRAINER.BiMC.INCREMENTAL, "OLD_RESIDUAL_WEIGHT", 1.0)))
-                    adapter_penalty = torch.stack([
-                        parameter.float().square().mean()
-                        for parameter in adapter.experts[-1].parameters()
-                    ]).mean()
+                    adapter_penalty = aux_by_block[int(block_idx)][
+                        "expert_output_energy"
+                    ][-1]
                     incremental_cfg = self.cfg.TRAINER.BiMC.INCREMENTAL
                     loss = (
                         classification

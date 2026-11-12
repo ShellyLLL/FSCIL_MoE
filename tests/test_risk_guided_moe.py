@@ -309,6 +309,25 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         self.assertTrue(all(torch.isfinite(torch.tensor(value))
                             for value in runner.expansion_thresholds.values()))
 
+    def test_incremental_expert_output_energy_is_differentiable_and_unweighted(self):
+        torch.manual_seed(241)
+        adapter = VisualMoEAdapter(8, num_experts=2, reduction=2)
+        adapter.add_expert(session_id=1, reduction=2)
+        adapter.set_newest_trainable()
+        tokens = torch.randn(3, 4, 8)
+        route = torch.randn(4, 8)
+        _, aux = adapter(tokens, route_input=route)
+        energy = aux["expert_output_energy"][-1]
+        energy.backward()
+        self.assertTrue(torch.isfinite(energy))
+        self.assertTrue(any(
+            parameter.grad is not None and parameter.grad.abs().sum() > 0
+            for parameter in adapter.experts[-1].parameters()
+        ))
+        self.assertTrue(all(
+            parameter.grad is None for parameter in adapter.experts[0].parameters()
+        ))
+
     def test_low_rank_ae_is_centered_tied_weight_and_orthogonal(self):
         torch.manual_seed(227)
         descriptor = RepresentationDescriptor(12, descriptor_dim=3, buffer_size=8)
