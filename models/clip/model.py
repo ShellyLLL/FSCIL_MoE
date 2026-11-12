@@ -368,6 +368,10 @@ class VisualMoEAdapter(nn.Module):
             topology = {"d_model": self.d_model, "base_expert_count": self.base_expert_count,
                         "experts": [{"reduction": self.default_reduction, "birth_session": 0}
                                     for _ in range(self.base_expert_count)]}
+        if not isinstance(topology, dict):
+            raise ValueError("MoE topology must be a mapping.")
+        if int(topology.get("version", 2)) != 2:
+            raise ValueError("Unsupported MoE topology version.")
         if int(topology.get("d_model", self.d_model)) != self.d_model:
             raise ValueError("MoE topology d_model mismatch.")
         if int(topology.get("base_expert_count", self.base_expert_count)) != self.base_expert_count:
@@ -375,6 +379,18 @@ class VisualMoEAdapter(nn.Module):
         specs = list(topology.get("experts", []))
         if len(specs) < self.base_expert_count:
             raise ValueError("MoE topology has fewer experts than the base pool.")
+        for index, spec in enumerate(specs):
+            if not isinstance(spec, dict):
+                raise ValueError(f"MoE topology expert {index} must be a mapping.")
+            reduction = spec.get("reduction", self.default_reduction)
+            birth_session = spec.get("birth_session", 0)
+            if isinstance(reduction, bool) or int(reduction) < 1:
+                raise ValueError(f"MoE topology expert {index} has invalid reduction.")
+            if isinstance(birth_session, bool) or int(birth_session) < 0:
+                raise ValueError(f"MoE topology expert {index} has invalid birth session.")
+            if index < self.base_expert_count and int(birth_session) != 0:
+                raise ValueError("Base experts must have birth_session=0.")
+        # Validate the complete topology before mutating live modules.
         self.experts, self.descriptors = nn.ModuleList(), nn.ModuleList()
         self.router, self.expert_birth_sessions = ExpandableRouter(self.d_model), []
         for spec in specs:
