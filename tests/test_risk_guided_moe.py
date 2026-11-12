@@ -183,6 +183,30 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             self.assertTrue(block.moe_adapter.training)
             self.assertFalse(any(p.requires_grad for p in block.moe_adapter.descriptors.parameters()))
 
+    def test_adapter_forward_matches_sample_gates_broadcast_over_all_tokens(self):
+        torch.manual_seed(19)
+        adapter = VisualMoEAdapter(8, num_experts=2, reduction=2).eval()
+        adapter.add_expert(session_id=1, reduction=4)
+        tokens = torch.randn(7, 3, 8)
+        output, aux = adapter(tokens)
+        normalized = adapter.layer_norm(tokens)
+        base_logits, base_weights = adapter.router(normalized[0], adapter.base_expert_count)
+        new_logits = adapter.router.columns[-1](normalized[0])
+        expected_weights = torch.cat([base_weights, torch.sigmoid(new_logits)], dim=-1)
+        expected = torch.zeros_like(normalized)
+        for expert_id, expert in enumerate(adapter.experts):
+            expected = expected + expert(normalized) * expected_weights[:, expert_id][None, :, None]
+        expected = adapter.residual_scale * expected
+        torch.testing.assert_close(aux["route_weights"], expected_weights)
+        torch.testing.assert_close(aux["logits"], torch.cat([base_logits, new_logits], dim=-1))
+        torch.testing.assert_close(output, expected)
+        self.assertEqual(tuple(output.shape), tuple(tokens.shape))
+
+    def test_adapter_rejects_invalid_token_batch_feature_shape(self):
+        adapter = VisualMoEAdapter(8, num_experts=2, reduction=2)
+        with self.assertRaisesRegex(ValueError, r"\[tokens, batch, dim\]"):
+            adapter(torch.randn(3, 8))
+
     def test_new_expert_changes_current_unified_path_but_old_modules_are_frozen(self):
         torch.manual_seed(7)
         adapter = VisualMoEAdapter(8, num_experts=2, reduction=2).eval()
