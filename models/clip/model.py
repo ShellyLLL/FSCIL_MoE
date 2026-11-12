@@ -195,7 +195,7 @@ class RepresentationDescriptor(nn.Module):
         if int(self.error_count.item()) < 3:
             raise RuntimeError("AE descriptor has fewer than three reference errors.")
         return ((self.reconstruction_error(x) - self.error_mean) /
-                self.error_std.clamp_min(self.eps)).abs()
+                self.error_std.clamp_min(self.eps))
 
     def is_ready(self):
         return int(self.error_count.item()) >= 3
@@ -420,8 +420,7 @@ class VisualMoEAdapter(nn.Module):
         residual = self.residual_scale.to(residual.dtype) * residual
         return residual, {"logits": logits, "route_weights": weights,
                           "top_k_indices": weights.argmax(dim=-1, keepdim=True),
-                          "cls_in": x_norm[0], "ae_in": x_norm.mean(dim=0),
-                          "patch_mean_in": x_norm[1:].mean(dim=0),
+                          "cls_in": x_norm[0],
                           "expert_residual_norms": torch.stack(norms),
                           "token_residual": residual.detach()}
 
