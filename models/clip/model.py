@@ -210,6 +210,28 @@ class RepresentationDescriptor(nn.Module):
         self.error_std.copy_(std.clamp_min(self.eps))
         return self.error_mean, self.error_std
 
+    @torch.no_grad()
+    def shrink_reference(self, prior_mean, prior_std, prior_strength):
+        """Empirical-Bayes moment shrinkage of few-shot AE error statistics."""
+        prior_mean = torch.as_tensor(prior_mean, device=self.error_mean.device, dtype=torch.float32)
+        prior_std = torch.as_tensor(prior_std, device=self.error_std.device, dtype=torch.float32)
+        strength = float(prior_strength)
+        count = int(self.error_count.item())
+        if count < 3 or not torch.isfinite(prior_mean) or not torch.isfinite(prior_std):
+            raise ValueError("AE shrinkage requires calibrated local and finite prior statistics.")
+        if prior_std <= 0 or not np.isfinite(strength) or strength <= 0:
+            raise ValueError("AE prior std and shrinkage strength must be positive.")
+        local_mean, local_std = self.error_mean.clone(), self.error_std.clone()
+        weight = float(count) / (float(count) + strength)
+        mean = weight * local_mean + (1.0 - weight) * prior_mean
+        variance = (
+            weight * (local_std.square() + (local_mean - mean).square())
+            + (1.0 - weight) * (prior_std.square() + (prior_mean - mean).square())
+        )
+        self.error_mean.copy_(mean)
+        self.error_std.copy_(variance.clamp_min(self.eps ** 2).sqrt())
+        return self.error_mean, self.error_std
+
     def standardized_score(self, x):
         if int(self.error_count.item()) < 3:
             raise RuntimeError("AE descriptor has fewer than three reference errors.")

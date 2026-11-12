@@ -332,6 +332,18 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             parameter.grad is None for parameter in adapter.experts[0].parameters()
         ))
 
+    def test_ae_error_statistics_shrink_toward_base_prior(self):
+        descriptor = RepresentationDescriptor(4, descriptor_dim=2, buffer_size=8)
+        errors = torch.tensor([1.0, 1.2, 0.8, 1.1])
+        descriptor.update_reference(errors)
+        local_mean = descriptor.error_mean.clone()
+        local_std = descriptor.error_std.clone()
+        mean, std = descriptor.shrink_reference(0.0, 0.5, prior_strength=8.0)
+        self.assertLess(float(mean), float(local_mean))
+        self.assertGreater(float(std), 0.0)
+        self.assertTrue(torch.isfinite(mean) and torch.isfinite(std))
+        self.assertEqual(int(descriptor.error_count.item()), 4)
+
     def test_low_rank_ae_is_centered_tied_weight_and_orthogonal(self):
         torch.manual_seed(227)
         descriptor = RepresentationDescriptor(12, descriptor_dim=3, buffer_size=8)
@@ -1107,13 +1119,14 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         calls = {"count": 0}
 
         def fail_second_layer(adapter, expert_id, values, epochs, sample_weights=None,
-                              calibration_values=None):
+                              calibration_values=None, shrinkage_prior=None):
             calls["count"] += 1
             if calls["count"] == 2:
                 raise RuntimeError("injected AE calibration failure")
             return original_fit(
                 adapter, expert_id, values, epochs, sample_weights,
                 calibration_values=calibration_values,
+                shrinkage_prior=shrinkage_prior,
             )
 
         runner._train_descriptor = fail_second_layer

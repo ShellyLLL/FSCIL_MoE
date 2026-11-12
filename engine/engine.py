@@ -54,6 +54,7 @@ class Runner:
         self.acc_list, self.task_acc_list = [], []
         self.session_diagnostics = []
         self.expansion_thresholds = {}
+        self.descriptor_error_priors = {}
         self._base_calibration_features = {}
         self.evaluator = AccuracyEvaluator(self.data_manager.class_index_in_task)
         self._resume_completed_session = -1
@@ -284,15 +285,16 @@ class Runner:
         required = (
             "schema_version", "completed_session", "model_state", "task_states",
             "support_manifest", "moe_topology", "expansion_thresholds",
+            "descriptor_error_priors",
         )
         missing = [key for key in required if key not in payload]
         if missing:
             raise ValueError(f"Resume checkpoint is missing required fields: {missing}")
         schema = int(payload["schema_version"])
-        if schema != 14:
+        if schema != 15:
             raise ValueError(
-                "This branch uses reference-transported BiMC checkpoint schema (14); "
-                "older single-path or pre-reference-prototype checkpoints are incompatible."
+                "This branch uses shrunk-AE reference-statistics checkpoint schema (15); "
+                "older checkpoints are incompatible."
             )
         if not isinstance(payload["model_state"], dict):
             raise TypeError("Resume checkpoint model_state must be a state_dict mapping.")
@@ -334,6 +336,19 @@ class Runner:
                     "Checkpoint expansion thresholds do not cover the deployed MoE blocks: "
                     f"{set(self.expansion_thresholds)} versus {expected_blocks}."
                 )
+        raw_priors = payload.get("descriptor_error_priors")
+        if not isinstance(raw_priors, dict):
+            raise TypeError("Checkpoint descriptor_error_priors must be a mapping.")
+        self.descriptor_error_priors = {
+            int(key): {"mean": float(value["mean"]), "std": float(value["std"])}
+            for key, value in raw_priors.items()
+        }
+        if bool(self._visual_moe_cfg().ENABLE):
+            if set(self.descriptor_error_priors) != expected_blocks:
+                raise ValueError("Checkpoint AE priors do not cover every deployed MoE block.")
+            for block, prior in self.descriptor_error_priors.items():
+                if not np.isfinite(prior["mean"]) or not np.isfinite(prior["std"]) or prior["std"] <= 0:
+                    raise ValueError(f"Checkpoint AE prior for block {block} is invalid.")
         checkpoint_class_ids = []
         for session_index, state in enumerate(payload["task_states"]):
             required_state = ("class_ids", "image_proto", "reference_image_proto",
@@ -383,7 +398,7 @@ class Runner:
         directory.mkdir(parents=True, exist_ok=True)
         topology = self.model_without_dp.export_moe_topology()
         payload = {
-            "schema_version": 14,
+            "schema_version": 15,
             "completed_session": int(completed_session),
             "model_state": self._cpu_copy(self.model_without_dp.state_dict()),
             "moe_topology": topology,
@@ -394,6 +409,7 @@ class Runner:
             "task_acc_list": copy.deepcopy(self.task_acc_list),
             "session_diagnostics": self._cpu_copy(self.session_diagnostics),
             "expansion_thresholds": {int(key): float(value) for key, value in self.expansion_thresholds.items()},
+            "descriptor_error_priors": self._cpu_copy(self.descriptor_error_priors),
             "rng_state": self._rng_state(),
             "config": self.cfg.dump() if hasattr(self.cfg, "dump") else str(self.cfg),
         }
@@ -430,7 +446,7 @@ class Runner:
                            betas=tuple(_cfg_value(optim_cfg, "BETAS", (0.9, 0.999))))
 
     def _train_descriptor(self, adapter, expert_id, values, epochs, sample_weights=None,
-                          calibration_values=None):
+                          calibration_values=None, shrinkage_prior=None):
         """Fit the SEMA linear AE on the full local representation distribution."""
         descriptor = adapter.descriptors[int(expert_id)]
         descriptor.float()
@@ -484,6 +500,11 @@ class Runner:
                     probabilities / probabilities.sum(), reference_count, replacement=True)
                 errors = errors[selected]
             adapter.update_descriptor_stats(errors, expert_id)
+            if shrinkage_prior is not None:
+                descriptor.shrink_reference(
+                    shrinkage_prior["mean"], shrinkage_prior["std"],
+                    float(getattr(self._visual_moe_cfg(), "AE_PRIOR_STRENGTH", 10.0)),
+                )
         for parameter in descriptor.parameters():
             parameter.requires_grad = False
             parameter.grad = None
@@ -535,6 +556,17 @@ class Runner:
                       f"mean={descriptor.error_mean.item():.6f} std={descriptor.error_std.item():.6f}")
             adapter.assert_descriptors_ready()
             adapter.freeze_all()
+            pooled_errors = torch.cat([
+                descriptor.error_history[:int(descriptor.error_count.item())].detach().float()
+                for descriptor in adapter.descriptors
+            ])
+            if pooled_errors.numel() < 3 or not torch.isfinite(pooled_errors).all():
+                raise RuntimeError(f"Block {block_idx} cannot form a finite Base AE error prior.")
+            prior_std = pooled_errors.std(unbiased=True).clamp_min(adapter.descriptor_eps)
+            self.descriptor_error_priors[int(block_idx)] = {
+                "mean": float(pooled_errors.mean().item()),
+                "std": float(prior_std.item()),
+            }
 
 
     @torch.no_grad()
@@ -952,9 +984,13 @@ class Runner:
             ae_calibration_values = (
                 local_values[calibration_mask] if calibration_mask.any() else None
             )
+            prior = getattr(self, "descriptor_error_priors", {}).get(int(block_idx))
+            if prior is None:
+                raise RuntimeError(f"Block {block_idx} has no Base AE error prior for few-shot shrinkage.")
             ae_loss = self._train_descriptor(
                 adapter, expert_id, ae_fit_values, ae_epochs,
                 calibration_values=ae_calibration_values,
+                shrinkage_prior=prior,
             )
             adapter.freeze_all()
             histories[block_idx] = {
