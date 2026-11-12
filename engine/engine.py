@@ -649,6 +649,29 @@ class Runner:
 
     def train_incremental_task(self, task_id, train_loader, extract_loader, class_index,
                                current_class_name, old_states):
+        """Transactional wrapper: a failed session cannot leave partial experts."""
+        snapshots = []
+        for block_idx, adapter in self._moe_adapters():
+            snapshots.append((
+                int(block_idx), adapter.export_topology(),
+                {key: value.detach().clone() for key, value in adapter.state_dict().items()},
+            ))
+        try:
+            return self._train_incremental_task_impl(
+                task_id, train_loader, extract_loader, class_index,
+                current_class_name, old_states,
+            )
+        except Exception:
+            # Restore every layer, not just the layer where the exception arose.
+            for block_idx, topology, state in snapshots:
+                adapter = self._adapter_by_block(block_idx)
+                adapter.rebuild_topology(topology)
+                adapter.load_state_dict(state, strict=True)
+                adapter.freeze_all()
+            raise
+
+    def _train_incremental_task_impl(self, task_id, train_loader, extract_loader, class_index,
+                                      current_class_name, old_states):
         """Expand only where AE coverage fails; train new experts on uncovered classes."""
         text, description = self._text_prototypes(current_class_name, class_index)
         optim_cfg = self.cfg.TRAINER.BiMC.OPTIM
