@@ -830,12 +830,14 @@ class Runner:
         for _, adapter in self._moe_adapters():
             adapter.freeze_all()
 
-        # Train shallow-to-deep: upstream experts alter downstream adapted inputs.\n        # Expansion decisions still use the independent frozen-reference stream.
+        # All layer-wise decisions share one immutable reference-feature scan.
+        expansion_features = self.model_without_dp.collect_blockwise_cls_features(extract_loader)
+        # Functional experts are trained shallow-to-deep because upstream
+        # adapters change the adapted inputs seen by downstream expert functions.
         for block_idx in self.model_without_dp.expandable_blocks():
-            features = self.model_without_dp.collect_blockwise_cls_features(extract_loader)
             threshold = float(calibrated_thresholds[int(block_idx)])
             decision = self.model_without_dp.plan_layer_expansion(
-                block_idx, features, class_index, threshold)
+                block_idx, expansion_features, class_index, threshold)
             decisions.append({
                 "block_idx": int(block_idx), "expand": bool(decision.expand),
                 "class_min_z": dict(decision.class_scores),
