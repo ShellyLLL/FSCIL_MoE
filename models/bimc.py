@@ -363,10 +363,12 @@ class BiMC(nn.Module):
 
     @torch.no_grad()
     def collect_blockwise_cls_features(self, loader):
-        """Collect current-path Adapter-LayerNorm CLS features and labels."""
+        """Collect current-path CLS inputs, labels and stable support source ids."""
         block_features, fallback_source_id = {}, 0
-        moe_blocks = [idx for idx, block in enumerate(self.clip_model.visual.transformer.resblocks)
-                      if getattr(block, "moe_adapter", None) is not None]
+        moe_blocks = [
+            idx for idx, block in enumerate(self.clip_model.visual.transformer.resblocks)
+            if getattr(block, "moe_adapter", None) is not None
+        ]
         if not moe_blocks:
             return block_features
         was_training = self.training
@@ -374,12 +376,17 @@ class BiMC(nn.Module):
         try:
             for batch in loader:
                 images, labels = self.parse_batch(batch)
-                raw = batch.get("source_ids", batch.get("source_id", batch.get("index"))) if isinstance(batch, dict) else None
-                source_ids = (torch.arange(fallback_source_id, fallback_source_id + labels.numel())
-                              if raw is None else torch.as_tensor(raw).reshape(-1))
+                raw = (
+                    batch.get("source_ids", batch.get("source_id", batch.get("index")))
+                    if isinstance(batch, dict) else None
+                )
+                source_ids = (
+                    torch.arange(fallback_source_id, fallback_source_id + labels.numel())
+                    if raw is None else torch.as_tensor(raw).reshape(-1)
+                )
                 fallback_source_id += labels.numel()
                 if source_ids.numel() != labels.numel():
-                    raise ValueError("support source ids must align with labels.")
+                    raise ValueError("Support source ids must align with labels.")
                 _, aux_list = self.clip_model.encode_image(images, return_moe_aux=True)
                 if len(aux_list) != len(moe_blocks):
                     raise RuntimeError("MoE auxiliary outputs do not match inserted blocks.")
@@ -388,25 +395,17 @@ class BiMC(nn.Module):
                     if cls_in is None or cls_in.ndim != 2:
                         raise RuntimeError(f"Block {block_idx} has invalid CLS features.")
                     item = block_features.setdefault(block_idx, {
-                        "cls_in": [], "ae_in": [], "patch_mean_in": [], "labels": [], "source_ids": []
+                        "cls_in": [], "labels": [], "source_ids": []
                     })
                     item["cls_in"].append(cls_in.detach().cpu())
-                    ae_in = aux.get("ae_in")
-                    if ae_in is None or ae_in.ndim != 2:
-                        raise RuntimeError(f"Block {block_idx} has invalid mean-token AE features.")
-                    item["ae_in"].append(ae_in.detach().cpu())
-                    if aux.get("patch_mean_in") is not None:
-                        item["patch_mean_in"].append(aux["patch_mean_in"].detach().cpu())
                     item["labels"].append(labels.detach().cpu())
                     item["source_ids"].append(source_ids.detach().cpu())
         finally:
             self.train(was_training)
         for item in block_features.values():
-            item["cls_in"], item["ae_in"], item["labels"] = (
-                torch.cat(item["cls_in"]), torch.cat(item["ae_in"]), torch.cat(item["labels"]))
+            item["cls_in"] = torch.cat(item["cls_in"])
+            item["labels"] = torch.cat(item["labels"])
             item["source_ids"] = torch.cat(item["source_ids"])
-            item["patch_mean_in"] = (torch.cat(item["patch_mean_in"]) if item["patch_mean_in"]
-                                     else item["cls_in"].new_empty(0, item["cls_in"].size(-1)))
         return block_features
 
     @torch.no_grad()
@@ -465,39 +464,43 @@ class BiMC(nn.Module):
 
     @torch.no_grad()
     def plan_layer_expansion(self, block_idx, features, class_index, threshold=None):
-        """SEMA expansion rule: every existing AE must flag the current class set."""
+        """Expand a layer iff at least one current class is uncovered by every AE."""
         block_idx = int(block_idx)
         threshold = float(getattr(
             self.cfg.TRAINER.BiMC.VISUAL_MOE, "EXPANSION_Z_THRESHOLD", 1.0
         ) if threshold is None else threshold)
         if block_idx not in features:
             raise KeyError(f"Block {block_idx} did not produce support features.")
+
         adapter = self.clip_model.visual.transformer.resblocks[block_idx].moe_adapter
         adapter.assert_descriptors_ready()
-        values = features[block_idx]["ae_in"].to(self.device)
+        values = features[block_idx]["cls_in"].to(self.device)
         labels = features[block_idx]["labels"].to(self.device)
         scores = adapter.descriptor_scores(values)
+
         expected = sorted(int(value) for value in class_index)
         observed = sorted(int(value) for value in torch.unique(labels, sorted=True).tolist())
         if observed != expected:
             raise RuntimeError(f"Block {block_idx} received classes {observed}, expected {expected}.")
-        # FSCIL sessions are class-balanced by construction. Average within
-        # class first so every class contributes equally to the layer decision.
+
+        class_ids = torch.unique(labels, sorted=True)
         per_class = torch.stack([
-            scores[labels.eq(class_id)].mean(dim=0)
-            for class_id in torch.unique(labels, sorted=True)
+            scores[labels.eq(class_id)].mean(dim=0) for class_id in class_ids
         ])
-        descriptor_z = per_class.mean(dim=0)
-        per_class_summary = {
-            int(class_id): float(per_class[row].min().item())
-            for row, class_id in enumerate(torch.unique(labels, sorted=True).tolist())
+        class_min_z = per_class.min(dim=1).values
+        class_scores = {
+            int(class_id): float(class_min_z[row].item())
+            for row, class_id in enumerate(class_ids.tolist())
         }
-        expand = bool(torch.all(descriptor_z > threshold).item())
-        decision = LayerExpansionDecision(block_idx, expand, per_class_summary,
-                                          [cid for cid, score in per_class_summary.items()
-                                           if score > threshold])
-        print(f"=> [SEMA-AE][B{block_idx}] z_by_descriptor={descriptor_z.tolist()} "
-              f"threshold={threshold:.3f} decision={'EXPAND' if expand else 'REUSE'}")
+        uncovered = [
+            class_id for class_id, score in class_scores.items() if score > threshold
+        ]
+        decision = LayerExpansionDecision(block_idx, bool(uncovered), class_scores, uncovered)
+        print(
+            f"=> [SEMA-AE][B{block_idx}] class_min_z={class_scores} "
+            f"threshold={threshold:.3f} uncovered={uncovered} "
+            f"decision={'EXPAND' if decision.expand else 'REUSE'}"
+        )
         return decision
 
     def add_expert(self, block_idx, session_id):
@@ -632,25 +635,13 @@ class BiMC(nn.Module):
     def extract_img_feature_train(self, images):
         return self.clip_model.encode_image(images.to(self.device), return_moe_aux=True)
 
-    def forward_train(self, images, task_stat, beta, compute_teacher=False):
+    def forward_train(self, images, task_stat, compute_teacher=False):
         img_feat, moe_aux = self.extract_img_feature_train(images)
         teacher_feat = self.extract_teacher_features(images) if compute_teacher else None
         img_feat_norm = F.normalize(img_feat, dim=-1)
-
-        text_features = task_stat["text_features"].to(self.device)
-        description_proto = task_stat["description_proto"].to(self.device)
-        image_proto = task_stat["image_proto"].to(self.device)
-
-        lambda_t = self.cfg.TRAINER.BiMC.LAMBDA_T if self.cfg.TRAINER.BiMC.TEXT_CALIBRATION else 0.0
-        calibrated_text_proto = F.normalize((1 - lambda_t) * text_features + lambda_t * description_proto, dim=-1)
-        fused_proto = task_stat.get("fused_proto")
-        if fused_proto is None:
-            fused_proto = F.normalize(beta * calibrated_text_proto + (1 - beta) * image_proto, dim=-1)
-        else:
-            fused_proto = fused_proto.to(self.device)
-
+        visual_proto = F.normalize(task_stat["image_proto"].to(self.device), dim=-1)
         logit_scale = self.clip_model.logit_scale.exp()
-        logits = logit_scale * img_feat_norm @ fused_proto.t()
+        logits = logit_scale * img_feat_norm @ visual_proto.t()
         return logits, img_feat, teacher_feat, moe_aux
 
     @torch.no_grad()
@@ -720,65 +711,56 @@ class BiMC(nn.Module):
     @torch.no_grad()
     def build_task_statistics(self, class_names, loader, class_index,
                               calibrate_novel_vision_proto=False):
-        cls_begin_index = class_index[0]
-        text_features, _ = self.inference_text_feature(class_names, self.template, cls_begin_index)
-        _, _, description_proto = self.inference_all_description_feature(class_names, self.cfg.DATASET.GPT_PATH, cls_begin_index)
-        images_features, anchor_labels, images_proto = self.inference_all_img_feature(loader)
-        anchor_features = images_features
-        anchor_proto = images_proto
-        if cls_begin_index == 0:
-            self.base_vision_prototype = images_proto
-        lambda_t = self.cfg.TRAINER.BiMC.LAMBDA_T if self.cfg.TRAINER.BiMC.TEXT_CALIBRATION else 0.0
-        calibrated_text = F.normalize((1 - lambda_t) * text_features + lambda_t * description_proto, dim=-1)
-        raw_fused = F.normalize(self.cfg.DATASET.BETA * calibrated_text + (1 - self.cfg.DATASET.BETA) * images_proto, dim=-1)
-        anchor_fused = F.normalize(self.cfg.DATASET.BETA * calibrated_text +
-                                   (1 - self.cfg.DATASET.BETA) * anchor_proto, dim=-1)
-        history_fused = getattr(self, "_fused_history_prototypes", None)
-        history_ids = getattr(self, "_fused_history_class_ids", None)
-        strength = float(getattr(self.cfg.TRAINER.BiMC, "FUSED_CONFLICT_STRENGTH", 0.0))
-        margin = float(getattr(self.cfg.TRAINER.BiMC, "FUSED_CONFLICT_MARGIN", 0.05))
-        fused_proto = refine_conflict_aware_fused_prototypes(
-            raw_fused, torch.as_tensor(class_index), history_fused, history_ids, strength, margin
+        """Build aligned text and raw visual support prototypes for one session."""
+        cls_begin_index = int(class_index[0])
+        text_features, _ = self.inference_text_feature(
+            class_names, self.template, cls_begin_index
         )
-        # Keep the actual visual mean separate from its fused classifier weight.
-        ids = torch.as_tensor(class_index, device=fused_proto.device, dtype=torch.long)
-        if history_fused is None:
-            self._fused_history_prototypes, self._fused_history_class_ids = fused_proto.detach(), ids.detach()
-        else:
-            keep = (history_ids[:, None].to(ids.device) != ids[None, :]).all(dim=1)
-            self._fused_history_prototypes = torch.cat([history_fused[keep], fused_proto.detach()], dim=0)
-            self._fused_history_class_ids = torch.cat([history_ids[keep].to(ids.device), ids.detach()], dim=0)
+        _, _, description_proto = self.inference_all_description_feature(
+            class_names, self.cfg.DATASET.GPT_PATH, cls_begin_index
+        )
+        images_features, anchor_labels, images_proto = self.inference_all_img_feature(loader)
+
+        class_ids = torch.as_tensor(
+            class_index, device=images_proto.device, dtype=torch.long
+        ).reshape(-1)
+        observed_ids = torch.unique(anchor_labels, sorted=True).to(class_ids.device)
+        matches = class_ids[:, None].eq(observed_ids[None, :])
+        if not matches.sum(dim=1).eq(1).all() or class_ids.numel() != images_proto.size(0):
+            raise ValueError("Visual support prototypes do not align one-to-one with session class ids.")
+        images_proto = images_proto[matches.long().argmax(dim=1)]
+
+        if cls_begin_index == 0:
+            self.base_vision_prototype = images_proto.detach().clone()
+
         source_ids = getattr(getattr(loader, "dataset", None), "source_ids", None)
-        source_ids = (torch.arange(len(anchor_labels)) if source_ids is None else
-                      torch.as_tensor(source_ids, dtype=torch.long).cpu())
+        source_ids = (
+            torch.arange(len(anchor_labels))
+            if source_ids is None else torch.as_tensor(source_ids, dtype=torch.long).cpu()
+        )
         if len(source_ids) != len(anchor_labels):
             raise ValueError("Anchor source ids must align with support features.")
+
         return {
             "description_proto": description_proto,
             "text_features": text_features,
             "image_proto": images_proto,
             "class_index": class_index,
-            "class_ids": ids,
+            "class_ids": class_ids,
             "sample_cnt": len(images_features),
-            "initial_fused_proto": raw_fused,
-            "fused_proto": fused_proto,
-            "anchor_fused_proto": anchor_fused,
-            "anchor_features": anchor_features.detach().to(device="cpu", dtype=torch.float16),
+            "anchor_features": images_features.detach().to(device="cpu", dtype=torch.float16),
             "anchor_labels": anchor_labels.detach().cpu(),
             "anchor_source_ids": source_ids,
             "encoder_version": 0,
         }
 
     @torch.no_grad()
-    def forward_ours(self, images, image_proto, description_proto, text_features, beta, fused_proto=None):
+    def forward_ours(self, images, image_proto, description_proto=None,
+                     text_features=None, beta=None, fused_proto=None):
+        """Compatibility inference entry point; classification is visual-only."""
         img_feat = F.normalize(self.extract_img_feature(images), dim=-1)
-        if fused_proto is None:
-            lambda_t = self.cfg.TRAINER.BiMC.LAMBDA_T if self.cfg.TRAINER.BiMC.TEXT_CALIBRATION else 0.0
-            calibrated_text_proto = F.normalize((1 - lambda_t) * text_features + lambda_t * description_proto, dim=-1)
-            fused_proto = F.normalize(beta * calibrated_text_proto + (1 - beta) * image_proto, dim=-1)
-        else:
-            fused_proto = F.normalize(fused_proto.to(self.device), dim=-1)
-        return 100.0 * img_feat @ fused_proto.t()
+        visual_proto = F.normalize(torch.as_tensor(image_proto, device=self.device), dim=-1)
+        return 100.0 * img_feat @ visual_proto.t()
 
     @torch.no_grad()
     def extract_img_feature(self, images):
