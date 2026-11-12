@@ -554,10 +554,12 @@ class VisionTransformer(nn.Module):
                     adapted_tokens = adapted_x.permute(1, 0, 2)
                     reference_tokens = reference_x.permute(1, 0, 2)
                     adapted_feature = self.ln_post(adapted_tokens[:, 0, :])
-                    reference_feature = self.ln_post(reference_tokens[:, 0, :])
+                    with torch.no_grad():
+                        reference_feature = self.ln_post(reference_tokens[:, 0, :])
+                        if self.proj is not None:
+                            reference_feature = reference_feature @ self.proj
                     if self.proj is not None:
                         adapted_feature = adapted_feature @ self.proj
-                        reference_feature = reference_feature @ self.proj
                     adapted_outputs.append(adapted_feature)
                     reference_outputs.append(reference_feature)
 
@@ -573,10 +575,12 @@ class VisionTransformer(nn.Module):
             adapted_tokens = adapted_x.permute(1, 0, 2)
             reference_tokens = reference_x.permute(1, 0, 2)
             adapted_feature = self.ln_post(adapted_tokens[:, 0, :])
-            reference_feature = self.ln_post(reference_tokens[:, 0, :])
+            with torch.no_grad():
+                reference_feature = self.ln_post(reference_tokens[:, 0, :])
+                if self.proj is not None:
+                    reference_feature = reference_feature @ self.proj
             if self.proj is not None:
                 adapted_feature = adapted_feature @ self.proj
-                reference_feature = reference_feature @ self.proj
             if return_reference:
                 if return_moe_aux:
                     return adapted_feature, reference_feature, moe_aux_list

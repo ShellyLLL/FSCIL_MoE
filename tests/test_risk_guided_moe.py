@@ -67,7 +67,7 @@ class TinyLifecycleCLIP(nn.Module):
             [TinyLifecycleBlock(), TinyLifecycleBlock()]
         )
 
-    def encode_image(self, images, return_moe_aux=False):
+    def encode_image(self, images, return_moe_aux=False, return_reference=False):
         if images.ndim != 2 or images.size(-1) != 8:
             raise ValueError("TinyLifecycleCLIP expects [batch, 8] feature-like images.")
         images = images.float()
@@ -78,7 +78,12 @@ class TinyLifecycleCLIP(nn.Module):
             tokens, reference_tokens, aux = block.forward_dual(tokens, reference_tokens)
             aux_list.append(aux)
         features = F.normalize(tokens[0], dim=-1)
-        reference_features = F.normalize(reference_tokens[0], dim=-1)
+        with torch.no_grad():
+            reference_features = F.normalize(reference_tokens[0], dim=-1)
+        if return_reference and return_moe_aux:
+            return features, reference_features, aux_list
+        if return_reference:
+            return features, reference_features
         if return_moe_aux:
             return features, aux_list
         return features
