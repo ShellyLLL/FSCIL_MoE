@@ -161,7 +161,12 @@ class RepresentationDescriptor(nn.Module):
 
     def reconstruction_error(self, x):
         value = x.detach().float()
-        return (self.forward(value) - value).square().mean(dim=-1)
+        if not torch.isfinite(value).all():
+            raise FloatingPointError("AE input contains non-finite representations.")
+        errors = (self.forward(value) - value).square().mean(dim=-1)
+        if not torch.isfinite(errors).all():
+            raise FloatingPointError("AE reconstruction errors are non-finite.")
+        return errors
 
     @torch.no_grad()
     def update_reference(self, errors):
