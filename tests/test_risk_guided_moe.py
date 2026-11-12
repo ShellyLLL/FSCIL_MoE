@@ -29,6 +29,13 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         torch.testing.assert_close(descriptor.error_history, errors[-500:])
         self.assertTrue(torch.isfinite(descriptor.standardized_score(values[:7])).all())
 
+    def test_descriptor_z_score_is_signed(self):
+        descriptor = RepresentationDescriptor(8, descriptor_dim=3, buffer_size=8)
+        descriptor.update_reference(torch.tensor([1.0, 2.0, 3.0]))
+        descriptor.reconstruction_error = lambda x: torch.tensor([0.0, 2.0, 4.0])
+        scores = descriptor.standardized_score(torch.zeros(3, 8))
+        torch.testing.assert_close(scores, torch.tensor([-2.0, 0.0, 2.0]))
+
     def test_incremental_expert_append_preserves_function_at_initialization(self):
         torch.manual_seed(5)
         adapter = VisualMoEAdapter(8, num_experts=3, reduction=2,
@@ -73,7 +80,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         torch.testing.assert_close(source(x)[0], restored(x)[0], rtol=0, atol=0)
         self.assertEqual(restored.num_experts, 3)
 
-    def test_expansion_requires_every_existing_descriptor_to_flag_shift(self):
+    def test_class_level_expansion_uses_each_classes_best_existing_descriptor(self):
         model = BiMC.__new__(BiMC)
         nn.Module.__init__(model)
         adapter = VisualMoEAdapter(8, num_experts=2, reduction=2, descriptor_dim=4)
@@ -90,30 +97,84 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             VISUAL_MOE=SimpleNamespace(EXPANSION_Z_THRESHOLD=1.0))))
         for descriptor in adapter.descriptors:
             descriptor.update_reference(torch.tensor([0.1, 0.11, 0.09, 0.1]))
-        adapter.descriptor_scores = lambda x, require_ready=True: torch.full(
-            (x.size(0), 2), 2.0)
-        features = {0: {"cls_in": torch.randn(4, 8), "ae_in": torch.randn(4, 8),
+        features = {0: {"cls_in": torch.randn(4, 8),
                         "labels": torch.tensor([2, 2, 3, 3])}}
+
+        adapter.descriptor_scores = lambda x, require_ready=True: torch.tensor(
+            [[0.2, 0.3], [0.2, 0.3], [1.5, 1.6], [1.5, 1.6]])
         decision = model.plan_layer_expansion(0, features, [2, 3])
         self.assertTrue(decision.expand)
+        self.assertEqual(decision.uncovered_classes, [3])
+        self.assertAlmostEqual(decision.class_scores[2], 0.2, places=5)
+        self.assertAlmostEqual(decision.class_scores[3], 1.5, places=5)
+
         adapter.descriptor_scores = lambda x, require_ready=True: torch.tensor(
-            [[2.0, 0.1]] * x.size(0))
+            [[1.5, 0.2], [1.5, 0.2], [0.2, 1.5], [0.2, 1.5]])
         decision = model.plan_layer_expansion(0, features, [2, 3])
         self.assertFalse(decision.expand)
+        self.assertEqual(decision.uncovered_classes, [])
 
-    def test_semantic_guidance_transfers_visual_direction_from_semantically_related_old_class(self):
+    def test_semantic_guidance_uses_only_fixed_base_visual_prototypes(self):
         runner = Runner.__new__(Runner)
         runner.device = "cpu"
         runner.cfg = SimpleNamespace(TRAINER=SimpleNamespace(BiMC=SimpleNamespace(
-            TEXT_CALIBRATION=False, LAMBDA_T=0.0, TAU=16.0,
-            SEMANTIC_VISUAL_CALIBRATION=0.5)))
-        old = {"image_proto": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
-               "text_features": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
-               "description_proto": torch.tensor([[1.0, 0.0], [0.0, 1.0]])}
+            TEXT_CALIBRATION=False, LAMBDA_T=0.0, VISION_CALIBRATION=True,
+            LAMBDA_I=0.5, TAU=16.0)))
+        base = {"image_proto": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+                "text_features": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+                "description_proto": torch.tensor([[1.0, 0.0], [0.0, 1.0]])}
+        old_incremental = {"image_proto": torch.tensor([[0.0, -1.0]]),
+                           "text_features": torch.tensor([[0.0, -1.0]]),
+                           "description_proto": torch.tensor([[0.0, -1.0]])}
         visual = torch.tensor([[0.0, 1.0]])
         semantic = torch.tensor([[1.0, 0.0]])
-        calibrated = runner._semantic_visual_calibration(visual, semantic, [old])
-        self.assertGreater(calibrated[0, 0].item(), calibrated[0, 1].item())
+        first = runner._semantic_visual_calibration(visual, semantic, [base, old_incremental])
+        changed_old = dict(old_incremental)
+        changed_old["image_proto"] = torch.tensor([[-1.0, 0.0]])
+        changed_old["text_features"] = torch.tensor([[-1.0, 0.0]])
+        changed_old["description_proto"] = torch.tensor([[-1.0, 0.0]])
+        second = runner._semantic_visual_calibration(visual, semantic, [base, changed_old])
+        torch.testing.assert_close(first, second)
+        self.assertGreater(first[0, 0].item(), first[0, 1].item())
+
+
+    def test_base_training_logits_use_visual_prototypes_not_text_fusion(self):
+        model = BiMC.__new__(BiMC)
+        nn.Module.__init__(model)
+        model.device = "cpu"
+        model.clip_model = nn.Module()
+        model.clip_model.logit_scale = nn.Parameter(torch.tensor(0.0))
+        model.extract_img_feature_train = lambda images: (torch.tensor([[1.0, 0.0]]), [])
+        task_state = {
+            "image_proto": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+            "fused_proto": torch.tensor([[0.0, 1.0], [1.0, 0.0]]),
+        }
+        logits, _, teacher, _ = model.forward_train(torch.zeros(1, 3, 2, 2), task_state)
+        self.assertIsNone(teacher)
+        self.assertEqual(int(logits.argmax(dim=1).item()), 0)
+
+    def test_merge_dicts_builds_visual_bank_without_fused_prototypes(self):
+        runner = Runner.__new__(Runner)
+        runner.device = "cpu"
+        states = [
+            {"class_ids": torch.tensor([0, 1]),
+             "image_proto": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+             "text_features": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+             "description_proto": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+             "fused_proto": torch.tensor([[0.0, 1.0], [1.0, 0.0]])},
+            {"class_ids": torch.tensor([2]),
+             "image_proto": torch.tensor([[-1.0, 0.0]]),
+             "text_features": torch.tensor([[-1.0, 0.0]]),
+             "description_proto": torch.tensor([[-1.0, 0.0]]),
+             "fused_proto": torch.tensor([[0.0, -1.0]])},
+        ]
+        merged = runner.merge_dicts(states)
+        self.assertEqual(merged["class_ids"].tolist(), [0, 1, 2])
+        self.assertNotIn("fused_proto", merged)
+        torch.testing.assert_close(
+            merged["image_proto"],
+            torch.tensor([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]])
+        )
 
     def test_global_incremental_logits_use_one_current_encoder_and_global_columns(self):
         runner = Runner.__new__(Runner)
