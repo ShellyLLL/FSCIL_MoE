@@ -678,6 +678,15 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             torch.tensor([[0.8, 0.6], [0.6, 0.8], [-0.8, 0.6]])
         )
 
+    def test_leave_one_out_cache_rejects_missing_requested_classes(self):
+        features = torch.randn(4, 8)
+        labels = torch.tensor([0, 0, 1, 1])
+        source_ids = torch.tensor([10, 11, 20, 21])
+        with self.assertRaisesRegex(ValueError, "missing requested classes"):
+            build_loo_cache_from_embeddings(
+                features, labels, source_ids, class_index=[0, 1, 2]
+            )
+
     def test_uncovered_batch_selection_keeps_images_labels_and_source_ids_aligned(self):
         images = torch.arange(4).float().unsqueeze(1)
         labels = torch.tensor([2, 3, 4, 3])

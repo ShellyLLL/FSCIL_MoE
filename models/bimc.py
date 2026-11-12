@@ -39,6 +39,11 @@ def build_loo_cache_from_embeddings(features, labels, source_ids, class_index=No
         if class_index is None
         else torch.unique(torch.as_tensor(class_index, device=feature.device, dtype=torch.long), sorted=True)
     )
+    missing_classes = classes[~torch.isin(classes, torch.unique(target))]
+    if missing_classes.numel():
+        raise ValueError(
+            f"LOO support is missing requested classes: {missing_classes.tolist()}"
+        )
     rows_per_query = []
     for sid in source:
         rows = []
