@@ -54,6 +54,7 @@ def extend_cfg(cfg):
     cfg.TRAINER.BiMC.TAU = -1
     cfg.TRAINER.BiMC.TEXT_CALIBRATION = False
     cfg.TRAINER.BiMC.LAMBDA_T = -1.0
+    cfg.TRAINER.BiMC.INTER_MODAL_WEIGHT = 0.5
     # Semantic-to-visual prototype transfer used by the unified FSCIL bank.
     cfg.TRAINER.BiMC.SEMANTIC_VISUAL_CALIBRATION = 0.1
 

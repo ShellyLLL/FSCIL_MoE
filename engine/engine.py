@@ -125,7 +125,7 @@ class Runner:
             torch.full_like(ids, int(state.get("creation_session", index)))
             for index, (ids, state) in enumerate(zip(per_state_ids, dict_list))
         ])[order]
-        candidate_keys = ("description_proto", "text_features", "image_proto")
+        candidate_keys = ("description_proto", "text_features", "image_proto", "final_proto")
         for key in candidate_keys:
             if not all(key in state for state in dict_list):
                 continue
@@ -139,8 +139,8 @@ class Runner:
                 chunks.append(value)
             if valid:
                 result[key] = torch.cat(chunks, dim=0)[order]
-        if "image_proto" not in result or "text_features" not in result:
-            raise KeyError("Classifier state is missing image/text prototypes.")
+        if "image_proto" not in result or "text_features" not in result or "final_proto" not in result:
+            raise KeyError("Classifier state is missing calibrated visual/text/final prototypes.")
         result["class_index"] = result["class_ids"]
         return result
 
@@ -559,41 +559,45 @@ class Runner:
             return None, None
         return torch.cat(means, dim=0), torch.cat(variances, dim=0)
 
-    def _semantic_visual_calibration(self, visual, semantic, old_states):
-        """Transfer fixed Base-class visual directions using semantic similarity."""
+    def _visual_intra_modal_calibration(self, visual, old_states):
+        """Calibrate novel visual prototypes using only fixed Base visual directions."""
         visual = F.normalize(visual.float(), dim=-1)
-        semantic = F.normalize(semantic.float(), dim=-1)
         if not old_states:
             return visual
-
-        # Session 0 is the immutable semantic/visual reference. Incremental
-        # classes never become migration sources for later sessions.
-        base_state = old_states[0]
         base_visual = F.normalize(
-            torch.as_tensor(base_state["image_proto"], device=self.device).float(), dim=-1
+            torch.as_tensor(old_states[0]["image_proto"], device=self.device).float(), dim=-1
         )
-        base_text = torch.as_tensor(base_state["text_features"], device=self.device).float()
-        base_description = torch.as_tensor(
-            base_state.get("description_proto", base_text), device=self.device
-        ).float()
-        lambda_t = (
-            float(self.cfg.TRAINER.BiMC.LAMBDA_T)
-            if self.cfg.TRAINER.BiMC.TEXT_CALIBRATION else 0.0
-        )
-        base_semantic = F.normalize(
-            (1.0 - lambda_t) * base_text + lambda_t * base_description, dim=-1
-        )
-        if base_semantic.size(0) != base_visual.size(0):
-            raise ValueError("Base semantic and visual prototypes must have identical class order.")
-
         tau = float(getattr(self.cfg.TRAINER.BiMC, "TAU", 16.0))
-        weights = torch.softmax(tau * semantic @ base_semantic.t(), dim=-1)
+        weights = torch.softmax(tau * visual @ base_visual.t(), dim=-1)
         guided_visual = F.normalize(weights @ base_visual, dim=-1)
         lambda_i = (
             float(self.cfg.TRAINER.BiMC.LAMBDA_I)
             if bool(getattr(self.cfg.TRAINER.BiMC, "VISION_CALIBRATION", True)) else 0.0
         )
         return F.normalize((1.0 - lambda_i) * visual + lambda_i * guided_visual, dim=-1)
+
+    def _text_intra_modal_calibration(self, text, description):
+        """Fuse prompt and generated-description prototypes within text modality."""
+        lambda_t = (
+            float(self.cfg.TRAINER.BiMC.LAMBDA_T)
+            if bool(getattr(self.cfg.TRAINER.BiMC, "TEXT_CALIBRATION", True)) else 0.0
+        )
+        return F.normalize(
+            (1.0 - lambda_t) * F.normalize(text.float(), dim=-1)
+            + lambda_t * F.normalize(description.float(), dim=-1),
+            dim=-1,
+        )
+
+    def _inter_modal_fusion(self, visual, semantic):
+        """Fuse calibrated visual and text prototypes in the shared CLIP space."""
+        beta = float(getattr(self.cfg.TRAINER.BiMC, "INTER_MODAL_WEIGHT", 0.5))
+        if not 0.0 <= beta <= 1.0:
+            raise ValueError("INTER_MODAL_WEIGHT must be in [0, 1].")
+        return F.normalize(
+            (1.0 - beta) * F.normalize(visual.float(), dim=-1)
+            + beta * F.normalize(semantic.float(), dim=-1),
+            dim=-1,
+        )
 
     def _build_incremental_bank(self, loader, class_index, text, description, old_states):
         """Build a global visual bank with query-exclusive novel prototypes."""
@@ -612,29 +616,27 @@ class Runner:
         ]), dim=-1)
         loo_visual = cache["loo_visual_prototypes"].to(self.device).float()
 
-        lambda_t = (
-            float(self.cfg.TRAINER.BiMC.LAMBDA_T)
-            if self.cfg.TRAINER.BiMC.TEXT_CALIBRATION else 0.0
-        )
-        semantic = F.normalize(
-            (1.0 - lambda_t) * text.float() + lambda_t * description.float(), dim=-1
-        )
+        semantic = self._text_intra_modal_calibration(text, description)
         requested_ids = torch.as_tensor(class_index, device=self.device, dtype=torch.long).reshape(-1)
         matches = classes[:, None].eq(requested_ids[None, :])
         if not matches.sum(dim=1).eq(1).all():
             raise ValueError("Incremental semantic and visual class ids do not align.")
         semantic = semantic[matches.long().argmax(dim=1)]
 
-        novel_full = self._semantic_visual_calibration(full_visual, semantic, old_states)
-        novel_loo = torch.stack([
-            self._semantic_visual_calibration(row, semantic, old_states)
+        novel_visual_full = self._visual_intra_modal_calibration(full_visual, old_states)
+        novel_visual_loo = torch.stack([
+            self._visual_intra_modal_calibration(row, old_states)
             for row in loo_visual
+        ])
+        novel_full = self._inter_modal_fusion(novel_visual_full, semantic)
+        novel_loo = torch.stack([
+            self._inter_modal_fusion(row, semantic) for row in novel_visual_loo
         ])
 
         old_visual, old_ids = [], []
         for state in old_states:
             old_visual.append(F.normalize(
-                torch.as_tensor(state["image_proto"], device=self.device).float(), dim=-1
+                torch.as_tensor(state.get("final_proto", state["image_proto"]), device=self.device).float(), dim=-1
             ))
             ids = state.get("class_ids", state.get("class_index"))
             old_ids.append(torch.as_tensor(ids, device=self.device, dtype=torch.long).reshape(-1))
@@ -899,11 +901,12 @@ class Runner:
             float(self.cfg.TRAINER.BiMC.LAMBDA_T)
             if self.cfg.TRAINER.BiMC.TEXT_CALIBRATION else 0.0
         )
-        semantic = F.normalize((1.0 - lambda_t) * text + lambda_t * desc, dim=-1)
-        visual = self._semantic_visual_calibration(
-            state["image_proto"].to(self.device), semantic, old_states
+        semantic = self._text_intra_modal_calibration(text, desc)
+        visual = self._visual_intra_modal_calibration(
+            state["image_proto"].to(self.device), old_states
         )
         state["image_proto"] = visual.detach()
+        state["final_proto"] = self._inter_modal_fusion(visual, semantic).detach()
         state["class_ids"] = torch.as_tensor(class_index, device=self.device, dtype=torch.long)
         state["class_index"] = state["class_ids"]
         state["encoder_version"] = 0
@@ -951,6 +954,13 @@ class Runner:
                         calibrate_novel_vision_proto=False)
                     state["class_ids"] = torch.as_tensor(class_index, device=self.device, dtype=torch.long)
                     state["class_index"] = state["class_ids"]
+                base_semantic = self.model_without_dp._state_class_ids(state, device=self.device)
+                text = state["text_features"].to(self.device).float()
+                description = state["description_proto"].to(self.device).float()
+                semantic = self._text_intra_modal_calibration(text, description)
+                state["final_proto"] = self._inter_modal_fusion(
+                    state["image_proto"].to(self.device), semantic
+                ).detach()
                 state["encoder_version"] = 0
                 state["creation_session"] = 0
                 state["anchor_by_block"] = self._collect_class_anchors(extract_loader)
@@ -1017,7 +1027,7 @@ class Runner:
     @torch.no_grad()
     def inference_task_bilevel(self, task_id, state_dict):
         """One current encoder, one feature space, one global calibrated prototype bank."""
-        prototypes = F.normalize(state_dict["image_proto"].to(self.device).float(), dim=-1)
+        prototypes = F.normalize(state_dict["final_proto"].to(self.device).float(), dim=-1)
         class_ids = torch.as_tensor(state_dict["class_ids"], device=self.device, dtype=torch.long)
         test_loader = self.data_manager.get_dataloader(task_id, source="test", mode="test")
         all_logits, all_targets = [], []

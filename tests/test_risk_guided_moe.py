@@ -186,8 +186,8 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         targets = torch.tensor([0.0, 1.0])
         loss = F.binary_cross_entropy_with_logits(logits, targets)
         loss.backward()
-        self.assertLess(float(logits.grad[0]), 0.0)
-        self.assertGreater(float(logits.grad[1]), 0.0)
+        self.assertGreater(float(logits.grad[0]), 0.0)
+        self.assertLess(float(logits.grad[1]), 0.0)
 
     def test_dual_path_reference_is_unchanged_by_adapter_updates(self):
         torch.manual_seed(211)
@@ -483,14 +483,29 @@ class UnifiedDynamicMoETests(unittest.TestCase):
                            "description_proto": torch.tensor([[0.0, -1.0]])}
         visual = torch.tensor([[0.0, 1.0]])
         semantic = torch.tensor([[1.0, 0.0]])
-        first = runner._semantic_visual_calibration(visual, semantic, [base, old_incremental])
+        first = runner._visual_intra_modal_calibration(visual, [base, old_incremental])
         changed_old = dict(old_incremental)
         changed_old["image_proto"] = torch.tensor([[-1.0, 0.0]])
         changed_old["text_features"] = torch.tensor([[-1.0, 0.0]])
         changed_old["description_proto"] = torch.tensor([[-1.0, 0.0]])
-        second = runner._semantic_visual_calibration(visual, semantic, [base, changed_old])
+        second = runner._visual_intra_modal_calibration(visual, [base, changed_old])
         torch.testing.assert_close(first, second)
         self.assertGreater(first[0, 0].item(), first[0, 1].item())
+
+    def test_bilevel_calibration_fuses_visual_textual_modalities(self):
+        runner = Runner.__new__(Runner)
+        runner.device = "cpu"
+        runner.cfg = SimpleNamespace(TRAINER=SimpleNamespace(BiMC=SimpleNamespace(
+            TEXT_CALIBRATION=True, LAMBDA_T=0.5, VISION_CALIBRATION=False,
+            LAMBDA_I=0.0, INTER_MODAL_WEIGHT=0.25,
+        )))
+        text = torch.tensor([[1.0, 0.0]])
+        description = torch.tensor([[0.0, 1.0]])
+        semantic = runner._text_intra_modal_calibration(text, description)
+        visual = torch.tensor([[1.0, 0.0]])
+        final = runner._inter_modal_fusion(visual, semantic)
+        self.assertGreater(final[0, 0].item(), final[0, 1].item())
+        self.assertTrue(torch.isfinite(final).all())
 
 
     def test_base_training_logits_use_visual_prototypes_not_text_fusion(self):
