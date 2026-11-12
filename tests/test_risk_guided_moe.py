@@ -314,6 +314,10 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         adapter = VisualMoEAdapter(8, num_experts=2, reduction=2)
         adapter.add_expert(session_id=1, reduction=2)
         adapter.set_newest_trainable()
+        # The production zero-up initialization deliberately yields zero
+        # energy and zero energy-gradient before the first task gradient.
+        with torch.no_grad():
+            adapter.experts[-1].c_proj.weight.normal_(std=0.1)
         tokens = torch.randn(3, 4, 8)
         route = torch.randn(4, 8)
         _, aux = adapter(tokens, route_input=route)
