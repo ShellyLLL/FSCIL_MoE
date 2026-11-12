@@ -609,28 +609,41 @@ class Runner:
             torch.as_tensor(old_states[0]["reference_image_proto"], device=self.device).float(), dim=-1
         )
         tau = float(getattr(self.cfg.TRAINER.BiMC, "TAU", 16.0))
+        if not np.isfinite(tau) or tau <= 0:
+            raise ValueError("TAU must be finite and positive.")
         weights = torch.softmax(tau * reference @ base_visual.t(), dim=-1)
         guided_reference = F.normalize(weights @ base_visual, dim=-1)
         lambda_i = (
             float(self.cfg.TRAINER.BiMC.LAMBDA_I)
             if bool(getattr(self.cfg.TRAINER.BiMC, "VISION_CALIBRATION", True)) else 0.0
         )
-        calibrated_reference = F.normalize(
-            (1.0 - lambda_i) * reference + lambda_i * guided_reference, dim=-1
-        )
-        return F.normalize(calibrated_reference + visual - reference, dim=-1)
+        if not 0.0 <= lambda_i <= 1.0:
+            raise ValueError("LAMBDA_I must be in [0, 1].")
+        calibrated_reference = (1.0 - lambda_i) * reference + lambda_i * guided_reference
+        if not torch.isfinite(calibrated_reference).all() or (calibrated_reference.norm(dim=-1) <= 1e-8).any():
+            raise ValueError("Visual intra-modal calibration produced invalid reference prototypes.")
+        calibrated_reference = F.normalize(calibrated_reference, dim=-1)
+        transported = calibrated_reference + visual - reference
+        if not torch.isfinite(transported).all() or (transported.norm(dim=-1) <= 1e-8).any():
+            raise ValueError("Visual reference-shift transport produced invalid prototypes.")
+        return F.normalize(transported, dim=-1)
 
     def _text_intra_modal_calibration(self, text, description):
         """Fuse prompt and generated-description prototypes within text modality."""
+        text = F.normalize(torch.as_tensor(text, device=self.device).float(), dim=-1)
+        description = F.normalize(torch.as_tensor(description, device=self.device).float(), dim=-1)
+        if text.shape != description.shape or text.ndim != 2:
+            raise ValueError("Text prompt and description prototypes must be aligned matrices.")
         lambda_t = (
             float(self.cfg.TRAINER.BiMC.LAMBDA_T)
             if bool(getattr(self.cfg.TRAINER.BiMC, "TEXT_CALIBRATION", True)) else 0.0
         )
-        return F.normalize(
-            (1.0 - lambda_t) * F.normalize(text.float(), dim=-1)
-            + lambda_t * F.normalize(description.float(), dim=-1),
-            dim=-1,
-        )
+        if not 0.0 <= lambda_t <= 1.0:
+            raise ValueError("LAMBDA_T must be in [0, 1].")
+        fused = (1.0 - lambda_t) * text + lambda_t * description
+        if not torch.isfinite(fused).all() or (fused.norm(dim=-1) <= 1e-8).any():
+            raise ValueError("Text intra-modal calibration produced invalid prototypes.")
+        return F.normalize(fused, dim=-1)
 
     def _inter_modal_fusion(self, visual, semantic):
         """Fuse calibrated visual and text prototypes in the shared CLIP space."""
