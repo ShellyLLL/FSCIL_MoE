@@ -279,24 +279,32 @@ class BiMC(nn.Module):
 
     @torch.no_grad()
     def extract_teacher_features(self, images):
-        images = images.to(self.device)
-        for block in self.clip_model.visual.transformer.resblocks:
-            if hasattr(block, 'moe_adapter') and block.moe_adapter is not None:
-                block._temp_moe = block.moe_adapter
-                block.moe_adapter = None
-        teacher_features = self.clip_model.encode_image(images)
-        for block in self.clip_model.visual.transformer.resblocks:
-            if hasattr(block, '_temp_moe'):
-                block.moe_adapter = block._temp_moe
-                del block._temp_moe
-        return teacher_features
+        # The reference stream is computed alongside the adapted stream.  Do
+        # not temporarily detach adapters from live Transformer blocks.
+        _, reference_features = self.clip_model.encode_image(
+            images.to(self.device), return_reference=True
+        )
+        return reference_features
 
-    def extract_img_feature_train(self, images):
-        return self.clip_model.encode_image(images.to(self.device), return_moe_aux=True)
+    def extract_img_feature_train(self, images, return_reference=False):
+        output = self.clip_model.encode_image(
+            images.to(self.device),
+            return_moe_aux=True,
+            return_reference=return_reference,
+        )
+        if return_reference:
+            adapted_features, reference_features, moe_aux = output
+            return adapted_features, moe_aux, reference_features
+        return output
 
     def forward_train(self, images, task_stat, compute_teacher=False):
-        img_feat, moe_aux = self.extract_img_feature_train(images)
-        teacher_feat = self.extract_teacher_features(images) if compute_teacher else None
+        if compute_teacher:
+            img_feat, moe_aux, teacher_feat = self.extract_img_feature_train(
+                images, return_reference=True
+            )
+        else:
+            img_feat, moe_aux = self.extract_img_feature_train(images)
+            teacher_feat = None
         img_feat_norm = F.normalize(img_feat, dim=-1)
         visual_proto = F.normalize(task_stat["image_proto"].to(self.device), dim=-1)
         logit_scale = self.clip_model.logit_scale.exp()

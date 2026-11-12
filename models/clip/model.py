@@ -423,14 +423,20 @@ class VisualMoEAdapter(nn.Module):
         self.expert_birth_sessions.pop()
         self.freeze_all()
 
-    def forward(self, x):
+    def forward(self, x, route_input=None):
         if x.ndim != 3:
             raise ValueError("VisualMoEAdapter expects [tokens, batch, dim].")
         x_norm = self.layer_norm(x)
+        # Expert functions consume the dynamically adapted token stream.  The
+        # router and its paired AE consume the frozen reference stream.
+        route_features = (
+            x_norm[0] if route_input is None
+            else self.layer_norm(route_input)
+        )
         # The base mixture is never renormalised when incremental experts arrive.
-        base_logits, base_weights = self.router(x_norm[0], self.base_expert_count)
+        base_logits, base_weights = self.router(route_features, self.base_expert_count)
         incremental_ids = list(range(self.base_expert_count, self.num_experts))
-        gate_logits = [self.router.columns[index](x_norm[0]) for index in incremental_ids]
+        gate_logits = [self.router.columns[index](route_features) for index in incremental_ids]
         incremental_gates = [torch.sigmoid(value) for value in gate_logits]
         weights = torch.cat([base_weights] + incremental_gates, dim=-1) if incremental_gates else base_weights
         logits = torch.cat([base_logits] + gate_logits, dim=-1) if gate_logits else base_logits
@@ -443,7 +449,7 @@ class VisualMoEAdapter(nn.Module):
         residual = self.residual_scale.to(residual.dtype) * residual
         return residual, {"logits": logits, "route_weights": weights,
                           "top_k_indices": weights.argmax(dim=-1, keepdim=True),
-                          "cls_in": x_norm[0],
+                          "cls_in": route_features,
                           "expert_residual_norms": torch.stack(norms),
                           "token_residual": residual.detach()}
 
@@ -475,6 +481,24 @@ class ResidualAttentionBlock(nn.Module):
             x = x + moe_out
         return x, moe_aux
 
+    def forward_dual(self, adapted_x: torch.Tensor, reference_x: torch.Tensor):
+        """Advance adapted and frozen-reference streams through one ViT block."""
+        # The reference stream is the original frozen CLIP path.  It never
+        # receives adapter residuals and never builds a backbone autograd graph.
+        with torch.no_grad():
+            reference_x = reference_x + self.attention(self.ln_1(reference_x))
+            reference_x = reference_x + self.mlp(self.ln_2(reference_x))
+
+        adapted_x = adapted_x + self.attention(self.ln_1(adapted_x))
+        adapted_x = adapted_x + self.mlp(self.ln_2(adapted_x))
+        moe_aux = None
+        if self.moe_adapter is not None:
+            moe_out, moe_aux = self.moe_adapter(
+                adapted_x, route_input=reference_x[0]
+            )
+            adapted_x = adapted_x + moe_out
+        return adapted_x, reference_x, moe_aux
+
 class Transformer(nn.Module):
     def __init__(self, width: int, layers: int, heads: int, attn_mask: torch.Tensor = None):
         super().__init__()
@@ -503,34 +527,99 @@ class VisionTransformer(nn.Module):
         self.ln_post = LayerNorm(width)
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
 
-    def forward(self, x: torch.Tensor, all_layer_outputs=False, return_moe_aux=False):
-        x = self.conv1(x)  
-        x = x.reshape(x.shape[0], x.shape[1], -1)  
-        x = x.permute(0, 2, 1)  
-        x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1) 
+    def forward(self, x: torch.Tensor, all_layer_outputs=False,
+                return_moe_aux=False, return_reference=False):
+        x = self.conv1(x)
+        x = x.reshape(x.shape[0], x.shape[1], -1)
+        x = x.permute(0, 2, 1)
+        x = torch.cat([
+            self.class_embedding.to(x.dtype) + torch.zeros(
+                x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device
+            ),
+            x,
+        ], dim=1)
         x = x + self.positional_embedding.to(x.dtype)
         x = self.ln_pre(x)
 
-        if not all_layer_outputs:
-            x = x.permute(1, 0, 2)  
-            x, moe_aux_list = self.transformer(x)
-            x = x.permute(1, 0, 2)  
-            x = self.ln_post(x[:, 0, :])
-            if self.proj is not None: x = x @ self.proj
-            if return_moe_aux: return x, moe_aux_list
-            return x
-        else:
-            x = x.permute(1, 0, 2)  
-            outputs, moe_aux_list = [], []
+        has_moe = any(block.moe_adapter is not None for block in self.transformer.resblocks)
+        if has_moe:
+            adapted_x = x.permute(1, 0, 2)
+            reference_x = adapted_x.detach()
+            moe_aux_list, adapted_outputs, reference_outputs = [], [], []
             for block in self.transformer.resblocks:
-                x, aux = block(x)
-                if aux is not None: moe_aux_list.append(aux)
-                cur_output = x.permute(1, 0, 2)
-                cur_output = self.ln_post(cur_output[:, 0, :])
-                if self.proj is not None: cur_output = cur_output @ self.proj
-                outputs.append(cur_output)
-            if return_moe_aux: return outputs, moe_aux_list
-            return outputs
+                adapted_x, reference_x, aux = block.forward_dual(adapted_x, reference_x)
+                if aux is not None:
+                    moe_aux_list.append(aux)
+                if all_layer_outputs:
+                    adapted_tokens = adapted_x.permute(1, 0, 2)
+                    reference_tokens = reference_x.permute(1, 0, 2)
+                    adapted_feature = self.ln_post(adapted_tokens[:, 0, :])
+                    reference_feature = self.ln_post(reference_tokens[:, 0, :])
+                    if self.proj is not None:
+                        adapted_feature = adapted_feature @ self.proj
+                        reference_feature = reference_feature @ self.proj
+                    adapted_outputs.append(adapted_feature)
+                    reference_outputs.append(reference_feature)
+
+            if all_layer_outputs:
+                if return_reference:
+                    if return_moe_aux:
+                        return adapted_outputs, reference_outputs, moe_aux_list
+                    return adapted_outputs, reference_outputs
+                if return_moe_aux:
+                    return adapted_outputs, moe_aux_list
+                return adapted_outputs
+
+            adapted_tokens = adapted_x.permute(1, 0, 2)
+            reference_tokens = reference_x.permute(1, 0, 2)
+            adapted_feature = self.ln_post(adapted_tokens[:, 0, :])
+            reference_feature = self.ln_post(reference_tokens[:, 0, :])
+            if self.proj is not None:
+                adapted_feature = adapted_feature @ self.proj
+                reference_feature = reference_feature @ self.proj
+            if return_reference:
+                if return_moe_aux:
+                    return adapted_feature, reference_feature, moe_aux_list
+                return adapted_feature, reference_feature
+            if return_moe_aux:
+                return adapted_feature, moe_aux_list
+            return adapted_feature
+
+        # Preserve the original single-pass CLIP path when no visual adapters
+        # are installed; reference and adapted representations are identical.
+        if not all_layer_outputs:
+            tokens = x.permute(1, 0, 2)
+            tokens, moe_aux_list = self.transformer(tokens)
+            tokens = tokens.permute(1, 0, 2)
+            feature = self.ln_post(tokens[:, 0, :])
+            if self.proj is not None:
+                feature = feature @ self.proj
+            if return_reference:
+                if return_moe_aux:
+                    return feature, feature, moe_aux_list
+                return feature, feature
+            if return_moe_aux:
+                return feature, moe_aux_list
+            return feature
+
+        tokens = x.permute(1, 0, 2)
+        outputs, moe_aux_list = [], []
+        for block in self.transformer.resblocks:
+            tokens, aux = block(tokens)
+            if aux is not None:
+                moe_aux_list.append(aux)
+            current = tokens.permute(1, 0, 2)
+            current = self.ln_post(current[:, 0, :])
+            if self.proj is not None:
+                current = current @ self.proj
+            outputs.append(current)
+        if return_reference:
+            if return_moe_aux:
+                return outputs, outputs, moe_aux_list
+            return outputs, outputs
+        if return_moe_aux:
+            return outputs, moe_aux_list
+        return outputs
 
 class CLIP(nn.Module):
     def __init__(self, embed_dim: int, image_resolution: int, vision_layers: Union[Tuple[int, int, int, int], int], vision_width: int, vision_patch_size: int, context_length: int, vocab_size: int, transformer_width: int, transformer_heads: int, transformer_layers: int):
@@ -585,12 +674,19 @@ class CLIP(nn.Module):
     def dtype(self):
         return self.visual.conv1.weight.dtype
 
-    def encode_image(self, image, return_moe_aux=False):
+    def encode_image(self, image, return_moe_aux=False, return_reference=False):
         if not isinstance(self.visual, VisionTransformer):
-            return self.visual(image.type(self.dtype))
-        if return_moe_aux:
-            return self.visual(image.type(self.dtype), return_moe_aux=True)
-        return self.visual(image.type(self.dtype))
+            feature = self.visual(image.type(self.dtype))
+            if return_reference:
+                if return_moe_aux:
+                    return feature, feature, []
+                return feature, feature
+            return (feature, []) if return_moe_aux else feature
+        return self.visual(
+            image.type(self.dtype),
+            return_moe_aux=return_moe_aux,
+            return_reference=return_reference,
+        )
 
     def encode_text(self, text):
         x = self.token_embedding(text).type(self.dtype)
