@@ -969,11 +969,15 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         original_fit = runner._train_descriptor
         calls = {"count": 0}
 
-        def fail_second_layer(adapter, expert_id, values, epochs, sample_weights=None):
+        def fail_second_layer(adapter, expert_id, values, epochs, sample_weights=None,
+                              calibration_values=None):
             calls["count"] += 1
             if calls["count"] == 2:
                 raise RuntimeError("injected AE calibration failure")
-            return original_fit(adapter, expert_id, values, epochs, sample_weights)
+            return original_fit(
+                adapter, expert_id, values, epochs, sample_weights,
+                calibration_values=calibration_values,
+            )
 
         runner._train_descriptor = fail_second_layer
         try:

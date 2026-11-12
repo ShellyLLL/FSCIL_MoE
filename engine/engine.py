@@ -54,6 +54,7 @@ class Runner:
         self.acc_list, self.task_acc_list = [], []
         self.session_diagnostics = []
         self.expansion_thresholds = {}
+        self._base_calibration_features = {}
         self.evaluator = AccuracyEvaluator(self.data_manager.class_index_in_task)
         self._resume_completed_session = -1
         self._resume_state_dict_list = []
@@ -390,7 +391,8 @@ class Runner:
         return optim.AdamW([{ "params": moe_params, "lr": base_lr }], weight_decay=wd,
                            betas=tuple(_cfg_value(optim_cfg, "BETAS", (0.9, 0.999))))
 
-    def _train_descriptor(self, adapter, expert_id, values, epochs, sample_weights=None):
+    def _train_descriptor(self, adapter, expert_id, values, epochs, sample_weights=None,
+                          calibration_values=None):
         """Fit the SEMA linear AE on the full local representation distribution."""
         descriptor = adapter.descriptors[int(expert_id)]
         descriptor.float()
@@ -428,8 +430,14 @@ class Runner:
                 optimizer.step()
         descriptor.eval()
         with torch.no_grad():
-            errors = descriptor.reconstruction_error(values)
-            if sample_weights is not None:
+            reference_values = (
+                values if calibration_values is None
+                else torch.as_tensor(calibration_values, device=values.device).float()
+            )
+            if reference_values.ndim != 2 or reference_values.size(0) < 3:
+                raise ValueError("AE error calibration requires at least three held-out representations.")
+            errors = descriptor.reconstruction_error(reference_values)
+            if sample_weights is not None and calibration_values is None:
                 probabilities = weights.clamp_min(0)
                 if not bool((probabilities.sum() > 0).item()):
                     raise ValueError("AE responsibility distribution has zero mass.")
@@ -448,15 +456,41 @@ class Runner:
     def _train_base_descriptors(self, extract_loader):
         epochs = int(_cfg_value(self.cfg.TRAINER.BiMC.OPTIM, "BASE_DESCRIPTOR_EPOCHS", 8))
         print(f"\n========== Fit Base SEMA Representation Descriptors ({epochs} epochs) ==========")
+        feature_map = self.model_without_dp.collect_blockwise_cls_features(extract_loader)
+        self._base_calibration_features = {}
         for block_idx, adapter in self._moe_adapters():
-            # Router and AE share the same per-sample CLS representation.
-            features = self.model_without_dp.collect_blockwise_cls_features(extract_loader)
-            values = features[block_idx]["cls_in"].to(self.device)
+            item = feature_map[block_idx]
+            values = item["cls_in"].to(self.device)
+            labels = item["labels"].to(self.device)
+            source_ids = item["source_ids"].to(self.device)
+            # Hold out one stable source per class. The AE is fitted without
+            # these examples; only held-out errors calibrate its reference.
+            calibration_mask = torch.zeros(labels.numel(), dtype=torch.bool, device=self.device)
+            for class_id in torch.unique(labels, sorted=True):
+                indices = torch.nonzero(labels.eq(class_id), as_tuple=False).flatten()
+                if indices.numel() > 1:
+                    order = torch.argsort(source_ids[indices], stable=True)
+                    calibration_mask[indices[order[0]]] = True
+            fit_mask = ~calibration_mask
+            if int(calibration_mask.sum()) < 3 or int(fit_mask.sum()) < 3:
+                # Tiny synthetic fixtures cannot support independent fitting
+                # and calibration; production Base protocols should.
+                fit_mask = torch.ones_like(calibration_mask)
+                calibration_mask = torch.zeros_like(calibration_mask)
+            fit_values = values[fit_mask]
+            calibration_values = values[calibration_mask] if calibration_mask.any() else None
+            self._base_calibration_features[int(block_idx)] = {
+                "cls_in": (values[calibration_mask] if calibration_mask.any() else values).detach().cpu(),
+                "labels": (labels[calibration_mask] if calibration_mask.any() else labels).detach().cpu(),
+            }
             with torch.no_grad():
-                _, responsibilities = adapter.router(values)
+                _, responsibilities = adapter.router(fit_values)
             for expert_id in range(adapter.num_experts):
                 loss = self._train_descriptor(
-                    adapter, expert_id, values, epochs, responsibilities[:, expert_id])
+                    adapter, expert_id, fit_values, epochs,
+                    responsibilities[:, expert_id],
+                    calibration_values=calibration_values,
+                )
                 descriptor = adapter.descriptors[expert_id]
                 print(f"=> [SEMA-AE][B{block_idx}][E{expert_id}] loss={loss:.6f} "
                       f"reference_n={int(descriptor.error_count.item())} "
@@ -464,17 +498,21 @@ class Runner:
             adapter.assert_descriptors_ready()
             adapter.freeze_all()
 
+
     @torch.no_grad()
     def _calibrate_expansion_thresholds(self, extract_loader):
-        """Calibrate per-layer known-class false-expansion thresholds on held-out Base sources."""
+        """Calibrate per-layer known-class false-expansion thresholds on Base holdout sources."""
         alpha = float(getattr(self._visual_moe_cfg(), "EXPANSION_FALSE_POSITIVE_RATE", 0.05))
         if not 0.0 < alpha < 1.0:
             raise ValueError("EXPANSION_FALSE_POSITIVE_RATE must be in (0, 1).")
-        feature_map = self.model_without_dp.collect_blockwise_cls_features(extract_loader)
+        if not getattr(self, "_base_calibration_features", None):
+            raise RuntimeError("Base AE holdout features must be prepared before threshold calibration.")
         thresholds = {}
         for block_idx, adapter in self._moe_adapters():
-            item = feature_map[block_idx]
+            item = self._base_calibration_features[int(block_idx)]
             values, labels = item["cls_in"].to(self.device), item["labels"].to(self.device)
+            if values.size(0) < 3:
+                raise RuntimeError(f"Block {block_idx} has fewer than three held-out Base representations.")
             sample_best = adapter.descriptor_scores(values).min(dim=1).values
             class_scores = torch.stack([
                 sample_best[labels.eq(class_id)].median()
@@ -488,6 +526,7 @@ class Runner:
         if set(thresholds) != {int(block) for block, _ in self._moe_adapters()}:
             raise RuntimeError("Expansion threshold calibration did not cover every MoE block.")
         self.expansion_thresholds = thresholds
+
 
     def _collect_class_anchors(self, loader):
         """Compact per-class, per-layer Gaussian anchors; no old images are retained."""
@@ -721,7 +760,7 @@ class Runner:
         # Scan shallow-to-deep; upstream expansion changes downstream CLS inputs.
         for block_idx in self.model_without_dp.expandable_blocks():
             features = self.model_without_dp.collect_blockwise_cls_features(extract_loader)
-            threshold = float(self.expansion_thresholds.get(int(block_idx), fallback_threshold))
+            threshold = float(getattr(self, "expansion_thresholds", {}).get(int(block_idx), fallback_threshold))
             decision = self.model_without_dp.plan_layer_expansion(
                 block_idx, features, class_index, threshold)
             decisions.append({
