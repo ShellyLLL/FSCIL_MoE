@@ -862,7 +862,28 @@ class Runner:
             local_item = new_features[block_idx]
             local_mask = torch.isin(local_item["labels"], uncovered_classes.detach().cpu())
             local_values = local_item["cls_in"][local_mask].to(self.device)
-            ae_loss = self._train_descriptor(adapter, expert_id, local_values, ae_epochs)
+            local_labels = local_item["labels"][local_mask].to(self.device)
+            local_sources = local_item["source_ids"][local_mask].to(self.device)
+            calibration_mask = torch.zeros(
+                local_labels.numel(), dtype=torch.bool, device=self.device
+            )
+            for class_id in uncovered_classes:
+                indices = torch.nonzero(local_labels.eq(class_id), as_tuple=False).flatten()
+                if indices.numel() > 1:
+                    order = torch.argsort(local_sources[indices], stable=True)
+                    calibration_mask[indices[order[0]]] = True
+            fit_mask = ~calibration_mask
+            if int(calibration_mask.sum()) < 3 or int(fit_mask.sum()) < 3:
+                fit_mask = torch.ones_like(calibration_mask)
+                calibration_mask = torch.zeros_like(calibration_mask)
+            ae_fit_values = local_values[fit_mask]
+            ae_calibration_values = (
+                local_values[calibration_mask] if calibration_mask.any() else None
+            )
+            ae_loss = self._train_descriptor(
+                adapter, expert_id, ae_fit_values, ae_epochs,
+                calibration_values=ae_calibration_values,
+            )
             adapter.freeze_all()
             histories[block_idx] = {
                 "expert_id": int(expert_id), "loss": loss_history, "ae_loss": ae_loss,

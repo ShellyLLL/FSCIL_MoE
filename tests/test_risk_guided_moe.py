@@ -229,6 +229,21 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         self.assertEqual(tuple(adapted.shape), tuple(reference.shape))
         self.assertEqual(tuple(aux[0]["cls_in"].shape), (images.size(0), 8))
 
+    def test_low_rank_ae_is_centered_tied_weight_and_orthogonal(self):
+        torch.manual_seed(227)
+        descriptor = RepresentationDescriptor(12, descriptor_dim=3, buffer_size=8)
+        values = torch.randn(20, 12) + 2.0
+        descriptor.set_center(values)
+        reconstructed = descriptor(values)
+        self.assertEqual(tuple(descriptor.basis.shape), (12, 3))
+        torch.testing.assert_close(descriptor.center, values.mean(0), rtol=0, atol=1e-6)
+        torch.testing.assert_close(
+            descriptor.basis.t() @ descriptor.basis,
+            torch.eye(3), rtol=1e-5, atol=1e-5
+        )
+        self.assertEqual(tuple(reconstructed.shape), tuple(values.shape))
+        self.assertLess(float(descriptor.orthogonality_loss()), 1e-8)
+
     def test_sema_descriptor_uses_linear_ae_and_rolling_500_error_buffer(self):
         torch.manual_seed(3)
         descriptor = RepresentationDescriptor(8, descriptor_dim=3, buffer_size=500)
