@@ -289,10 +289,10 @@ class Runner:
         if missing:
             raise ValueError(f"Resume checkpoint is missing required fields: {missing}")
         schema = int(payload["schema_version"])
-        if schema != 13:
+        if schema != 14:
             raise ValueError(
-                "This branch uses calibrated dual-path BiMC checkpoint schema (13); "
-                "older single-path or pre-fusion checkpoints are incompatible."
+                "This branch uses reference-transported BiMC checkpoint schema (14); "
+                "older single-path or pre-reference-prototype checkpoints are incompatible."
             )
         if not isinstance(payload["model_state"], dict):
             raise TypeError("Resume checkpoint model_state must be a state_dict mapping.")
@@ -374,7 +374,7 @@ class Runner:
         directory.mkdir(parents=True, exist_ok=True)
         topology = self.model_without_dp.export_moe_topology()
         payload = {
-            "schema_version": 13,
+            "schema_version": 14,
             "completed_session": int(completed_session),
             "model_state": self._cpu_copy(self.model_without_dp.state_dict()),
             "moe_topology": topology,

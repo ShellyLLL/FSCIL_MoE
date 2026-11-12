@@ -50,7 +50,7 @@ python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/t
 
 This branch implements a single current visual feature space. It intentionally
 does not support resuming checkpoints produced by the earlier versioned/task-
-gated architecture. Unified checkpoints use schema 13.
+gated architecture. Unified checkpoints use schema 14.
 
 The incremental procedure is:
 
