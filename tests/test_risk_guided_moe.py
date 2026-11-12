@@ -29,6 +29,116 @@ class TinyVisualCLIP(nn.Module):
         return self.visual(images, return_moe_aux=return_moe_aux)
 
 
+class TinyLifecycleBlock(nn.Module):
+    """A real VisualMoEAdapter in a deterministic, lightweight two-layer path."""
+
+    def __init__(self):
+        super().__init__()
+        self.moe_adapter = VisualMoEAdapter(
+            8, num_experts=2, reduction=2, descriptor_dim=1,
+            descriptor_buffer_size=16, incremental_gate_bias_init=-1.0,
+        )
+        # A trained Base path is represented by a stable identity residual.
+        # This isolates the incremental lifecycle without mocking MoE behavior.
+        with torch.no_grad():
+            for expert in self.moe_adapter.experts:
+                expert.c_proj.weight.zero_()
+                expert.c_proj.bias.zero_()
+
+    def forward(self, tokens):
+        residual, aux = self.moe_adapter(tokens)
+        return tokens + residual, aux
+
+
+class TinyLifecycleCLIP(nn.Module):
+    """Deterministic two-layer encoder for real Runner/BiMC integration tests."""
+
+    def __init__(self):
+        super().__init__()
+        self.visual = nn.Module()
+        self.visual.transformer = nn.Module()
+        self.visual.transformer.resblocks = nn.ModuleList(
+            [TinyLifecycleBlock(), TinyLifecycleBlock()]
+        )
+
+    def encode_image(self, images, return_moe_aux=False):
+        if images.ndim != 2 or images.size(-1) != 8:
+            raise ValueError("TinyLifecycleCLIP expects [batch, 8] feature-like images.")
+        images = images.float()
+        tokens = torch.stack([images, images.roll(1, dims=-1)], dim=0)
+        aux_list = []
+        for block in self.visual.transformer.resblocks:
+            tokens, aux = block(tokens)
+            aux_list.append(aux)
+        features = F.normalize(tokens[0], dim=-1)
+        return (features, aux_list) if return_moe_aux else features
+
+
+def build_lifecycle_runner():
+    optim_cfg = SimpleNamespace(
+        BASE_DESCRIPTOR_EPOCHS=30,
+        INCREMENTAL_DESCRIPTOR_EPOCHS=30,
+        LR_DESCRIPTOR=0.03,
+        LR_INCREMENTAL_EXPERT=0.08,
+        LR_INCREMENTAL_ROUTER=0.08,
+        WEIGHT_DECAY=0.0,
+    )
+    incremental_cfg = SimpleNamespace(
+        EPOCHS=8,
+        LOGIT_SCALE=20.0,
+        OLD_RESIDUAL_WEIGHT=1.0,
+        OLD_SUPPRESSION_WEIGHT=10.0,
+    )
+    bimc_cfg = SimpleNamespace(
+        VISUAL_MOE=SimpleNamespace(
+            ENABLE=True,
+            NUM_BASE_EXPERTS=2,
+            INCREMENTAL_REDUCTION=2,
+            EXPANSION_Z_THRESHOLD=1.0,
+        ),
+        OPTIM=optim_cfg,
+        INCREMENTAL=incremental_cfg,
+        TEXT_CALIBRATION=False,
+        LAMBDA_T=0.0,
+        VISION_CALIBRATION=False,
+        LAMBDA_I=0.0,
+        TAU=16.0,
+    )
+    cfg = SimpleNamespace(TRAINER=SimpleNamespace(BiMC=bimc_cfg))
+    model = BiMC.__new__(BiMC)
+    nn.Module.__init__(model)
+    model.cfg = cfg
+    model.device = torch.device("cpu")
+    model.clip_model = TinyLifecycleCLIP()
+    model._apply_freeze_policy()
+
+    runner = Runner.__new__(Runner)
+    runner.cfg = cfg
+    runner.device = torch.device("cpu")
+    runner.model = model
+    runner.model_without_dp = model
+    runner._text_prototypes = lambda _names, class_index: (
+        F.normalize(torch.eye(8)[torch.as_tensor(class_index, dtype=torch.long)], dim=-1),
+        F.normalize(torch.eye(8)[torch.as_tensor(class_index, dtype=torch.long)], dim=-1),
+    )
+    return runner, model
+
+
+def lifecycle_batch(class_id, feature, source_start, augmented=False, seed=0):
+    count = 4
+    images = feature.reshape(1, 8).repeat(count, 1).clone()
+    if augmented:
+        generator = torch.Generator().manual_seed(seed)
+        perturbation = torch.randn(images.shape, generator=generator) * 0.30
+        perturbation[:, class_id] = 0.0
+        images = images + perturbation
+    return {
+        "image": images,
+        "label": torch.full((count,), int(class_id), dtype=torch.long),
+        "source_ids": torch.arange(source_start, source_start + count),
+    }
+
+
 class UnifiedDynamicMoETests(unittest.TestCase):
     def test_sema_descriptor_uses_linear_ae_and_rolling_500_error_buffer(self):
         torch.manual_seed(3)
@@ -379,6 +489,186 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         self.assertTrue(torch.isfinite(loss))
         self.assertIsNotNone(adapter.router.columns[-1].weight.grad)
         self.assertIsNotNone(adapter.experts[-1].c_proj.weight.grad)
+
+
+    def test_multisession_expansion_reuse_history_and_topology_restore(self):
+        torch.manual_seed(23)
+        runner, model = build_lifecycle_runner()
+        model.eval()
+
+        base_support = lifecycle_batch(0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 100)
+        runner._train_base_descriptors([base_support])
+        base_anchors = runner._collect_class_anchors([base_support])
+        with torch.no_grad():
+            base_proto = F.normalize(
+                model.extract_img_feature(base_support["image"]).mean(0, keepdim=True), dim=-1
+            )
+        base_state = {
+            "class_ids": torch.tensor([0]),
+            "image_proto": base_proto,
+            "text_features": F.normalize(torch.eye(8)[[0]], dim=-1),
+            "description_proto": F.normalize(torch.eye(8)[[0]], dim=-1),
+            "anchor_by_block": base_anchors,
+            "creation_session": 0,
+        }
+        for _, adapter in runner._moe_adapters():
+            adapter.assert_descriptors_ready()
+
+        session1_support = lifecycle_batch(
+            1, torch.tensor([0., 1., 0., 0., 0., 0., 0., 0.]), 200
+        )
+        session1_train = lifecycle_batch(
+            1, torch.tensor([0., 1., 0., 0., 0., 0., 0., 0.]), 200,
+            augmented=True, seed=31,
+        )
+        before_session1 = {
+            block: {key: value.detach().clone() for key, value in adapter.state_dict().items()}
+            for block, adapter in runner._moe_adapters()
+        }
+        baseline_block1 = model.collect_blockwise_cls_features([session1_support])[1][
+            "cls_in"
+        ].clone()
+        captured_block1 = {}
+        original_plan = model.plan_layer_expansion
+
+        def capture_downstream_plan(block_idx, features, class_index, threshold=None):
+            if int(block_idx) == 1:
+                captured_block1["cls_in"] = features[1]["cls_in"].detach().clone()
+            return original_plan(block_idx, features, class_index, threshold)
+
+        model.plan_layer_expansion = capture_downstream_plan
+        try:
+            session1_result = runner.train_incremental_task(
+                1, [session1_train], [session1_support], [1], ["class_1"], [base_state]
+            )
+        finally:
+            model.plan_layer_expansion = original_plan
+
+        self.assertEqual([item["block_idx"] for item in session1_result["expanded"]], [0, 1])
+        self.assertEqual([adapter.num_experts for _, adapter in runner._moe_adapters()], [3, 3])
+        self.assertTrue(captured_block1)
+        self.assertFalse(torch.allclose(baseline_block1, captured_block1["cls_in"]))
+        for block, adapter in runner._moe_adapters():
+            adapter.assert_descriptors_ready()
+            for key, old_value in before_session1[block].items():
+                torch.testing.assert_close(adapter.state_dict()[key], old_value, rtol=0, atol=0)
+            old_mean = base_anchors[block]["mean"].float()
+            old_var = base_anchors[block]["var"].float()
+            old_gate = adapter.old_anchor_response(old_mean, old_var)
+            current = model.collect_blockwise_cls_features([session1_support])[block]["cls_in"]
+            new_gate = torch.sigmoid(adapter.router.columns[-1](current)).mean().item()
+            self.assertLess(old_gate, 0.5)
+            self.assertGreater(new_gate, old_gate)
+
+        # The same class must be recognized by its newly calibrated expert,
+        # rather than causing a duplicate expert in the next pass.
+        session1_features = model.collect_blockwise_cls_features([session1_support])
+        for block in model.expandable_blocks():
+            decision = model.plan_layer_expansion(block, session1_features, [1])
+            self.assertFalse(decision.expand)
+            self.assertEqual(decision.uncovered_classes, [])
+
+        session1_anchors = runner._collect_class_anchors([session1_support])
+        with torch.no_grad():
+            session1_proto = F.normalize(
+                model.extract_img_feature(session1_support["image"]).mean(0, keepdim=True), dim=-1
+            )
+        session1_state = {
+            "class_ids": torch.tensor([1]),
+            "image_proto": session1_proto,
+            "text_features": F.normalize(torch.eye(8)[[1]], dim=-1),
+            "description_proto": F.normalize(torch.eye(8)[[1]], dim=-1),
+            "anchor_by_block": session1_anchors,
+            "creation_session": 1,
+        }
+
+        old_images = torch.cat([base_support["image"][:1], session1_support["image"][:1]], dim=0)
+        old_labels = torch.tensor([0, 1])
+        old_prototypes = torch.cat([base_proto, session1_proto], dim=0)
+
+        def old_predictions():
+            model.eval()
+            with torch.no_grad():
+                features = F.normalize(model.extract_img_feature(old_images), dim=-1)
+                return (features @ old_prototypes.t()).argmax(dim=-1)
+
+        predictions_before_session2 = old_predictions()
+        self.assertEqual(predictions_before_session2.tolist(), old_labels.tolist())
+
+        session2_support = lifecycle_batch(
+            2, torch.tensor([0., 0., 1., 0., 0., 0., 0., 0.]), 300
+        )
+        session2_train = lifecycle_batch(
+            2, torch.tensor([0., 0., 1., 0., 0., 0., 0., 0.]), 300,
+            augmented=True, seed=37,
+        )
+        before_session2 = {
+            block: {key: value.detach().clone() for key, value in adapter.state_dict().items()}
+            for block, adapter in runner._moe_adapters()
+        }
+        session2_result = runner.train_incremental_task(
+            2, [session2_train], [session2_support], [2], ["class_2"],
+            [base_state, session1_state],
+        )
+        self.assertEqual([item["block_idx"] for item in session2_result["expanded"]], [0, 1])
+        self.assertEqual([adapter.num_experts for _, adapter in runner._moe_adapters()], [4, 4])
+
+        for block, adapter in runner._moe_adapters():
+            adapter.assert_descriptors_ready()
+            for key, old_value in before_session2[block].items():
+                torch.testing.assert_close(adapter.state_dict()[key], old_value, rtol=0, atol=0)
+            old_mean, old_var = runner._all_old_anchors([base_state, session1_state], block)
+            old_gate = adapter.old_anchor_response(old_mean, old_var)
+            current = model.collect_blockwise_cls_features([session2_support])[block]["cls_in"]
+            new_gate = torch.sigmoid(adapter.router.columns[-1](current)).mean().item()
+            self.assertLess(old_gate, 0.5)
+            self.assertGreater(new_gate, old_gate)
+
+        predictions_after_session2 = old_predictions()
+        self.assertEqual(predictions_after_session2.tolist(), old_labels.tolist())
+        torch.testing.assert_close(
+            predictions_after_session2, predictions_before_session2, rtol=0, atol=0
+        )
+
+        session2_features = model.collect_blockwise_cls_features([session2_support])
+        for block in model.expandable_blocks():
+            decision = model.plan_layer_expansion(block, session2_features, [2])
+            self.assertFalse(decision.expand)
+            self.assertEqual(decision.uncovered_classes, [])
+
+        # Checkpoint-style topology reconstruction must preserve the complete
+        # multi-session expert pool, AE references, route outputs and encoder.
+        topology = model.export_moe_topology()
+        checkpoint_state = {
+            key: value.detach().clone() for key, value in model.state_dict().items()
+        }
+        model.eval()
+        with torch.no_grad():
+            expected_features, expected_aux = model.extract_img_feature_train(
+                session2_support["image"]
+            )
+        restored_runner, restored_model = build_lifecycle_runner()
+        restored_model.rebuild_moe_topology(topology)
+        restored_model.load_state_dict(checkpoint_state, strict=True)
+        restored_model.eval()
+        with torch.no_grad():
+            restored_features, restored_aux = restored_model.extract_img_feature_train(
+                session2_support["image"]
+            )
+        torch.testing.assert_close(restored_features, expected_features, rtol=0, atol=0)
+        self.assertEqual(topology, restored_model.export_moe_topology())
+        self.assertEqual(
+            [adapter.expert_birth_sessions for _, adapter in restored_runner._moe_adapters()],
+            [[0, 0, 1, 2], [0, 0, 1, 2]],
+        )
+        for expected, restored in zip(expected_aux, restored_aux):
+            torch.testing.assert_close(
+                restored["route_weights"], expected["route_weights"], rtol=0, atol=0
+            )
+            torch.testing.assert_close(restored["cls_in"], expected["cls_in"], rtol=0, atol=0)
+        for _, adapter in restored_runner._moe_adapters():
+            adapter.assert_descriptors_ready()
+
 
 
 if __name__ == "__main__":
