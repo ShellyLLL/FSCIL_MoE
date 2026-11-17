@@ -690,8 +690,14 @@ class Runner:
                 "source_ids": calibration_sources.detach().cpu(),
             }
             with torch.no_grad():
-                _, fit_responsibilities = adapter.router(fit_values)
-                _, calibration_responsibilities = adapter.router(calibration_values)
+                fit_responsibilities = torch.stack([
+                    adapter.expert_responsibility(fit_values, expert_id)
+                    for expert_id in range(adapter.num_experts)
+                ], dim=-1)
+                calibration_responsibilities = torch.stack([
+                    adapter.expert_responsibility(calibration_values, expert_id)
+                    for expert_id in range(adapter.num_experts)
+                ], dim=-1)
             for expert_id in range(adapter.num_experts):
                 loss = self._train_descriptor(
                     adapter, expert_id, fit_values, epochs,
@@ -1178,8 +1184,10 @@ class Runner:
             ae_fit_values = local_values[fit_mask]
             ae_calibration_values = local_values[calibration_mask]
             with torch.no_grad():
-                _, ae_calibration_responsibilities = adapter.router(ae_calibration_values)
-                ae_calibration_weights = ae_calibration_responsibilities[:, expert_id]
+                ae_calibration_route = adapter.layer_norm(ae_calibration_values)
+                ae_calibration_weights = adapter.expert_responsibility(
+                    ae_calibration_route, expert_id
+                )
             parent_expert_id = int(decision.parent_expert_id)
             if parent_expert_id >= expert_id or parent_expert_id < 0:
                 raise RuntimeError(f"Block {block_idx} selected an invalid historical AE parent.")
