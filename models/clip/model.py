@@ -272,13 +272,15 @@ class RepresentationDescriptor(nn.Module):
         return self.error_mean, self.error_std
 
     def standardized_score(self, x):
-        if int(self.error_count.item()) < 1:
-            raise RuntimeError("AE descriptor has no independent reference errors.")
+        if (int(self.error_count.item()) < 1
+                or float(self.effective_error_count.item()) <= 0.0):
+            raise RuntimeError("AE descriptor has no valid independent weighted reference errors.")
         return (self.reconstruction_error(x) - self.error_mean) / self.error_std.clamp_min(self.eps)
 
     def is_ready(self):
         return (
             int(self.error_count.item()) >= 1
+            and float(self.effective_error_count.item()) > 0.0
             and bool(torch.isfinite(self.error_mean).item())
             and bool(torch.isfinite(self.error_std).item())
             and float(self.error_std.item()) > 0.0
