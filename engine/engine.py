@@ -964,7 +964,7 @@ class Runner:
                 optimizer.step()
                 totals["loss"] += float(loss.item())
                 totals["ce"] += float(loss_ce.item())
-                    totals["lb"] += float(loss_lb.item())
+                totals["lb"] += float(loss_lb.item())
                 totals["n"] += 1
             scheduler.step()
             n = max(1, totals["n"])
