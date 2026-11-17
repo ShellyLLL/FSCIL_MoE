@@ -147,6 +147,8 @@ class RepresentationDescriptor(nn.Module):
         self.basis = nn.Parameter(basis)
         self.register_buffer("center", torch.zeros(self.d_model, dtype=torch.float32))
         self.register_buffer("error_history", torch.zeros(self.buffer_size, dtype=torch.float32))
+        self.register_buffer("error_weight_history", torch.zeros(self.buffer_size, dtype=torch.float32))
+        self.register_buffer("effective_error_count", torch.zeros((), dtype=torch.float32))
         self.register_buffer("error_count", torch.zeros((), dtype=torch.long))
         self.register_buffer("error_cursor", torch.zeros((), dtype=torch.long))
         self.register_buffer("error_mean", torch.zeros((), dtype=torch.float32))
@@ -176,6 +178,8 @@ class RepresentationDescriptor(nn.Module):
         self.basis.copy_(parent.basis.to(device=self.basis.device, dtype=self.basis.dtype))
         self.set_center(values, weights)
         self.error_history.zero_()
+        self.error_weight_history.zero_()
+        self.effective_error_count.zero_()
         self.error_count.zero_()
         self.error_cursor.zero_()
         self.error_mean.zero_()
@@ -210,42 +214,54 @@ class RepresentationDescriptor(nn.Module):
         return errors
 
     @torch.no_grad()
-    def update_reference(self, errors):
+    def update_reference(self, errors, weights=None):
         errors = torch.as_tensor(errors, device=self.error_history.device, dtype=torch.float32).reshape(-1)
         if errors.numel() == 0 or not torch.isfinite(errors).all():
             raise ValueError("AE reference update requires non-empty finite errors.")
+        weights = torch.ones_like(errors) if weights is None else torch.as_tensor(
+            weights, device=errors.device, dtype=torch.float32
+        ).reshape(-1)
+        if (weights.numel() != errors.numel() or not torch.isfinite(weights).all()
+                or (weights < 0).any() or not bool((weights.sum() > 0).item())):
+            raise ValueError("AE calibration weights must align with errors and have positive mass.")
         n = errors.numel()
         if n >= self.buffer_size:
             self.error_history.copy_(errors[-self.buffer_size:])
+            self.error_weight_history.copy_(weights[-self.buffer_size:])
             self.error_count.fill_(self.buffer_size)
             self.error_cursor.zero_()
         else:
             cursor = int(self.error_cursor.item())
             positions = (torch.arange(n, device=errors.device) + cursor) % self.buffer_size
             self.error_history[positions] = errors
+            self.error_weight_history[positions] = weights
             self.error_count.fill_(min(self.buffer_size, int(self.error_count.item()) + n))
             self.error_cursor.fill_((cursor + n) % self.buffer_size)
         count = int(self.error_count.item())
-        reference = self.error_history if count == self.buffer_size else self.error_history[:count]
-        mean = reference.mean()
-        std = reference.std(unbiased=True) if count > 1 else mean.new_zeros(())
+        values = self.error_history if count == self.buffer_size else self.error_history[:count]
+        mass_weights = self.error_weight_history if count == self.buffer_size else self.error_weight_history[:count]
+        mass = mass_weights.sum().clamp_min(self.eps)
+        mean = (values * mass_weights).sum() / mass
+        effective_n = mass.square() / mass_weights.square().sum().clamp_min(self.eps)
+        variance = (mass_weights * (values - mean).square()).sum() / mass
+        correction = effective_n / (effective_n - 1.0).clamp_min(1.0)
         self.error_mean.copy_(mean)
-        self.error_std.copy_(std.clamp_min(self.eps))
+        self.error_std.copy_((variance * correction).clamp_min(self.eps ** 2).sqrt())
+        self.effective_error_count.copy_(effective_n)
         return self.error_mean, self.error_std
 
     @torch.no_grad()
     def shrink_reference(self, prior_mean, prior_std, prior_strength):
-        """Empirical-Bayes moment shrinkage of few-shot AE error statistics."""
         prior_mean = torch.as_tensor(prior_mean, device=self.error_mean.device, dtype=torch.float32)
         prior_std = torch.as_tensor(prior_std, device=self.error_std.device, dtype=torch.float32)
         strength = float(prior_strength)
-        count = int(self.error_count.item())
-        if count < 1 or not torch.isfinite(prior_mean) or not torch.isfinite(prior_std):
-            raise ValueError("AE shrinkage requires at least one independent local error and finite prior statistics.")
+        effective_n = float(self.effective_error_count.item())
+        if effective_n <= 0 or not torch.isfinite(prior_mean) or not torch.isfinite(prior_std):
+            raise ValueError("AE shrinkage requires independent weighted errors and finite priors.")
         if prior_std <= 0 or not np.isfinite(strength) or strength <= 0:
             raise ValueError("AE prior std and shrinkage strength must be positive.")
         local_mean, local_std = self.error_mean.clone(), self.error_std.clone()
-        weight = float(count) / (float(count) + strength)
+        weight = effective_n / (effective_n + strength)
         mean = weight * local_mean + (1.0 - weight) * prior_mean
         variance = (
             weight * (local_std.square() + (local_mean - mean).square())
