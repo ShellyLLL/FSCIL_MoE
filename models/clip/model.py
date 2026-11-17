@@ -163,8 +163,9 @@ class RepresentationDescriptor(nn.Module):
             center = values.mean(dim=0)
         else:
             weights = torch.as_tensor(weights, device=values.device, dtype=torch.float32).reshape(-1)
-            if weights.numel() != values.size(0) or (weights < 0).any() or weights.sum() <= 0:
-                raise ValueError("AE center weights must be non-negative with positive mass.")
+            if (weights.numel() != values.size(0) or not torch.isfinite(weights).all()
+                    or (weights < 0).any() or not bool((weights.sum() > 0).item())):
+                raise ValueError("AE center weights must be finite, non-negative and have positive mass.")
             center = (values * weights[:, None]).sum(0) / weights.sum()
         self.center.copy_(center)
 
