@@ -658,7 +658,6 @@ class Runner:
             }
             with torch.no_grad():
                 _, fit_responsibilities = adapter.router(fit_values)
-                _, calibration_responsibilities = adapter.router(calibration_values)
             for expert_id in range(adapter.num_experts):
                 loss = self._train_descriptor(
                     adapter, expert_id, fit_values, epochs,
