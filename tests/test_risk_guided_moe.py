@@ -635,15 +635,15 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             runner.task_acc_list = [[50.0]]
             runner.session_diagnostics = [{"session": 0}]
             runner.expansion_thresholds = {0: 1.25, 1: 1.5}
-            runner.descriptor_error_priors = {
-                0: {"mean": 0.02, "std": 0.01},
-                1: {"mean": 0.03, "std": 0.02},
-            }
             model.base_vision_prototype = torch.tensor([[1.0, 0.0, 0.0, 0.0,
                                                          0.0, 0.0, 0.0, 0.0]])
             runner._train_base_descriptors([lifecycle_batch(
                 0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 7000
             )])
+            runner.descriptor_error_priors = {
+                0: {"mean": 0.02, "std": 0.01},
+                1: {"mean": 0.03, "std": 0.02},
+            }
             prototype = torch.tensor([[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]])
             anchor_var = torch.full_like(prototype, 0.1)
             anchor_bank = {
