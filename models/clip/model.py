@@ -375,6 +375,30 @@ class VisualMoEAdapter(nn.Module):
     def update_descriptor_stats(self, errors, expert_id):
         return self.descriptors[int(expert_id)].update_reference(errors)
 
+    def routing_outputs(self, route_features):
+        """Return the exact base-softmax plus incremental-sigmoid gates used by forward."""
+        if route_features.ndim != 2 or route_features.size(-1) != self.d_model:
+            raise ValueError("Router inputs must have shape [batch, d_model].")
+        if len(self.router.columns) != self.num_experts:
+            raise RuntimeError("Router columns and deployed experts are not aligned.")
+        base_logits, base_weights = self.router(route_features, self.base_expert_count)
+        incremental_ids = list(range(self.base_expert_count, self.num_experts))
+        gate_logits = [self.router.columns[index](route_features) for index in incremental_ids]
+        incremental_gates = [torch.sigmoid(value) for value in gate_logits]
+        logits = torch.cat([base_logits] + gate_logits, dim=-1) if gate_logits else base_logits
+        weights = torch.cat([base_weights] + incremental_gates, dim=-1) if incremental_gates else base_weights
+        return logits, weights
+
+    def expert_responsibility(self, route_features, expert_id):
+        """Return one expert's deployed responsibility, not a surrogate softmax."""
+        expert_id = int(expert_id)
+        if expert_id < 0 or expert_id >= self.num_experts:
+            raise IndexError(f"Expert id {expert_id} is outside the deployed expert pool.")
+        if expert_id < self.base_expert_count:
+            _, base_weights = self.router(route_features, self.base_expert_count)
+            return base_weights[:, expert_id]
+        return torch.sigmoid(self.router.columns[expert_id](route_features)).reshape(-1)
+
     @staticmethod
     def _anchor_points(mean, variance):
         mean = torch.as_tensor(mean).float()
@@ -537,14 +561,9 @@ class VisualMoEAdapter(nn.Module):
             else self.layer_norm(route_input)
         )
         # The base mixture is never renormalised when incremental experts arrive.
-        base_logits, base_weights = self.router(route_features, self.base_expert_count)
-        incremental_ids = list(range(self.base_expert_count, self.num_experts))
-        gate_logits = [self.router.columns[index](route_features) for index in incremental_ids]
-        incremental_gates = [torch.sigmoid(value) for value in gate_logits]
-        weights = torch.cat([base_weights] + incremental_gates, dim=-1) if incremental_gates else base_weights
-        logits = torch.cat([base_logits] + gate_logits, dim=-1) if gate_logits else base_logits
+        logits, weights = self.routing_outputs(route_features)
         residual, norms, output_energies = torch.zeros_like(x_norm), [], []
-        expert_ids = list(range(self.base_expert_count)) + incremental_ids
+        expert_ids = list(range(self.num_experts))
         for column, expert_id in enumerate(expert_ids):
             expert_output = self.experts[expert_id](x_norm)
             weighted = expert_output * weights[:, column].unsqueeze(0).unsqueeze(-1)
