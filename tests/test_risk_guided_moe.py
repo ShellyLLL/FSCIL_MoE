@@ -143,7 +143,7 @@ def build_lifecycle_runner():
 
 
 def lifecycle_batch(class_id, feature, source_start, augmented=False, seed=0):
-    count = 6
+    count = 8
     images = feature.reshape(1, 8).repeat(count, 1).clone()
     if augmented:
         generator = torch.Generator().manual_seed(seed)
@@ -302,20 +302,20 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         for block_idx, adapter in runner._moe_adapters():
             threshold_holdout = runner._base_calibration_features[block_idx]
             ae_holdout = runner._base_ae_calibration_features[block_idx]
-            self.assertEqual(threshold_holdout["labels"].numel(), 3)
-            self.assertEqual(ae_holdout["labels"].numel(), 6)
+            self.assertEqual(threshold_holdout["labels"].numel(), 6)
+            self.assertEqual(ae_holdout["labels"].numel(), 9)
             self.assertEqual(set(threshold_holdout["labels"].tolist()), {0, 1, 2})
             self.assertEqual(set(ae_holdout["labels"].tolist()), {0, 1, 2})
             self.assertTrue(all(
-                int((threshold_holdout["labels"] == class_id).sum().item()) == 1
-                and int((ae_holdout["labels"] == class_id).sum().item()) == 2
+                int((threshold_holdout["labels"] == class_id).sum().item()) == 2
+                and int((ae_holdout["labels"] == class_id).sum().item()) == 3
                 for class_id in (0, 1, 2)
             ))
             self.assertFalse(torch.isin(
                 threshold_holdout["source_ids"], ae_holdout["source_ids"]
             ).any())
             self.assertTrue(all(
-                int(descriptor.error_count.item()) == 6
+                int(descriptor.error_count.item()) == 9
                 and float(descriptor.effective_error_count.item()) > 0
                 for descriptor in adapter.descriptors
             ))
