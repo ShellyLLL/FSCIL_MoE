@@ -1157,7 +1157,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         session1_state = make_lifecycle_state(runner, model, 1, session1_support, 1)
 
         old_images = torch.cat([base_support["image"], session1_support["image"]], dim=0)
-        old_labels = torch.tensor([0] * 4 + [1] * 4)
+        old_labels = torch.tensor([0] * base_support["image"].size(0) + [1] * session1_support["image"].size(0))
         old_prototypes = torch.cat([
             base_state["image_proto"], session1_state["image_proto"]
         ], dim=0)
