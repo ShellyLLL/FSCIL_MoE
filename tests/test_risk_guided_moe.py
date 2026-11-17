@@ -1197,7 +1197,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             ))
             newest_old_responses.append(float(after[:, -1].mean().item()))
 
-        self.assertEqual(before_accuracy, 8)
+        self.assertEqual(before_accuracy, old_labels.numel())
         self.assertEqual(after_accuracy, before_accuracy)
         self.assertTrue(torch.isfinite(per_sample_cosine).all())
         self.assertGreaterEqual(feature_cosine, 0.98)
