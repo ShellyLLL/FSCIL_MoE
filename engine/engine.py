@@ -579,7 +579,7 @@ class Runner:
             reference_values = torch.as_tensor(
                 calibration_values, device=values.device
             ).float()
-            minimum_calibration = 1 if shrinkage_prior is not None else 3
+            minimum_calibration = 1 if shrinkage_prior is not None else 2
             if (reference_values.ndim != 2 or reference_values.size(0) < minimum_calibration
                     or not torch.isfinite(reference_values).all()):
                 raise ValueError(
@@ -598,8 +598,8 @@ class Runner:
                     shrinkage_prior["mean"], shrinkage_prior["std"],
                     float(getattr(self._visual_moe_cfg(), "AE_PRIOR_STRENGTH", 10.0)),
                 )
-            elif int(descriptor.error_count.item()) < 3:
-                raise RuntimeError("Base AE descriptors require at least three independent calibration errors.")
+            elif int(descriptor.error_count.item()) < 2:
+                raise RuntimeError("Base AE descriptors require at least two independent calibration errors.")
         for parameter in descriptor.parameters():
             parameter.requires_grad = False
             parameter.grad = None
@@ -675,19 +675,37 @@ class Runner:
             values = item["cls_in"].to(self.device)
             labels = item["labels"].to(self.device)
             source_ids = item["source_ids"].to(self.device)
-            calibration_mask = self._make_calibration_mask(
-                labels, source_ids, min_calibration_count=3, min_fit_per_class=3,
-                min_calibration_per_class=3,
+            # Three disjoint source sets: AE error reference, threshold calibration,
+            # and descriptor fitting. Every class contributes to both holdouts.
+            ae_mask = self._make_calibration_mask(
+                labels, source_ids, min_calibration_count=2,
+                min_fit_per_class=4, min_calibration_per_class=2,
             )
-            fit_mask = ~calibration_mask
+            remaining = ~ae_mask
+            threshold_local = self._make_calibration_mask(
+                labels[remaining], source_ids[remaining],
+                min_calibration_count=1, min_fit_per_class=3,
+                min_calibration_per_class=1,
+            )
+            threshold_mask = torch.zeros_like(ae_mask)
+            threshold_mask[remaining] = threshold_local
+            fit_mask = ~(ae_mask | threshold_mask)
+            ae_values = values[ae_mask]
+            ae_labels = labels[ae_mask]
+            ae_sources = source_ids[ae_mask]
+            threshold_values = values[threshold_mask]
+            threshold_labels = labels[threshold_mask]
+            threshold_sources = source_ids[threshold_mask]
             fit_values = values[fit_mask]
-            calibration_values = values[calibration_mask]
-            calibration_labels = labels[calibration_mask]
-            calibration_sources = source_ids[calibration_mask]
+            self._base_ae_calibration_features[int(block_idx)] = {
+                "cls_in": ae_values.detach().cpu(),
+                "labels": ae_labels.detach().cpu(),
+                "source_ids": ae_sources.detach().cpu(),
+            }
             self._base_calibration_features[int(block_idx)] = {
-                "cls_in": calibration_values.detach().cpu(),
-                "labels": calibration_labels.detach().cpu(),
-                "source_ids": calibration_sources.detach().cpu(),
+                "cls_in": threshold_values.detach().cpu(),
+                "labels": threshold_labels.detach().cpu(),
+                "source_ids": threshold_sources.detach().cpu(),
             }
             with torch.no_grad():
                 fit_responsibilities = torch.stack([
@@ -695,19 +713,19 @@ class Runner:
                     for expert_id in range(adapter.num_experts)
                 ], dim=-1)
                 calibration_responsibilities = torch.stack([
-                    adapter.expert_responsibility(calibration_values, expert_id)
+                    adapter.expert_responsibility(ae_values, expert_id)
                     for expert_id in range(adapter.num_experts)
                 ], dim=-1)
             for expert_id in range(adapter.num_experts):
                 loss = self._train_descriptor(
                     adapter, expert_id, fit_values, epochs,
                     fit_responsibilities[:, expert_id],
-                    calibration_values=calibration_values,
+                    calibration_values=ae_values,
                     calibration_weights=calibration_responsibilities[:, expert_id],
                 )
                 descriptor = adapter.descriptors[expert_id]
-                if int(descriptor.error_count.item()) < 3:
-                    raise RuntimeError("Base descriptor calibration requires at least three independent held-out errors.")
+                if int(descriptor.error_count.item()) < 2:
+                    raise RuntimeError("Base descriptor calibration requires at least two independent held-out errors.")
                 print(f"=> [SEMA-AE][B{block_idx}][E{expert_id}] loss={loss:.6f} "
                       f"reference_n={int(descriptor.error_count.item())} "
                       f"mean={descriptor.error_mean.item():.6f} std={descriptor.error_std.item():.6f}")
@@ -749,7 +767,8 @@ class Runner:
                 for class_id in torch.unique(labels, sorted=True)
             ])
             class_scores = class_descriptor_scores.min(dim=1).values
-            if class_scores.numel() < 2 or not torch.isfinite(class_scores).all():
+            if (class_scores.numel() < 3 or not torch.isfinite(class_scores).all()
+                    or any(not labels.eq(class_id).any() for class_id in torch.unique(labels))):
                 raise RuntimeError(f"Block {block_idx} has insufficient finite Base classes for threshold calibration.")
             threshold = torch.quantile(class_scores.float(), 1.0 - alpha)
             thresholds[int(block_idx)] = float(threshold.item())
@@ -1184,9 +1203,8 @@ class Runner:
             ae_fit_values = local_values[fit_mask]
             ae_calibration_values = local_values[calibration_mask]
             with torch.no_grad():
-                ae_calibration_route = adapter.layer_norm(ae_calibration_values)
                 ae_calibration_weights = adapter.expert_responsibility(
-                    ae_calibration_route, expert_id
+                    ae_calibration_values, expert_id
                 )
             parent_expert_id = int(decision.parent_expert_id)
             if parent_expert_id >= expert_id or parent_expert_id < 0:
