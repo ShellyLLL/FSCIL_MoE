@@ -323,6 +323,23 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         self.assertEqual(set(runner.expansion_thresholds), {0, 1})
         self.assertTrue(all(torch.isfinite(torch.tensor(value))
                             for value in runner.expansion_thresholds.values()))
+        alpha = 0.05
+        for block_idx, adapter in runner._moe_adapters():
+            holdout = runner._base_calibration_features[block_idx]
+            values = holdout["cls_in"]
+            labels = holdout["labels"]
+            scores = adapter.descriptor_scores(values)
+            class_scores = torch.stack([
+                scores[labels.eq(class_id)].median(dim=0).values.min()
+                for class_id in torch.unique(labels, sorted=True)
+            ]).sort().values
+            rank = min(class_scores.numel(), int(torch.ceil(
+                torch.tensor((class_scores.numel() + 1) * (1.0 - alpha))
+            ).item()))
+            torch.testing.assert_close(
+                torch.tensor(runner.expansion_thresholds[block_idx]),
+                class_scores[max(0, rank - 1)],
+            )
 
     def test_incremental_expert_output_energy_is_differentiable_and_unweighted(self):
         torch.manual_seed(241)
@@ -406,6 +423,15 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Insufficient independent support sources"):
             Runner._make_calibration_mask(
                 labels, source_ids, min_calibration_count=3, min_fit_per_class=3
+            )
+
+    def test_ae_calibration_rejects_source_identity_cross_class_collisions(self):
+        labels = torch.tensor([0, 0, 1, 1, 1, 1])
+        source_ids = torch.tensor([10, 11, 10, 12, 13, 14])
+        with self.assertRaisesRegex(ValueError, "source id 10.*multiple classes"):
+            Runner._make_calibration_mask(
+                labels, source_ids, min_calibration_count=1,
+                min_fit_per_class=3, min_calibration_per_class=1,
             )
 
     def test_new_descriptor_initializes_from_parent_basis_and_recenters(self):
