@@ -63,11 +63,11 @@ The incremental lifecycle is:
    fitted with Base-router responsibility weights and independently held-out
    source identities. Their per-layer known-class scores calibrate expansion
    thresholds using the same class-wise statistic used at incremental time.
-3. For each class and layer, compute the median across support sources of the
-   minimum signed reconstruction-error Z-score over all existing descriptors.
-   Expand only if at least one class exceeds the calibrated threshold for every
-   existing descriptor. Select the child AE parent by the lowest class-balanced
-   mean descriptor score over uncovered classes.
+3. For each class and layer, compute the median signed reconstruction-error
+   Z-score separately for every existing descriptor, then take the minimum
+   across descriptors. Expand only if at least one class exceeds the calibrated
+   threshold for every existing descriptor. Select the child AE parent by the
+   lowest class-balanced mean descriptor score over uncovered classes.
 4. Add at most one zero-up-initialized residual expert per layer per session.
    Train only that expert and its independent sigmoid router column. Base
    experts retain their softmax mixture; historical incremental columns remain
@@ -79,10 +79,10 @@ The incremental lifecycle is:
    suppress its gated residual using the corresponding adapted-space anchors.
 6. Initialize each new AE basis from the selected historical parent, recenter
    it on only the uncovered classes assigned to the new expert, and fit it in
-   the stable reference CLS space. Calibrate its error buffer only on independent
-   held-out source identities; shrink one- or few-shot error moments toward the
-   selected parent descriptor's error statistics. Never fall back to in-sample
-   AE calibration.
+   the stable reference CLS space. Calibrate reconstruction errors on independent
+   held-out source identities using that expert's router responsibilities;
+   shrink weighted moments toward the selected parent descriptor's error
+   statistics using effective sample size. Never use in-sample AE calibration.
 7. Build source-exclusive leave-one-out visual prototypes. Calibrate new visual
    prototypes using a mixture of visual-neighbor and text-semantic-neighbor
    distributions over Base classes, transport the adapted/reference feature
