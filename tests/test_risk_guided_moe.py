@@ -671,6 +671,10 @@ class UnifiedDynamicMoETests(unittest.TestCase):
                 SAVE_EVERY_SESSION=True
             )
             restored.data_manager = SimpleNamespace(
+                num_tasks=5,
+                class_index_in_task=[torch.tensor([0])] + [
+                    torch.tensor([index]) for index in range(1, 5)
+                ],
                 load_support_manifest=lambda manifest: self.assertEqual(
                     manifest, {"seed": 7, "support_ids": [1, 2, 3]}
                 )
