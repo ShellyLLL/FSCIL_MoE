@@ -281,10 +281,10 @@ class BiMC(nn.Module):
             ])
             for class_id in class_ids
         ])
-        sample_best_z = scores.min(dim=1).values
-        class_min_z = torch.stack([
-            sample_best_z[labels.eq(class_id)].median() for class_id in class_ids
-        ])
+        # A class is covered if at least one descriptor covers the class-level
+        # distribution. Aggregate each descriptor over the class before taking
+        # the minimum across descriptors; min-then-median is not equivalent.
+        class_min_z = class_descriptor_scores.min(dim=1).values
         class_scores = {
             int(class_id): float(class_min_z[row].item())
             for row, class_id in enumerate(class_ids.tolist())
