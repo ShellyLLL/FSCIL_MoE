@@ -736,12 +736,17 @@ class UnifiedDynamicMoETests(unittest.TestCase):
 
         # Different samples in one class are covered by different experts.
         # Per-sample min then median would incorrectly call this covered.
+        crossing_features = {
+            0: {"cls_in": torch.randn(8, 8),
+                "labels": torch.tensor([2, 2, 2, 2, 3, 3, 3, 3])}
+        }
         adapter.descriptor_scores = lambda x, require_ready=True: torch.tensor(
-            [[0.2, 2.0], [2.0, 0.2], [0.2, 0.2], [0.2, 0.2]])
-        decision = model.plan_layer_expansion(0, features, [2, 3])
+            [[0.2, 2.0], [2.0, 0.2], [2.0, 2.0], [2.0, 2.0],
+             [0.2, 0.2], [0.2, 0.2], [0.2, 0.2], [0.2, 0.2]])
+        decision = model.plan_layer_expansion(0, crossing_features, [2, 3])
         self.assertTrue(decision.expand)
         self.assertEqual(decision.uncovered_classes, [2])
-        self.assertAlmostEqual(decision.class_scores[2], 1.1, places=5)
+        self.assertAlmostEqual(decision.class_scores[2], 2.0, places=5)
         self.assertAlmostEqual(decision.class_scores[3], 0.2, places=5)
 
         adapter.descriptor_scores = lambda x, require_ready=True: torch.tensor(
