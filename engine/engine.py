@@ -708,14 +708,14 @@ class Runner:
             # Three disjoint source sets: AE error reference, threshold calibration,
             # and descriptor fitting. Every class contributes to both holdouts.
             ae_mask = self._make_calibration_mask(
-                labels, source_ids, min_calibration_count=2,
-                min_fit_per_class=4, min_calibration_per_class=2,
+                labels, source_ids, min_calibration_count=3,
+                min_fit_per_class=5, min_calibration_per_class=3,
             )
             remaining = ~ae_mask
             threshold_local = self._make_calibration_mask(
                 labels[remaining], source_ids[remaining],
-                min_calibration_count=1, min_fit_per_class=3,
-                min_calibration_per_class=1,
+                min_calibration_count=2, min_fit_per_class=3,
+                min_calibration_per_class=2,
             )
             threshold_mask = torch.zeros_like(ae_mask)
             threshold_mask[remaining] = threshold_local
