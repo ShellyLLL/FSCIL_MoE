@@ -641,6 +641,9 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             }
             model.base_vision_prototype = torch.tensor([[1.0, 0.0, 0.0, 0.0,
                                                          0.0, 0.0, 0.0, 0.0]])
+            runner._train_base_descriptors([lifecycle_batch(
+                0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 7000
+            )])
             prototype = torch.tensor([[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]])
             anchor_var = torch.full_like(prototype, 0.1)
             anchor_bank = {
