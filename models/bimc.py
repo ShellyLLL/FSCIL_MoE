@@ -484,9 +484,6 @@ class BiMC(nn.Module):
             "class_index": class_index,
             "class_ids": class_ids,
             "sample_cnt": len(images_features),
-            "anchor_features": images_features.detach().to(device="cpu", dtype=torch.float16),
-            "anchor_labels": anchor_labels.detach().cpu(),
-            "anchor_source_ids": source_ids,
             "encoder_version": 0,
         }
 
