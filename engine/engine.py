@@ -1142,6 +1142,9 @@ class Runner:
             fit_mask = ~calibration_mask
             ae_fit_values = local_values[fit_mask]
             ae_calibration_values = local_values[calibration_mask]
+            with torch.no_grad():
+                _, ae_calibration_responsibilities = adapter.router(ae_calibration_values)
+                ae_calibration_weights = ae_calibration_responsibilities[:, expert_id]
             parent_expert_id = int(decision.parent_expert_id)
             if parent_expert_id >= expert_id or parent_expert_id < 0:
                 raise RuntimeError(f"Block {block_idx} selected an invalid historical AE parent.")
@@ -1156,6 +1159,7 @@ class Runner:
                 adapter, expert_id, ae_fit_values, ae_epochs,
                 calibration_values=ae_calibration_values,
                 shrinkage_prior=prior,
+                calibration_weights=ae_calibration_weights,
                 initialization_descriptor=parent_descriptor,
             )
             adapter.freeze_all()
