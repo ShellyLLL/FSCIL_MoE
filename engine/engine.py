@@ -492,7 +492,7 @@ class Runner:
     def _train_descriptor(
         self, adapter, expert_id, values, epochs, sample_weights=None,
         calibration_values=None, shrinkage_prior=None,
-        initialization_descriptor=None,
+        calibration_weights=None, initialization_descriptor=None,
     ):
         """Fit a reference-space linear AE with independent held-out error calibration."""
         descriptor = adapter.descriptors[int(expert_id)]
@@ -552,11 +552,12 @@ class Runner:
                     "finite independent held-out representations."
                 )
             errors = descriptor.reconstruction_error(reference_values)
-            # Keep one error observation per independent held-out support source.
-            # Router responsibilities shape AE fitting, but bootstrapping these
-            # calibration errors with replacement would turn a small holdout
-            # into duplicated pseudo-observations and overstate error_count.
-            adapter.update_descriptor_stats(errors, expert_id)
+            weights = torch.ones_like(errors) if calibration_weights is None else torch.as_tensor(
+                calibration_weights, device=errors.device, dtype=torch.float32
+            ).reshape(-1)
+            if weights.numel() != errors.numel():
+                raise ValueError("AE calibration responsibilities must align with held-out sources.")
+            descriptor.update_reference(errors, weights)
             if shrinkage_prior is not None:
                 descriptor.shrink_reference(
                     shrinkage_prior["mean"], shrinkage_prior["std"],
@@ -572,41 +573,41 @@ class Runner:
         return float(loss.item())
 
     @staticmethod
-    def _make_calibration_mask(labels, source_ids, min_calibration_count=3, min_fit_per_class=3):
-        """Hold out whole source identities while retaining independent AE fitting data."""
+    def _make_calibration_mask(
+        labels, source_ids, min_calibration_count=3,
+        min_fit_per_class=3, min_calibration_per_class=1,
+    ):
+        """Hold out independent source identities with a per-class minimum."""
         labels = torch.as_tensor(labels).long().reshape(-1)
         source_ids = torch.as_tensor(source_ids, device=labels.device).reshape(-1)
         if labels.numel() == 0 or source_ids.numel() != labels.numel():
             raise ValueError("AE calibration labels and source ids must be non-empty and aligned.")
         min_calibration_count = int(min_calibration_count)
         min_fit_per_class = int(min_fit_per_class)
-        if min_calibration_count < 1 or min_fit_per_class < 3:
-            raise ValueError("AE calibration requires at least one held-out source and three fit sources per class.")
+        min_calibration_per_class = int(min_calibration_per_class)
+        if min_calibration_count < 1 or min_fit_per_class < 3 or min_calibration_per_class < 1:
+            raise ValueError("AE calibration requires positive holdout counts and at least three fit sources per class.")
         classes = torch.unique(labels, sorted=True)
-        per_class_sources = {}
-        holdout_counts = {}
-        for class_id in classes:
+        per_class_sources, holdout_counts = {}, {}
+        for class_id in classes.tolist():
             class_sources = torch.unique(source_ids[labels.eq(class_id)], sorted=True)
-            if class_sources.numel() <= min_fit_per_class:
+            capacity = int(class_sources.numel()) - min_fit_per_class
+            if capacity < min_calibration_per_class:
                 raise ValueError(
-                    f"Class {int(class_id)} has {class_sources.numel()} independent sources; "
-                    f"at least {min_fit_per_class + 1} are required for disjoint AE fitting/calibration."
+                    f"Class {class_id} has {class_sources.numel()} independent sources; "
+                    f"requires at least {min_fit_per_class + min_calibration_per_class} "
+                    "for disjoint fitting and per-class calibration."
                 )
-            # Select held-out source identities by a stable class/source hash,
-            # not by the smallest dataset indices.  Dataset indices are often
-            # ordered by class or acquisition time; taking their prefix can
-            # systematically bias the AE error reference distribution.
-            ordered_sources = sorted(
+            ordered = sorted(
                 (int(source_id) for source_id in class_sources.tolist()),
                 key=lambda source_id: hashlib.sha256(
                     f"fscil-ae-holdout:{int(class_id)}:{source_id}".encode("utf-8")
                 ).digest(),
             )
             per_class_sources[int(class_id)] = torch.as_tensor(
-                ordered_sources, device=class_sources.device, dtype=class_sources.dtype
+                ordered, device=class_sources.device, dtype=class_sources.dtype
             )
-            holdout_counts[int(class_id)] = 1
-
+            holdout_counts[int(class_id)] = min_calibration_per_class
         heldout_total = sum(holdout_counts.values())
         while heldout_total < min_calibration_count:
             progressed = False
@@ -619,21 +620,15 @@ class Runner:
                     if heldout_total >= min_calibration_count:
                         break
             if not progressed:
-                raise ValueError(
-                    "Insufficient independent support sources to meet the AE calibration "
-                    "minimum without reusing fitting examples."
-                )
-
-        calibration_mask = torch.zeros(labels.numel(), dtype=torch.bool, device=labels.device)
+                raise ValueError("Insufficient independent support sources for requested AE calibration holdout.")
+        mask = torch.zeros(labels.numel(), dtype=torch.bool, device=labels.device)
         for class_id in classes.tolist():
-            selected_sources = per_class_sources[int(class_id)][:holdout_counts[int(class_id)]]
-            calibration_mask |= labels.eq(int(class_id)) & torch.isin(source_ids, selected_sources)
-            fit_sources = torch.unique(source_ids[labels.eq(int(class_id)) & ~calibration_mask], sorted=True)
+            selected = per_class_sources[int(class_id)][:holdout_counts[int(class_id)]]
+            mask |= labels.eq(int(class_id)) & torch.isin(source_ids, selected)
+            fit_sources = torch.unique(source_ids[labels.eq(int(class_id)) & ~mask], sorted=True)
             if fit_sources.numel() < min_fit_per_class:
-                raise RuntimeError(f"AE calibration split left too few fitting sources for class {int(class_id)}.")
-        if int(calibration_mask.sum()) < min_calibration_count:
-            raise RuntimeError("AE calibration split did not produce the required independent holdout count.")
-        return calibration_mask
+                raise RuntimeError(f"AE calibration split left too few fitting sources for class {class_id}.")
+        return mask
 
     def _train_base_descriptors(self, extract_loader):
         epochs = int(_cfg_value(self.cfg.TRAINER.BiMC.OPTIM, "BASE_DESCRIPTOR_EPOCHS", 8))
@@ -646,22 +641,28 @@ class Runner:
             labels = item["labels"].to(self.device)
             source_ids = item["source_ids"].to(self.device)
             calibration_mask = self._make_calibration_mask(
-                labels, source_ids, min_calibration_count=3, min_fit_per_class=3
+                labels, source_ids, min_calibration_count=3, min_fit_per_class=3,
+                min_calibration_per_class=3,
             )
             fit_mask = ~calibration_mask
             fit_values = values[fit_mask]
             calibration_values = values[calibration_mask]
+            calibration_labels = labels[calibration_mask]
+            calibration_sources = source_ids[calibration_mask]
             self._base_calibration_features[int(block_idx)] = {
                 "cls_in": calibration_values.detach().cpu(),
-                "labels": labels[calibration_mask].detach().cpu(),
+                "labels": calibration_labels.detach().cpu(),
+                "source_ids": calibration_sources.detach().cpu(),
             }
             with torch.no_grad():
                 _, fit_responsibilities = adapter.router(fit_values)
+                _, calibration_responsibilities = adapter.router(calibration_values)
             for expert_id in range(adapter.num_experts):
                 loss = self._train_descriptor(
                     adapter, expert_id, fit_values, epochs,
                     fit_responsibilities[:, expert_id],
                     calibration_values=calibration_values,
+                    calibration_weights=calibration_responsibilities[:, expert_id],
                 )
                 descriptor = adapter.descriptors[expert_id]
                 if int(descriptor.error_count.item()) < 3:
@@ -698,11 +699,15 @@ class Runner:
             values, labels = item["cls_in"].to(self.device), item["labels"].to(self.device)
             if values.size(0) < 3:
                 raise RuntimeError(f"Block {block_idx} has fewer than three held-out Base representations.")
-            sample_best = adapter.descriptor_scores(values).min(dim=1).values
-            class_scores = torch.stack([
-                sample_best[labels.eq(class_id)].median()
+            descriptor_scores = adapter.descriptor_scores(values)
+            class_descriptor_scores = torch.stack([
+                torch.stack([
+                    descriptor_scores[labels.eq(class_id), expert_id].median()
+                    for expert_id in range(adapter.num_experts)
+                ])
                 for class_id in torch.unique(labels, sorted=True)
             ])
+            class_scores = class_descriptor_scores.min(dim=1).values
             if class_scores.numel() < 2 or not torch.isfinite(class_scores).all():
                 raise RuntimeError(f"Block {block_idx} has insufficient finite Base classes for threshold calibration.")
             threshold = torch.quantile(class_scores.float(), 1.0 - alpha)
