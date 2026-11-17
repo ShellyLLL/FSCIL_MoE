@@ -542,7 +542,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         _, aux = adapter(tokens, route_input=route)
         for expert_id in range(adapter.num_experts):
             expected = aux["route_weights"][:, expert_id]
-            actual = adapter.expert_responsibility(route, expert_id)
+            actual = adapter.expert_responsibility(aux["cls_in"], expert_id)
             torch.testing.assert_close(actual, expected)
         self.assertFalse(torch.allclose(
             adapter.expert_responsibility(route, 2),
