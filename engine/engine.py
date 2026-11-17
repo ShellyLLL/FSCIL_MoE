@@ -1203,6 +1203,7 @@ class Runner:
             ae_fit_values = local_values[fit_mask]
             ae_calibration_values = local_values[calibration_mask]
             with torch.no_grad():
+                ae_fit_weights = adapter.expert_responsibility(ae_fit_values, expert_id)
                 ae_calibration_weights = adapter.expert_responsibility(
                     ae_calibration_values, expert_id
                 )
@@ -1218,6 +1219,7 @@ class Runner:
             }
             ae_loss = self._train_descriptor(
                 adapter, expert_id, ae_fit_values, ae_epochs,
+                sample_weights=ae_fit_weights,
                 calibration_values=ae_calibration_values,
                 shrinkage_prior=prior,
                 calibration_weights=ae_calibration_weights,
