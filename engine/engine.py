@@ -304,6 +304,8 @@ class Runner:
         if not isinstance(diagnostics, list):
             raise TypeError("Resume checkpoint session_diagnostics must be a list.")
         completed_session = int(payload["completed_session"])
+        if completed_session < 0 or completed_session >= self.data_manager.num_tasks:
+            raise ValueError("Checkpoint completed_session is outside the configured FSCIL task range.")
         if completed_session != len(payload["task_states"]) - 1:
             raise ValueError(
                 "Resume checkpoint has inconsistent completed_session/task_states length: "
@@ -365,6 +367,13 @@ class Runner:
                     f"Checkpoint task state {session_index} is missing calibrated fields: {missing_state}"
                 )
             class_ids = torch.as_tensor(state["class_ids"], dtype=torch.long).reshape(-1)
+            expected_ids = torch.as_tensor(
+                self.data_manager.class_index_in_task[session_index], dtype=torch.long
+            ).reshape(-1)
+            if not torch.equal(class_ids.sort().values, expected_ids.sort().values):
+                raise ValueError(
+                    f"Checkpoint session {session_index} class ids do not match the configured FSCIL split."
+                )
             checkpoint_class_ids.append(class_ids)
             for key in ("image_proto", "reference_image_proto", "text_features",
                         "description_proto"):
@@ -429,9 +438,29 @@ class Runner:
             raise ValueError("Resume checkpoint support_manifest must not be null.")
         self.data_manager.load_support_manifest(manifest)
         base_proto = payload.get("base_vision_prototype")
-        self.model_without_dp.base_vision_prototype = (
-            None if base_proto is None else base_proto.to(self.device)
-        )
+        if base_proto is None:
+            raise ValueError("Checkpoint is missing the frozen Base reference visual prototype bank.")
+        base_proto = torch.as_tensor(base_proto).float()
+        expected_base = torch.as_tensor(
+            payload["task_states"][0]["reference_image_proto"]
+        ).float()
+        if base_proto.shape != expected_base.shape or not torch.isfinite(base_proto).all():
+            raise ValueError("Checkpoint Base reference prototype bank has invalid shape or values.")
+        if not torch.allclose(base_proto.cpu(), expected_base.cpu(), rtol=1e-5, atol=1e-6):
+            raise ValueError("Checkpoint Base reference prototype bank disagrees with Base task state.")
+        self.model_without_dp.base_vision_prototype = base_proto.to(self.device)
+        for block_idx, adapter in self._moe_adapters():
+            adapter.assert_descriptors_ready()
+            births = list(adapter.expert_birth_sessions)
+            if len(births) != adapter.num_experts or any(
+                int(session) < 0 or int(session) > completed_session for session in births
+            ):
+                raise ValueError(f"Checkpoint block {block_idx} has invalid expert birth-session metadata.")
+            if any(int(session) != 0 for session in births[:adapter.base_expert_count]):
+                raise ValueError(f"Checkpoint block {block_idx} has non-Base birth metadata in its Base pool.")
+            incremental_births = births[adapter.base_expert_count:]
+            if len(incremental_births) != len(set(incremental_births)):
+                raise ValueError(f"Checkpoint block {block_idx} contains multiple expansions in one session.")
         self._resume_state_dict_list = payload.get("task_states", [])
         self.acc_list = payload.get("acc_list", [])
         self.task_acc_list = payload.get("task_acc_list", [])
