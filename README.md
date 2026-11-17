@@ -115,7 +115,8 @@ percentage points: for each task, take its best observed task accuracy from
 the task's introduction through the current session, subtract its current
 accuracy, then average across tasks. Checkpoints save the complete expert
 topology, AE reference buffers, dual-space per-class/per-layer old-class
-anchors, global prototype states, diagnostics and RNG state.
+anchors, global visual prototype states, diagnostics and RNG state; historical
+per-sample feature embeddings are not retained in task state.
 
 ## Acknowledgment
 
