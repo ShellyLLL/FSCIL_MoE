@@ -468,14 +468,6 @@ class BiMC(nn.Module):
             # adapted classifier; keep it in the frozen-reference embedding space.
             self.base_vision_prototype = reference_images_proto.detach().clone()
 
-        source_ids = getattr(getattr(loader, "dataset", None), "source_ids", None)
-        source_ids = (
-            torch.arange(len(anchor_labels))
-            if source_ids is None else torch.as_tensor(source_ids, dtype=torch.long).cpu()
-        )
-        if len(source_ids) != len(anchor_labels):
-            raise ValueError("Anchor source ids must align with support features.")
-
         return {
             "description_proto": description_proto,
             "text_features": text_features,
