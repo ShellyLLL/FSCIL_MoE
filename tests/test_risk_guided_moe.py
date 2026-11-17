@@ -300,10 +300,15 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         self.assertEqual(set(runner._base_calibration_features), {0, 1})
         for block_idx, adapter in runner._moe_adapters():
             holdout = runner._base_calibration_features[block_idx]
-            self.assertEqual(holdout["labels"].numel(), 3)
+            self.assertEqual(holdout["labels"].numel(), 9)
             self.assertEqual(set(holdout["labels"].tolist()), {0, 1, 2})
             self.assertTrue(all(
-                int(descriptor.error_count.item()) == 3
+                int((holdout["labels"] == class_id).sum().item()) == 3
+                for class_id in (0, 1, 2)
+            ))
+            self.assertTrue(all(
+                int(descriptor.error_count.item()) == 9
+                and float(descriptor.effective_error_count.item()) > 0
                 for descriptor in adapter.descriptors
             ))
         runner._calibrate_expansion_thresholds(supports)
