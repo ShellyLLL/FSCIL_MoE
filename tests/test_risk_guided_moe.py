@@ -650,7 +650,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
                 "reference_image_proto": prototype.clone(),
                 "text_features": prototype.clone(),
                 "description_proto": prototype.clone(),
-                                "anchor_by_block": {0: anchor_bank, 1: anchor_bank},
+                "anchor_by_block": {0: anchor_bank, 1: anchor_bank},
                 "creation_session": 0,
             }
             checkpoint_path = runner.save_checkpoint(0, [state])
