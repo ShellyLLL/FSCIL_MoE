@@ -59,10 +59,12 @@ The incremental lifecycle is:
    features, after a frozen adapter LayerNorm, are the stable input for AE
    descriptors, router columns, expansion decisions and old-class route
    anchors. Expert functions consume the adapted stream.
-2. Each expert owns a centered, tied-weight, low-rank linear AE. Base AEs are
-   fitted with Base-router responsibility weights and independently held-out
-   source identities. Their per-layer known-class scores calibrate expansion
-   thresholds using the same class-wise statistic used at incremental time.
+2. Each expert owns a centered, tied-weight, low-rank linear AE. Base support
+   sources are partitioned by class into disjoint AE-fit, AE-error-reference and
+   expansion-threshold sets (at least 3, 3 and 2 sources per class). Base AEs are
+   fitted and calibrated with the exact deployed Base-softmax responsibilities.
+   Thresholds use only the separate threshold holdout and the same class-wise
+   statistic used at incremental time.
 3. For each class and layer, compute the median signed reconstruction-error
    Z-score separately for every existing descriptor, then take the minimum
    across descriptors. Expand only if at least one class exceeds the calibrated
@@ -109,11 +111,14 @@ Do not start real-dataset acceptance until the architecture-level test suite,
 checkpoint roundtrip, multi-session lifecycle, freeze-boundary checks and
 reference/adapted feature-space checks all pass.
 
-The support manifest remains fixed across comparisons. AA is the mean of the
-per-session overall accuracies observed so far. PD is average forgetting in
-percentage points: for each task, take its best observed task accuracy from
-the task's introduction through the current session, subtract its current
-accuracy, then average across tasks. Checkpoints save the complete expert
+The support manifest remains fixed across comparisons. Base expansion
+thresholds use the finite-sample one-sided conformal order statistic
+\(k=\lceil(n+1)(1-\alpha)\rceil\), capped at the available number of
+independent Base calibration classes; no interpolated quantile is used. AA is
+the mean of the per-session overall accuracies observed so far. PD is average
+forgetting in percentage points: for each task, take its best observed task
+accuracy from the task's introduction through the current session, subtract
+its current accuracy, then average across tasks. Checkpoints save the complete expert
 topology, AE reference buffers, dual-space per-class/per-layer old-class
 anchors, global visual prototype states, diagnostics and RNG state; historical
 per-sample feature embeddings are not retained in task state.
