@@ -353,6 +353,12 @@ class Runner:
         for session_index, state in enumerate(payload["task_states"]):
             required_state = ("class_ids", "image_proto", "reference_image_proto",
                               "text_features", "description_proto", "anchor_by_block")
+            forbidden_state = ("anchor_features", "anchor_labels", "anchor_source_ids")
+            retained_raw = [key for key in forbidden_state if key in state]
+            if retained_raw:
+                raise ValueError(
+                    f"Checkpoint task state {session_index} stores forbidden historical sample features: {retained_raw}"
+                )
             missing_state = [key for key in required_state if key not in state]
             if missing_state:
                 raise ValueError(
