@@ -15,6 +15,7 @@ class LayerExpansionDecision:
     expand: bool
     class_scores: Dict[int, float]
     uncovered_classes: List[int]
+    parent_expert_id: int | None = None
 
 
 def build_loo_cache_from_embeddings(features, labels, source_ids, class_index=None):
@@ -106,7 +107,12 @@ class BiMC(nn.Module):
                 if "moe_adapter" in name:
                     # Descriptors are opened only by their reconstruction-only
                     # training stage; classification never owns their gradient.
-                    param.requires_grad = ".descriptors." not in name
+                    # The same affine normalization is applied to reference
+                    # router/AE inputs and adapted expert inputs. Freeze it so
+                    # the reference distribution cannot drift during Base training.
+                    param.requires_grad = (
+                        ".descriptors." not in name and ".layer_norm." not in name
+                    )
         trainable = [
             name for name, param in self.clip_model.named_parameters()
             if param.requires_grad
@@ -168,18 +174,23 @@ class BiMC(nn.Module):
                     raise RuntimeError("MoE auxiliary outputs do not match inserted blocks.")
                 for block_idx, aux in zip(moe_blocks, aux_list):
                     cls_in = aux.get("cls_in")
+                    expert_in = aux.get("expert_in")
                     if cls_in is None or cls_in.ndim != 2:
-                        raise RuntimeError(f"Block {block_idx} has invalid CLS features.")
+                        raise RuntimeError(f"Block {block_idx} has invalid reference CLS features.")
+                    if expert_in is None or expert_in.shape != cls_in.shape:
+                        raise RuntimeError(f"Block {block_idx} has invalid adapted expert-input CLS features.")
                     item = block_features.setdefault(block_idx, {
-                        "cls_in": [], "labels": [], "source_ids": []
+                        "cls_in": [], "expert_in": [], "labels": [], "source_ids": []
                     })
                     item["cls_in"].append(cls_in.detach().cpu())
+                    item["expert_in"].append(expert_in.detach().cpu())
                     item["labels"].append(labels.detach().cpu())
                     item["source_ids"].append(source_ids.detach().cpu())
         finally:
             self.train(was_training)
         for item in block_features.values():
             item["cls_in"] = torch.cat(item["cls_in"])
+            item["expert_in"] = torch.cat(item["expert_in"])
             item["labels"] = torch.cat(item["labels"])
             item["source_ids"] = torch.cat(item["source_ids"])
         return block_features
@@ -260,7 +271,16 @@ class BiMC(nn.Module):
         if observed != expected:
             raise RuntimeError(f"Block {block_idx} received classes {observed}, expected {expected}.")
 
+        if scores.ndim != 2 or scores.size(1) != adapter.num_experts or not torch.isfinite(scores).all():
+            raise FloatingPointError(f"Block {block_idx} produced invalid descriptor Z-scores.")
         class_ids = torch.unique(labels, sorted=True)
+        class_descriptor_scores = torch.stack([
+            torch.stack([
+                scores[labels.eq(class_id), expert_id].median()
+                for expert_id in range(adapter.num_experts)
+            ])
+            for class_id in class_ids
+        ])
         sample_best_z = scores.min(dim=1).values
         class_min_z = torch.stack([
             sample_best_z[labels.eq(class_id)].median() for class_id in class_ids
@@ -272,10 +292,25 @@ class BiMC(nn.Module):
         uncovered = [
             class_id for class_id, score in class_scores.items() if score > threshold
         ]
-        decision = LayerExpansionDecision(block_idx, bool(uncovered), class_scores, uncovered)
+        parent_expert_id = None
+        if uncovered:
+            uncovered_set = set(uncovered)
+            uncovered_rows = torch.as_tensor(
+                [row for row, class_id in enumerate(class_ids.tolist()) if class_id in uncovered_set],
+                device=class_descriptor_scores.device,
+                dtype=torch.long,
+            )
+            # Equal class weighting prevents classes with more support views from
+            # dominating which historical descriptor initializes the new expert.
+            parent_scores = class_descriptor_scores[uncovered_rows].mean(dim=0)
+            parent_expert_id = int(parent_scores.argmin().item())
+        decision = LayerExpansionDecision(
+            block_idx, bool(uncovered), class_scores, uncovered, parent_expert_id
+        )
         print(
             f"=> [SEMA-AE][B{block_idx}] class_min_z={class_scores} "
             f"threshold={threshold:.3f} uncovered={uncovered} "
+            f"parent={parent_expert_id} "
             f"decision={'EXPAND' if decision.expand else 'REUSE'}"
         )
         return decision

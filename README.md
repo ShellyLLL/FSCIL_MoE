@@ -48,66 +48,73 @@ python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/t
 
 ### Unified AE-driven dynamic FSCIL MoE
 
-This branch implements a single current visual feature space. It intentionally
-does not support resuming checkpoints produced by the earlier versioned/task-
-gated architecture. Unified checkpoints use schema 14.
+This branch implements one current visual feature space with a frozen CLIP ViT
+reference stream and an adapted stream. Unified checkpoints use schema 16;
+older schemas are rejected because they do not contain the dual-space old-class
+anchors and parent-initialized descriptor state required by this architecture.
 
-The incremental procedure is:
+The incremental lifecycle is:
 
-1. Run a frozen-reference ViT stream alongside the adapted stream. The reference stream never receives adapter residuals and supplies stable per-layer CLS features for routing, AE descriptors, expansion decisions, and old-class anchors.
-2. Score each layer with the reconstruction-error Z-scores of every deployed
-   linear AE descriptor. Each descriptor is a centered, tied-weight, low-rank linear AE and keeps a rolling 500-error reference. Incremental error moments are shrunk toward a per-layer Base prior using the support count, with the prior strength fixed in configuration.
-3. Expand a layer only when the class-balanced mean absolute Z-score is above
-   the configured threshold for **every** existing descriptor. Scan blocks in
-   ascending order and recollect deeper-layer features after an upstream layer
-   has been expanded and trained.
-4. Add at most one residual expert per layer per session. Its up-projection is
-   zero-initialized. Freeze the CLIP backbone, all historical experts and all
-   historical router columns; train only the new expert and its independent
-   sigmoid router column.
-5. Suppress the new expert's router response and residual on stored old-class,
-   per-layer Gaussian anchors. No historical images or historical encoder
-   versions are used.
-6. Fit the new expert's paired AE on its final local representation distribution,
-   then freeze it and its 500-error reference buffer.
-7. Build current-session visual prototypes with source-exclusive leave-one-out
-   support means. Use calibrated text semantics to retrieve related old visual
-   prototype directions and align the new visual prototypes. Fuse calibrated
-   visual and textual prototypes into one global classifier over every seen
-   class.
-8. Evaluate all seen classes using one current CLIP+MoE forward path and that
-   single global prototype bank. No task gate, version-specific feature
-   extraction, or task-specific classifier branch participates in prediction.
+1. The reference stream never receives adapter residuals. Its per-layer CLS
+   features, after a frozen adapter LayerNorm, are the stable input for AE
+   descriptors, router columns, expansion decisions and old-class route
+   anchors. Expert functions consume the adapted stream.
+2. Each expert owns a centered, tied-weight, low-rank linear AE. Base AEs are
+   fitted with Base-router responsibility weights and independently held-out
+   source identities. Their per-layer known-class scores calibrate expansion
+   thresholds using the same class-wise statistic used at incremental time.
+3. For each class and layer, compute the median across support sources of the
+   minimum signed reconstruction-error Z-score over all existing descriptors.
+   Expand only if at least one class exceeds the calibrated threshold for every
+   existing descriptor. Select the child AE parent by the lowest class-balanced
+   mean descriptor score over uncovered classes.
+4. Add at most one zero-up-initialized residual expert per layer per session.
+   Train only that expert and its independent sigmoid router column. Base
+   experts retain their softmax mixture; historical incremental columns remain
+   independent and frozen. Layer decisions share one reference-feature scan
+   because adapter residuals cannot change the reference stream; functional
+   experts are still trained shallow-to-deep.
+5. Store old-class Gaussian anchors separately in reference-route space and
+   adapted expert-input space. Suppress the new router on reference anchors and
+   suppress its gated residual using the corresponding adapted-space anchors.
+6. Initialize each new AE basis from the selected historical parent, recenter
+   it on only the uncovered classes assigned to the new expert, and fit it in
+   the stable reference CLS space. Calibrate its error buffer only on independent
+   held-out source identities; shrink one- or few-shot error moments toward the
+   selected parent descriptor's error statistics. Never fall back to in-sample
+   AE calibration.
+7. Build source-exclusive leave-one-out visual prototypes. Calibrate new visual
+   prototypes using a mixture of visual-neighbor and text-semantic-neighbor
+   distributions over Base classes, transport the adapted/reference feature
+   shift, calibrate prompt and generated-description text prototypes, then
+   fuse visual and textual prototypes into one global classifier.
+8. Evaluate every seen class with one current CLIP+MoE forward path and the
+   global calibrated prototype bank. No task gate, version-specific feature
+   extraction, task-specific classifier, or task ID participates in prediction.
 
-The SEMA implementation is the reference for the linear AE, MSE
-reconstruction objective, rolling reconstruction-error records and absolute
-Z-score outlier rule. The BiMC paper supplies the textual intra-modal
-calibration and visual/textual prototype fusion motivation. The semantic
-similarity transfer from old visual prototypes is the FSCIL-specific alignment
-design used in this branch; it is not claimed to be a verbatim reproduction of
-BiMC's visual calibration equation.
+The linear AE, MSE reconstruction objective and reconstruction-error outlier
+logic follow the SEMA reference. The text-description calibration and
+visual/textual prototype fusion are motivated by BiMC. The independent
+incremental sigmoid columns, dynamic expert lifecycle and global FSCIL
+prototype bank are the unified design implemented in this branch.
 
-Run tests:
+Run module-level architecture tests:
 
 ~~~bash
-python -m unittest tests.test_risk_guided_moe -v
+python -m unittest discover -s tests -p "test_risk_guided_moe.py" -v
 ~~~
 
-Run a full experiment using the standard configuration:
-
-~~~bash
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml
-~~~
+Do not start real-dataset acceptance until the architecture-level test suite,
+checkpoint roundtrip, multi-session lifecycle, freeze-boundary checks and
+reference/adapted feature-space checks all pass.
 
 The support manifest remains fixed across comparisons. AA is the mean of the
 per-session overall accuracies observed so far. PD is average forgetting in
 percentage points: for each task, take its best observed task accuracy from
 the task's introduction through the current session, subtract its current
 accuracy, then average across tasks. Checkpoints save the complete expert
-topology, AE reference buffers, per-class/per-layer old-class anchors, global
-prototype states, diagnostics and RNG state. Do not resume schema 6-9
-checkpoints: their versioned feature paths and task gates are incompatible
-with the unified feature space.
+topology, AE reference buffers, dual-space per-class/per-layer old-class
+anchors, global prototype states, diagnostics and RNG state.
 
 ## Acknowledgment
 

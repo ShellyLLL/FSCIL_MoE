@@ -291,7 +291,7 @@ class Runner:
         if missing:
             raise ValueError(f"Resume checkpoint is missing required fields: {missing}")
         schema = int(payload["schema_version"])
-        if schema != 15:
+        if schema != 16:
             raise ValueError(
                 "This branch uses shrunk-AE reference-statistics checkpoint schema (15); "
                 "older checkpoints are incompatible."
@@ -352,7 +352,8 @@ class Runner:
         checkpoint_class_ids = []
         for session_index, state in enumerate(payload["task_states"]):
             required_state = ("class_ids", "image_proto", "reference_image_proto",
-                              "text_features", "description_proto", "final_proto")
+                              "text_features", "description_proto", "final_proto",
+                              "anchor_by_block")
             missing_state = [key for key in required_state if key not in state]
             if missing_state:
                 raise ValueError(
@@ -370,6 +371,50 @@ class Runner:
                 if not torch.isfinite(prototype).all():
                     raise ValueError(
                         f"Checkpoint task state {session_index} has non-finite {key}."
+                    )
+            anchor_by_block = state["anchor_by_block"]
+            if not isinstance(anchor_by_block, dict) or not anchor_by_block:
+                raise ValueError(f"Checkpoint task state {session_index} has no per-layer old-class anchors.")
+            anchor_blocks = {int(block) for block in anchor_by_block}
+            if bool(self._visual_moe_cfg().ENABLE) and anchor_blocks != expected_blocks:
+                raise ValueError(
+                    f"Checkpoint task state {session_index} anchor blocks do not match MoE topology."
+                )
+            for block_idx, bank in anchor_by_block.items():
+                anchor_fields = ("class_ids", "route_mean", "route_var", "expert_mean", "expert_var")
+                missing_anchor = [key for key in anchor_fields if key not in bank]
+                if missing_anchor:
+                    raise ValueError(
+                        f"Checkpoint task state {session_index} block {block_idx} "
+                        f"is missing anchor fields: {missing_anchor}"
+                    )
+                anchor_ids = torch.as_tensor(bank["class_ids"], dtype=torch.long).reshape(-1)
+                if not torch.equal(anchor_ids.sort().values, class_ids.sort().values):
+                    raise ValueError(
+                        f"Checkpoint task state {session_index} block {block_idx} "
+                        "anchor class ids do not match classifier class ids."
+                    )
+                route_mean = torch.as_tensor(bank["route_mean"]).float()
+                route_var = torch.as_tensor(bank["route_var"]).float()
+                expert_mean = torch.as_tensor(bank["expert_mean"]).float()
+                expert_var = torch.as_tensor(bank["expert_var"]).float()
+                if (route_mean.ndim != 2 or route_var.shape != route_mean.shape
+                        or expert_mean.shape != route_mean.shape or expert_var.shape != route_mean.shape
+                        or route_mean.size(0) != class_ids.numel()):
+                    raise ValueError(
+                        f"Checkpoint task state {session_index} block {block_idx} "
+                        "has misaligned reference/adapted anchor tensors."
+                    )
+                for tensor in (route_mean, route_var, expert_mean, expert_var):
+                    if not torch.isfinite(tensor).all():
+                        raise ValueError(
+                            f"Checkpoint task state {session_index} block {block_idx} "
+                            "contains non-finite anchors."
+                        )
+                if (route_var < 0).any() or (expert_var < 0).any():
+                    raise ValueError(
+                        f"Checkpoint task state {session_index} block {block_idx} "
+                        "contains negative anchor variances."
                     )
         all_checkpoint_ids = torch.cat(checkpoint_class_ids)
         if torch.unique(all_checkpoint_ids).numel() != all_checkpoint_ids.numel():
@@ -398,7 +443,7 @@ class Runner:
         directory.mkdir(parents=True, exist_ok=True)
         topology = self.model_without_dp.export_moe_topology()
         payload = {
-            "schema_version": 15,
+            "schema_version": 16,
             "completed_session": int(completed_session),
             "model_state": self._cpu_copy(self.model_without_dp.state_dict()),
             "moe_topology": topology,
@@ -445,19 +490,29 @@ class Runner:
         return optim.AdamW([{ "params": moe_params, "lr": base_lr }], weight_decay=wd,
                            betas=tuple(_cfg_value(optim_cfg, "BETAS", (0.9, 0.999))))
 
-    def _train_descriptor(self, adapter, expert_id, values, epochs, sample_weights=None,
-                          calibration_values=None, shrinkage_prior=None):
-        """Fit the SEMA linear AE on the full local representation distribution."""
+    def _train_descriptor(
+        self, adapter, expert_id, values, epochs, sample_weights=None,
+        calibration_values=None, shrinkage_prior=None, calibration_weights=None,
+        initialization_descriptor=None,
+    ):
+        """Fit a reference-space linear AE with independent held-out error calibration."""
         descriptor = adapter.descriptors[int(expert_id)]
         descriptor.float()
         values = values.detach().float()
-        weights = (torch.ones(values.size(0), device=values.device) if sample_weights is None
-                   else torch.as_tensor(sample_weights, device=values.device).float().reshape(-1))
-        if weights.numel() != values.size(0) or not bool((weights.sum() > 0).item()):
-            raise ValueError("AE sample weights must align with features and have positive mass.")
-        if values.ndim != 2 or values.size(0) < 3:
-            raise ValueError("AE fitting requires at least three CLS representations.")
-        descriptor.set_center(values, weights)
+        if values.ndim != 2 or values.size(0) < 3 or not torch.isfinite(values).all():
+            raise ValueError("AE fitting requires at least three finite CLS representations.")
+        weights = (
+            torch.ones(values.size(0), device=values.device)
+            if sample_weights is None
+            else torch.as_tensor(sample_weights, device=values.device).float().reshape(-1)
+        )
+        if (weights.numel() != values.size(0) or not torch.isfinite(weights).all()
+                or (weights < 0).any() or not bool((weights.sum() > 0).item())):
+            raise ValueError("AE sample weights must align with features and have positive finite mass.")
+        if initialization_descriptor is None:
+            descriptor.set_center(values, weights)
+        else:
+            descriptor.initialize_from(initialization_descriptor, values, weights)
         for parameter in descriptor.parameters():
             parameter.requires_grad = True
         descriptor.train()
@@ -482,22 +537,35 @@ class Runner:
                     raise FloatingPointError("Non-finite AE reconstruction loss.")
                 loss.backward()
                 optimizer.step()
+                descriptor.retract_basis_()
         descriptor.eval()
         with torch.no_grad():
-            reference_values = (
-                values if calibration_values is None
-                else torch.as_tensor(calibration_values, device=values.device).float()
-            )
-            if reference_values.ndim != 2 or reference_values.size(0) < 3:
-                raise ValueError("AE error calibration requires at least three held-out representations.")
+            if calibration_values is None:
+                raise ValueError("AE reference statistics require independent held-out representations.")
+            reference_values = torch.as_tensor(
+                calibration_values, device=values.device
+            ).float()
+            minimum_calibration = 1 if shrinkage_prior is not None else 3
+            if (reference_values.ndim != 2 or reference_values.size(0) < minimum_calibration
+                    or not torch.isfinite(reference_values).all()):
+                raise ValueError(
+                    f"AE error calibration requires at least {minimum_calibration} "
+                    "finite independent held-out representations."
+                )
             errors = descriptor.reconstruction_error(reference_values)
-            if sample_weights is not None and calibration_values is None:
-                probabilities = weights.clamp_min(0)
-                if not bool((probabilities.sum() > 0).item()):
-                    raise ValueError("AE responsibility distribution has zero mass.")
+            if calibration_weights is not None:
+                probabilities = torch.as_tensor(
+                    calibration_weights, device=values.device
+                ).float().reshape(-1)
+                if (probabilities.numel() != errors.numel()
+                        or not torch.isfinite(probabilities).all()
+                        or (probabilities < 0).any()
+                        or not bool((probabilities.sum() > 0).item())):
+                    raise ValueError("AE calibration responsibilities must align and have positive finite mass.")
                 reference_count = min(adapter.descriptor_buffer_size, errors.numel())
                 selected = torch.multinomial(
-                    probabilities / probabilities.sum(), reference_count, replacement=True)
+                    probabilities / probabilities.sum(), reference_count, replacement=True
+                )
                 errors = errors[selected]
             adapter.update_descriptor_stats(errors, expert_id)
             if shrinkage_prior is not None:
@@ -505,12 +573,66 @@ class Runner:
                     shrinkage_prior["mean"], shrinkage_prior["std"],
                     float(getattr(self._visual_moe_cfg(), "AE_PRIOR_STRENGTH", 10.0)),
                 )
+            elif int(descriptor.error_count.item()) < 3:
+                raise RuntimeError("Base AE descriptors require at least three independent calibration errors.")
         for parameter in descriptor.parameters():
             parameter.requires_grad = False
             parameter.grad = None
         if not descriptor.is_ready():
-            raise RuntimeError("AE descriptor did not reach its minimum reference-buffer size.")
+            raise RuntimeError("AE descriptor did not reach a valid independent reference-statistics state.")
         return float(loss.item())
+
+    @staticmethod
+    def _make_calibration_mask(labels, source_ids, min_calibration_count=3, min_fit_per_class=3):
+        """Hold out whole source identities while retaining independent AE fitting data."""
+        labels = torch.as_tensor(labels).long().reshape(-1)
+        source_ids = torch.as_tensor(source_ids, device=labels.device).reshape(-1)
+        if labels.numel() == 0 or source_ids.numel() != labels.numel():
+            raise ValueError("AE calibration labels and source ids must be non-empty and aligned.")
+        min_calibration_count = int(min_calibration_count)
+        min_fit_per_class = int(min_fit_per_class)
+        if min_calibration_count < 1 or min_fit_per_class < 3:
+            raise ValueError("AE calibration requires at least one held-out source and three fit sources per class.")
+        classes = torch.unique(labels, sorted=True)
+        per_class_sources = {}
+        holdout_counts = {}
+        for class_id in classes:
+            class_sources = torch.unique(source_ids[labels.eq(class_id)], sorted=True)
+            if class_sources.numel() <= min_fit_per_class:
+                raise ValueError(
+                    f"Class {int(class_id)} has {class_sources.numel()} independent sources; "
+                    f"at least {min_fit_per_class + 1} are required for disjoint AE fitting/calibration."
+                )
+            per_class_sources[int(class_id)] = class_sources
+            holdout_counts[int(class_id)] = 1
+
+        heldout_total = sum(holdout_counts.values())
+        while heldout_total < min_calibration_count:
+            progressed = False
+            for class_id in classes.tolist():
+                capacity = int(per_class_sources[int(class_id)].numel()) - min_fit_per_class
+                if holdout_counts[int(class_id)] < capacity:
+                    holdout_counts[int(class_id)] += 1
+                    heldout_total += 1
+                    progressed = True
+                    if heldout_total >= min_calibration_count:
+                        break
+            if not progressed:
+                raise ValueError(
+                    "Insufficient independent support sources to meet the AE calibration "
+                    "minimum without reusing fitting examples."
+                )
+
+        calibration_mask = torch.zeros(labels.numel(), dtype=torch.bool, device=labels.device)
+        for class_id in classes.tolist():
+            selected_sources = per_class_sources[int(class_id)][:holdout_counts[int(class_id)]]
+            calibration_mask |= labels.eq(int(class_id)) & torch.isin(source_ids, selected_sources)
+            fit_sources = torch.unique(source_ids[labels.eq(int(class_id)) & ~calibration_mask], sorted=True)
+            if fit_sources.numel() < min_fit_per_class:
+                raise RuntimeError(f"AE calibration split left too few fitting sources for class {int(class_id)}.")
+        if int(calibration_mask.sum()) < min_calibration_count:
+            raise RuntimeError("AE calibration split did not produce the required independent holdout count.")
+        return calibration_mask
 
     def _train_base_descriptors(self, extract_loader):
         epochs = int(_cfg_value(self.cfg.TRAINER.BiMC.OPTIM, "BASE_DESCRIPTOR_EPOCHS", 8))
@@ -522,35 +644,29 @@ class Runner:
             values = item["cls_in"].to(self.device)
             labels = item["labels"].to(self.device)
             source_ids = item["source_ids"].to(self.device)
-            # Hold out one stable source per class. The AE is fitted without
-            # these examples; only held-out errors calibrate its reference.
-            calibration_mask = torch.zeros(labels.numel(), dtype=torch.bool, device=self.device)
-            for class_id in torch.unique(labels, sorted=True):
-                indices = torch.nonzero(labels.eq(class_id), as_tuple=False).flatten()
-                if indices.numel() > 1:
-                    order = torch.argsort(source_ids[indices], stable=True)
-                    calibration_mask[indices[order[0]]] = True
+            calibration_mask = self._make_calibration_mask(
+                labels, source_ids, min_calibration_count=3, min_fit_per_class=3
+            )
             fit_mask = ~calibration_mask
-            if int(calibration_mask.sum()) < 3 or int(fit_mask.sum()) < 3:
-                # Tiny synthetic fixtures cannot support independent fitting
-                # and calibration; production Base protocols should.
-                fit_mask = torch.ones_like(calibration_mask)
-                calibration_mask = torch.zeros_like(calibration_mask)
             fit_values = values[fit_mask]
-            calibration_values = values[calibration_mask] if calibration_mask.any() else None
+            calibration_values = values[calibration_mask]
             self._base_calibration_features[int(block_idx)] = {
-                "cls_in": (values[calibration_mask] if calibration_mask.any() else values).detach().cpu(),
-                "labels": (labels[calibration_mask] if calibration_mask.any() else labels).detach().cpu(),
+                "cls_in": calibration_values.detach().cpu(),
+                "labels": labels[calibration_mask].detach().cpu(),
             }
             with torch.no_grad():
-                _, responsibilities = adapter.router(fit_values)
+                _, fit_responsibilities = adapter.router(fit_values)
+                _, calibration_responsibilities = adapter.router(calibration_values)
             for expert_id in range(adapter.num_experts):
                 loss = self._train_descriptor(
                     adapter, expert_id, fit_values, epochs,
-                    responsibilities[:, expert_id],
+                    fit_responsibilities[:, expert_id],
                     calibration_values=calibration_values,
+                    calibration_weights=calibration_responsibilities[:, expert_id],
                 )
                 descriptor = adapter.descriptors[expert_id]
+                if int(descriptor.error_count.item()) < 3:
+                    raise RuntimeError("Base descriptor calibration requires at least three independent held-out errors.")
                 print(f"=> [SEMA-AE][B{block_idx}][E{expert_id}] loss={loss:.6f} "
                       f"reference_n={int(descriptor.error_count.item())} "
                       f"mean={descriptor.error_mean.item():.6f} std={descriptor.error_std.item():.6f}")
@@ -599,51 +715,108 @@ class Runner:
 
 
     def _collect_class_anchors(self, loader):
-        """Compact per-class, per-layer Gaussian anchors; no old images are retained."""
+        """Store compact per-class anchors in both stable route and adapted expert-input spaces."""
         feature_map = self.model_without_dp.collect_blockwise_cls_features(loader)
         anchors = {}
         for block_idx, item in feature_map.items():
-            values = item["cls_in"].float()
+            route_values = item["cls_in"].float()
+            expert_values = item["expert_in"].float()
             labels = item["labels"].long()
-            means, variances, class_ids = [], [], []
+            if route_values.shape != expert_values.shape or route_values.size(0) != labels.numel():
+                raise RuntimeError(f"Block {block_idx} produced misaligned route/expert anchor features.")
+            route_means, route_variances = [], []
+            expert_means, expert_variances, class_ids = [], [], []
             for class_id in torch.unique(labels, sorted=True):
-                group = values[labels.eq(class_id)]
-                means.append(group.mean(0))
-                variances.append(group.var(0, unbiased=False).clamp_min(1e-6))
+                mask = labels.eq(class_id)
+                route_group = route_values[mask]
+                expert_group = expert_values[mask]
+                route_means.append(route_group.mean(0))
+                route_variances.append(route_group.var(0, unbiased=False).clamp_min(1e-6))
+                expert_means.append(expert_group.mean(0))
+                expert_variances.append(expert_group.var(0, unbiased=False).clamp_min(1e-6))
                 class_ids.append(int(class_id))
+            route_mean = torch.stack(route_means).cpu().half()
+            route_var = torch.stack(route_variances).cpu().half()
+            expert_mean = torch.stack(expert_means).cpu().half()
+            expert_var = torch.stack(expert_variances).cpu().half()
             anchors[int(block_idx)] = {
                 "class_ids": torch.tensor(class_ids, dtype=torch.long),
-                "mean": torch.stack(means).cpu().half(),
-                "var": torch.stack(variances).cpu().half(),
+                "route_mean": route_mean,
+                "route_var": route_var,
+                "expert_mean": expert_mean,
+                "expert_var": expert_var,
+                # Keep the old names as read-only aliases for diagnostics.
+                "mean": route_mean,
+                "var": route_var,
             }
         return anchors
 
-    def _all_old_anchors(self, old_states, block_idx):
-        means, variances = [], []
+    def _all_old_anchor_sets(self, old_states, block_idx):
+        route_means, route_variances = [], []
+        expert_means, expert_variances = [], []
         for state in old_states:
             bank = state.get("anchor_by_block", {}).get(int(block_idx))
-            if bank is not None:
-                means.append(torch.as_tensor(bank["mean"], device=self.device).float())
-                variances.append(torch.as_tensor(bank["var"], device=self.device).float())
-        if not means:
-            return None, None
-        return torch.cat(means, dim=0), torch.cat(variances, dim=0)
+            if bank is None:
+                continue
+            route_mean = bank.get("route_mean", bank.get("mean"))
+            route_var = bank.get("route_var", bank.get("var"))
+            expert_mean, expert_var = bank.get("expert_mean"), bank.get("expert_var")
+            if any(value is None for value in (route_mean, route_var, expert_mean, expert_var)):
+                raise ValueError(
+                    f"Block {block_idx} old-class anchors must include both reference and adapted spaces."
+                )
+            route_means.append(torch.as_tensor(route_mean, device=self.device).float())
+            route_variances.append(torch.as_tensor(route_var, device=self.device).float())
+            expert_means.append(torch.as_tensor(expert_mean, device=self.device).float())
+            expert_variances.append(torch.as_tensor(expert_var, device=self.device).float())
+        if not route_means:
+            return {
+                "route_mean": None, "route_var": None,
+                "expert_mean": None, "expert_var": None,
+            }
+        return {
+            "route_mean": torch.cat(route_means, dim=0),
+            "route_var": torch.cat(route_variances, dim=0),
+            "expert_mean": torch.cat(expert_means, dim=0),
+            "expert_var": torch.cat(expert_variances, dim=0),
+        }
 
-    def _visual_intra_modal_calibration(self, visual, reference, old_states):
-        """Calibrate in the frozen Base space, then transport the adapted support shift."""
+    def _all_old_anchors(self, old_states, block_idx):
+        anchors = self._all_old_anchor_sets(old_states, block_idx)
+        return anchors["route_mean"], anchors["route_var"]
+
+    def _visual_intra_modal_calibration(self, visual, reference, semantic, old_states):
+        """Use visual and text-semantic neighbors to calibrate the frozen Base visual space."""
         visual = F.normalize(visual.float(), dim=-1)
         reference = F.normalize(reference.float(), dim=-1)
-        if visual.shape != reference.shape:
-            raise ValueError("Adapted and reference visual prototypes must have identical shapes.")
+        semantic = F.normalize(torch.as_tensor(semantic, device=self.device).float(), dim=-1)
+        if visual.shape != reference.shape or visual.shape != semantic.shape:
+            raise ValueError("Adapted visual, reference visual and semantic prototypes must align.")
         if not old_states:
             return visual
+        base_state = old_states[0]
         base_visual = F.normalize(
-            torch.as_tensor(old_states[0]["reference_image_proto"], device=self.device).float(), dim=-1
+            torch.as_tensor(base_state["reference_image_proto"], device=self.device).float(), dim=-1
         )
+        base_semantic = self._text_intra_modal_calibration(
+            torch.as_tensor(base_state["text_features"], device=self.device),
+            torch.as_tensor(base_state["description_proto"], device=self.device),
+        )
+        if base_visual.shape != base_semantic.shape or base_visual.ndim != 2:
+            raise ValueError("Base visual and semantic prototype banks must be aligned matrices.")
         tau = float(getattr(self.cfg.TRAINER.BiMC, "TAU", 16.0))
         if not np.isfinite(tau) or tau <= 0:
             raise ValueError("TAU must be finite and positive.")
-        weights = torch.softmax(tau * reference @ base_visual.t(), dim=-1)
+        visual_weights = torch.softmax(tau * reference @ base_visual.t(), dim=-1)
+        semantic_weights = torch.softmax(tau * semantic @ base_semantic.t(), dim=-1)
+        semantic_weight = float(getattr(
+            self.cfg.TRAINER.BiMC, "SEMANTIC_VISUAL_CALIBRATION", 0.1
+        ))
+        if not 0.0 <= semantic_weight <= 1.0:
+            raise ValueError("SEMANTIC_VISUAL_CALIBRATION must be in [0, 1].")
+        # Mix normalized neighbor distributions: visual evidence remains the
+        # default, while text semantics can redirect the Base visual prior.
+        weights = (1.0 - semantic_weight) * visual_weights + semantic_weight * semantic_weights
         guided_reference = F.normalize(weights @ base_visual, dim=-1)
         lambda_i = (
             float(self.cfg.TRAINER.BiMC.LAMBDA_I)
@@ -718,10 +891,10 @@ class Runner:
         semantic = semantic[matches.long().argmax(dim=1)]
 
         novel_visual_full = self._visual_intra_modal_calibration(
-            full_visual, reference_full, old_states
+            full_visual, reference_full, semantic, old_states
         )
         novel_visual_loo = torch.stack([
-            self._visual_intra_modal_calibration(current, reference, old_states)
+            self._visual_intra_modal_calibration(current, reference, semantic, old_states)
             for current, reference in zip(loo_visual, loo_reference)
         ])
         novel_full = self._inter_modal_fusion(novel_visual_full, semantic)
@@ -862,9 +1035,10 @@ class Runner:
         for _, adapter in self._moe_adapters():
             adapter.freeze_all()
 
-        # All layer-wise decisions share one immutable reference-feature scan.
+        # The reference stream is invariant to adapter residuals, so one scan
+        # supplies comparable AE/routing inputs for every layer and decision.
         expansion_features = self.model_without_dp.collect_blockwise_cls_features(extract_loader)
-        # Functional experts are trained shallow-to-deep because upstream
+        # Functional experts are still trained shallow-to-deep because upstream
         # adapters change the adapted inputs seen by downstream expert functions.
         for block_idx in self.model_without_dp.expandable_blocks():
             threshold = float(calibrated_thresholds[int(block_idx)])
@@ -874,6 +1048,7 @@ class Runner:
                 "block_idx": int(block_idx), "expand": bool(decision.expand),
                 "class_min_z": dict(decision.class_scores),
                 "uncovered_classes": list(decision.uncovered_classes),
+                "parent_expert_id": decision.parent_expert_id,
             })
             if not decision.expand:
                 continue
@@ -885,8 +1060,11 @@ class Runner:
                 raise RuntimeError("AE requested expansion without an uncovered class.")
 
             adapter = self._adapter_by_block(block_idx)
+            if decision.parent_expert_id is None:
+                raise RuntimeError(f"Block {block_idx} expansion has no historical AE parent.")
             expert_id = self.model_without_dp.add_expert(block_idx, task_id)
-            anchor_mean, anchor_var = self._all_old_anchors(old_states, block_idx)
+            anchor_sets = self._all_old_anchor_sets(old_states, block_idx)
+            anchor_mean, anchor_var = anchor_sets["route_mean"], anchor_sets["route_var"]
             optimizer = optim.AdamW([
                 {"params": adapter.experts[-1].parameters(),
                  "lr": float(optim_cfg.LR_INCREMENTAL_EXPERT)},
@@ -931,6 +1109,7 @@ class Runner:
                         classification = route_responsibility.new_zeros(())
                     old_suppression = adapter.old_anchor_suppression_loss(
                         anchor_mean, anchor_var,
+                        anchor_sets["expert_mean"], anchor_sets["expert_var"],
                         residual_weight=float(getattr(
                             self.cfg.TRAINER.BiMC.INCREMENTAL, "OLD_RESIDUAL_WEIGHT", 1.0)))
                     adapter_penalty = aux_by_block[int(block_idx)][
@@ -961,46 +1140,49 @@ class Runner:
                 loss_history.append(total / count)
             adapter.freeze_all()
 
-            # Fit the new AE on exactly the CLS distribution handled by its expert.
+            # The paired AE always describes the stable reference CLS space,
+            # while its functional expert consumes the adapted stream.
             new_features = self.model_without_dp.collect_blockwise_cls_features(extract_loader)
             local_item = new_features[block_idx]
             local_mask = torch.isin(local_item["labels"], uncovered_classes.detach().cpu())
             local_values = local_item["cls_in"][local_mask].to(self.device)
             local_labels = local_item["labels"][local_mask].to(self.device)
             local_sources = local_item["source_ids"][local_mask].to(self.device)
-            calibration_mask = torch.zeros(
-                local_labels.numel(), dtype=torch.bool, device=self.device
+            calibration_mask = self._make_calibration_mask(
+                local_labels, local_sources, min_calibration_count=1, min_fit_per_class=3
             )
-            for class_id in uncovered_classes:
-                indices = torch.nonzero(local_labels.eq(class_id), as_tuple=False).flatten()
-                if indices.numel() > 1:
-                    order = torch.argsort(local_sources[indices], stable=True)
-                    calibration_mask[indices[order[0]]] = True
             fit_mask = ~calibration_mask
-            if int(calibration_mask.sum()) < 3 or int(fit_mask.sum()) < 3:
-                fit_mask = torch.ones_like(calibration_mask)
-                calibration_mask = torch.zeros_like(calibration_mask)
             ae_fit_values = local_values[fit_mask]
-            ae_calibration_values = (
-                local_values[calibration_mask] if calibration_mask.any() else None
-            )
-            prior = getattr(self, "descriptor_error_priors", {}).get(int(block_idx))
-            if prior is None:
-                raise RuntimeError(f"Block {block_idx} has no Base AE error prior for few-shot shrinkage.")
+            ae_calibration_values = local_values[calibration_mask]
+            parent_expert_id = int(decision.parent_expert_id)
+            if parent_expert_id >= expert_id or parent_expert_id < 0:
+                raise RuntimeError(f"Block {block_idx} selected an invalid historical AE parent.")
+            parent_descriptor = adapter.descriptors[parent_expert_id]
+            if not parent_descriptor.is_ready():
+                raise RuntimeError(f"Block {block_idx} selected an uncalibrated AE parent.")
+            prior = {
+                "mean": float(parent_descriptor.error_mean.item()),
+                "std": float(parent_descriptor.error_std.item()),
+            }
             ae_loss = self._train_descriptor(
                 adapter, expert_id, ae_fit_values, ae_epochs,
                 calibration_values=ae_calibration_values,
                 shrinkage_prior=prior,
+                initialization_descriptor=parent_descriptor,
             )
             adapter.freeze_all()
             histories[block_idx] = {
-                "expert_id": int(expert_id), "loss": loss_history, "ae_loss": ae_loss,
+                "expert_id": int(expert_id), "parent_expert_id": parent_expert_id,
+                "loss": loss_history, "ae_loss": ae_loss,
                 "uncovered_classes": uncovered_classes.detach().cpu().tolist(),
                 "selected_samples": int(selected_samples),
+                "ae_calibration_sources": int(calibration_mask.sum().item()),
+                "ae_prior_mean": prior["mean"], "ae_prior_std": prior["std"],
                 "old_anchor_gate_mean": adapter.old_anchor_response(anchor_mean, anchor_var),
             }
             expanded.append({
                 "block_idx": int(block_idx), "expert_id": int(expert_id),
+                "parent_expert_id": parent_expert_id,
                 "uncovered_classes": uncovered_classes.detach().cpu().tolist(),
             })
 
@@ -1030,6 +1212,7 @@ class Runner:
         visual = self._visual_intra_modal_calibration(
             state["image_proto"].to(self.device),
             state["reference_image_proto"].to(self.device),
+            semantic,
             old_states,
         )
         state["image_proto"] = visual.detach()

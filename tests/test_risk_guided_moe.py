@@ -143,7 +143,7 @@ def build_lifecycle_runner():
 
 
 def lifecycle_batch(class_id, feature, source_start, augmented=False, seed=0):
-    count = 4
+    count = 6
     images = feature.reshape(1, 8).repeat(count, 1).clone()
     if augmented:
         generator = torch.Generator().manual_seed(seed)
@@ -346,6 +346,45 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         self.assertTrue(torch.isfinite(mean) and torch.isfinite(std))
         self.assertEqual(int(descriptor.error_count.item()), 4)
 
+    def test_incremental_descriptor_can_shrink_from_one_independent_holdout(self):
+        descriptor = RepresentationDescriptor(4, descriptor_dim=2, buffer_size=8)
+        descriptor.update_reference(torch.tensor([0.25]))
+        mean, std = descriptor.shrink_reference(0.10, 0.30, prior_strength=10.0)
+        self.assertTrue(descriptor.is_ready())
+        self.assertEqual(int(descriptor.error_count.item()), 1)
+        self.assertTrue(torch.isfinite(mean) and torch.isfinite(std))
+        self.assertGreater(float(std), 0.0)
+
+    def test_incremental_calibration_mask_keeps_one_source_out_of_fit(self):
+        labels = torch.tensor([3, 3, 3, 3, 3])
+        source_ids = torch.tensor([101, 102, 103, 104, 105])
+        mask = Runner._make_calibration_mask(
+            labels, source_ids, min_calibration_count=1, min_fit_per_class=3
+        )
+        self.assertEqual(int(mask.sum()), 1)
+        self.assertEqual(int((~mask).sum()), 4)
+        self.assertFalse(torch.isin(source_ids[mask], source_ids[~mask]).any())
+
+    def test_base_calibration_mask_never_reuses_fit_sources_as_holdout(self):
+        labels = torch.tensor([3, 3, 3, 3])
+        source_ids = torch.tensor([201, 202, 203, 204])
+        with self.assertRaisesRegex(ValueError, "Insufficient independent support sources"):
+            Runner._make_calibration_mask(
+                labels, source_ids, min_calibration_count=3, min_fit_per_class=3
+            )
+
+    def test_new_descriptor_initializes_from_parent_basis_and_recenters(self):
+        torch.manual_seed(271)
+        parent = RepresentationDescriptor(6, descriptor_dim=2, buffer_size=8)
+        child = RepresentationDescriptor(6, descriptor_dim=2, buffer_size=8)
+        values = torch.randn(5, 6) + 3.0
+        parent.update_reference(torch.tensor([0.1, 0.2, 0.15]))
+        child.initialize_from(parent, values)
+        torch.testing.assert_close(child.basis, parent.basis, rtol=0, atol=0)
+        torch.testing.assert_close(child.center, values.mean(0), rtol=0, atol=1e-6)
+        self.assertEqual(int(child.error_count.item()), 0)
+        self.assertFalse(child.is_ready())
+
     def test_low_rank_ae_is_centered_tied_weight_and_orthogonal(self):
         torch.manual_seed(227)
         descriptor = RepresentationDescriptor(12, descriptor_dim=3, buffer_size=8)
@@ -421,6 +460,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         self.assertEqual(len(captured), 1)
         torch.testing.assert_close(captured[0], expected_cls)
         torch.testing.assert_close(aux["cls_in"], expected_cls)
+        torch.testing.assert_close(aux["expert_in"], expected_cls)
         self.assertEqual(tuple(aux["cls_in"].shape), (tokens.size(1), tokens.size(2)))
         self.assertFalse(torch.allclose(aux["cls_in"], adapter.layer_norm(tokens).mean(dim=0)))
 
@@ -505,8 +545,10 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         trainable = [name for name, parameter in model.clip_model.named_parameters()
                      if parameter.requires_grad]
         self.assertTrue(trainable)
-        self.assertTrue(all("moe_adapter" in name and ".descriptors." not in name
-                            for name in trainable))
+        self.assertTrue(all(
+            "moe_adapter" in name and ".descriptors." not in name and ".layer_norm." not in name
+            for name in trainable
+        ))
         self.assertFalse(model.clip_model.visual.proj.requires_grad)
         model.train()
         self.assertFalse(model.clip_model.training)
@@ -573,6 +615,13 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             model.base_vision_prototype = torch.tensor([[1.0, 0.0, 0.0, 0.0,
                                                          0.0, 0.0, 0.0, 0.0]])
             prototype = torch.tensor([[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]])
+            anchor_var = torch.full_like(prototype, 0.1)
+            anchor_bank = {
+                "class_ids": torch.tensor([0]),
+                "route_mean": prototype.clone(), "route_var": anchor_var.clone(),
+                "expert_mean": prototype.clone(), "expert_var": anchor_var.clone(),
+                "mean": prototype.clone(), "var": anchor_var.clone(),
+            }
             state = {
                 "class_ids": torch.tensor([0]),
                 "image_proto": prototype.clone(),
@@ -580,11 +629,12 @@ class UnifiedDynamicMoETests(unittest.TestCase):
                 "text_features": prototype.clone(),
                 "description_proto": prototype.clone(),
                 "final_proto": prototype.clone(),
+                "anchor_by_block": {0: anchor_bank, 1: anchor_bank},
                 "creation_session": 0,
             }
             checkpoint_path = runner.save_checkpoint(0, [state])
             payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-            self.assertEqual(payload["schema_version"], 15)
+            self.assertEqual(payload["schema_version"], 16)
             self.assertEqual(payload["expansion_thresholds"], {0: 1.25, 1: 1.5})
             self.assertEqual(payload["descriptor_error_priors"][0]["mean"], 0.02)
             self.assertIn("reference_image_proto", payload["task_states"][0])
@@ -649,6 +699,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         self.assertEqual(decision.uncovered_classes, [3])
         self.assertAlmostEqual(decision.class_scores[2], 0.2, places=5)
         self.assertAlmostEqual(decision.class_scores[3], 1.5, places=5)
+        self.assertEqual(decision.parent_expert_id, 0)
 
         adapter.descriptor_scores = lambda x, require_ready=True: torch.tensor(
             [[1.5, 0.2], [1.5, 0.2], [0.2, 1.5], [0.2, 1.5]])
@@ -656,12 +707,12 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         self.assertFalse(decision.expand)
         self.assertEqual(decision.uncovered_classes, [])
 
-    def test_semantic_guidance_uses_only_fixed_base_visual_prototypes(self):
+    def test_semantic_guidance_uses_fixed_base_semantics_to_retrieve_visual_directions(self):
         runner = Runner.__new__(Runner)
         runner.device = "cpu"
         runner.cfg = SimpleNamespace(TRAINER=SimpleNamespace(BiMC=SimpleNamespace(
             TEXT_CALIBRATION=False, LAMBDA_T=0.0, VISION_CALIBRATION=True,
-            LAMBDA_I=0.8, TAU=16.0)))
+            LAMBDA_I=0.8, TAU=16.0, SEMANTIC_VISUAL_CALIBRATION=1.0)))
         base = {"image_proto": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
                 "reference_image_proto": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
                 "text_features": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
@@ -670,15 +721,24 @@ class UnifiedDynamicMoETests(unittest.TestCase):
                            "text_features": torch.tensor([[0.0, -1.0]]),
                            "description_proto": torch.tensor([[0.0, -1.0]])}
         visual = torch.tensor([[0.0, 1.0]])
+        reference = visual.clone()
         semantic = torch.tensor([[1.0, 0.0]])
-        first = runner._visual_intra_modal_calibration(visual, visual, [base, old_incremental])
+        first = runner._visual_intra_modal_calibration(
+            visual, reference, semantic, [base, old_incremental]
+        )
         changed_old = dict(old_incremental)
         changed_old["image_proto"] = torch.tensor([[-1.0, 0.0]])
         changed_old["text_features"] = torch.tensor([[-1.0, 0.0]])
         changed_old["description_proto"] = torch.tensor([[-1.0, 0.0]])
-        second = runner._visual_intra_modal_calibration(visual, visual, [base, changed_old])
+        second = runner._visual_intra_modal_calibration(
+            visual, reference, semantic, [base, changed_old]
+        )
         torch.testing.assert_close(first, second)
-        self.assertGreater(first[0, 1].item(), first[0, 0].item())
+        self.assertGreater(first[0, 0].item(), first[0, 1].item())
+        visual_guided = runner._visual_intra_modal_calibration(
+            visual, reference, torch.tensor([[0.0, 1.0]]), [base]
+        )
+        self.assertGreater(visual_guided[0, 1].item(), visual_guided[0, 0].item())
 
     def test_bilevel_calibration_fuses_visual_textual_modalities(self):
         runner = Runner.__new__(Runner)
@@ -780,14 +840,32 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         self.assertEqual(int(targets.item()), 1)
         self.assertEqual(int(logits.argmax(dim=1).item()), 1)
 
-    def test_anchor_suppression_is_differentiable_and_finite(self):
+    def test_anchor_suppression_uses_reference_route_and_adapted_expert_spaces(self):
         adapter = VisualMoEAdapter(8, num_experts=2, reduction=2)
         adapter.add_expert(1, reduction=2)
-        mean = torch.randn(4, 8)
-        var = torch.ones_like(mean) * 0.1
-        loss = adapter.old_anchor_suppression_loss(mean, var)
+        route_mean = torch.randn(4, 8)
+        route_var = torch.ones_like(route_mean) * 0.1
+        expert_mean = route_mean + 2.0
+        expert_var = torch.ones_like(expert_mean) * 0.2
+        captured_route, captured_expert = [], []
+        route_hook = adapter.router.columns[-1].register_forward_pre_hook(
+            lambda _module, args: captured_route.append(args[0].detach().clone())
+        )
+        expert_hook = adapter.experts[-1].register_forward_pre_hook(
+            lambda _module, args: captured_expert.append(args[0].detach().clone())
+        )
+        try:
+            loss = adapter.old_anchor_suppression_loss(
+                route_mean, route_var, expert_mean, expert_var
+            )
+        finally:
+            route_hook.remove()
+            expert_hook.remove()
         loss.backward()
         self.assertTrue(torch.isfinite(loss))
+        self.assertEqual(len(captured_route), 1)
+        self.assertEqual(len(captured_expert), 1)
+        self.assertFalse(torch.allclose(captured_route[0], captured_expert[0]))
         self.assertIsNotNone(adapter.router.columns[-1].weight.grad)
         self.assertIsNotNone(adapter.experts[-1].c_proj.weight.grad)
 
@@ -1185,7 +1263,8 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         calls = {"count": 0}
 
         def fail_second_layer(adapter, expert_id, values, epochs, sample_weights=None,
-                              calibration_values=None, shrinkage_prior=None):
+                              calibration_values=None, shrinkage_prior=None,
+                              calibration_weights=None, initialization_descriptor=None):
             calls["count"] += 1
             if calls["count"] == 2:
                 raise RuntimeError("injected AE calibration failure")
@@ -1193,6 +1272,8 @@ class UnifiedDynamicMoETests(unittest.TestCase):
                 adapter, expert_id, values, epochs, sample_weights,
                 calibration_values=calibration_values,
                 shrinkage_prior=shrinkage_prior,
+                calibration_weights=calibration_weights,
+                initialization_descriptor=initialization_descriptor,
             )
 
         runner._train_descriptor = fail_second_layer

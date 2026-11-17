@@ -166,6 +166,29 @@ class RepresentationDescriptor(nn.Module):
             center = (values * weights[:, None]).sum(0) / weights.sum()
         self.center.copy_(center)
 
+    @torch.no_grad()
+    def initialize_from(self, parent, values, weights=None):
+        """Transfer a historical descriptor subspace and recenter on its new responsibility."""
+        if not isinstance(parent, RepresentationDescriptor):
+            raise TypeError("AE initialization parent must be a RepresentationDescriptor.")
+        if parent.d_model != self.d_model or parent.descriptor_dim != self.descriptor_dim:
+            raise ValueError("Parent and child AE descriptor dimensions must match.")
+        self.basis.copy_(parent.basis.to(device=self.basis.device, dtype=self.basis.dtype))
+        self.set_center(values, weights)
+        self.error_history.zero_()
+        self.error_count.zero_()
+        self.error_cursor.zero_()
+        self.error_mean.zero_()
+        self.error_std.fill_(1.0)
+
+    @torch.no_grad()
+    def retract_basis_(self):
+        """Retract the learned basis onto the Stiefel manifold after each optimizer step."""
+        q, r = torch.linalg.qr(self.basis.float(), mode="reduced")
+        diagonal = torch.diagonal(r)
+        signs = torch.where(diagonal < 0, -torch.ones_like(diagonal), torch.ones_like(diagonal))
+        self.basis.copy_((q * signs.unsqueeze(0)).to(dtype=self.basis.dtype))
+
     def forward(self, x):
         centered = x.float() - self.center
         basis = self.basis.float()
@@ -217,8 +240,8 @@ class RepresentationDescriptor(nn.Module):
         prior_std = torch.as_tensor(prior_std, device=self.error_std.device, dtype=torch.float32)
         strength = float(prior_strength)
         count = int(self.error_count.item())
-        if count < 3 or not torch.isfinite(prior_mean) or not torch.isfinite(prior_std):
-            raise ValueError("AE shrinkage requires calibrated local and finite prior statistics.")
+        if count < 1 or not torch.isfinite(prior_mean) or not torch.isfinite(prior_std):
+            raise ValueError("AE shrinkage requires at least one independent local error and finite prior statistics.")
         if prior_std <= 0 or not np.isfinite(strength) or strength <= 0:
             raise ValueError("AE prior std and shrinkage strength must be positive.")
         local_mean, local_std = self.error_mean.clone(), self.error_std.clone()
@@ -233,12 +256,17 @@ class RepresentationDescriptor(nn.Module):
         return self.error_mean, self.error_std
 
     def standardized_score(self, x):
-        if int(self.error_count.item()) < 3:
-            raise RuntimeError("AE descriptor has fewer than three reference errors.")
+        if int(self.error_count.item()) < 1:
+            raise RuntimeError("AE descriptor has no independent reference errors.")
         return (self.reconstruction_error(x) - self.error_mean) / self.error_std.clamp_min(self.eps)
 
     def is_ready(self):
-        return int(self.error_count.item()) >= 3
+        return (
+            int(self.error_count.item()) >= 1
+            and bool(torch.isfinite(self.error_mean).item())
+            and bool(torch.isfinite(self.error_std).item())
+            and float(self.error_std.item()) > 0.0
+        )
 
 
 class ExpandableRouter(nn.Module):
@@ -329,23 +357,47 @@ class VisualMoEAdapter(nn.Module):
     def update_descriptor_stats(self, errors, expert_id):
         return self.descriptors[int(expert_id)].update_reference(errors)
 
-    def old_anchor_suppression_loss(self, anchor_mean, anchor_var, residual_weight=1.0):
-        if anchor_mean is None or anchor_mean.numel() == 0:
+    @staticmethod
+    def _anchor_points(mean, variance):
+        mean = torch.as_tensor(mean).float()
+        variance = torch.as_tensor(variance, device=mean.device).float()
+        if mean.ndim != 2 or variance.shape != mean.shape:
+            raise ValueError("Anchor means and variances must be aligned [classes, dim] matrices.")
+        if not torch.isfinite(mean).all() or not torch.isfinite(variance).all() or (variance < 0).any():
+            raise ValueError("Anchor statistics must be finite with non-negative variances.")
+        variance = variance.clamp_min(1e-6)
+        return torch.cat([mean, mean + variance.sqrt(), mean - variance.sqrt()], dim=0)
+
+    def old_anchor_suppression_loss(
+        self, route_anchor_mean, route_anchor_var,
+        expert_anchor_mean, expert_anchor_var, residual_weight=1.0,
+    ):
+        """Suppress routing in the frozen reference space and residuals in expert-input space."""
+        values = (route_anchor_mean, route_anchor_var, expert_anchor_mean, expert_anchor_var)
+        if all(value is None for value in values):
             return self.residual_scale.new_zeros(())
-        mean = anchor_mean.to(device=self.residual_scale.device, dtype=torch.float32)
-        var = anchor_var.to(device=mean.device, dtype=torch.float32).clamp_min(1e-6)
-        anchors = torch.cat([mean, mean + var.sqrt(), mean - var.sqrt()], dim=0)
-        gate = torch.sigmoid(self.router.columns[-1](anchors))
-        residual = self.experts[-1](anchors)
-        return gate.square().mean() + float(residual_weight) * (gate * residual).square().mean()
+        if any(value is None for value in values):
+            raise ValueError("Route and expert-input anchor statistics must be supplied together.")
+        route_points = self._anchor_points(route_anchor_mean, route_anchor_var).to(
+            device=self.residual_scale.device
+        )
+        expert_points = self._anchor_points(expert_anchor_mean, expert_anchor_var).to(
+            device=self.residual_scale.device
+        )
+        if route_points.shape != expert_points.shape:
+            raise ValueError("Reference-route and adapted expert-input anchors must align.")
+        gate = torch.sigmoid(self.router.columns[-1](route_points))
+        residual = self.experts[-1](expert_points)
+        gated_residual = self.residual_scale.to(residual.dtype) * gate * residual
+        return gate.square().mean() + float(residual_weight) * gated_residual.square().mean()
 
     @torch.no_grad()
     def old_anchor_response(self, anchor_mean, anchor_var):
         if anchor_mean is None or anchor_mean.numel() == 0:
             return 0.0
-        mean = anchor_mean.to(device=self.residual_scale.device, dtype=torch.float32)
-        var = anchor_var.to(device=mean.device, dtype=torch.float32).clamp_min(1e-6)
-        anchors = torch.cat([mean, mean + var.sqrt(), mean - var.sqrt()], dim=0)
+        anchors = self._anchor_points(anchor_mean, anchor_var).to(
+            device=self.residual_scale.device
+        )
         return float(torch.sigmoid(self.router.columns[-1](anchors)).mean().item())
 
     def freeze_all(self):
@@ -487,6 +539,7 @@ class VisualMoEAdapter(nn.Module):
         return residual, {"logits": logits, "route_weights": weights,
                           "top_k_indices": weights.argmax(dim=-1, keepdim=True),
                           "cls_in": route_features,
+                          "expert_in": x_norm[0],
                           "expert_residual_norms": torch.stack(norms),
                           "expert_output_energy": torch.stack(output_energies),
                           "token_residual": residual.detach()}
