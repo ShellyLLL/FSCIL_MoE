@@ -49,9 +49,9 @@ python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/t
 ### Unified AE-driven dynamic FSCIL MoE
 
 This branch implements one current visual feature space with a frozen CLIP ViT
-reference stream and an adapted stream. Unified checkpoints use schema 16;
-older schemas are rejected because they do not contain the dual-space old-class
-anchors and parent-initialized descriptor state required by this architecture.
+reference stream and an adapted stream. Unified checkpoints use schema 17;
+older schemas are rejected because they do not contain the visual-only classifier
+state and parent-initialized descriptor state required by this architecture.
 
 The incremental lifecycle is:
 
@@ -86,17 +86,18 @@ The incremental lifecycle is:
 7. Build source-exclusive leave-one-out visual prototypes. Calibrate new visual
    prototypes using a mixture of visual-neighbor and text-semantic-neighbor
    distributions over Base classes, transport the adapted/reference feature
-   shift, calibrate prompt and generated-description text prototypes, then
-   fuse visual and textual prototypes into one global classifier.
+   shift, and retain the calibrated visual prototype as the classifier target.
+   Text semantics guide the calibration weights but are not fused into the
+   final classifier.
 8. Evaluate every seen class with one current CLIP+MoE forward path and the
    global calibrated prototype bank. No task gate, version-specific feature
    extraction, task-specific classifier, or task ID participates in prediction.
 
 The linear AE, MSE reconstruction objective and reconstruction-error outlier
-logic follow the SEMA reference. The text-description calibration and
-visual/textual prototype fusion are motivated by BiMC. The independent
-incremental sigmoid columns, dynamic expert lifecycle and global FSCIL
-prototype bank are the unified design implemented in this branch.
+logic follow the SEMA reference. Text-description semantics guide visual
+prototype calibration, while the final FSCIL classifier remains visual-only.
+The independent incremental sigmoid columns, dynamic expert lifecycle and
+global visual prototype bank are the unified design implemented in this branch.
 
 Run module-level architecture tests:
 

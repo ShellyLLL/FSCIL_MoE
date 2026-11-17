@@ -650,13 +650,12 @@ class UnifiedDynamicMoETests(unittest.TestCase):
                 "reference_image_proto": prototype.clone(),
                 "text_features": prototype.clone(),
                 "description_proto": prototype.clone(),
-                "final_proto": prototype.clone(),
-                "anchor_by_block": {0: anchor_bank, 1: anchor_bank},
+                                "anchor_by_block": {0: anchor_bank, 1: anchor_bank},
                 "creation_session": 0,
             }
             checkpoint_path = runner.save_checkpoint(0, [state])
             payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-            self.assertEqual(payload["schema_version"], 16)
+            self.assertEqual(payload["schema_version"], 17)
             self.assertEqual(payload["expansion_thresholds"], {0: 1.25, 1: 1.5})
             self.assertEqual(payload["descriptor_error_priors"][0]["mean"], 0.02)
             self.assertIn("reference_image_proto", payload["task_states"][0])
@@ -762,23 +761,26 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         )
         self.assertGreater(visual_guided[0, 1].item(), visual_guided[0, 0].item())
 
-    def test_bilevel_calibration_fuses_visual_textual_modalities(self):
+    def test_classifier_bank_never_fuses_text_semantics_into_visual_prototypes(self):
         runner = Runner.__new__(Runner)
         runner.device = "cpu"
-        runner.cfg = SimpleNamespace(TRAINER=SimpleNamespace(BiMC=SimpleNamespace(
-            TEXT_CALIBRATION=True, LAMBDA_T=0.5, VISION_CALIBRATION=False,
-            LAMBDA_I=0.0, INTER_MODAL_WEIGHT=0.25,
-        )))
-        text = torch.tensor([[1.0, 0.0]])
-        description = torch.tensor([[0.0, 1.0]])
-        semantic = runner._text_intra_modal_calibration(text, description)
-        visual = torch.tensor([[1.0, 0.0]])
-        final = runner._inter_modal_fusion(visual, semantic)
-        self.assertGreater(final[0, 0].item(), final[0, 1].item())
-        self.assertTrue(torch.isfinite(final).all())
+        states = [
+            {"class_ids": torch.tensor([0]),
+             "image_proto": torch.tensor([[1.0, 0.0]]),
+             "text_features": torch.tensor([[0.0, 1.0]]),
+             "description_proto": torch.tensor([[0.0, 1.0]])},
+            {"class_ids": torch.tensor([1]),
+             "image_proto": torch.tensor([[0.0, 1.0]]),
+             "text_features": torch.tensor([[1.0, 0.0]]),
+             "description_proto": torch.tensor([[1.0, 0.0]])},
+        ]
+        merged = runner.merge_dicts(states)
+        torch.testing.assert_close(
+            merged["image_proto"], torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+        )
+        self.assertNotIn("final_proto", merged)
 
-
-    def test_base_training_logits_use_visual_prototypes_not_text_fusion(self):
+    def test_base_training_logits_use_frozen_reference_visual_prototypes(self):
         model = BiMC.__new__(BiMC)
         nn.Module.__init__(model)
         model.device = "cpu"
@@ -786,35 +788,32 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         model.clip_model.logit_scale = nn.Parameter(torch.tensor(0.0))
         model.extract_img_feature_train = lambda images: (torch.tensor([[1.0, 0.0]]), [])
         task_state = {
-            "image_proto": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
-            "fused_proto": torch.tensor([[0.0, 1.0], [1.0, 0.0]]),
+            "image_proto": torch.tensor([[0.0, 1.0], [1.0, 0.0]]),
+            "reference_image_proto": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
         }
-        logits, _, teacher, _ = model.forward_train(torch.zeros(1, 3, 2, 2), task_state)
-        self.assertIsNone(teacher)
+        logits, _, _ = model.forward_train(torch.zeros(1, 3, 2, 2), task_state)
         self.assertEqual(int(logits.argmax(dim=1).item()), 0)
 
-    def test_merge_dicts_builds_global_calibrated_prototype_bank(self):
+    def test_merge_dicts_builds_one_global_visual_prototype_bank(self):
         runner = Runner.__new__(Runner)
         runner.device = "cpu"
         states = [
             {"class_ids": torch.tensor([0, 1]),
              "image_proto": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
-             "text_features": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
-             "description_proto": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
-             "final_proto": torch.tensor([[0.8, 0.6], [0.6, 0.8]])},
+             "text_features": torch.tensor([[0.0, 1.0], [1.0, 0.0]]),
+             "description_proto": torch.tensor([[0.0, 1.0], [1.0, 0.0]])},
             {"class_ids": torch.tensor([2]),
              "image_proto": torch.tensor([[-1.0, 0.0]]),
-             "text_features": torch.tensor([[-1.0, 0.0]]),
-             "description_proto": torch.tensor([[-1.0, 0.0]]),
-             "final_proto": torch.tensor([[-0.8, 0.6]])},
+             "text_features": torch.tensor([[1.0, 0.0]]),
+             "description_proto": torch.tensor([[1.0, 0.0]])},
         ]
         merged = runner.merge_dicts(states)
         self.assertEqual(merged["class_ids"].tolist(), [0, 1, 2])
-        self.assertIn("final_proto", merged)
         torch.testing.assert_close(
-            merged["final_proto"],
-            torch.tensor([[0.8, 0.6], [0.6, 0.8], [-0.8, 0.6]])
+            merged["image_proto"],
+            torch.tensor([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]])
         )
+        self.assertNotIn("final_proto", merged)
 
     def test_leave_one_out_cache_rejects_missing_requested_classes(self):
         features = torch.randn(4, 8)

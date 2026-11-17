@@ -126,7 +126,7 @@ class Runner:
             torch.full_like(ids, int(state.get("creation_session", index)))
             for index, (ids, state) in enumerate(zip(per_state_ids, dict_list))
         ])[order]
-        candidate_keys = ("description_proto", "text_features", "image_proto", "final_proto")
+        candidate_keys = ("description_proto", "text_features", "image_proto")
         for key in candidate_keys:
             if not all(key in state for state in dict_list):
                 continue
@@ -140,8 +140,8 @@ class Runner:
                 chunks.append(value)
             if valid:
                 result[key] = torch.cat(chunks, dim=0)[order]
-        if "image_proto" not in result or "text_features" not in result or "final_proto" not in result:
-            raise KeyError("Classifier state is missing calibrated visual/text/final prototypes.")
+        if "image_proto" not in result:
+            raise KeyError("Classifier state is missing calibrated visual prototypes.")
         result["class_index"] = result["class_ids"]
         return result
 
@@ -291,9 +291,9 @@ class Runner:
         if missing:
             raise ValueError(f"Resume checkpoint is missing required fields: {missing}")
         schema = int(payload["schema_version"])
-        if schema != 16:
+        if schema != 17:
             raise ValueError(
-                "This branch uses shrunk-AE reference-statistics checkpoint schema (16); "
+                "This branch uses visual-only classifier checkpoint schema (17); "
                 "older checkpoints are incompatible."
             )
         if not isinstance(payload["model_state"], dict):
@@ -352,8 +352,7 @@ class Runner:
         checkpoint_class_ids = []
         for session_index, state in enumerate(payload["task_states"]):
             required_state = ("class_ids", "image_proto", "reference_image_proto",
-                              "text_features", "description_proto", "final_proto",
-                              "anchor_by_block")
+                              "text_features", "description_proto", "anchor_by_block")
             missing_state = [key for key in required_state if key not in state]
             if missing_state:
                 raise ValueError(
@@ -362,7 +361,7 @@ class Runner:
             class_ids = torch.as_tensor(state["class_ids"], dtype=torch.long).reshape(-1)
             checkpoint_class_ids.append(class_ids)
             for key in ("image_proto", "reference_image_proto", "text_features",
-                        "description_proto", "final_proto"):
+                        "description_proto"):
                 prototype = torch.as_tensor(state[key]).float()
                 if prototype.ndim != 2 or prototype.size(0) != class_ids.numel():
                     raise ValueError(
@@ -443,7 +442,7 @@ class Runner:
         directory.mkdir(parents=True, exist_ok=True)
         topology = self.model_without_dp.export_moe_topology()
         payload = {
-            "schema_version": 16,
+            "schema_version": 17,
             "completed_session": int(completed_session),
             "model_state": self._cpu_copy(self.model_without_dp.state_dict()),
             "moe_topology": topology,
@@ -850,17 +849,6 @@ class Runner:
             raise ValueError("Text intra-modal calibration produced invalid prototypes.")
         return F.normalize(fused, dim=-1)
 
-    def _inter_modal_fusion(self, visual, semantic):
-        """Fuse calibrated visual and text prototypes in the shared CLIP space."""
-        beta = float(getattr(self.cfg.TRAINER.BiMC, "INTER_MODAL_WEIGHT", 0.5))
-        if not 0.0 <= beta <= 1.0:
-            raise ValueError("INTER_MODAL_WEIGHT must be in [0, 1].")
-        return F.normalize(
-            (1.0 - beta) * F.normalize(visual.float(), dim=-1)
-            + beta * F.normalize(semantic.float(), dim=-1),
-            dim=-1,
-        )
-
     def _build_incremental_bank(self, loader, class_index, text, description, old_states):
         """Build a global visual bank with query-exclusive novel prototypes."""
         if not old_states:
@@ -897,15 +885,15 @@ class Runner:
             self._visual_intra_modal_calibration(current, reference, semantic, old_states)
             for current, reference in zip(loo_visual, loo_reference)
         ])
-        novel_full = self._inter_modal_fusion(novel_visual_full, semantic)
-        novel_loo = torch.stack([
-            self._inter_modal_fusion(row, semantic) for row in novel_visual_loo
-        ])
+        # Text semantics guide visual calibration weights only; the global
+        # classifier remains a single visual-prototype classifier.
+        novel_full = novel_visual_full
+        novel_loo = novel_visual_loo
 
         old_visual, old_ids = [], []
         for state in old_states:
             old_visual.append(F.normalize(
-                torch.as_tensor(state.get("final_proto", state["image_proto"]), device=self.device).float(), dim=-1
+                torch.as_tensor(state["image_proto"], device=self.device).float(), dim=-1
             ))
             ids = state.get("class_ids", state.get("class_index"))
             old_ids.append(torch.as_tensor(ids, device=self.device, dtype=torch.long).reshape(-1))
@@ -954,7 +942,6 @@ class Runner:
         loss_cfg = self.cfg.TRAINER.BiMC.LOSS
         epochs = int(_cfg_value(optim_cfg, "BASE_EPOCHS", 50))
         ce_weight = float(_cfg_value(loss_cfg, "CE_WEIGHT", 1.0))
-        kd_weight = float(_cfg_value(loss_cfg, "KD_WEIGHT", 0.1))
         lb_weight = float(_cfg_value(loss_cfg, "LB_WEIGHT", 0.01))
         num_experts = int(_cfg_value(self._visual_moe_cfg(), "NUM_BASE_EXPERTS", 4))
         optimizer = self.build_base_optimizer()
@@ -962,31 +949,27 @@ class Runner:
         print(f"\n========== Start Unified Base MoE Training ({epochs} epochs) ==========")
         for epoch in range(epochs):
             self.model.train()
-            totals = {"loss": 0.0, "ce": 0.0, "kd": 0.0, "lb": 0.0, "n": 0}
+            totals = {"loss": 0.0, "ce": 0.0, "lb": 0.0, "n": 0}
             for batch in tqdm(train_loader, desc=f"Base Epoch {epoch + 1}/{epochs}"):
                 images, labels = self.parse_batch(batch)
                 targets = self._targets_to_columns(labels, task_stat)
                 optimizer.zero_grad(set_to_none=True)
-                logits, img_feat, teacher_feat, moe_aux = self.model_without_dp.forward_train(
-                    images, task_stat, compute_teacher=True
-                )
+                logits, img_feat, moe_aux = self.model_without_dp.forward_train(images, task_stat)
                 loss_ce = F.cross_entropy(logits, targets)
-                loss_kd = 1.0 - F.cosine_similarity(img_feat, teacher_feat, dim=-1).mean()
                 loss_lb = compute_load_balance_loss(moe_aux, num_experts).to(images.device)
-                loss = ce_weight * loss_ce + kd_weight * loss_kd + lb_weight * loss_lb
+                loss = ce_weight * loss_ce + lb_weight * loss_lb
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(
                     [p for p in self.model_without_dp.parameters() if p.requires_grad], 1.0)
                 optimizer.step()
                 totals["loss"] += float(loss.item())
                 totals["ce"] += float(loss_ce.item())
-                totals["kd"] += float(loss_kd.item())
-                totals["lb"] += float(loss_lb.item())
+                    totals["lb"] += float(loss_lb.item())
                 totals["n"] += 1
             scheduler.step()
             n = max(1, totals["n"])
             print(f"=> [Base][{epoch+1}/{epochs}] loss={totals['loss']/n:.4f} "
-                  f"ce={totals['ce']/n:.4f} kd={totals['kd']/n:.4f} lb={totals['lb']/n:.4f}")
+                  f"ce={totals['ce']/n:.4f} lb={totals['lb']/n:.4f}")
         for _, adapter in self._moe_adapters():
             adapter.freeze_all()
         self._train_base_descriptors(extract_loader)
@@ -1216,7 +1199,6 @@ class Runner:
             old_states,
         )
         state["image_proto"] = visual.detach()
-        state["final_proto"] = self._inter_modal_fusion(visual, semantic).detach()
         state["class_ids"] = torch.as_tensor(class_index, device=self.device, dtype=torch.long)
         state["class_index"] = state["class_ids"]
         state["encoder_version"] = 0
@@ -1267,9 +1249,6 @@ class Runner:
                 text = state["text_features"].to(self.device).float()
                 description = state["description_proto"].to(self.device).float()
                 semantic = self._text_intra_modal_calibration(text, description)
-                state["final_proto"] = self._inter_modal_fusion(
-                    state["image_proto"].to(self.device), semantic
-                ).detach()
                 state["encoder_version"] = 0
                 state["creation_session"] = 0
                 state["anchor_by_block"] = self._collect_class_anchors(extract_loader)
@@ -1336,7 +1315,7 @@ class Runner:
     @torch.no_grad()
     def inference_task_bilevel(self, task_id, state_dict):
         """One current encoder, one feature space, one global calibrated prototype bank."""
-        prototypes = F.normalize(state_dict["final_proto"].to(self.device).float(), dim=-1)
+        prototypes = F.normalize(state_dict["image_proto"].to(self.device).float(), dim=-1)
         class_ids = torch.as_tensor(state_dict["class_ids"], device=self.device, dtype=torch.long)
         test_loader = self.data_manager.get_dataloader(task_id, source="test", mode="test")
         all_logits, all_targets = [], []

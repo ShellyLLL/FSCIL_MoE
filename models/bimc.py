@@ -352,19 +352,16 @@ class BiMC(nn.Module):
             return adapted_features, moe_aux, reference_features
         return output
 
-    def forward_train(self, images, task_stat, compute_teacher=False):
-        if compute_teacher:
-            img_feat, moe_aux, teacher_feat = self.extract_img_feature_train(
-                images, return_reference=True
-            )
-        else:
-            img_feat, moe_aux = self.extract_img_feature_train(images)
-            teacher_feat = None
+    def forward_train(self, images, task_stat):
+        """Train the adapted stream against frozen-reference Base visual prototypes."""
+        img_feat, moe_aux = self.extract_img_feature_train(images)
         img_feat_norm = F.normalize(img_feat, dim=-1)
-        visual_proto = F.normalize(task_stat["image_proto"].to(self.device), dim=-1)
+        reference_proto = F.normalize(
+            task_stat["reference_image_proto"].to(self.device), dim=-1
+        )
         logit_scale = self.clip_model.logit_scale.exp()
-        logits = logit_scale * img_feat_norm @ visual_proto.t()
-        return logits, img_feat, teacher_feat, moe_aux
+        logits = logit_scale * img_feat_norm @ reference_proto.t()
+        return logits, img_feat, moe_aux
 
     @torch.no_grad()
     def inference_text_feature(self, class_names, template, cls_begin_index):
