@@ -298,16 +298,24 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         ]
         runner._train_base_descriptors(supports)
         self.assertEqual(set(runner._base_calibration_features), {0, 1})
+        self.assertEqual(set(runner._base_ae_calibration_features), {0, 1})
         for block_idx, adapter in runner._moe_adapters():
-            holdout = runner._base_calibration_features[block_idx]
-            self.assertEqual(holdout["labels"].numel(), 9)
-            self.assertEqual(set(holdout["labels"].tolist()), {0, 1, 2})
+            threshold_holdout = runner._base_calibration_features[block_idx]
+            ae_holdout = runner._base_ae_calibration_features[block_idx]
+            self.assertEqual(threshold_holdout["labels"].numel(), 3)
+            self.assertEqual(ae_holdout["labels"].numel(), 6)
+            self.assertEqual(set(threshold_holdout["labels"].tolist()), {0, 1, 2})
+            self.assertEqual(set(ae_holdout["labels"].tolist()), {0, 1, 2})
             self.assertTrue(all(
-                int((holdout["labels"] == class_id).sum().item()) == 3
+                int((threshold_holdout["labels"] == class_id).sum().item()) == 1
+                and int((ae_holdout["labels"] == class_id).sum().item()) == 2
                 for class_id in (0, 1, 2)
             ))
+            self.assertFalse(torch.isin(
+                threshold_holdout["source_ids"], ae_holdout["source_ids"]
+            ).any())
             self.assertTrue(all(
-                int(descriptor.error_count.item()) == 9
+                int(descriptor.error_count.item()) == 6
                 and float(descriptor.effective_error_count.item()) > 0
                 for descriptor in adapter.descriptors
             ))
@@ -524,6 +532,24 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         adapter = VisualMoEAdapter(8, num_experts=2, reduction=2)
         with self.assertRaisesRegex(RuntimeError, "uncalibrated descriptors"):
             adapter.descriptor_scores(torch.randn(3, 8))
+
+    def test_expert_responsibility_matches_exact_deployed_forward_gates(self):
+        torch.manual_seed(257)
+        adapter = VisualMoEAdapter(8, num_experts=2, reduction=2)
+        adapter.add_expert(session_id=1, reduction=2)
+        route = torch.randn(5, 8)
+        tokens = torch.randn(3, 5, 8)
+        _, aux = adapter(tokens, route_input=route)
+        for expert_id in range(adapter.num_experts):
+            expected = aux["route_weights"][:, expert_id]
+            actual = adapter.expert_responsibility(route, expert_id)
+            torch.testing.assert_close(actual, expected)
+        self.assertFalse(torch.allclose(
+            adapter.expert_responsibility(route, 2),
+            torch.softmax(adapter.router(torch.nn.functional.layer_norm(
+                route, (8,), eps=1e-5
+            ))[0], dim=-1)[:, 0],
+        ))
 
     def test_descriptor_rejects_zero_effective_weight_calibration_state(self):
         descriptor = RepresentationDescriptor(4, descriptor_dim=2, buffer_size=8)
