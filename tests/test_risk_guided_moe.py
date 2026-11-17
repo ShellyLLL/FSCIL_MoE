@@ -1216,6 +1216,21 @@ class UnifiedDynamicMoETests(unittest.TestCase):
 
         self.assertEqual(before_accuracy, old_labels.numel())
         self.assertEqual(after_accuracy, before_accuracy)
+        # Historical Adapted CLS anchors must remain valid at every downstream
+        # layer after shallow-to-deep expansion. This is the condition that lets
+        # the compact old-class Gaussian anchors remain usable without replay.
+        current_old_anchors = runner._collect_class_anchors([
+            base_support, session1_support
+        ])
+        for block_idx, _adapter in runner._moe_adapters():
+            expected_means = torch.cat([
+                base_state["anchor_by_block"][block_idx]["expert_mean"].float(),
+                session1_state["anchor_by_block"][block_idx]["expert_mean"].float(),
+            ], dim=0)
+            actual_means = current_old_anchors[block_idx]["expert_mean"].float()
+            self.assertEqual(actual_means.shape, expected_means.shape)
+            anchor_cosine = F.cosine_similarity(actual_means, expected_means, dim=-1)
+            self.assertGreaterEqual(float(anchor_cosine.min().item()), 0.98)
         self.assertTrue(torch.isfinite(per_sample_cosine).all())
         self.assertGreaterEqual(feature_cosine, 0.98)
         self.assertTrue(all(torch.isfinite(torch.tensor(route_deltas))))
