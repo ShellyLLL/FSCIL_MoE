@@ -365,6 +365,28 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         self.assertEqual(int((~mask).sum()), 4)
         self.assertFalse(torch.isin(source_ids[mask], source_ids[~mask]).any())
 
+    def test_calibration_split_is_source_order_invariant_and_reproducible(self):
+        labels = torch.tensor([0] * 6 + [1] * 6)
+        source_ids = torch.tensor([11, 12, 13, 14, 15, 16, 21, 22, 23, 24, 25, 26])
+        first = Runner._make_calibration_mask(
+            labels, source_ids, min_calibration_count=2, min_fit_per_class=3
+        )
+        permutation = torch.tensor([7, 2, 10, 0, 8, 4, 11, 1, 5, 9, 3, 6])
+        second = Runner._make_calibration_mask(
+            labels[permutation], source_ids[permutation],
+            min_calibration_count=2, min_fit_per_class=3
+        )
+        selected_first = set(source_ids[first].tolist())
+        selected_second = set(source_ids[permutation][second].tolist())
+        self.assertEqual(selected_first, selected_second)
+        self.assertEqual(len(selected_first), 2)
+        for class_id in (0, 1):
+            class_selected = [
+                sid for sid in selected_first
+                if sid // 10 == class_id + 1
+            ]
+            self.assertEqual(len(class_selected), 1)
+
     def test_base_calibration_mask_never_reuses_fit_sources_as_holdout(self):
         labels = torch.tensor([3, 3, 3, 3])
         source_ids = torch.tensor([201, 202, 203, 204])
