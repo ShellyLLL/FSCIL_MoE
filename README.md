@@ -49,7 +49,7 @@ python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/t
 ### Unified AE-driven dynamic FSCIL MoE
 
 This branch implements one current visual feature space with a frozen CLIP ViT
-reference stream and an adapted stream. Unified checkpoints use schema 17;
+reference stream and an adapted stream. Unified checkpoints use schema 18;
 older schemas are rejected because they do not contain the visual-only classifier
 state and parent-initialized descriptor state required by this architecture.
 
