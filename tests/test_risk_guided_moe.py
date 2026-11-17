@@ -839,7 +839,8 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         calibrated, diagnostics = runner._semantic_guided_visual_prototype_calibration(
             visual, semantic, torch.tensor([1]), [base, old_incremental]
         )
-        self.assertGreater(calibrated[0, 0].item(), calibrated[0, 1].item())
+        self.assertGreater(calibrated[0, 0].item(), visual[0, 0].item())
+        self.assertLess(calibrated[0, 1].item(), visual[0, 1].item())
         self.assertGreater(diagnostics["alpha"].item(), 0.0)
         changed_incremental = dict(old_incremental)
         changed_incremental["image_proto"] = torch.tensor([[-1.0, 0.0]])
@@ -1392,7 +1393,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
 
         def fail_second_layer(adapter, expert_id, values, epochs, sample_weights=None,
                               calibration_values=None, shrinkage_prior=None,
-                              calibration_weights=None, initialization_descriptor=None):
+                              calibration_weights=None):
             calls["count"] += 1
             if calls["count"] == 2:
                 raise RuntimeError("injected AE calibration failure")
@@ -1401,7 +1402,6 @@ class UnifiedDynamicMoETests(unittest.TestCase):
                 calibration_values=calibration_values,
                 shrinkage_prior=shrinkage_prior,
                 calibration_weights=calibration_weights,
-                initialization_descriptor=initialization_descriptor,
             )
 
         runner._train_descriptor = fail_second_layer
