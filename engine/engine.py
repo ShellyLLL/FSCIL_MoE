@@ -293,7 +293,7 @@ class Runner:
         schema = int(payload["schema_version"])
         if schema != 16:
             raise ValueError(
-                "This branch uses shrunk-AE reference-statistics checkpoint schema (15); "
+                "This branch uses shrunk-AE reference-statistics checkpoint schema (16); "
                 "older checkpoints are incompatible."
             )
         if not isinstance(payload["model_state"], dict):
@@ -603,7 +603,19 @@ class Runner:
                     f"Class {int(class_id)} has {class_sources.numel()} independent sources; "
                     f"at least {min_fit_per_class + 1} are required for disjoint AE fitting/calibration."
                 )
-            per_class_sources[int(class_id)] = class_sources
+            # Select held-out source identities by a stable class/source hash,
+            # not by the smallest dataset indices.  Dataset indices are often
+            # ordered by class or acquisition time; taking their prefix can
+            # systematically bias the AE error reference distribution.
+            ordered_sources = sorted(
+                (int(source_id) for source_id in class_sources.tolist()),
+                key=lambda source_id: hashlib.sha256(
+                    f"fscil-ae-holdout:{int(class_id)}:{source_id}".encode("utf-8")
+                ).digest(),
+            )
+            per_class_sources[int(class_id)] = torch.as_tensor(
+                ordered_sources, device=class_sources.device, dtype=class_sources.dtype
+            )
             holdout_counts[int(class_id)] = 1
 
         heldout_total = sum(holdout_counts.values())
