@@ -699,6 +699,7 @@ class Runner:
         print(f"\n========== Fit Base SEMA Representation Descriptors ({epochs} epochs) ==========")
         feature_map = self.model_without_dp.collect_blockwise_cls_features(extract_loader)
         self._base_calibration_features = {}
+        self._base_ae_calibration_features = {}
         for block_idx, adapter in self._moe_adapters():
             item = feature_map[block_idx]
             values = item["cls_in"].to(self.device)
