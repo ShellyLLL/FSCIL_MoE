@@ -1343,8 +1343,7 @@ class Runner:
                     self.train_base_task(state, train_loader, extract_loader)
                     self.model.eval()
                     state = self.model_without_dp.build_task_statistics(
-                        class_names, extract_loader, class_index,
-                        calibrate_novel_vision_proto=False)
+                        class_names, extract_loader, class_index)
                     state["class_ids"] = torch.as_tensor(class_index, device=self.device, dtype=torch.long)
                     state["class_index"] = state["class_ids"]
                 state["encoder_version"] = 0
