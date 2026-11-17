@@ -15,7 +15,6 @@ class LayerExpansionDecision:
     expand: bool
     class_scores: Dict[int, float]
     uncovered_classes: List[int]
-    parent_expert_id: int | None = None
 
 
 def build_loo_cache_from_embeddings(features, labels, source_ids, class_index=None):
@@ -94,7 +93,7 @@ class BiMC(nn.Module):
         self.text_proto = None
         self.description_proto = None
         self.vision_proto = None
-        self.base_vision_prototype = None
+        self.base_enhanced_visual_prototype = None
         self._apply_freeze_policy()
 
     def _apply_freeze_policy(self):
@@ -292,25 +291,12 @@ class BiMC(nn.Module):
         uncovered = [
             class_id for class_id, score in class_scores.items() if score > threshold
         ]
-        parent_expert_id = None
-        if uncovered:
-            uncovered_set = set(uncovered)
-            uncovered_rows = torch.as_tensor(
-                [row for row, class_id in enumerate(class_ids.tolist()) if class_id in uncovered_set],
-                device=class_descriptor_scores.device,
-                dtype=torch.long,
-            )
-            # Equal class weighting prevents classes with more support views from
-            # dominating which historical descriptor initializes the new expert.
-            parent_scores = class_descriptor_scores[uncovered_rows].mean(dim=0)
-            parent_expert_id = int(parent_scores.argmin().item())
         decision = LayerExpansionDecision(
-            block_idx, bool(uncovered), class_scores, uncovered, parent_expert_id
+            block_idx, bool(uncovered), class_scores, uncovered
         )
         print(
-            f"=> [SEMA-AE][B{block_idx}] class_min_z={class_scores} "
+            f"=> [AE-Coverage][B{block_idx}] class_min_z={class_scores} "
             f"threshold={threshold:.3f} uncovered={uncovered} "
-            f"parent={parent_expert_id} "
             f"decision={'EXPAND' if decision.expand else 'REUSE'}"
         )
         return decision
@@ -422,27 +408,9 @@ class BiMC(nn.Module):
             description_embeddings.append(text_features)
         return torch.cat(description_embeddings, dim=0), torch.cat(all_targets, dim=0), F.normalize(torch.cat(mean_embeddings, dim=0), dim=-1)
 
-    def soft_calibration(self, base_protos, cur_protos):
-        shift_weight, tau = self.cfg.TRAINER.BiMC.LAMBDA_I, self.cfg.TRAINER.BiMC.TAU
-        base_protos, cur_protos = F.normalize(base_protos, p=2, dim=-1), F.normalize(cur_protos, p=2, dim=-1)
-        norm_weights = torch.softmax(torch.mm(cur_protos, base_protos.T) * tau, dim=1)
-        delta_protos = F.normalize(torch.matmul(norm_weights, base_protos), p=2, dim=-1)
-        return F.normalize((1 - shift_weight) * cur_protos + shift_weight * delta_protos, dim=-1)
-
-    def calibrate_incremental_visual(self, current, reference):
-        """Calibrate in the base space, then transport the paired support shift."""
-        if self.base_vision_prototype is None:
-            raise RuntimeError("Base visual prototypes must be built before an incremental session.")
-        shape = current.shape
-        reference = reference.reshape(-1, shape[-1])
-        current = current.reshape(-1, shape[-1])
-        calibrated = self.soft_calibration(self.base_vision_prototype, reference)
-        return F.normalize(calibrated + current - reference, dim=-1).reshape(shape)
-
     @torch.no_grad()
-    def build_task_statistics(self, class_names, loader, class_index,
-                              calibrate_novel_vision_proto=False):
-        """Build aligned text and raw visual support prototypes for one session."""
+    def build_task_statistics(self, class_names, loader, class_index):
+        """Build aligned text, adapted visual and frozen-reference support prototypes."""
         cls_begin_index = int(class_index[0])
         text_features, _ = self.inference_text_feature(
             class_names, self.template, cls_begin_index
@@ -462,11 +430,14 @@ class BiMC(nn.Module):
         class_rows = matches.long().argmax(dim=1)
         images_proto = images_proto[class_rows]
         reference_images_proto = reference_images_proto[class_rows]
+        support_count = torch.stack([
+            anchor_labels.eq(class_id).sum() for class_id in class_ids
+        ]).to(dtype=torch.long)
 
         if cls_begin_index == 0:
-            # This bank is consumed by reference-space calibration, not by the
-            # adapted classifier; keep it in the frozen-reference embedding space.
-            self.base_vision_prototype = reference_images_proto.detach().clone()
+            # Semantic retrieval uses Base visual prototypes from the same
+            # adapted feature space as the global classifier.
+            self.base_enhanced_visual_prototype = images_proto.detach().clone()
 
         return {
             "description_proto": description_proto,
@@ -476,6 +447,7 @@ class BiMC(nn.Module):
             "class_index": class_index,
             "class_ids": class_ids,
             "sample_cnt": len(images_features),
+            "support_count": support_count,
             "encoder_version": 0,
         }
 

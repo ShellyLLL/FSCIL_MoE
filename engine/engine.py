@@ -38,7 +38,7 @@ def _cfg_value(node, name, default):
 
 
 class Runner:
-    """FSCIL runner with SEMA-style AE expansion and one global prototype space."""
+    """FSCIL runner with class-wise AE coverage, dynamic experts and semantic visual prototypes."""
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -292,9 +292,9 @@ class Runner:
         if missing:
             raise ValueError(f"Resume checkpoint is missing required fields: {missing}")
         schema = int(payload["schema_version"])
-        if schema != 18:
+        if schema != 19:
             raise ValueError(
-                "This branch uses visual-only classifier checkpoint schema (18); "
+                "This branch uses semantic-guided visual prototype checkpoint schema (19); "
                 "older checkpoints are incompatible."
             )
         if not isinstance(payload["model_state"], dict):
@@ -363,7 +363,7 @@ class Runner:
         checkpoint_class_ids = []
         for session_index, state in enumerate(payload["task_states"]):
             required_state = ("class_ids", "image_proto", "reference_image_proto",
-                              "text_features", "description_proto", "anchor_by_block")
+                              "text_features", "description_proto", "support_count", "anchor_by_block")
             forbidden_state = ("anchor_features", "anchor_labels", "anchor_source_ids")
             retained_raw = [key for key in forbidden_state if key in state]
             if retained_raw:
@@ -384,6 +384,9 @@ class Runner:
                     f"Checkpoint session {session_index} class ids do not match the configured FSCIL split."
                 )
             checkpoint_class_ids.append(class_ids)
+            support_count = torch.as_tensor(state["support_count"], dtype=torch.long).reshape(-1)
+            if support_count.numel() != class_ids.numel() or (support_count <= 0).any():
+                raise ValueError(f"Checkpoint session {session_index} has invalid per-class support counts.")
             for key in ("image_proto", "reference_image_proto", "text_features",
                         "description_proto"):
                 prototype = torch.as_tensor(state[key]).float()
@@ -454,18 +457,18 @@ class Runner:
         if manifest is None:
             raise ValueError("Resume checkpoint support_manifest must not be null.")
         self.data_manager.load_support_manifest(manifest)
-        base_proto = payload.get("base_vision_prototype")
+        base_proto = payload.get("base_enhanced_visual_prototype")
         if base_proto is None:
             raise ValueError("Checkpoint is missing the frozen Base reference visual prototype bank.")
         base_proto = torch.as_tensor(base_proto).float()
         expected_base = torch.as_tensor(
-            payload["task_states"][0]["reference_image_proto"]
+            payload["task_states"][0]["image_proto"]
         ).float()
         if base_proto.shape != expected_base.shape or not torch.isfinite(base_proto).all():
-            raise ValueError("Checkpoint Base reference prototype bank has invalid shape or values.")
+            raise ValueError("Checkpoint Base enhanced visual prototype bank has invalid shape or values.")
         if not torch.allclose(base_proto.cpu(), expected_base.cpu(), rtol=1e-5, atol=1e-6):
             raise ValueError("Checkpoint Base reference prototype bank disagrees with Base task state.")
-        self.model_without_dp.base_vision_prototype = base_proto.to(self.device)
+        self.model_without_dp.base_enhanced_visual_prototype = base_proto.to(self.device)
         for block_idx, adapter in self._moe_adapters():
             adapter.assert_descriptors_ready()
             births = list(adapter.expert_birth_sessions)
@@ -512,12 +515,12 @@ class Runner:
         directory.mkdir(parents=True, exist_ok=True)
         topology = self.model_without_dp.export_moe_topology()
         payload = {
-            "schema_version": 18,
+            "schema_version": 19,
             "completed_session": int(completed_session),
             "model_state": self._cpu_copy(self.model_without_dp.state_dict()),
             "moe_topology": topology,
             "task_states": self._cpu_copy(state_dict_list),
-            "base_vision_prototype": self._cpu_copy(self.model_without_dp.base_vision_prototype),
+            "base_enhanced_visual_prototype": self._cpu_copy(self.model_without_dp.base_enhanced_visual_prototype),
             "support_manifest": self.data_manager.get_support_manifest(),
             "acc_list": list(self.acc_list),
             "task_acc_list": copy.deepcopy(self.task_acc_list),
@@ -562,7 +565,7 @@ class Runner:
     def _train_descriptor(
         self, adapter, expert_id, values, epochs, sample_weights=None,
         calibration_values=None, shrinkage_prior=None,
-        calibration_weights=None, initialization_descriptor=None,
+        calibration_weights=None,
     ):
         """Fit a reference-space linear AE with independent held-out error calibration."""
         descriptor = adapter.descriptors[int(expert_id)]
@@ -578,10 +581,7 @@ class Runner:
         if (weights.numel() != values.size(0) or not torch.isfinite(weights).all()
                 or (weights < 0).any() or not bool((weights.sum() > 0).item())):
             raise ValueError("AE sample weights must align with features and have positive finite mass.")
-        if initialization_descriptor is None:
-            descriptor.set_center(values, weights)
-        else:
-            descriptor.initialize_from(initialization_descriptor, values, weights)
+        descriptor.set_center(values, weights)
         for parameter in descriptor.parameters():
             parameter.requires_grad = True
         descriptor.train()
@@ -708,7 +708,7 @@ class Runner:
 
     def _train_base_descriptors(self, extract_loader):
         epochs = int(_cfg_value(self.cfg.TRAINER.BiMC.OPTIM, "BASE_DESCRIPTOR_EPOCHS", 8))
-        print(f"\n========== Fit Base SEMA Representation Descriptors ({epochs} epochs) ==========")
+        print(f"\n========== Fit Base AE Distribution Descriptors ({epochs} epochs) ==========")
         feature_map = self.model_without_dp.collect_blockwise_cls_features(extract_loader)
         self._base_calibration_features = {}
         self._base_ae_calibration_features = {}
@@ -768,7 +768,7 @@ class Runner:
                 descriptor = adapter.descriptors[expert_id]
                 if int(descriptor.error_count.item()) < 2:
                     raise RuntimeError("Base descriptor calibration requires at least two independent held-out errors.")
-                print(f"=> [SEMA-AE][B{block_idx}][E{expert_id}] loss={loss:.6f} "
+                print(f"=> [AE-Descriptor][B{block_idx}][E{expert_id}] loss={loss:.6f} "
                       f"reference_n={int(descriptor.error_count.item())} "
                       f"mean={descriptor.error_mean.item():.6f} std={descriptor.error_std.item():.6f}")
             adapter.assert_descriptors_ready()
@@ -902,111 +902,108 @@ class Runner:
         anchors = self._all_old_anchor_sets(old_states, block_idx)
         return anchors["route_mean"], anchors["route_var"]
 
-    def _visual_intra_modal_calibration(self, visual, reference, semantic, old_states):
-        """Use visual and text-semantic neighbors to calibrate the frozen Base visual space."""
-        visual = F.normalize(visual.float(), dim=-1)
-        reference = F.normalize(reference.float(), dim=-1)
+    def _semantic_guided_visual_prototype_calibration(
+        self, visual, semantic, support_count, old_states,
+    ):
+        """Calibrate novel visual prototypes using Base text semantics only.
+
+        The description embedding retrieves related Base adapted visual
+        prototypes. Text features do not form a classifier and are never
+        fused into visual prototype vectors.
+        """
+        visual = F.normalize(torch.as_tensor(visual, device=self.device).float(), dim=-1)
         semantic = F.normalize(torch.as_tensor(semantic, device=self.device).float(), dim=-1)
-        if visual.shape != reference.shape or visual.shape != semantic.shape:
-            raise ValueError("Adapted visual, reference visual and semantic prototypes must align.")
+        support_count = torch.as_tensor(
+            support_count, device=self.device, dtype=torch.float32
+        ).reshape(-1)
+        if visual.ndim != 2 or semantic.shape != visual.shape:
+            raise ValueError("Novel visual and description-semantic prototypes must align.")
+        if support_count.numel() != visual.size(0) or (support_count <= 0).any():
+            raise ValueError("Per-class support counts must be positive and align with novel prototypes.")
+        if not torch.isfinite(visual).all() or not torch.isfinite(semantic).all():
+            raise ValueError("Novel visual and semantic prototypes must be finite.")
         if not old_states:
-            return visual
+            diagnostics = {
+                "alpha": torch.zeros(visual.size(0), device=self.device),
+                "semantic_confidence": torch.zeros(visual.size(0), device=self.device),
+                "visual_prototype_reliability": torch.ones(visual.size(0), device=self.device),
+            }
+            return visual, diagnostics
+
         base_state = old_states[0]
         base_visual = F.normalize(
-            torch.as_tensor(base_state["reference_image_proto"], device=self.device).float(), dim=-1
+            torch.as_tensor(base_state["image_proto"], device=self.device).float(), dim=-1
         )
-        base_semantic = self._text_intra_modal_calibration(
-            torch.as_tensor(base_state["text_features"], device=self.device),
-            torch.as_tensor(base_state["description_proto"], device=self.device),
+        base_semantic = F.normalize(
+            torch.as_tensor(base_state["description_proto"], device=self.device).float(), dim=-1
         )
-        if base_visual.shape != base_semantic.shape or base_visual.ndim != 2:
-            raise ValueError("Base visual and semantic prototype banks must be aligned matrices.")
-        tau = float(getattr(self.cfg.TRAINER.BiMC, "TAU", 16.0))
-        if not np.isfinite(tau) or tau <= 0:
-            raise ValueError("TAU must be finite and positive.")
-        visual_weights = torch.softmax(tau * reference @ base_visual.t(), dim=-1)
-        semantic_weights = torch.softmax(tau * semantic @ base_semantic.t(), dim=-1)
-        semantic_weight = float(getattr(
-            self.cfg.TRAINER.BiMC, "SEMANTIC_VISUAL_CALIBRATION", 0.1
-        ))
-        if not 0.0 <= semantic_weight <= 1.0:
-            raise ValueError("SEMANTIC_VISUAL_CALIBRATION must be in [0, 1].")
-        # Mix normalized neighbor distributions: visual evidence remains the
-        # default, while text semantics can redirect the Base visual prior.
-        weights = (1.0 - semantic_weight) * visual_weights + semantic_weight * semantic_weights
-        guided_reference = F.normalize(weights @ base_visual, dim=-1)
-        lambda_i = (
-            float(self.cfg.TRAINER.BiMC.LAMBDA_I)
-            if bool(getattr(self.cfg.TRAINER.BiMC, "VISION_CALIBRATION", True)) else 0.0
-        )
-        if not 0.0 <= lambda_i <= 1.0:
-            raise ValueError("LAMBDA_I must be in [0, 1].")
-        calibrated_reference = (1.0 - lambda_i) * reference + lambda_i * guided_reference
-        if not torch.isfinite(calibrated_reference).all() or (calibrated_reference.norm(dim=-1) <= 1e-8).any():
-            raise ValueError("Visual intra-modal calibration produced invalid reference prototypes.")
-        calibrated_reference = F.normalize(calibrated_reference, dim=-1)
-        transported = calibrated_reference + visual - reference
-        if not torch.isfinite(transported).all() or (transported.norm(dim=-1) <= 1e-8).any():
-            raise ValueError("Visual reference-shift transport produced invalid prototypes.")
-        return F.normalize(transported, dim=-1)
+        if (base_visual.ndim != 2 or base_semantic.shape != base_visual.shape
+                or base_visual.size(0) == 0 or base_visual.size(1) != visual.size(1)):
+            raise ValueError("Base enhanced visual and description-semantic banks must align.")
 
-    def _text_intra_modal_calibration(self, text, description):
-        """Fuse prompt and generated-description prototypes within text modality."""
-        text = F.normalize(torch.as_tensor(text, device=self.device).float(), dim=-1)
-        description = F.normalize(torch.as_tensor(description, device=self.device).float(), dim=-1)
-        if text.shape != description.shape or text.ndim != 2:
-            raise ValueError("Text prompt and description prototypes must be aligned matrices.")
-        lambda_t = (
-            float(self.cfg.TRAINER.BiMC.LAMBDA_T)
-            if bool(getattr(self.cfg.TRAINER.BiMC, "TEXT_CALIBRATION", True)) else 0.0
-        )
-        if not 0.0 <= lambda_t <= 1.0:
-            raise ValueError("LAMBDA_T must be in [0, 1].")
-        fused = (1.0 - lambda_t) * text + lambda_t * description
-        if not torch.isfinite(fused).all() or (fused.norm(dim=-1) <= 1e-8).any():
-            raise ValueError("Text intra-modal calibration produced invalid prototypes.")
-        return F.normalize(fused, dim=-1)
+        moe_cfg = self._visual_moe_cfg()
+        temperature = float(getattr(moe_cfg, "SEMANTIC_TEMPERATURE", 0.07))
+        alpha_max = float(getattr(moe_cfg, "SEMANTIC_CALIBRATION_MAX_ALPHA", 0.5))
+        reliability_k = float(getattr(moe_cfg, "PROTOTYPE_RELIABILITY_K", 5.0))
+        if not np.isfinite(temperature) or temperature <= 0:
+            raise ValueError("SEMANTIC_TEMPERATURE must be finite and positive.")
+        if not np.isfinite(alpha_max) or not 0.0 <= alpha_max <= 1.0:
+            raise ValueError("SEMANTIC_CALIBRATION_MAX_ALPHA must be in [0, 1].")
+        if not np.isfinite(reliability_k) or reliability_k <= 0:
+            raise ValueError("PROTOTYPE_RELIABILITY_K must be finite and positive.")
 
-    def _build_incremental_bank(self, loader, class_index, text, description, old_states):
-        """Build a global visual bank with query-exclusive novel prototypes."""
+        # q_c = T(Description(c)); semantic similarity alone retrieves Base
+        # visual directions. No visual-neighbor weighting or text intra-modal
+        # prompt/description fusion is performed.
+        semantic_weights = torch.softmax((semantic @ base_semantic.t()) / temperature, dim=-1)
+        guided_visual = F.normalize(semantic_weights @ base_visual, dim=-1)
+        if base_visual.size(0) == 1:
+            semantic_confidence = torch.ones(visual.size(0), device=self.device)
+        else:
+            entropy = -(
+                semantic_weights.clamp_min(1e-8)
+                * semantic_weights.clamp_min(1e-8).log()
+            ).sum(dim=-1)
+            semantic_confidence = (
+                1.0 - entropy / math.log(float(base_visual.size(0)))
+            ).clamp(0.0, 1.0)
+        visual_reliability = support_count / (support_count + reliability_k)
+        alpha = alpha_max * semantic_confidence * (1.0 - visual_reliability)
+        calibrated = F.normalize(
+            (1.0 - alpha.unsqueeze(-1)) * visual
+            + alpha.unsqueeze(-1) * guided_visual,
+            dim=-1,
+        )
+        if not torch.isfinite(calibrated).all() or (calibrated.norm(dim=-1) <= 1e-8).any():
+            raise ValueError("Semantic-guided visual prototype calibration produced invalid vectors.")
+        diagnostics = {
+            "alpha": alpha.detach(),
+            "semantic_confidence": semantic_confidence.detach(),
+            "visual_prototype_reliability": visual_reliability.detach(),
+        }
+        return calibrated, diagnostics
+
+    def _build_incremental_bank(self, loader, class_index, old_states):
+        """Build an uncalibrated, query-exclusive bank for expert training.
+
+        Semantic prototype calibration is deferred until new experts have
+        finished training and are frozen. The training objective therefore
+        uses actual support visual prototypes rather than a post-training
+        semantic correction.
+        """
         if not old_states:
             raise ValueError("Incremental visual classification requires the Base classifier state.")
         cache = self.model_without_dp.build_leave_one_out_prototypes(loader, class_index)
         if not bool(cache["loo_valid"].all().item()):
             raise ValueError("Every incremental training source needs another same-class source for LOO.")
-
         classes = cache["classes"].to(self.device)
         labels = cache["labels"].to(self.device)
         sources = cache["source_ids"].to(self.device)
         features = cache["features"].to(self.device).float()
-        full_visual = F.normalize(torch.stack([
+        novel_full = F.normalize(torch.stack([
             features[labels.eq(cls)].mean(0) for cls in classes
         ]), dim=-1)
-        loo_visual = cache["loo_visual_prototypes"].to(self.device).float()
-        reference_features = cache["reference_features"].to(self.device).float()
-        reference_full = F.normalize(torch.stack([
-            reference_features[labels.eq(cls)].mean(0) for cls in classes
-        ]), dim=-1)
-        loo_reference = cache["loo_reference_prototypes"].to(self.device).float()
-
-        semantic = self._text_intra_modal_calibration(text, description)
-        requested_ids = torch.as_tensor(class_index, device=self.device, dtype=torch.long).reshape(-1)
-        matches = classes[:, None].eq(requested_ids[None, :])
-        if not matches.sum(dim=1).eq(1).all():
-            raise ValueError("Incremental semantic and visual class ids do not align.")
-        semantic = semantic[matches.long().argmax(dim=1)]
-
-        novel_visual_full = self._visual_intra_modal_calibration(
-            full_visual, reference_full, semantic, old_states
-        )
-        novel_visual_loo = torch.stack([
-            self._visual_intra_modal_calibration(current, reference, semantic, old_states)
-            for current, reference in zip(loo_visual, loo_reference)
-        ])
-        # Text semantics guide visual calibration weights only; the global
-        # classifier remains a single visual-prototype classifier.
-        novel_full = novel_visual_full
-        novel_loo = novel_visual_loo
+        novel_loo = cache["loo_visual_prototypes"].to(self.device).float()
 
         old_visual, old_ids = [], []
         for state in old_states:
@@ -1119,7 +1116,6 @@ class Runner:
     def _train_incremental_task_impl(self, task_id, train_loader, extract_loader, class_index,
                                       current_class_name, old_states):
         """Expand only where AE coverage fails; train new experts on uncovered classes."""
-        text, description = self._text_prototypes(current_class_name, class_index)
         optim_cfg = self.cfg.TRAINER.BiMC.OPTIM
         epochs = int(self.cfg.TRAINER.BiMC.INCREMENTAL.EPOCHS)
         scale = float(self.cfg.TRAINER.BiMC.INCREMENTAL.LOGIT_SCALE)
@@ -1149,7 +1145,6 @@ class Runner:
                 "block_idx": int(block_idx), "expand": bool(decision.expand),
                 "class_min_z": dict(decision.class_scores),
                 "uncovered_classes": list(decision.uncovered_classes),
-                "parent_expert_id": decision.parent_expert_id,
             })
             if not decision.expand:
                 continue
@@ -1161,8 +1156,6 @@ class Runner:
                 raise RuntimeError("AE requested expansion without an uncovered class.")
 
             adapter = self._adapter_by_block(block_idx)
-            if decision.parent_expert_id is None:
-                raise RuntimeError(f"Block {block_idx} expansion has no historical AE parent.")
             expert_id = self.model_without_dp.add_expert(block_idx, task_id)
             anchor_sets = self._all_old_anchor_sets(old_states, block_idx)
             anchor_mean, anchor_var = anchor_sets["route_mean"], anchor_sets["route_var"]
@@ -1176,7 +1169,7 @@ class Runner:
 
             for epoch in range(epochs):
                 bank = self._build_incremental_bank(
-                    extract_loader, class_index, text, description, old_states)
+                    extract_loader, class_index, old_states)
                 self.model.train()
                 total, count = 0.0, 0
                 for batch in train_loader:
@@ -1260,37 +1253,31 @@ class Runner:
                 ae_calibration_weights = adapter.expert_responsibility(
                     ae_calibration_values, expert_id
                 )
-            parent_expert_id = int(decision.parent_expert_id)
-            if parent_expert_id >= expert_id or parent_expert_id < 0:
-                raise RuntimeError(f"Block {block_idx} selected an invalid historical AE parent.")
-            parent_descriptor = adapter.descriptors[parent_expert_id]
-            if not parent_descriptor.is_ready():
-                raise RuntimeError(f"Block {block_idx} selected an uncalibrated AE parent.")
-            prior = {
-                "mean": float(parent_descriptor.error_mean.item()),
-                "std": float(parent_descriptor.error_std.item()),
-            }
+            prior = self.descriptor_error_priors.get(int(block_idx))
+            if (not isinstance(prior, dict)
+                    or not np.isfinite(float(prior.get("mean", float("nan"))))
+                    or not np.isfinite(float(prior.get("std", float("nan"))))
+                    or float(prior["std"]) <= 0):
+                raise RuntimeError(f"Block {block_idx} has no valid Base AE error prior for the new descriptor.")
             ae_loss = self._train_descriptor(
                 adapter, expert_id, ae_fit_values, ae_epochs,
                 sample_weights=ae_fit_weights,
                 calibration_values=ae_calibration_values,
                 shrinkage_prior=prior,
                 calibration_weights=ae_calibration_weights,
-                initialization_descriptor=parent_descriptor,
             )
             adapter.freeze_all()
             histories[block_idx] = {
-                "expert_id": int(expert_id), "parent_expert_id": parent_expert_id,
+                "expert_id": int(expert_id),
                 "loss": loss_history, "ae_loss": ae_loss,
                 "uncovered_classes": uncovered_classes.detach().cpu().tolist(),
                 "selected_samples": int(selected_samples),
                 "ae_calibration_sources": int(calibration_mask.sum().item()),
-                "ae_prior_mean": prior["mean"], "ae_prior_std": prior["std"],
+                "ae_prior_mean": float(prior["mean"]), "ae_prior_std": float(prior["std"]),
                 "old_anchor_gate_mean": adapter.old_anchor_response(anchor_mean, anchor_var),
             }
             expanded.append({
                 "block_idx": int(block_idx), "expert_id": int(expert_id),
-                "parent_expert_id": parent_expert_id,
                 "uncovered_classes": uncovered_classes.detach().cpu().tolist(),
             })
 
@@ -1299,31 +1286,20 @@ class Runner:
         return {"trained": bool(expanded), "decisions": decisions, "expanded": expanded,
                 "training": histories, "encoder_version": 0}
 
-    def _text_prototypes(self, class_names, class_index):
-        model = self.model_without_dp
-        text, _ = model.inference_text_feature(class_names, model.template, int(class_index[0]))
-        _, _, description = model.inference_all_description_feature(
-            class_names, self.cfg.DATASET.GPT_PATH, int(class_index[0]))
-        return text.detach(), description.detach()
-
-
     def _build_and_refine_task_state(self, current_class_name, extract_loader, class_index,
                                      old_states):
-        """Build a Base-guided visual state without visual-text classifier fusion."""
+        """Build a novel visual prototype, then apply the single semantic-guided calibration."""
         state = self.model_without_dp.build_task_statistics(
             current_class_name, extract_loader, class_index,
-            calibrate_novel_vision_proto=False,
         )
-        text = state["text_features"].to(self.device).float()
-        desc = state["description_proto"].to(self.device).float()
-        semantic = self._text_intra_modal_calibration(text, desc)
-        visual = self._visual_intra_modal_calibration(
-            state["image_proto"].to(self.device),
-            state["reference_image_proto"].to(self.device),
-            semantic,
-            old_states,
+        semantic = state["description_proto"].to(self.device).float()
+        visual, calibration = self._semantic_guided_visual_prototype_calibration(
+            state["image_proto"].to(self.device), semantic, state["support_count"], old_states,
         )
         state["image_proto"] = visual.detach()
+        state["calibration_alpha"] = calibration["alpha"].detach().cpu()
+        state["semantic_confidence"] = calibration["semantic_confidence"].detach().cpu()
+        state["visual_prototype_reliability"] = calibration["visual_prototype_reliability"].detach().cpu()
         state["class_ids"] = torch.as_tensor(class_index, device=self.device, dtype=torch.long)
         state["class_index"] = state["class_ids"]
         state["encoder_version"] = 0
@@ -1360,7 +1336,7 @@ class Runner:
             if task_id == 0:
                 state = self.model_without_dp.build_task_statistics(
                     class_names, extract_loader, class_index,
-                    calibrate_novel_vision_proto=False)
+                    )
                 state["class_ids"] = torch.as_tensor(class_index, device=self.device, dtype=torch.long)
                 state["class_index"] = state["class_ids"]
                 if use_moe:
@@ -1371,9 +1347,6 @@ class Runner:
                         calibrate_novel_vision_proto=False)
                     state["class_ids"] = torch.as_tensor(class_index, device=self.device, dtype=torch.long)
                     state["class_index"] = state["class_ids"]
-                text = state["text_features"].to(self.device).float()
-                description = state["description_proto"].to(self.device).float()
-                semantic = self._text_intra_modal_calibration(text, description)
                 state["encoder_version"] = 0
                 state["creation_session"] = 0
                 state["anchor_by_block"] = self._collect_class_anchors(extract_loader)

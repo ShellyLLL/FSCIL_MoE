@@ -135,7 +135,7 @@ class QuickGELU(nn.Module):
 
 
 class RepresentationDescriptor(nn.Module):
-    """Centered tied-weight low-rank linear AE with a rolling error reference."""
+    """Centered tied-weight low-rank linear AE for expert distribution coverage."""
     def __init__(self, d_model, descriptor_dim=64, eps=1e-4, buffer_size=500):
         super().__init__()
         self.d_model = int(d_model)
@@ -168,23 +168,6 @@ class RepresentationDescriptor(nn.Module):
                 raise ValueError("AE center weights must be finite, non-negative and have positive mass.")
             center = (values * weights[:, None]).sum(0) / weights.sum()
         self.center.copy_(center)
-
-    @torch.no_grad()
-    def initialize_from(self, parent, values, weights=None):
-        """Transfer a historical descriptor subspace and recenter on its new responsibility."""
-        if not isinstance(parent, RepresentationDescriptor):
-            raise TypeError("AE initialization parent must be a RepresentationDescriptor.")
-        if parent.d_model != self.d_model or parent.descriptor_dim != self.descriptor_dim:
-            raise ValueError("Parent and child AE descriptor dimensions must match.")
-        self.basis.copy_(parent.basis.to(device=self.basis.device, dtype=self.basis.dtype))
-        self.set_center(values, weights)
-        self.error_history.zero_()
-        self.error_weight_history.zero_()
-        self.effective_error_count.zero_()
-        self.error_count.zero_()
-        self.error_cursor.zero_()
-        self.error_mean.zero_()
-        self.error_std.fill_(1.0)
 
     @torch.no_grad()
     def retract_basis_(self):

@@ -172,6 +172,7 @@ def make_lifecycle_state(runner, model, class_id, support, creation_session):
         "reference_image_proto": reference_prototype,
         "text_features": semantic,
         "description_proto": semantic,
+        "support_count": torch.tensor([support["label"].numel()], dtype=torch.long),
         "anchor_by_block": anchors,
         "creation_session": int(creation_session),
     }
@@ -446,18 +447,6 @@ class UnifiedDynamicMoETests(unittest.TestCase):
                 min_fit_per_class=3, min_calibration_per_class=1,
             )
 
-    def test_new_descriptor_initializes_from_parent_basis_and_recenters(self):
-        torch.manual_seed(271)
-        parent = RepresentationDescriptor(6, descriptor_dim=2, buffer_size=8)
-        child = RepresentationDescriptor(6, descriptor_dim=2, buffer_size=8)
-        values = torch.randn(5, 6) + 3.0
-        parent.update_reference(torch.tensor([0.1, 0.2, 0.15]))
-        child.initialize_from(parent, values)
-        torch.testing.assert_close(child.basis, parent.basis, rtol=0, atol=0)
-        torch.testing.assert_close(child.center, values.mean(0), rtol=0, atol=1e-6)
-        self.assertEqual(int(child.error_count.item()), 0)
-        self.assertFalse(child.is_ready())
-
     def test_low_rank_ae_is_centered_tied_weight_and_orthogonal(self):
         torch.manual_seed(227)
         descriptor = RepresentationDescriptor(12, descriptor_dim=3, buffer_size=8)
@@ -707,7 +696,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             runner.task_acc_list = [[50.0]]
             runner.session_diagnostics = [{"session": 0}]
             runner.expansion_thresholds = {0: 1.25, 1: 1.5}
-            model.base_vision_prototype = torch.tensor([[1.0, 0.0, 0.0, 0.0,
+            model.base_enhanced_visual_prototype = torch.tensor([[1.0, 0.0, 0.0, 0.0,
                                                          0.0, 0.0, 0.0, 0.0]])
             runner._train_base_descriptors([lifecycle_batch(
                 0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 7000
@@ -729,13 +718,14 @@ class UnifiedDynamicMoETests(unittest.TestCase):
                 "image_proto": prototype.clone(),
                 "reference_image_proto": prototype.clone(),
                 "text_features": prototype.clone(),
+                "support_count": torch.tensor([5]),
                 "description_proto": prototype.clone(),
                 "anchor_by_block": {0: anchor_bank, 1: anchor_bank},
                 "creation_session": 0,
             }
             checkpoint_path = runner.save_checkpoint(0, [state])
             payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-            self.assertEqual(payload["schema_version"], 18)
+            self.assertEqual(payload["schema_version"], 19)
             self.assertEqual(payload["expansion_thresholds"], {0: 1.25, 1: 1.5})
             self.assertEqual(payload["descriptor_error_priors"][0]["mean"], 0.02)
             self.assertIn("reference_image_proto", payload["task_states"][0])
@@ -760,7 +750,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             self.assertEqual(restored.descriptor_error_priors, runner.descriptor_error_priors)
             self.assertEqual(len(restored._resume_state_dict_list), 1)
             torch.testing.assert_close(
-                restored_model.base_vision_prototype, model.base_vision_prototype
+                restored_model.base_enhanced_visual_prototype, model.base_enhanced_visual_prototype
             )
 
     def test_topology_roundtrip_preserves_experts_and_descriptors(self):
@@ -804,7 +794,6 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         self.assertEqual(decision.uncovered_classes, [3])
         self.assertAlmostEqual(decision.class_scores[2], 0.2, places=5)
         self.assertAlmostEqual(decision.class_scores[3], 1.5, places=5)
-        self.assertEqual(decision.parent_expert_id, 0)
 
         # Different samples in one class are covered by different experts.
         # Per-sample min then median would incorrectly call this covered.
@@ -827,38 +816,42 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         self.assertFalse(decision.expand)
         self.assertEqual(decision.uncovered_classes, [])
 
-    def test_semantic_guidance_uses_fixed_base_semantics_to_retrieve_visual_directions(self):
+    def test_semantic_guided_calibration_uses_only_base_description_to_retrieve_enhanced_visual(self):
         runner = Runner.__new__(Runner)
         runner.device = "cpu"
         runner.cfg = SimpleNamespace(TRAINER=SimpleNamespace(BiMC=SimpleNamespace(
-            TEXT_CALIBRATION=False, LAMBDA_T=0.0, VISION_CALIBRATION=True,
-            LAMBDA_I=0.8, TAU=16.0, SEMANTIC_VISUAL_CALIBRATION=1.0)))
-        base = {"image_proto": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
-                "reference_image_proto": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
-                "text_features": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
-                "description_proto": torch.tensor([[1.0, 0.0], [0.0, 1.0]])}
-        old_incremental = {"image_proto": torch.tensor([[0.0, -1.0]]),
-                           "text_features": torch.tensor([[0.0, -1.0]]),
-                           "description_proto": torch.tensor([[0.0, -1.0]])}
+            VISUAL_MOE=SimpleNamespace(
+                SEMANTIC_TEMPERATURE=0.05,
+                SEMANTIC_CALIBRATION_MAX_ALPHA=0.5,
+                PROTOTYPE_RELIABILITY_K=5.0,
+            )
+        )))
+        base = {
+            "image_proto": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+            "description_proto": torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+        }
+        old_incremental = {
+            "image_proto": torch.tensor([[0.0, -1.0]]),
+            "description_proto": torch.tensor([[0.0, -1.0]]),
+        }
         visual = torch.tensor([[0.0, 1.0]])
-        reference = visual.clone()
         semantic = torch.tensor([[1.0, 0.0]])
-        first = runner._visual_intra_modal_calibration(
-            visual, reference, semantic, [base, old_incremental]
+        calibrated, diagnostics = runner._semantic_guided_visual_prototype_calibration(
+            visual, semantic, torch.tensor([1]), [base, old_incremental]
         )
-        changed_old = dict(old_incremental)
-        changed_old["image_proto"] = torch.tensor([[-1.0, 0.0]])
-        changed_old["text_features"] = torch.tensor([[-1.0, 0.0]])
-        changed_old["description_proto"] = torch.tensor([[-1.0, 0.0]])
-        second = runner._visual_intra_modal_calibration(
-            visual, reference, semantic, [base, changed_old]
+        self.assertGreater(calibrated[0, 0].item(), calibrated[0, 1].item())
+        self.assertGreater(diagnostics["alpha"].item(), 0.0)
+        changed_incremental = dict(old_incremental)
+        changed_incremental["image_proto"] = torch.tensor([[-1.0, 0.0]])
+        changed, _ = runner._semantic_guided_visual_prototype_calibration(
+            visual, semantic, torch.tensor([1]), [base, changed_incremental]
         )
-        torch.testing.assert_close(first, second)
-        self.assertGreater(first[0, 0].item(), first[0, 1].item())
-        visual_guided = runner._visual_intra_modal_calibration(
-            visual, reference, torch.tensor([[0.0, 1.0]]), [base]
+        torch.testing.assert_close(calibrated, changed)
+        reliable, reliable_diag = runner._semantic_guided_visual_prototype_calibration(
+            visual, semantic, torch.tensor([100]), [base]
         )
-        self.assertGreater(visual_guided[0, 1].item(), visual_guided[0, 0].item())
+        self.assertLess(reliable_diag["alpha"].item(), diagnostics["alpha"].item())
+        self.assertGreater(reliable[0, 1].item(), calibrated[0, 1].item())
 
     def test_classifier_bank_never_fuses_text_semantics_into_visual_prototypes(self):
         runner = Runner.__new__(Runner)
