@@ -240,9 +240,12 @@ class RepresentationDescriptor(nn.Module):
         count = int(self.error_count.item())
         values = self.error_history if count == self.buffer_size else self.error_history[:count]
         mass_weights = self.error_weight_history if count == self.buffer_size else self.error_weight_history[:count]
-        mass = mass_weights.sum().clamp_min(self.eps)
+        mass = mass_weights.sum()
+        squared_mass = mass_weights.square().sum()
+        if not bool((mass > 0).item()) or not bool((squared_mass > 0).item()):
+            raise ValueError("AE calibration responsibility mass must be strictly positive.")
         mean = (values * mass_weights).sum() / mass
-        effective_n = mass.square() / mass_weights.square().sum().clamp_min(self.eps)
+        effective_n = mass.square() / squared_mass
         variance = (mass_weights * (values - mean).square()).sum() / mass
         correction = effective_n / (effective_n - 1.0).clamp_min(1.0)
         self.error_mean.copy_(mean)
