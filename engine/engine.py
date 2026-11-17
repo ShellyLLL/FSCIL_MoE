@@ -492,7 +492,7 @@ class Runner:
 
     def _train_descriptor(
         self, adapter, expert_id, values, epochs, sample_weights=None,
-        calibration_values=None, shrinkage_prior=None, calibration_weights=None,
+        calibration_values=None, shrinkage_prior=None,
         initialization_descriptor=None,
     ):
         """Fit a reference-space linear AE with independent held-out error calibration."""
@@ -553,20 +553,10 @@ class Runner:
                     "finite independent held-out representations."
                 )
             errors = descriptor.reconstruction_error(reference_values)
-            if calibration_weights is not None:
-                probabilities = torch.as_tensor(
-                    calibration_weights, device=values.device
-                ).float().reshape(-1)
-                if (probabilities.numel() != errors.numel()
-                        or not torch.isfinite(probabilities).all()
-                        or (probabilities < 0).any()
-                        or not bool((probabilities.sum() > 0).item())):
-                    raise ValueError("AE calibration responsibilities must align and have positive finite mass.")
-                reference_count = min(adapter.descriptor_buffer_size, errors.numel())
-                selected = torch.multinomial(
-                    probabilities / probabilities.sum(), reference_count, replacement=True
-                )
-                errors = errors[selected]
+            # Keep one error observation per independent held-out support source.
+            # Router responsibilities shape AE fitting, but bootstrapping these
+            # calibration errors with replacement would turn a small holdout
+            # into duplicated pseudo-observations and overstate error_count.
             adapter.update_descriptor_stats(errors, expert_id)
             if shrinkage_prior is not None:
                 descriptor.shrink_reference(
@@ -674,7 +664,6 @@ class Runner:
                     adapter, expert_id, fit_values, epochs,
                     fit_responsibilities[:, expert_id],
                     calibration_values=calibration_values,
-                    calibration_weights=calibration_responsibilities[:, expert_id],
                 )
                 descriptor = adapter.descriptors[expert_id]
                 if int(descriptor.error_count.item()) < 3:
