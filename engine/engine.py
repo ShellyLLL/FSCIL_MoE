@@ -293,7 +293,7 @@ class Runner:
         schema = int(payload["schema_version"])
         if schema != 18:
             raise ValueError(
-                "This branch uses visual-only classifier checkpoint schema (17); "
+                "This branch uses visual-only classifier checkpoint schema (18); 
                 "older checkpoints are incompatible."
             )
         if not isinstance(payload["model_state"], dict):
@@ -319,6 +319,14 @@ class Runner:
         topology = payload.get("moe_topology", {})
         if not isinstance(topology, dict):
             raise TypeError("Resume checkpoint moe_topology must be a mapping.")
+        expected_topology_blocks = {
+            str(block) for block in self.model_without_dp.expandable_blocks()
+        }
+        if set(topology) != expected_topology_blocks:
+            raise ValueError(
+                "Checkpoint MoE topology blocks do not match configured insertion blocks: "
+                f"{set(topology)} versus {expected_topology_blocks}."
+            )
         self.model_without_dp.rebuild_moe_topology(topology)
         self.model_without_dp.load_state_dict(payload["model_state"], strict=True)
         for _, adapter in self._moe_adapters():
@@ -461,9 +469,24 @@ class Runner:
             incremental_births = births[adapter.base_expert_count:]
             if len(incremental_births) != len(set(incremental_births)):
                 raise ValueError(f"Checkpoint block {block_idx} contains multiple expansions in one session.")
+        acc_list = payload.get("acc_list")
+        task_acc_list = payload.get("task_acc_list")
+        expected_sessions = completed_session + 1
+        if (not isinstance(acc_list, list) or len(acc_list) != expected_sessions
+                or not all(np.isfinite(float(value)) for value in acc_list)):
+            raise ValueError("Checkpoint acc_list must contain one finite AA entry per completed session.")
+        if (not isinstance(task_acc_list, list) or len(task_acc_list) != expected_sessions):
+            raise ValueError("Checkpoint task_acc_list must contain one entry per completed session.")
+        for session_index, values in enumerate(task_acc_list):
+            if (not isinstance(values, (list, tuple))
+                    or len(values) != session_index + 1
+                    or not all(np.isfinite(float(value)) for value in values)):
+                raise ValueError(
+                    f"Checkpoint task accuracy history for session {session_index} is incomplete or non-finite."
+                )
         self._resume_state_dict_list = payload.get("task_states", [])
-        self.acc_list = payload.get("acc_list", [])
-        self.task_acc_list = payload.get("task_acc_list", [])
+        self.acc_list = list(acc_list)
+        self.task_acc_list = [list(values) for values in task_acc_list]
         self.session_diagnostics = diagnostics
         # Thresholds were validated and installed before restoring support data.
         self._resume_completed_session = completed_session
@@ -617,6 +640,12 @@ class Runner:
         source_ids = torch.as_tensor(source_ids, device=labels.device).reshape(-1)
         if labels.numel() == 0 or source_ids.numel() != labels.numel():
             raise ValueError("AE calibration labels and source ids must be non-empty and aligned.")
+        for source_id in torch.unique(source_ids, sorted=True):
+            source_labels = torch.unique(labels[source_ids.eq(source_id)])
+            if source_labels.numel() != 1:
+                raise ValueError(
+                    f"AE calibration source id {int(source_id)} is associated with multiple classes."
+                )
         min_calibration_count = int(min_calibration_count)
         min_fit_per_class = int(min_fit_per_class)
         min_calibration_per_class = int(min_calibration_per_class)
