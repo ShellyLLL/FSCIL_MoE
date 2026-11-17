@@ -293,7 +293,7 @@ class Runner:
         schema = int(payload["schema_version"])
         if schema != 18:
             raise ValueError(
-                "This branch uses visual-only classifier checkpoint schema (18); 
+                "This branch uses visual-only classifier checkpoint schema (18); "
                 "older checkpoints are incompatible."
             )
         if not isinstance(payload["model_state"], dict):
