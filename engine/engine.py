@@ -1,6 +1,7 @@
 import copy
 import hashlib
 import json
+import math
 import os
 import random
 import time
@@ -390,6 +391,12 @@ class Runner:
                     raise ValueError(
                         f"Checkpoint task state {session_index} has invalid {key}/class-id alignment."
                     )
+                if key != "image_proto" and prototype.shape != torch.as_tensor(
+                    state["image_proto"]
+                ).shape:
+                    raise ValueError(
+                        f"Checkpoint task state {session_index} has inconsistent prototype dimensions."
+                    )
                 if not torch.isfinite(prototype).all():
                     raise ValueError(
                         f"Checkpoint task state {session_index} has non-finite {key}."
@@ -420,9 +427,11 @@ class Runner:
                 route_var = torch.as_tensor(bank["route_var"]).float()
                 expert_mean = torch.as_tensor(bank["expert_mean"]).float()
                 expert_var = torch.as_tensor(bank["expert_var"]).float()
+                expected_anchor_dim = self._adapter_by_block(int(block_idx)).d_model
                 if (route_mean.ndim != 2 or route_var.shape != route_mean.shape
                         or expert_mean.shape != route_mean.shape or expert_var.shape != route_mean.shape
-                        or route_mean.size(0) != class_ids.numel()):
+                        or route_mean.size(0) != class_ids.numel()
+                        or route_mean.size(1) != expected_anchor_dim):
                     raise ValueError(
                         f"Checkpoint task state {session_index} block {block_idx} "
                         "has misaligned reference/adapted anchor tensors."
@@ -467,8 +476,11 @@ class Runner:
             if any(int(session) != 0 for session in births[:adapter.base_expert_count]):
                 raise ValueError(f"Checkpoint block {block_idx} has non-Base birth metadata in its Base pool.")
             incremental_births = births[adapter.base_expert_count:]
-            if len(incremental_births) != len(set(incremental_births)):
-                raise ValueError(f"Checkpoint block {block_idx} contains multiple expansions in one session.")
+            if (len(incremental_births) != len(set(incremental_births))
+                    or incremental_births != sorted(incremental_births)):
+                raise ValueError(
+                    f"Checkpoint block {block_idx} has duplicate or non-monotonic expansion birth sessions."
+                )
         acc_list = payload.get("acc_list")
         task_acc_list = payload.get("task_acc_list")
         expected_sessions = completed_session + 1
@@ -800,9 +812,20 @@ class Runner:
             if (class_scores.numel() < 3 or not torch.isfinite(class_scores).all()
                     or any(not labels.eq(class_id).any() for class_id in torch.unique(labels))):
                 raise RuntimeError(f"Block {block_idx} has insufficient finite Base classes for threshold calibration.")
-            threshold = torch.quantile(class_scores.float(), 1.0 - alpha)
+            # Finite-sample one-sided conformal order statistic. Unlike an
+            # interpolated quantile, this does not claim a smaller tail risk
+            # than the available number of independent calibration classes supports.
+            ordered_scores = class_scores.float().sort().values
+            rank = min(
+                ordered_scores.numel(),
+                int(math.ceil((ordered_scores.numel() + 1) * (1.0 - alpha))),
+            )
+            threshold = ordered_scores[max(0, rank - 1)]
             thresholds[int(block_idx)] = float(threshold.item())
-            print(f"=> [ExpansionCalibration][B{block_idx}] alpha={alpha:.3f} threshold={threshold.item():.4f}")
+            print(
+                f"=> [ExpansionCalibration][B{block_idx}] alpha={alpha:.3f} "
+                f"n_classes={ordered_scores.numel()} rank={rank} threshold={threshold.item():.4f}"
+            )
         if set(thresholds) != {int(block) for block, _ in self._moe_adapters()}:
             raise RuntimeError("Expansion threshold calibration did not cover every MoE block.")
         self.expansion_thresholds = thresholds
