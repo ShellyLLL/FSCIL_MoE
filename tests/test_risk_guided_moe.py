@@ -525,6 +525,14 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "uncalibrated descriptors"):
             adapter.descriptor_scores(torch.randn(3, 8))
 
+    def test_descriptor_rejects_zero_effective_weight_calibration_state(self):
+        descriptor = RepresentationDescriptor(4, descriptor_dim=2, buffer_size=8)
+        descriptor.update_reference(torch.tensor([0.1, 0.2, 0.3]))
+        descriptor.effective_error_count.zero_()
+        self.assertFalse(descriptor.is_ready())
+        with self.assertRaisesRegex(RuntimeError, "weighted reference errors"):
+            descriptor.standardized_score(torch.randn(2, 4))
+
     def test_blockwise_collection_uses_exact_router_cls_and_preserves_sample_identity(self):
         torch.manual_seed(17)
         model = BiMC.__new__(BiMC)
