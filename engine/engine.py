@@ -291,7 +291,7 @@ class Runner:
         if missing:
             raise ValueError(f"Resume checkpoint is missing required fields: {missing}")
         schema = int(payload["schema_version"])
-        if schema != 17:
+        if schema != 18:
             raise ValueError(
                 "This branch uses visual-only classifier checkpoint schema (17); "
                 "older checkpoints are incompatible."
@@ -477,7 +477,7 @@ class Runner:
         directory.mkdir(parents=True, exist_ok=True)
         topology = self.model_without_dp.export_moe_topology()
         payload = {
-            "schema_version": 17,
+            "schema_version": 18,
             "completed_session": int(completed_session),
             "model_state": self._cpu_copy(self.model_without_dp.state_dict()),
             "moe_topology": topology,
