@@ -376,6 +376,18 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         self.assertTrue(torch.isfinite(mean) and torch.isfinite(std))
         self.assertEqual(int(descriptor.error_count.item()), 4)
 
+    def test_weighted_ae_reference_uses_exact_responsibility_mass(self):
+        descriptor = RepresentationDescriptor(4, descriptor_dim=2, buffer_size=8)
+        errors = torch.tensor([1.0, 3.0, 5.0])
+        weights = torch.tensor([1e-8, 2e-8, 3e-8])
+        descriptor.update_reference(errors, weights)
+        expected_mean = (errors * weights).sum() / weights.sum()
+        expected_effective_n = weights.sum().square() / weights.square().sum()
+        torch.testing.assert_close(descriptor.error_mean, expected_mean)
+        torch.testing.assert_close(descriptor.effective_error_count, expected_effective_n)
+        self.assertTrue(torch.isfinite(descriptor.error_std))
+        self.assertGreater(float(descriptor.error_std), 0.0)
+
     def test_incremental_descriptor_can_shrink_from_one_independent_holdout(self):
         descriptor = RepresentationDescriptor(4, descriptor_dim=2, buffer_size=8)
         descriptor.update_reference(torch.tensor([0.25]))
