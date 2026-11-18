@@ -49,7 +49,7 @@ python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/t
 ### Unified AE-driven dynamic FSCIL MoE (method model v1.0)
 
 The branch implements the unified FSCIL method model:
-class-wise AE coverage detection, on-demand residual expert expansion,
+task-level AE distribution-shift detection, on-demand residual expert expansion,
 Base-Softmax plus incremental-Sigmoid routing, selective training/freeze,
 semantic-guided novel visual prototype calibration, and one global visual
 prototype classifier.
@@ -66,21 +66,23 @@ Lifecycle:
    centered low-rank linear AE is fitted using its deployed Base-Softmax
    responsibility. The per-layer threshold is calibrated on the independent
    Base holdout.
-3. For each incremental class and layer, calculate the median signed
-   reconstruction-error Z-score for each existing descriptor, then take the
-   minimum across descriptors. A layer expands only when at least one class
-   exceeds the calibrated threshold for every existing descriptor. At most
-   one zero-up-initialized expert and one independent sigmoid router column
-   are added per layer per session.
-4. Train only the new expert and its router column on uncovered classes.
-   Covered current classes provide negative router supervision; uncovered
-   classes provide positive supervision. Old-class route and adapted expert
-   input anchors suppress new-expert interference. All historical experts,
+3. For each incremental class and layer, calculate the median standardized
+   reconstruction-error score for every deployed descriptor, then take the
+   minimum across descriptors. A class is marked novel when this score exceeds
+   the Base-calibrated class threshold. Aggregate the number of novel classes
+   into a task novelty fraction. The layer expands only when this fraction
+   exceeds a separately calibrated Base pseudo-Session threshold. At most one
+   zero-up-initialized expert and one independent sigmoid router column are
+   added per layer per session.
+4. Train the new expert and its router column on all current-Session samples.
+   Every current-Session sample is positive router supervision and participates
+   in the global seen-class visual-prototype classification objective. Old-class
+   route anchors suppress new-expert interference. All historical experts,
    router columns and the ViT remain frozen.
-5. Fit the new expert's paired AE independently on the raw reference CLS
-   features assigned to that expert. Its error statistics use independent
-   held-out source identities and the layer's Base error prior for statistical
-   shrinkage. The AE is used for future expansion decisions, not classification.
+5. Fit the new expert's paired AE on all current-Session raw reference CLS
+   features. Fit and calibration partitions use disjoint source identities,
+   and every current class contributes to both. The AE is used for future
+   task-level expansion decisions, not classification.
 6. After expert training and freezing, compute each novel class's adapted
    visual support prototype. Encode its class description with the frozen
    CLIP text encoder. Description-semantic similarity retrieves related Base
