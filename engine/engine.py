@@ -38,7 +38,7 @@ def _cfg_value(node, name, default):
 
 
 class Runner:
-    """FSCIL runner with class-wise AE coverage, dynamic experts and semantic visual prototypes."""
+    """FSCIL runner with task-level AE shift detection, dynamic experts and semantic visual prototypes."""
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -196,12 +196,6 @@ class Runner:
         if source_ids.numel() != expected_size:
             raise ValueError("Batch source ids must align with image batch size.")
         return source_ids
-
-    @staticmethod
-    def _select_uncovered_batch(images, labels, source_ids, uncovered_classes):
-        class_ids = torch.as_tensor(uncovered_classes, device=labels.device, dtype=torch.long).reshape(-1)
-        mask = torch.isin(labels, class_ids)
-        return images[mask], labels[mask], source_ids[mask]
 
     def _support_manifest_hash(self):
         """Short stable identity for the exact support protocol in this run."""
