@@ -1098,7 +1098,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         for block in model.expandable_blocks():
             decision = model.plan_layer_expansion(block, session2_features, [2])
             self.assertFalse(decision.expand)
-            self.assertEqual(decision.uncovered_classes, [])
+            self.assertEqual(decision.novel_classes, [])
 
         # Checkpoint-style topology reconstruction must preserve the complete
         # multi-session expert pool, AE references, route outputs and encoder.
