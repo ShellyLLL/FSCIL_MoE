@@ -270,9 +270,9 @@ class BiMC(nn.Module):
         ) if threshold is None else threshold)
         moe_cfg = self.cfg.TRAINER.BiMC.VISUAL_MOE
         if task_threshold is None:
-            task_threshold = float(getattr(
-                moe_cfg, "TASK_EXPANSION_SCORE_THRESHOLD", 0.0
-            ))
+            raise RuntimeError(
+                "Task-level expansion requires a separately Base-calibrated pseudo-Session threshold."
+            )
         task_threshold = float(task_threshold)
         if not np.isfinite(class_threshold):
             raise ValueError("Base-calibrated class novelty threshold must be finite.")
