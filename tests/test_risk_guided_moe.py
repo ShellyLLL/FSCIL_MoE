@@ -113,7 +113,6 @@ def build_lifecycle_runner():
             EXPANSION_Z_THRESHOLD=1.0,
             EXPANSION_FALSE_POSITIVE_RATE=0.05,
             TASK_EXPANSION_FALSE_POSITIVE_RATE=0.25,
-            TASK_EXPANSION_SCORE_THRESHOLD=0.0,
         ),
         OPTIM=optim_cfg,
         INCREMENTAL=incremental_cfg,
@@ -915,17 +914,6 @@ class UnifiedDynamicMoETests(unittest.TestCase):
                 features, labels, source_ids, class_index=[0, 1, 2]
             )
 
-    def test_uncovered_batch_selection_keeps_images_labels_and_source_ids_aligned(self):
-        images = torch.arange(4).float().unsqueeze(1)
-        labels = torch.tensor([2, 3, 4, 3])
-        source_ids = torch.tensor([10, 11, 12, 13])
-        selected_images, selected_labels, selected_sources = Runner._select_uncovered_batch(
-            images, labels, source_ids, [3]
-        )
-        self.assertEqual(selected_images.squeeze(1).tolist(), [1.0, 3.0])
-        self.assertEqual(selected_labels.tolist(), [3, 3])
-        self.assertEqual(selected_sources.tolist(), [11, 13])
-
     def test_global_incremental_logits_use_one_current_encoder_and_global_columns(self):
         runner = Runner.__new__(Runner)
         class Encoder:
@@ -1028,7 +1016,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         # rather than causing a duplicate expert in the next pass.
         session1_features = model.collect_blockwise_cls_features([session1_support])
         for block in model.expandable_blocks():
-            decision = model.plan_layer_expansion(block, session1_features, [1])
+            decision = model.plan_layer_expansion(block, session1_features, [1], 1.0, 0.0)
             self.assertFalse(decision.expand)
             self.assertEqual(decision.novel_classes, [])
 
@@ -1096,7 +1084,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
 
         session2_features = model.collect_blockwise_cls_features([session2_support])
         for block in model.expandable_blocks():
-            decision = model.plan_layer_expansion(block, session2_features, [2])
+            decision = model.plan_layer_expansion(block, session2_features, [2], 1.0, 0.0)
             self.assertFalse(decision.expand)
             self.assertEqual(decision.novel_classes, [])
 
@@ -1177,9 +1165,9 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             )
             for block in model.expandable_blocks():
                 features = model.collect_blockwise_cls_features([support])
-                decision = model.plan_layer_expansion(block, features, [session_id])
+                decision = model.plan_layer_expansion(block, features, [session_id], 1.0, 0.0)
                 self.assertFalse(decision.expand)
-                self.assertEqual(decision.uncovered_classes, [])
+                self.assertEqual(decision.novel_classes, [])
             states.append(make_lifecycle_state(
                 runner, model, session_id, support, session_id
             ))
@@ -1279,7 +1267,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             "labels": torch.tensor([7, 7, 7, 7]),
         }}
         with self.assertRaises((FloatingPointError, ValueError)):
-            model.plan_layer_expansion(0, features, [7])
+            model.plan_layer_expansion(0, features, [7], 1.0, 0.0)
 
     def test_duplicate_source_ids_are_query_exclusive_and_cross_class_collisions_fail(self):
         feature = torch.tensor([
