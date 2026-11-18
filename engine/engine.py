@@ -548,8 +548,7 @@ class Runner:
 
     def _train_descriptor(
         self, adapter, expert_id, values, epochs, sample_weights=None,
-        calibration_values=None, shrinkage_prior=None,
-        calibration_weights=None,
+        calibration_values=None, calibration_weights=None,
     ):
         """Fit a reference-space linear AE with independent held-out error calibration."""
         descriptor = adapter.descriptors[int(expert_id)]
@@ -598,7 +597,7 @@ class Runner:
             reference_values = torch.as_tensor(
                 calibration_values, device=values.device
             ).float()
-            minimum_calibration = 1 if shrinkage_prior is not None else 2
+            minimum_calibration = 2
             if (reference_values.ndim != 2 or reference_values.size(0) < minimum_calibration
                     or not torch.isfinite(reference_values).all()):
                 raise ValueError(
@@ -612,13 +611,8 @@ class Runner:
             if weights.numel() != errors.numel():
                 raise ValueError("AE calibration responsibilities must align with held-out sources.")
             descriptor.update_reference(errors, weights)
-            if shrinkage_prior is not None:
-                descriptor.shrink_reference(
-                    shrinkage_prior["mean"], shrinkage_prior["std"],
-                    float(getattr(self._visual_moe_cfg(), "AE_PRIOR_STRENGTH", 10.0)),
-                )
-            elif int(descriptor.error_count.item()) < 2:
-                raise RuntimeError("Base AE descriptors require at least two independent calibration errors.")
+            if int(descriptor.error_count.item()) < 2:
+                raise RuntimeError("AE descriptors require at least two independent calibration errors.")
         for parameter in descriptor.parameters():
             parameter.requires_grad = False
             parameter.grad = None
@@ -821,31 +815,21 @@ class Runner:
         anchors = {}
         for block_idx, item in feature_map.items():
             route_values = item["cls_in"].float()
-            expert_values = item["expert_in"].float()
             labels = item["labels"].long()
-            if route_values.shape != expert_values.shape or route_values.size(0) != labels.numel():
-                raise RuntimeError(f"Block {block_idx} produced misaligned route/expert anchor features.")
             route_means, route_variances = [], []
-            expert_means, expert_variances, class_ids = [], [], []
+            class_ids = []
             for class_id in torch.unique(labels, sorted=True):
                 mask = labels.eq(class_id)
                 route_group = route_values[mask]
-                expert_group = expert_values[mask]
                 route_means.append(route_group.mean(0))
                 route_variances.append(route_group.var(0, unbiased=False).clamp_min(1e-6))
-                expert_means.append(expert_group.mean(0))
-                expert_variances.append(expert_group.var(0, unbiased=False).clamp_min(1e-6))
                 class_ids.append(int(class_id))
             route_mean = torch.stack(route_means).cpu().half()
             route_var = torch.stack(route_variances).cpu().half()
-            expert_mean = torch.stack(expert_means).cpu().half()
-            expert_var = torch.stack(expert_variances).cpu().half()
             anchors[int(block_idx)] = {
                 "class_ids": torch.tensor(class_ids, dtype=torch.long),
                 "route_mean": route_mean,
                 "route_var": route_var,
-                "expert_mean": expert_mean,
-                "expert_var": expert_var,
                 # Keep the old names as read-only aliases for diagnostics.
                 "mean": route_mean,
                 "var": route_var,
@@ -861,25 +845,18 @@ class Runner:
                 continue
             route_mean = bank.get("route_mean", bank.get("mean"))
             route_var = bank.get("route_var", bank.get("var"))
-            expert_mean, expert_var = bank.get("expert_mean"), bank.get("expert_var")
-            if any(value is None for value in (route_mean, route_var, expert_mean, expert_var)):
-                raise ValueError(
-                    f"Block {block_idx} old-class anchors must include both reference and adapted spaces."
-                )
+            if any(value is None for value in (route_mean, route_var)):
+                raise ValueError(f"Block {block_idx} old-class anchors must include reference route statistics.")
             route_means.append(torch.as_tensor(route_mean, device=self.device).float())
             route_variances.append(torch.as_tensor(route_var, device=self.device).float())
-            expert_means.append(torch.as_tensor(expert_mean, device=self.device).float())
-            expert_variances.append(torch.as_tensor(expert_var, device=self.device).float())
         if not route_means:
             return {
                 "route_mean": None, "route_var": None,
-                "expert_mean": None, "expert_var": None,
+
             }
         return {
             "route_mean": torch.cat(route_means, dim=0),
             "route_var": torch.cat(route_variances, dim=0),
-            "expert_mean": torch.cat(expert_means, dim=0),
-            "expert_var": torch.cat(expert_variances, dim=0),
         }
 
     def _all_old_anchors(self, old_states, block_idx):
@@ -1178,8 +1155,7 @@ class Runner:
                     route_responsibility = F.binary_cross_entropy_with_logits(
                         route_logits, route_targets
                     )
-                    route_sparse = torch.sigmoid(route_logits).mean()
-                    if labels.numel() > 0:
+                            if labels.numel() > 0:
                         logits, targets = self._global_incremental_logits(
                             images, labels, source_ids, bank, scale)
                         classification = F.cross_entropy(logits, targets)
@@ -1188,9 +1164,6 @@ class Runner:
                     old_suppression = adapter.old_route_suppression_loss(
                         anchor_mean, anchor_var,
 
-                    adapter_penalty = aux_by_block[int(block_idx)][
-                        "expert_output_energy"
-                    ][-1]
                     incremental_cfg = self.cfg.TRAINER.BiMC.INCREMENTAL
                     loss = (
                         classification
