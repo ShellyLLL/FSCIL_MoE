@@ -237,27 +237,6 @@ class RepresentationDescriptor(nn.Module):
         self.effective_error_count.copy_(effective_n)
         return self.error_mean, self.error_std
 
-    @torch.no_grad()
-    def shrink_reference(self, prior_mean, prior_std, prior_strength):
-        prior_mean = torch.as_tensor(prior_mean, device=self.error_mean.device, dtype=torch.float32)
-        prior_std = torch.as_tensor(prior_std, device=self.error_std.device, dtype=torch.float32)
-        strength = float(prior_strength)
-        effective_n = float(self.effective_error_count.item())
-        if effective_n <= 0 or not torch.isfinite(prior_mean) or not torch.isfinite(prior_std):
-            raise ValueError("AE shrinkage requires independent weighted errors and finite priors.")
-        if prior_std <= 0 or not np.isfinite(strength) or strength <= 0:
-            raise ValueError("AE prior std and shrinkage strength must be positive.")
-        local_mean, local_std = self.error_mean.clone(), self.error_std.clone()
-        weight = effective_n / (effective_n + strength)
-        mean = weight * local_mean + (1.0 - weight) * prior_mean
-        variance = (
-            weight * (local_std.square() + (local_mean - mean).square())
-            + (1.0 - weight) * (prior_std.square() + (prior_mean - mean).square())
-        )
-        self.error_mean.copy_(mean)
-        self.error_std.copy_(variance.clamp_min(self.eps ** 2).sqrt())
-        return self.error_mean, self.error_std
-
     def standardized_score(self, x):
         if (int(self.error_count.item()) < 1
                 or float(self.effective_error_count.item()) <= 0.0):
