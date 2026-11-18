@@ -376,28 +376,19 @@ class VisualMoEAdapter(nn.Module):
         variance = variance.clamp_min(1e-6)
         return torch.cat([mean, mean + variance.sqrt(), mean - variance.sqrt()], dim=0)
 
-    def old_anchor_suppression_loss(
-        self, route_anchor_mean, route_anchor_var,
-        expert_anchor_mean, expert_anchor_var, residual_weight=1.0,
-    ):
-        """Suppress routing in the frozen reference space and residuals in expert-input space."""
-        values = (route_anchor_mean, route_anchor_var, expert_anchor_mean, expert_anchor_var)
-        if all(value is None for value in values):
+    def old_route_suppression_loss(self, route_anchor_mean, route_anchor_var):
+        """Suppress only the newest sigmoid gate on frozen raw/reference class anchors.
+
+        This is the direct implementation of L_old-route in the unified v1.0 model;
+        expert-output residual suppression is intentionally not part of the objective.
+        """
+        if route_anchor_mean is None or route_anchor_var is None:
             return self.residual_scale.new_zeros(())
-        if any(value is None for value in values):
-            raise ValueError("Route and expert-input anchor statistics must be supplied together.")
-        route_points = self._anchor_points(route_anchor_mean, route_anchor_var).to(
+        anchors = self._anchor_points(route_anchor_mean, route_anchor_var).to(
             device=self.residual_scale.device
         )
-        expert_points = self._anchor_points(expert_anchor_mean, expert_anchor_var).to(
-            device=self.residual_scale.device
-        )
-        if route_points.shape != expert_points.shape:
-            raise ValueError("Reference-route and adapted expert-input anchors must align.")
-        gate = torch.sigmoid(self.router.columns[-1](route_points))
-        residual = self.experts[-1](expert_points)
-        gated_residual = self.residual_scale.to(residual.dtype) * gate * residual
-        return gate.square().mean() + float(residual_weight) * gated_residual.square().mean()
+        gate = torch.sigmoid(self.router.columns[-1](anchors))
+        return gate.square().mean()
 
     @torch.no_grad()
     def old_anchor_response(self, anchor_mean, anchor_var):
