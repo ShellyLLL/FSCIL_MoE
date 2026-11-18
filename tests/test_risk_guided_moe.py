@@ -983,10 +983,14 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         captured_block1 = {}
         original_plan = model.plan_layer_expansion
 
-        def capture_downstream_plan(block_idx, features, class_index, threshold=None):
+        def capture_downstream_plan(
+            block_idx, features, class_index, threshold=None, task_threshold=None
+        ):
             if int(block_idx) == 1:
                 captured_block1["cls_in"] = features[1]["cls_in"].detach().clone()
-            return original_plan(block_idx, features, class_index, threshold)
+            return original_plan(
+                block_idx, features, class_index, threshold, task_threshold
+            )
 
         model.plan_layer_expansion = capture_downstream_plan
         try:
