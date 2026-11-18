@@ -111,6 +111,9 @@ def build_lifecycle_runner():
             NUM_BASE_EXPERTS=2,
             INCREMENTAL_REDUCTION=2,
             EXPANSION_Z_THRESHOLD=1.0,
+            EXPANSION_FALSE_POSITIVE_RATE=0.05,
+            TASK_EXPANSION_FALSE_POSITIVE_RATE=0.25,
+            TASK_EXPANSION_SCORE_THRESHOLD=0.0,
         ),
         OPTIM=optim_cfg,
         INCREMENTAL=incremental_cfg,
@@ -120,7 +123,10 @@ def build_lifecycle_runner():
         LAMBDA_I=0.0,
         TAU=16.0,
     )
-    cfg = SimpleNamespace(TRAINER=SimpleNamespace(BiMC=bimc_cfg))
+    cfg = SimpleNamespace(
+        TRAINER=SimpleNamespace(BiMC=bimc_cfg),
+        DATASET=SimpleNamespace(NUM_INC_CLS=1, NUM_INC_SHOT=5),
+    )
     model = BiMC.__new__(BiMC)
     nn.Module.__init__(model)
     model.cfg = cfg
@@ -132,6 +138,7 @@ def build_lifecycle_runner():
     runner.cfg = cfg
     runner.device = torch.device("cpu")
     runner.expansion_thresholds = {0: 1.0, 1: 1.0}
+    runner.task_expansion_thresholds = {0: 0.0, 1: 0.0}
     runner.model = model
     runner.model_without_dp = model
     runner._text_prototypes = lambda _names, class_index: (
@@ -690,6 +697,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             runner.task_acc_list = [[50.0]]
             runner.session_diagnostics = [{"session": 0}]
             runner.expansion_thresholds = {0: 1.25, 1: 1.5}
+            runner.task_expansion_thresholds = {0: 0.2, 1: 0.3}
             model.base_enhanced_visual_prototype = torch.tensor([[1.0, 0.0, 0.0, 0.0,
                                                          0.0, 0.0, 0.0, 0.0]])
             runner._train_base_descriptors([lifecycle_batch(
@@ -714,8 +722,9 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             }
             checkpoint_path = runner.save_checkpoint(0, [state])
             payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-            self.assertEqual(payload["schema_version"], 20)
+            self.assertEqual(payload["schema_version"], 21)
             self.assertEqual(payload["expansion_thresholds"], {0: 1.25, 1: 1.5})
+            self.assertEqual(payload["task_expansion_thresholds"], {0: 0.2, 1: 0.3})
             self.assertNotIn("descriptor_error_priors", payload)
             self.assertIn("reference_image_proto", payload["task_states"][0])
 
@@ -736,6 +745,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             restored._load_resume_checkpoint_if_requested()
             self.assertEqual(restored._resume_completed_session, 0)
             self.assertEqual(restored.expansion_thresholds, {0: 1.25, 1: 1.5})
+            self.assertEqual(restored.task_expansion_thresholds, {0: 0.2, 1: 0.3})
             self.assertEqual(len(restored._resume_state_dict_list), 1)
             torch.testing.assert_close(
                 restored_model.base_enhanced_visual_prototype, model.base_enhanced_visual_prototype
@@ -1020,7 +1030,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         for block in model.expandable_blocks():
             decision = model.plan_layer_expansion(block, session1_features, [1])
             self.assertFalse(decision.expand)
-            self.assertEqual(decision.uncovered_classes, [])
+            self.assertEqual(decision.novel_classes, [])
 
         session1_anchors = runner._collect_class_anchors([session1_support])
         with torch.no_grad():
@@ -1154,7 +1164,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             )
             self.assertTrue(result["trained"])
             self.assertEqual(
-                [entry["uncovered_classes"] for entry in result["expanded"]],
+                [entry["novel_classes"] for entry in result["expanded"]],
                 [[session_id], [session_id]],
             )
             self.assertEqual(
