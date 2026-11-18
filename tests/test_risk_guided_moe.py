@@ -340,6 +340,21 @@ class UnifiedDynamicMoETests(unittest.TestCase):
                 class_scores[max(0, rank - 1)],
             )
 
+    def test_old_route_suppression_only_updates_new_sigmoid_gate(self):
+        torch.manual_seed(17)
+        adapter = VisualMoEAdapter(8, num_experts=2, reduction=2)
+        adapter.add_expert(session_id=1, reduction=2)
+        adapter.set_newest_trainable()
+        route_mean = torch.randn(3, 8)
+        route_var = torch.ones_like(route_mean) * 0.1
+        loss = adapter.old_route_suppression_loss(route_mean, route_var)
+        loss.backward()
+        self.assertTrue(torch.isfinite(loss))
+        self.assertIsNotNone(adapter.router.columns[-1].weight.grad)
+        self.assertIsNone(adapter.experts[-1].c_fc.weight.grad)
+        self.assertIsNone(adapter.experts[-1].c_proj.weight.grad)
+        self.assertTrue(all(p.grad is None for p in adapter.experts[0].parameters()))
+
     def test_incremental_expert_output_energy_is_differentiable_and_unweighted(self):
         torch.manual_seed(241)
         adapter = VisualMoEAdapter(8, num_experts=2, reduction=2)
