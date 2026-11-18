@@ -55,7 +55,6 @@ class Runner:
         self.acc_list, self.task_acc_list = [], []
         self.session_diagnostics = []
         self.expansion_thresholds = {}
-        self.descriptor_error_priors = {}
         self._base_calibration_features = {}
         self.evaluator = AccuracyEvaluator(self.data_manager.class_index_in_task)
         self._resume_completed_session = -1
@@ -286,15 +285,14 @@ class Runner:
         required = (
             "schema_version", "completed_session", "model_state", "task_states",
             "support_manifest", "moe_topology", "expansion_thresholds",
-            "descriptor_error_priors",
-        )
+                    )
         missing = [key for key in required if key not in payload]
         if missing:
             raise ValueError(f"Resume checkpoint is missing required fields: {missing}")
         schema = int(payload["schema_version"])
-        if schema != 19:
+        if schema != 20:
             raise ValueError(
-                "This branch uses semantic-guided visual prototype checkpoint schema (19); "
+                "This branch uses semantic-guided visual prototype checkpoint schema (20); "
                 "older checkpoints are incompatible."
             )
         if not isinstance(payload["model_state"], dict):
@@ -347,19 +345,6 @@ class Runner:
                     "Checkpoint expansion thresholds do not cover the deployed MoE blocks: "
                     f"{set(self.expansion_thresholds)} versus {expected_blocks}."
                 )
-        raw_priors = payload.get("descriptor_error_priors")
-        if not isinstance(raw_priors, dict):
-            raise TypeError("Checkpoint descriptor_error_priors must be a mapping.")
-        self.descriptor_error_priors = {
-            int(key): {"mean": float(value["mean"]), "std": float(value["std"])}
-            for key, value in raw_priors.items()
-        }
-        if bool(self._visual_moe_cfg().ENABLE):
-            if set(self.descriptor_error_priors) != expected_blocks:
-                raise ValueError("Checkpoint AE priors do not cover every deployed MoE block.")
-            for block, prior in self.descriptor_error_priors.items():
-                if not np.isfinite(prior["mean"]) or not np.isfinite(prior["std"]) or prior["std"] <= 0:
-                    raise ValueError(f"Checkpoint AE prior for block {block} is invalid.")
         checkpoint_class_ids = []
         for session_index, state in enumerate(payload["task_states"]):
             required_state = ("class_ids", "image_proto", "reference_image_proto",
@@ -515,7 +500,7 @@ class Runner:
         directory.mkdir(parents=True, exist_ok=True)
         topology = self.model_without_dp.export_moe_topology()
         payload = {
-            "schema_version": 19,
+            "schema_version": 20,
             "completed_session": int(completed_session),
             "model_state": self._cpu_copy(self.model_without_dp.state_dict()),
             "moe_topology": topology,
@@ -526,7 +511,6 @@ class Runner:
             "task_acc_list": copy.deepcopy(self.task_acc_list),
             "session_diagnostics": self._cpu_copy(self.session_diagnostics),
             "expansion_thresholds": {int(key): float(value) for key, value in self.expansion_thresholds.items()},
-            "descriptor_error_priors": self._cpu_copy(self.descriptor_error_priors),
             "rng_state": self._rng_state(),
             "config": self.cfg.dump() if hasattr(self.cfg, "dump") else str(self.cfg),
         }
