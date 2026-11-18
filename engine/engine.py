@@ -895,8 +895,8 @@ class Runner:
                     score for class_id, score in class_score_by_id.items()
                     if class_id not in group_set
                 ], dtype=torch.float32)
-                if reference_scores.numel() < 3:
-                    raise RuntimeError("Leave-group-out Base class calibration has too few references.")
+                if reference_scores.numel() < 2:
+                    raise RuntimeError("Leave-group-out Base class calibration requires at least two reference classes.")
                 reference_scores = reference_scores.sort().values
                 reference_rank = min(
                     reference_scores.numel(),
