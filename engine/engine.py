@@ -1375,9 +1375,19 @@ class Runner:
                 raise RuntimeError(
                     f"Block {block_idx} AE fit/calibration split must include every current class."
                 )
+            with torch.no_grad():
+                # The descriptor models the complete Session distribution,
+                # weighted by the exact deployed responsibility of its paired
+                # incremental expert.  No current class is filtered out.
+                ae_fit_weights = adapter.expert_responsibility(ae_fit_values, expert_id)
+                ae_calibration_weights = adapter.expert_responsibility(
+                    ae_calibration_values, expert_id
+                )
             ae_loss = self._train_descriptor(
                 adapter, expert_id, ae_fit_values, ae_epochs,
+                sample_weights=ae_fit_weights,
                 calibration_values=ae_calibration_values,
+                calibration_weights=ae_calibration_weights,
             )
             adapter.freeze_all()
             histories[block_idx] = {
@@ -1392,6 +1402,9 @@ class Runner:
                 "router_positive_fraction": 1.0,
                 "ae_fit_samples": int(ae_fit_values.size(0)),
                 "ae_calibration_sources": int(calibration_mask.sum().item()),
+                "ae_effective_calibration_count": float(
+                    adapter.descriptors[expert_id].effective_error_count.item()
+                ),
                 "ae_fit_classes": fit_class_ids,
                 "ae_calibration_classes": calibration_class_ids,
                 "old_anchor_gate_mean": adapter.old_anchor_response(anchor_mean, anchor_var),
