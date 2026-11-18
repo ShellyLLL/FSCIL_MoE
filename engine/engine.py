@@ -748,19 +748,6 @@ class Runner:
                       f"mean={descriptor.error_mean.item():.6f} std={descriptor.error_std.item():.6f}")
             adapter.assert_descriptors_ready()
             adapter.freeze_all()
-            pooled_errors = torch.cat([
-                descriptor.error_history[:int(descriptor.error_count.item())].detach().float()
-                for descriptor in adapter.descriptors
-            ])
-            if pooled_errors.numel() < 3 or not torch.isfinite(pooled_errors).all():
-                raise RuntimeError(f"Block {block_idx} cannot form a finite Base AE error prior.")
-            prior_std = pooled_errors.std(unbiased=True).clamp_min(adapter.descriptor_eps)
-            self.descriptor_error_priors[int(block_idx)] = {
-                "mean": float(pooled_errors.mean().item()),
-                "std": float(prior_std.item()),
-            }
-
-
     @torch.no_grad()
     def _calibrate_expansion_thresholds(self, extract_loader):
         """Calibrate per-layer known-class false-expansion thresholds on Base holdout sources."""
