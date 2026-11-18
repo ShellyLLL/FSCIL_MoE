@@ -822,7 +822,6 @@ class Runner:
 
     def _all_old_anchor_sets(self, old_states, block_idx):
         route_means, route_variances = [], []
-        expert_means, expert_variances = [], []
         for state in old_states:
             bank = state.get("anchor_by_block", {}).get(int(block_idx))
             if bank is None:
@@ -836,7 +835,6 @@ class Runner:
         if not route_means:
             return {
                 "route_mean": None, "route_var": None,
-
             }
         return {
             "route_mean": torch.cat(route_means, dim=0),
