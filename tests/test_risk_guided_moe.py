@@ -103,6 +103,7 @@ def build_lifecycle_runner():
         EPOCHS=8,
         LOGIT_SCALE=20.0,
         OLD_SUPPRESSION_WEIGHT=10.0,
+        ROUTE_WEIGHT=1.0,
     )
     bimc_cfg = SimpleNamespace(
         VISUAL_MOE=SimpleNamespace(
@@ -186,9 +187,10 @@ def lifecycle_route_snapshot(model, images):
 
 
 class UnifiedDynamicMoETests(unittest.TestCase):
-    def test_incremental_session_trains_positive_and_negative_route_responsibilities(self):
+    def test_incremental_session_trains_all_current_classes_as_positive_route_responsibilities(self):
         torch.manual_seed(239)
         runner, model = build_lifecycle_runner()
+        runner.task_expansion_thresholds = {0: 0.25, 1: 0.25}
         model.eval()
         base_support = lifecycle_batch(
             0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 6000
@@ -205,20 +207,20 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         support = [covered_support, novel_support]
         train = [covered_support, novel_support]
         result = runner.train_incremental_task(
-            1, train, support, [1, 2], ["covered_new_class", "uncovered_new_class"],
+            1, train, support, [1, 2], ["covered_new_class", "novel_new_class"],
             [base_state],
         )
-        self.assertEqual(
-            [item["uncovered_classes"] for item in result["expanded"]], [[2], [2]]
-        )
+        self.assertEqual([item["block_idx"] for item in result["expanded"]], [0, 1])
         for block_idx, adapter in runner._moe_adapters():
+            history = result["training"][block_idx]
+            self.assertEqual(history["classification_samples_per_epoch"], [16] * 8)
+            self.assertEqual(history["classification_samples_total"], 128)
+            self.assertEqual(history["router_positive_fraction"], 1.0)
+            self.assertEqual(history["ae_fit_classes"], [1, 2])
+            self.assertEqual(history["ae_calibration_classes"], [1, 2])
             features = model.collect_blockwise_cls_features(support)[block_idx]
             gates = torch.sigmoid(adapter.router.columns[-1](features["cls_in"]))
-            labels = features["labels"]
-            covered_gate = gates[labels.eq(1)].mean()
-            novel_gate = gates[labels.eq(2)].mean()
-            self.assertGreater(float(novel_gate), float(covered_gate))
-            self.assertLess(float(covered_gate), 0.5)
+            self.assertGreater(float(gates.mean()), 0.5)
 
     def test_incremental_route_responsibility_has_positive_and_negative_targets(self):
         logits = torch.tensor([-1.0, 1.0], requires_grad=True)
@@ -753,7 +755,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         torch.testing.assert_close(source(x)[0], restored(x)[0], rtol=0, atol=0)
         self.assertEqual(restored.num_experts, 3)
 
-    def test_class_level_expansion_uses_each_classes_best_existing_descriptor(self):
+    def test_task_level_expansion_aggregates_novel_class_fraction(self):
         model = BiMC.__new__(BiMC)
         nn.Module.__init__(model)
         adapter = VisualMoEAdapter(8, num_experts=2, reduction=2, descriptor_dim=4)
@@ -775,14 +777,14 @@ class UnifiedDynamicMoETests(unittest.TestCase):
 
         adapter.descriptor_scores = lambda x, require_ready=True: torch.tensor(
             [[0.2, 0.3], [0.2, 0.3], [1.5, 1.6], [1.5, 1.6]])
-        decision = model.plan_layer_expansion(0, features, [2, 3])
+        decision = model.plan_layer_expansion(0, features, [2, 3], 1.0, 0.25)
         self.assertTrue(decision.expand)
-        self.assertEqual(decision.uncovered_classes, [3])
-        self.assertAlmostEqual(decision.class_scores[2], 0.2, places=5)
-        self.assertAlmostEqual(decision.class_scores[3], 1.5, places=5)
+        self.assertEqual(decision.novel_classes, [3])
+        self.assertAlmostEqual(decision.task_novelty_score, 0.5)
+        self.assertAlmostEqual(decision.task_novelty_threshold, 0.25)
 
-        # Different samples in one class are covered by different experts.
-        # Per-sample min then median would incorrectly call this covered.
+        # Different samples in one class are summarized per descriptor before
+        # the minimum across descriptors is taken.
         crossing_features = {
             0: {"cls_in": torch.randn(8, 8),
                 "labels": torch.tensor([2, 2, 2, 2, 3, 3, 3, 3])}
@@ -790,17 +792,17 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         adapter.descriptor_scores = lambda x, require_ready=True: torch.tensor(
             [[0.2, 2.0], [2.0, 0.2], [2.0, 2.0], [2.0, 2.0],
              [0.2, 0.2], [0.2, 0.2], [0.2, 0.2], [0.2, 0.2]])
-        decision = model.plan_layer_expansion(0, crossing_features, [2, 3])
+        decision = model.plan_layer_expansion(0, crossing_features, [2, 3], 1.0, 0.25)
         self.assertTrue(decision.expand)
-        self.assertEqual(decision.uncovered_classes, [2])
+        self.assertEqual(decision.novel_classes, [2])
         self.assertAlmostEqual(decision.class_scores[2], 2.0, places=5)
-        self.assertAlmostEqual(decision.class_scores[3], 0.2, places=5)
 
         adapter.descriptor_scores = lambda x, require_ready=True: torch.tensor(
             [[1.5, 0.2], [1.5, 0.2], [0.2, 1.5], [0.2, 1.5]])
-        decision = model.plan_layer_expansion(0, features, [2, 3])
+        decision = model.plan_layer_expansion(0, features, [2, 3], 1.0, 0.25)
         self.assertFalse(decision.expand)
-        self.assertEqual(decision.uncovered_classes, [])
+        self.assertEqual(decision.novel_classes, [])
+        self.assertAlmostEqual(decision.task_novelty_score, 0.0)
 
     def test_semantic_guided_calibration_uses_only_base_description_to_retrieve_enhanced_visual(self):
         runner = Runner.__new__(Runner)
