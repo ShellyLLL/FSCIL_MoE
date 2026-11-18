@@ -1182,7 +1182,9 @@ class Runner:
             local_labels = local_item["labels"][local_mask].to(self.device)
             local_sources = local_item["source_ids"][local_mask].to(self.device)
             calibration_mask = self._make_calibration_mask(
-                local_labels, local_sources, min_calibration_count=1, min_fit_per_class=3
+                local_labels, local_sources,
+                min_calibration_count=2, min_fit_per_class=3,
+                min_calibration_per_class=2,
             )
             fit_mask = ~calibration_mask
             ae_fit_values = local_values[fit_mask]
