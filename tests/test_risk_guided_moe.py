@@ -363,18 +363,6 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             parameter.grad is None for parameter in adapter.experts[0].parameters()
         ))
 
-    def _test_ae_error_statistics_shrink_toward_base_prior(self):
-        descriptor = RepresentationDescriptor(4, descriptor_dim=2, buffer_size=8)
-        errors = torch.tensor([1.0, 1.2, 0.8, 1.1])
-        descriptor.update_reference(errors)
-        local_mean = descriptor.error_mean.clone()
-        local_std = descriptor.error_std.clone()
-        mean, std = descriptor.shrink_reference(0.0, 0.5, prior_strength=8.0)
-        self.assertLess(float(mean), float(local_mean))
-        self.assertGreater(float(std), 0.0)
-        self.assertTrue(torch.isfinite(mean) and torch.isfinite(std))
-        self.assertEqual(int(descriptor.error_count.item()), 4)
-
     def test_weighted_ae_reference_uses_exact_responsibility_mass(self):
         descriptor = RepresentationDescriptor(4, descriptor_dim=2, buffer_size=8)
         errors = torch.tensor([1.0, 3.0, 5.0])
@@ -386,15 +374,6 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         torch.testing.assert_close(descriptor.effective_error_count, expected_effective_n)
         self.assertTrue(torch.isfinite(descriptor.error_std))
         self.assertGreater(float(descriptor.error_std), 0.0)
-
-    def _test_incremental_descriptor_can_shrink_from_one_independent_holdout(self):
-        descriptor = RepresentationDescriptor(4, descriptor_dim=2, buffer_size=8)
-        descriptor.update_reference(torch.tensor([0.25]))
-        mean, std = descriptor.shrink_reference(0.10, 0.30, prior_strength=10.0)
-        self.assertTrue(descriptor.is_ready())
-        self.assertEqual(int(descriptor.error_count.item()), 1)
-        self.assertTrue(torch.isfinite(mean) and torch.isfinite(std))
-        self.assertGreater(float(std), 0.0)
 
     def test_incremental_calibration_mask_keeps_one_source_out_of_fit(self):
         labels = torch.tensor([3, 3, 3, 3, 3])
@@ -945,36 +924,6 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         self.assertEqual(tuple(logits.shape), (1, 3))
         self.assertEqual(int(targets.item()), 1)
         self.assertEqual(int(logits.argmax(dim=1).item()), 1)
-
-    def _test_anchor_suppression_uses_reference_route_and_adapted_expert_spaces(self):
-        adapter = VisualMoEAdapter(8, num_experts=2, reduction=2)
-        adapter.add_expert(1, reduction=2)
-        route_mean = torch.randn(4, 8)
-        route_var = torch.ones_like(route_mean) * 0.1
-        expert_mean = route_mean + 2.0
-        expert_var = torch.ones_like(expert_mean) * 0.2
-        captured_route, captured_expert = [], []
-        route_hook = adapter.router.columns[-1].register_forward_pre_hook(
-            lambda _module, args: captured_route.append(args[0].detach().clone())
-        )
-        expert_hook = adapter.experts[-1].register_forward_pre_hook(
-            lambda _module, args: captured_expert.append(args[0].detach().clone())
-        )
-        try:
-            loss = adapter.old_route_suppression_loss(
-                route_mean, route_var
-            )
-        finally:
-            route_hook.remove()
-            expert_hook.remove()
-        loss.backward()
-        self.assertTrue(torch.isfinite(loss))
-        self.assertEqual(len(captured_route), 1)
-        self.assertEqual(len(captured_expert), 1)
-        self.assertFalse(torch.allclose(captured_route[0], captured_expert[0]))
-        self.assertIsNotNone(adapter.router.columns[-1].weight.grad)
-        self.assertIsNotNone(adapter.experts[-1].c_proj.weight.grad)
-
 
     def test_multisession_expansion_reuse_history_and_topology_restore(self):
         torch.manual_seed(23)
