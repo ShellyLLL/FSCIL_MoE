@@ -224,6 +224,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             self.assertEqual(history["router_positive_fraction"], 1.0)
             self.assertEqual(history["ae_fit_classes"], [1, 2])
             self.assertEqual(history["ae_calibration_classes"], [1, 2])
+            self.assertGreater(history["ae_effective_calibration_count"], 0.0)
             features = model.collect_blockwise_cls_features(support)[block_idx]
             gates = torch.sigmoid(adapter.router.columns[-1](features["cls_in"]))
             self.assertGreater(float(gates.mean()), 0.5)
@@ -328,8 +329,13 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             ))
         runner._calibrate_expansion_thresholds(supports)
         self.assertEqual(set(runner.expansion_thresholds), {0, 1})
+        self.assertEqual(set(runner.task_expansion_thresholds), {0, 1})
         self.assertTrue(all(torch.isfinite(torch.tensor(value))
                             for value in runner.expansion_thresholds.values()))
+        self.assertTrue(all(
+            0.0 <= value <= 1.0
+            for value in runner.task_expansion_thresholds.values()
+        ))
         alpha = 0.05
         for block_idx, adapter in runner._moe_adapters():
             holdout = runner._base_calibration_features[block_idx]
