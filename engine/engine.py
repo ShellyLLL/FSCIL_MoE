@@ -1137,21 +1137,24 @@ class Runner:
                     route_responsibility = F.binary_cross_entropy_with_logits(
                         route_logits, route_targets
                     )
-                            if labels.numel() > 0:
+                    if labels.numel() > 0:
                         logits, targets = self._global_incremental_logits(
-                            images, labels, source_ids, bank, scale)
+                            images, labels, source_ids, bank, scale
+                        )
                         classification = F.cross_entropy(logits, targets)
                     else:
                         classification = route_responsibility.new_zeros(())
-                    old_suppression = adapter.old_route_suppression_loss(
-                        anchor_mean, anchor_var,
 
+                    old_suppression = adapter.old_route_suppression_loss(
+                        anchor_mean, anchor_var
+                    )
                     incremental_cfg = self.cfg.TRAINER.BiMC.INCREMENTAL
                     loss = (
                         classification
-                        + float(getattr(incremental_cfg, "ROUTE_WEIGHT", 1.0)) * route_responsibility
-                        + float(getattr(incremental_cfg, "OLD_SUPPRESSION_WEIGHT", 1.0)) * old_suppression
-
+                        + float(getattr(incremental_cfg, "ROUTE_WEIGHT", 1.0))
+                        * route_responsibility
+                        + float(getattr(incremental_cfg, "OLD_SUPPRESSION_WEIGHT", 1.0))
+                        * old_suppression
                     )
                     if not bool(torch.isfinite(loss).item()):
                         raise FloatingPointError("Non-finite global visual-prototype incremental loss.")
