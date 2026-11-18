@@ -11,10 +11,13 @@ import models.clip.clip as clip
 
 @dataclass
 class LayerExpansionDecision:
+    """Task-level decision with per-class evidence retained for diagnostics."""
     block_idx: int
     expand: bool
     class_scores: Dict[int, float]
-    uncovered_classes: List[int]
+    novel_classes: List[int]
+    task_novelty_score: float
+    task_novelty_threshold: float
 
 
 def build_loo_cache_from_embeddings(features, labels, source_ids, class_index=None):
@@ -250,12 +253,31 @@ class BiMC(nn.Module):
                 if getattr(block, "moe_adapter", None) is not None]
 
     @torch.no_grad()
-    def plan_layer_expansion(self, block_idx, features, class_index, threshold=None):
-        """Expand a layer iff at least one current class is uncovered by every AE."""
+    def plan_layer_expansion(
+        self, block_idx, features, class_index, threshold=None, task_threshold=None,
+    ):
+        """Decide whether the complete current Session has a novel distribution.
+
+        A class score is the minimum across deployed descriptors of the
+        per-descriptor median standardized reconstruction error.  The task
+        score is the fraction of current classes whose score exceeds the
+        Base-calibrated class threshold.  Expansion is decided only from the
+        separately Base-calibrated pseudo-Session task threshold.
+        """
         block_idx = int(block_idx)
-        threshold = float(getattr(
+        class_threshold = float(getattr(
             self.cfg.TRAINER.BiMC.VISUAL_MOE, "EXPANSION_Z_THRESHOLD", 1.0
         ) if threshold is None else threshold)
+        moe_cfg = self.cfg.TRAINER.BiMC.VISUAL_MOE
+        if task_threshold is None:
+            task_threshold = float(getattr(
+                moe_cfg, "TASK_EXPANSION_SCORE_THRESHOLD", 0.0
+            ))
+        task_threshold = float(task_threshold)
+        if not np.isfinite(class_threshold):
+            raise ValueError("Base-calibrated class novelty threshold must be finite.")
+        if not np.isfinite(task_threshold) or not 0.0 <= task_threshold <= 1.0:
+            raise ValueError("Base-calibrated task novelty threshold must be finite and in [0, 1].")
         if block_idx not in features:
             raise KeyError(f"Block {block_idx} did not produce support features.")
 
@@ -268,10 +290,12 @@ class BiMC(nn.Module):
         expected = sorted(int(value) for value in class_index)
         observed = sorted(int(value) for value in torch.unique(labels, sorted=True).tolist())
         if observed != expected:
-            raise RuntimeError(f"Block {block_idx} received classes {observed}, expected {expected}.")
-
+            raise RuntimeError(
+                f"Block {block_idx} received classes {observed}, expected {expected}."
+            )
         if scores.ndim != 2 or scores.size(1) != adapter.num_experts or not torch.isfinite(scores).all():
             raise FloatingPointError(f"Block {block_idx} produced invalid descriptor Z-scores.")
+
         class_ids = torch.unique(labels, sorted=True)
         class_descriptor_scores = torch.stack([
             torch.stack([
@@ -280,23 +304,29 @@ class BiMC(nn.Module):
             ])
             for class_id in class_ids
         ])
-        # A class is covered if at least one descriptor covers the class-level
-        # distribution. Aggregate each descriptor over the class before taking
-        # the minimum across descriptors; min-then-median is not equivalent.
-        class_min_z = class_descriptor_scores.min(dim=1).values
+        class_min_scores = class_descriptor_scores.min(dim=1).values
         class_scores = {
-            int(class_id): float(class_min_z[row].item())
+            int(class_id): float(class_min_scores[row].item())
             for row, class_id in enumerate(class_ids.tolist())
         }
-        uncovered = [
-            class_id for class_id, score in class_scores.items() if score > threshold
+        novel_classes = [
+            class_id for class_id, score in class_scores.items()
+            if score > class_threshold
         ]
+        task_score = len(novel_classes) / float(len(expected))
+        expand = task_score > task_threshold
         decision = LayerExpansionDecision(
-            block_idx, bool(uncovered), class_scores, uncovered
+            block_idx=block_idx,
+            expand=bool(expand),
+            class_scores=class_scores,
+            novel_classes=novel_classes,
+            task_novelty_score=float(task_score),
+            task_novelty_threshold=task_threshold,
         )
         print(
-            f"=> [AE-Coverage][B{block_idx}] class_min_z={class_scores} "
-            f"threshold={threshold:.3f} uncovered={uncovered} "
+            f"=> [Task-Expansion][B{block_idx}] novel_classes={novel_classes} "
+            f"task_novelty={task_score:.3f} threshold={task_threshold:.3f} "
+            f"class_threshold={class_threshold:.4f} "
             f"decision={'EXPAND' if decision.expand else 'REUSE'}"
         )
         return decision
