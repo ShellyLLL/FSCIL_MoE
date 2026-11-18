@@ -1185,11 +1185,9 @@ class Runner:
                         classification = F.cross_entropy(logits, targets)
                     else:
                         classification = route_responsibility.new_zeros(())
-                    old_suppression = adapter.old_anchor_suppression_loss(
+                    old_suppression = adapter.old_route_suppression_loss(
                         anchor_mean, anchor_var,
-                        anchor_sets["expert_mean"], anchor_sets["expert_var"],
-                        residual_weight=float(getattr(
-                            self.cfg.TRAINER.BiMC.INCREMENTAL, "OLD_RESIDUAL_WEIGHT", 1.0)))
+
                     adapter_penalty = aux_by_block[int(block_idx)][
                         "expert_output_energy"
                     ][-1]
@@ -1198,8 +1196,7 @@ class Runner:
                         classification
                         + float(getattr(incremental_cfg, "ROUTE_WEIGHT", 1.0)) * route_responsibility
                         + float(getattr(incremental_cfg, "OLD_SUPPRESSION_WEIGHT", 1.0)) * old_suppression
-                        + float(getattr(incremental_cfg, "SPARSE_WEIGHT", 0.01)) * route_sparse
-                        + float(getattr(incremental_cfg, "ADAPTER_WEIGHT", 1e-4)) * adapter_penalty
+
                     )
                     if not bool(torch.isfinite(loss).item()):
                         raise FloatingPointError("Non-finite global visual-prototype incremental loss.")
@@ -1237,17 +1234,10 @@ class Runner:
                 ae_calibration_weights = adapter.expert_responsibility(
                     ae_calibration_values, expert_id
                 )
-            prior = self.descriptor_error_priors.get(int(block_idx))
-            if (not isinstance(prior, dict)
-                    or not np.isfinite(float(prior.get("mean", float("nan"))))
-                    or not np.isfinite(float(prior.get("std", float("nan"))))
-                    or float(prior["std"]) <= 0):
-                raise RuntimeError(f"Block {block_idx} has no valid Base AE error prior for the new descriptor.")
             ae_loss = self._train_descriptor(
                 adapter, expert_id, ae_fit_values, ae_epochs,
                 sample_weights=ae_fit_weights,
                 calibration_values=ae_calibration_values,
-                shrinkage_prior=prior,
                 calibration_weights=ae_calibration_weights,
             )
             adapter.freeze_all()
@@ -1257,8 +1247,7 @@ class Runner:
                 "uncovered_classes": uncovered_classes.detach().cpu().tolist(),
                 "selected_samples": int(selected_samples),
                 "ae_calibration_sources": int(calibration_mask.sum().item()),
-                "ae_prior_mean": float(prior["mean"]), "ae_prior_std": float(prior["std"]),
-                "old_anchor_gate_mean": adapter.old_anchor_response(anchor_mean, anchor_var),
+                                "old_anchor_gate_mean": adapter.old_anchor_response(anchor_mean, anchor_var),
             }
             expanded.append({
                 "block_idx": int(block_idx), "expert_id": int(expert_id),
