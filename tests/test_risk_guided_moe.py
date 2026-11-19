@@ -346,6 +346,24 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             parameter.grad is None for parameter in adapter.experts[0].parameters()
         ))
 
+    def test_weighted_ae_rejects_degenerate_effective_sample_size_atomically(self):
+        descriptor = RepresentationDescriptor(4, descriptor_dim=2, buffer_size=8)
+        before = {key: value.detach().clone() for key, value in descriptor.state_dict().items()}
+        with self.assertRaisesRegex(ValueError, "effective sample size greater than one"):
+            descriptor.update_reference(
+                torch.tensor([0.1, 0.2, 0.3]),
+                torch.tensor([1.0, 1e-8, 1e-8]),
+            )
+        self.assertFalse(descriptor.is_ready())
+        for key, value in before.items():
+            torch.testing.assert_close(descriptor.state_dict()[key], value, rtol=0, atol=0)
+
+    def test_weighted_ae_requires_two_independent_reference_errors(self):
+        descriptor = RepresentationDescriptor(4, descriptor_dim=2, buffer_size=8)
+        with self.assertRaisesRegex(ValueError, "at least two finite independent errors"):
+            descriptor.update_reference(torch.tensor([0.1]), torch.tensor([1.0]))
+        self.assertFalse(descriptor.is_ready())
+
     def test_weighted_ae_reference_uses_exact_responsibility_mass(self):
         descriptor = RepresentationDescriptor(4, descriptor_dim=2, buffer_size=8)
         errors = torch.tensor([1.0, 3.0, 5.0])
@@ -679,7 +697,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             }
             checkpoint_path = runner.save_checkpoint(0, [state])
             payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-            self.assertEqual(payload["schema_version"], 22)
+            self.assertEqual(payload["schema_version"], 23)
             self.assertNotIn("expansion_thresholds", payload)
             self.assertNotIn("task_expansion_thresholds", payload)
             self.assertNotIn("descriptor_error_priors", payload)
