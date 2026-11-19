@@ -1311,6 +1311,25 @@ class Runner:
             adapter = self._adapter_by_block(block_idx)
             local_item = expansion_features[int(block_idx)]
             local_values = local_item["cls_in"].to(self.device).float()
+            local_labels = local_item["labels"].to(self.device).long()
+            local_sources = local_item["source_ids"].to(self.device)
+            # Source-level split: descriptor optimization and its error-scale
+            # calibration are disjoint, while CE and routing still use every
+            # Session support source.
+            calibration_mask = self._make_calibration_mask(
+                local_labels, local_sources,
+                min_calibration_count=max(2, int(torch.unique(local_labels).numel())),
+                min_fit_per_class=3,
+                min_calibration_per_class=1,
+            )
+            descriptor_fit_mask = ~calibration_mask
+            descriptor_calibration_mask = calibration_mask
+            descriptor_fit_values = local_values[descriptor_fit_mask]
+            descriptor_calibration_values = local_values[descriptor_calibration_mask]
+            if (not descriptor_fit_values.numel() or not descriptor_calibration_values.numel()
+                    or set(local_labels[descriptor_fit_mask].tolist()) != set(expected_classes)
+                    or set(local_labels[descriptor_calibration_mask].tolist()) != set(expected_classes)):
+                raise ValueError("New RD requires source-disjoint fit and calibration sources from every Session class.")
             anchor_expert_id, anchor_q90 = adapter.select_descriptor_anchor(local_values)
             expert_id = self.model_without_dp.add_expert(
                 block_idx, task_id, anchor_expert_id=anchor_expert_id
@@ -1336,8 +1355,9 @@ class Runner:
                 raise ValueError("RD noise, residual and objective weights must be finite and non-negative.")
             noise_std = adapter.base_feature_std.to(self.device).reshape(1, -1) * descriptor_noise_scale
             source_to_row = {
-                int(source_id): row for row, source_id in enumerate(local_item["source_ids"].tolist())
+                int(source_id): row for row, source_id in enumerate(local_sources.tolist())
             }
+            fit_source_ids = set(local_sources[descriptor_fit_mask].detach().cpu().tolist())
             optimizer = optim.AdamW([
                 {"params": adapter.experts[-1].parameters(),
                  "lr": float(optim_cfg.LR_INCREMENTAL_EXPERT)},
@@ -1397,12 +1417,19 @@ class Runner:
                         raise KeyError(
                             f"Training source {error.args[0]} is absent from the Session RD feature cache."
                         ) from error
-                    rd_clean = local_values[rd_rows]
-                    rd_noisy = rd_clean + torch.randn_like(rd_clean) * noise_std
-                    rd_reconstruction = descriptor(rd_noisy)
-                    rd_reconstruction_loss = F.mse_loss(rd_reconstruction, rd_clean)
-                    rd_residual_loss = descriptor.residual_output(rd_clean).square().mean()
-                    rd_loss = rd_reconstruction_loss + descriptor_residual_weight * rd_residual_loss
+                    rd_fit_mask = torch.as_tensor(
+                        [int(source_id) in fit_source_ids for source_id in all_source_ids.tolist()],
+                        device=self.device, dtype=torch.bool,
+                    )
+                    rd_clean = local_values[rd_rows[rd_fit_mask]]
+                    if rd_clean.numel():
+                        rd_noisy = rd_clean + torch.randn_like(rd_clean) * noise_std
+                        rd_reconstruction = descriptor(rd_noisy)
+                        rd_reconstruction_loss = F.mse_loss(rd_reconstruction, rd_clean)
+                        rd_residual_loss = descriptor.residual_output(rd_clean).square().mean()
+                        rd_loss = rd_reconstruction_loss + descriptor_residual_weight * rd_residual_loss
+                    else:
+                        rd_loss = classification.new_zeros(())
                     pd_weight = float(getattr(incremental_cfg, "OLD_SUPPRESSION_WEIGHT", 1.0))
                     loss = classification + pd_weight * old_suppression + rd_weight * rd_loss
                     if not bool(torch.isfinite(loss).item()):
@@ -1436,21 +1463,22 @@ class Runner:
                 rd_history.append(rd_total / count)
                 pd_history.append(pd_total / count)
 
-            # The paired RD is optimized jointly with the new expert/router,
-            # but only its zero-output low-rank residual receives RD gradients.
-            # Its reference statistics are estimated from the full Session.
+            # The paired RD is optimized only on the fit partition. Its
+            # standardized error scale is calibrated on disjoint source IDs.
             descriptor.eval()
             with torch.no_grad():
-                session_errors = descriptor.reconstruction_error(local_values)
+                session_errors = descriptor.reconstruction_error(
+                    descriptor_calibration_values
+                )
                 descriptor.update_reference(session_errors)
             adapter.freeze_all()
             ae_loss = float(rd_history[-1])
-            calibration_count = int(local_values.size(0))
-            local_labels = local_item["labels"].to(self.device)
             fit_class_ids = sorted(int(value) for value in torch.unique(
-                local_labels, sorted=True
+                local_labels[descriptor_fit_mask], sorted=True
             ).tolist())
-            calibration_class_ids = fit_class_ids
+            calibration_class_ids = sorted(int(value) for value in torch.unique(
+                local_labels[descriptor_calibration_mask], sorted=True
+            ).tolist())
 
             histories[block_idx] = {
                 "expert_id": int(expert_id),
@@ -1465,8 +1493,10 @@ class Runner:
                 "session_q95_threshold": float(decision.threshold),
                 "classification_samples_per_epoch": samples_per_epoch,
                 "classification_samples_total": int(classification_samples_total),
-                "rd_training_samples": int(local_values.size(0)),
-                "rd_reference_samples": calibration_count,
+                "rd_training_samples": int(descriptor_fit_values.size(0)),
+                "rd_reference_samples": int(descriptor_calibration_values.size(0)),
+                "rd_fit_source_ids": sorted(int(value) for value in local_sources[descriptor_fit_mask].tolist()),
+                "rd_calibration_source_ids": sorted(int(value) for value in local_sources[descriptor_calibration_mask].tolist()),
                 "rd_effective_reference_count": float(
                     adapter.descriptors[expert_id].effective_error_count.item()
                 ),
