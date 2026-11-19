@@ -748,30 +748,30 @@ class VisualMoEAdapter(nn.Module):
     def forward(self, x, route_input=None):
         if x.ndim != 3:
             raise ValueError("VisualMoEAdapter expects [tokens, batch, dim].")
-        x_norm = self.layer_norm(x)
-        # Expert functions consume the dynamically adapted token stream.  The
-        # router and its paired AE consume the frozen reference stream.
-        route_features = (
-            x_norm[0] if route_input is None
-            else self.layer_norm(route_input)
-        )
-        # The base mixture is never renormalised when incremental experts arrive.
+        # Both routing and expert functions consume the frozen-reference token
+        # stream. The adapted stream receives only the resulting residual.
+        # This makes every layer's expert-input distribution invariant to
+        # upstream adapter updates and keeps historical expert anchors valid.
+        if route_input is None:
+            expert_tokens = self.layer_norm(x)
+        else:
+            if route_input.shape != x.shape:
+                raise ValueError("Reference expert tokens must match adapted token shape.")
+            expert_tokens = self.layer_norm(route_input)
+        route_features = expert_tokens[0]
         logits, weights = self.routing_outputs(route_features)
-        residual, norms, output_energies = torch.zeros_like(x_norm), [], []
-        expert_ids = list(range(self.num_experts))
-        for column, expert_id in enumerate(expert_ids):
-            expert_output = self.experts[expert_id](x_norm)
+        residual, norms, output_energies = torch.zeros_like(x), [], []
+        for column, expert_id in enumerate(range(self.num_experts)):
+            expert_output = self.experts[expert_id](expert_tokens)
             weighted = expert_output * weights[:, column].unsqueeze(0).unsqueeze(-1)
             residual = residual + weighted
             norms.append(weighted.detach().float().pow(2).mean().sqrt())
-            # Keep the un-gated functional output energy differentiable. This
-            # regularizes expert magnitude independently of route sparsity.
             output_energies.append(expert_output.float().pow(2).mean())
         residual = self.residual_scale.to(residual.dtype) * residual
         return residual, {"logits": logits, "route_weights": weights,
                           "top_k_indices": weights.argmax(dim=-1, keepdim=True),
                           "cls_in": route_features,
-                          "expert_in": x_norm[0],
+                          "expert_in": expert_tokens[0],
                           "expert_residual_norms": torch.stack(norms),
                           "expert_output_energy": torch.stack(output_energies),
                           "token_residual": residual.detach()}
@@ -817,7 +817,7 @@ class ResidualAttentionBlock(nn.Module):
         moe_aux = None
         if self.moe_adapter is not None:
             moe_out, moe_aux = self.moe_adapter(
-                adapted_x, route_input=reference_x[0]
+                adapted_x, route_input=reference_x
             )
             adapted_x = adapted_x + moe_out
         return adapted_x, reference_x, moe_aux
