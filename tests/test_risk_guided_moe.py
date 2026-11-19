@@ -865,11 +865,11 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         adapter = model.clip_model.visual.transformer.resblocks[0].moe_adapter
         for descriptor in adapter.descriptors:
             descriptor.update_reference(torch.tensor([0.1, 0.11, 0.09, 0.1]))
-        values = torch.arange(80, dtype=torch.float32).reshape(10, 8)
+        values = torch.arange(320, dtype=torch.float32).reshape(40, 8)
         adapter.descriptor_scores = lambda x, require_ready=True: torch.stack(
             [x[:, 0], x[:, 0] + 1.0], dim=-1
         )
-        labels = torch.tensor([0] * 5 + [1] * 5)
+        labels = torch.tensor([0] * 20 + [1] * 20)
         first = runner._calibrate_session_expansion_thresholds(
             adapter, values, labels, [4, 8], 0
         )
