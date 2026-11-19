@@ -316,20 +316,30 @@ class UnifiedDynamicMoETests(unittest.TestCase):
                 self.assertTrue(torch.isfinite(descriptor.error_mean))
                 self.assertTrue(torch.isfinite(descriptor.error_std))
 
-    def test_old_route_suppression_only_updates_new_sigmoid_gate(self):
+    def test_old_feature_pd_updates_new_gate_and_expert_but_not_history(self):
         torch.manual_seed(17)
         adapter = VisualMoEAdapter(8, num_experts=2, reduction=2)
         adapter.add_expert(session_id=1, reduction=2)
         adapter.set_newest_trainable()
+        with torch.no_grad():
+            adapter.experts[-1].c_proj.weight.normal_(std=0.1)
         route_mean = torch.randn(3, 8)
+        expert_mean = torch.randn(3, 8)
         route_var = torch.ones_like(route_mean) * 0.1
-        loss = adapter.old_route_suppression_loss(route_mean, route_var)
+        expert_var = torch.ones_like(expert_mean) * 0.1
+        loss = adapter.old_feature_preservation_loss(
+            route_mean, route_var, expert_mean, expert_var
+        )
         loss.backward()
         self.assertTrue(torch.isfinite(loss))
         self.assertIsNotNone(adapter.router.columns[-1].weight.grad)
-        self.assertIsNone(adapter.experts[-1].c_fc.weight.grad)
-        self.assertIsNone(adapter.experts[-1].c_proj.weight.grad)
+        self.assertIsNotNone(adapter.experts[-1].c_fc.weight.grad)
+        self.assertIsNotNone(adapter.experts[-1].c_proj.weight.grad)
         self.assertTrue(all(p.grad is None for p in adapter.experts[0].parameters()))
+        residual = adapter.old_anchor_residual_response(
+            route_mean, route_var, expert_mean, expert_var
+        )
+        self.assertTrue(torch.isfinite(torch.tensor(residual)))
 
     def test_incremental_expert_output_energy_is_differentiable_and_unweighted(self):
         torch.manual_seed(241)
@@ -768,6 +778,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             anchor_bank = {
                 "class_ids": torch.tensor([0]),
                 "route_mean": prototype.clone(), "route_var": anchor_var.clone(),
+                "expert_mean": prototype.clone(), "expert_var": anchor_var.clone(),
                 "mean": prototype.clone(), "var": anchor_var.clone(),
             }
             state = {
