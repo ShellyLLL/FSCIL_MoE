@@ -87,15 +87,27 @@ class Runner:
         """Checkpointed contract for robust task-level AE shift detection."""
         moe_cfg = self._visual_moe_cfg()
         return {
-            "version": 2,
+            "version": 3,
             "decision_unit": "incremental_session",
-            "sample_score": "minimum_zscore_over_all_existing_descriptors",
+            "sample_score": "minimum_weighted_standardized_reconstruction_error",
             "task_score": "median_over_all_current_session_support_samples",
             "decision": "task_score_greater_than_fixed_zscore_threshold",
             "threshold": float(_cfg_value(moe_cfg, "EXPANSION_Z_THRESHOLD", 1.5)),
             "expert_training_scope": "all_current_session_samples",
             "descriptor_training_scope": "all_current_session_reference_cls",
             "router_positive_scope": "all_current_session_samples",
+            "visual_moe_enabled": bool(_cfg_value(moe_cfg, "ENABLE", False)),
+            "insert_blocks": [int(value) for value in _cfg_value(moe_cfg, "INSERT_BLOCKS", [])],
+            "num_base_experts": int(_cfg_value(moe_cfg, "NUM_BASE_EXPERTS", 4)),
+            "base_reduction": int(_cfg_value(moe_cfg, "BASE_REDUCTION", 4)),
+            "incremental_reduction": int(_cfg_value(moe_cfg, "INCREMENTAL_REDUCTION", 8)),
+            "descriptor_dim": int(_cfg_value(moe_cfg, "DESCRIPTOR_DIM", 64)),
+            "descriptor_eps": float(_cfg_value(moe_cfg, "DESCRIPTOR_EPS", 1e-4)),
+            "descriptor_buffer_size": int(_cfg_value(moe_cfg, "DESCRIPTOR_BUFFER_SIZE", 500)),
+            "incremental_gate_bias_init": float(_cfg_value(moe_cfg, "INCREMENTAL_GATE_BIAS_INIT", -1.0)),
+            "base_scale_init": float(_cfg_value(moe_cfg, "BASE_SCALE_INIT", 1.0)),
+            "backbone_name": str(self.cfg.MODEL.BACKBONE.NAME),
+            "precision": str(_cfg_value(self.cfg.TRAINER.BiMC, "PREC", "fp32")),
         }
 
     @staticmethod
@@ -297,9 +309,9 @@ class Runner:
         if missing:
             raise ValueError(f"Resume checkpoint is missing required fields: {missing}")
         schema = int(payload["schema_version"])
-        if schema != 22:
+        if schema != 23:
             raise ValueError(
-                "This branch uses robust task-level AE expansion checkpoint schema (22); "
+                "This branch uses robust task-level AE expansion checkpoint schema (23); "
                 "older class-level and pseudo-Session calibration checkpoints are incompatible."
             )
         checkpoint_policy = payload.get("expansion_policy")
@@ -495,7 +507,7 @@ class Runner:
         directory.mkdir(parents=True, exist_ok=True)
         topology = self.model_without_dp.export_moe_topology()
         payload = {
-            "schema_version": 22,
+            "schema_version": 23,
             "completed_session": int(completed_session),
             "model_state": self._cpu_copy(self.model_without_dp.state_dict()),
             "moe_topology": topology,
