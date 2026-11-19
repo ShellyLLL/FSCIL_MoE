@@ -1,5 +1,6 @@
 
 import json
+import math
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
@@ -252,19 +253,21 @@ class BiMC(nn.Module):
 
     @torch.no_grad()
     def plan_layer_expansion(self, block_idx, features, class_index, threshold=None):
-        """Detect task-level shift using the complete Session support set.
+        """Conformal task-level shift test, calibrated for the deployed expert pool.
 
-        For each support sample, the best existing descriptor is the one with
-        the minimum standardized reconstruction error. The Session score is
-        the median of these per-sample best-descriptor scores. A layer expands
-        only when this robust task score exceeds the fixed Z-score threshold.
+        Each descriptor produces an upper-tail conformal p-value from its
+        independent, unweighted holdout errors. The maximum across descriptors
+        tests the null that at least one deployed expert covers a sample; this
+        remains valid as the number of experts changes. A lower-median order
+        statistic across independent Session support sources is then converted
+        to an exact binomial-tail p-value.
         """
         block_idx = int(block_idx)
-        configured_threshold = float(getattr(
-            self.cfg.TRAINER.BiMC.VISUAL_MOE, "EXPANSION_Z_THRESHOLD", 1.5
+        alpha = float(getattr(
+            self.cfg.TRAINER.BiMC.VISUAL_MOE, "EXPANSION_FALSE_ALARM_RATE", 0.05
         ) if threshold is None else threshold)
-        if not np.isfinite(configured_threshold):
-            raise ValueError("Expansion Z-score threshold must be finite.")
+        if not 0.0 < alpha < 1.0:
+            raise ValueError("Expansion false-alarm rate must be strictly between zero and one.")
         if block_idx not in features:
             raise KeyError(f"Block {block_idx} did not produce support features.")
 
@@ -273,6 +276,7 @@ class BiMC(nn.Module):
         item = features[block_idx]
         values = torch.as_tensor(item["cls_in"], device=self.device).float()
         labels = torch.as_tensor(item["labels"], device=self.device, dtype=torch.long).reshape(-1)
+        sources = torch.as_tensor(item["source_ids"], device=self.device).reshape(-1)
         expected = sorted(int(value) for value in class_index)
         observed = sorted(int(value) for value in torch.unique(labels, sorted=True).tolist())
         if observed != expected:
@@ -280,37 +284,50 @@ class BiMC(nn.Module):
                 f"Block {block_idx} received classes {observed}, expected {expected}."
             )
         if (values.ndim != 2 or values.size(0) == 0 or labels.numel() != values.size(0)
-                or not torch.isfinite(values).all()):
+                or sources.numel() != values.size(0) or not torch.isfinite(values).all()):
             raise ValueError(f"Block {block_idx} received empty, misaligned or non-finite support features.")
-
-        descriptor_scores = adapter.descriptor_scores(values)
-        if (descriptor_scores.ndim != 2
-                or descriptor_scores.size(0) != values.size(0)
-                or descriptor_scores.size(1) != adapter.num_experts
-                or not torch.isfinite(descriptor_scores).all()):
-            raise FloatingPointError(
-                f"Block {block_idx} produced invalid descriptor Z-scores."
+        if torch.unique(sources).numel() != sources.numel():
+            raise ValueError(
+                "Task-level conformal aggregation requires one independent support row per source id."
             )
 
-        # One existing expert is sufficient to cover an individual sample.
-        sample_shift_scores = descriptor_scores.min(dim=1).values.float()
-        # torch.quantile(..., 0.5) implements the conventional median, including
-        # averaging the two central values when the support count is even.
-        task_shift_score = torch.quantile(sample_shift_scores, 0.5)
-        if not bool(torch.isfinite(task_shift_score).item()):
-            raise FloatingPointError(f"Block {block_idx} produced a non-finite task shift score.")
+        coverage_pvalues = adapter.descriptor_coverage_pvalues(values)
+        if (coverage_pvalues.ndim != 2
+                or coverage_pvalues.size(0) != values.size(0)
+                or coverage_pvalues.size(1) != adapter.num_experts
+                or not torch.isfinite(coverage_pvalues).all()
+                or (coverage_pvalues < 0).any()
+                or (coverage_pvalues > 1).any()):
+            raise FloatingPointError(f"Block {block_idx} produced invalid conformal coverage p-values.")
+
+        # H0(sample): at least one existing expert covers this sample.
+        # max(p_k) is super-uniform under this union null, regardless of
+        # dependence or the number of deployed experts.
+        sample_novelty_pvalues = coverage_pvalues.max(dim=1).values.float()
+        n = int(sample_novelty_pvalues.numel())
+        order = (n - 1) // 2  # lower median: ceil(n/2)-th order statistic
+        median_pvalue = torch.sort(sample_novelty_pvalues).values[order]
+        k = (n + 1) // 2
+        x = float(median_pvalue.item())
+        task_pvalue = sum(
+            math.comb(n, j) * (x ** j) * ((1.0 - x) ** (n - j))
+            for j in range(k, n + 1)
+        )
+        task_pvalue = min(1.0, max(0.0, float(task_pvalue)))
+        if not math.isfinite(task_pvalue):
+            raise FloatingPointError(f"Block {block_idx} produced a non-finite task p-value.")
 
         decision = LayerExpansionDecision(
             block_idx=block_idx,
-            expand=bool((task_shift_score > configured_threshold).item()),
-            task_shift_score=float(task_shift_score.item()),
-            threshold=configured_threshold,
-            support_count=int(values.size(0)),
+            expand=task_pvalue < alpha,
+            task_shift_score=task_pvalue,
+            threshold=alpha,
+            support_count=n,
         )
         print(
-            f"=> [Task-Expansion][B{block_idx}] support_n={decision.support_count} "
-            f"median_best_z={decision.task_shift_score:.4f} "
-            f"threshold={decision.threshold:.4f} "
+            f"=> [Task-Expansion][B{block_idx}] support_n={n} "
+            f"task_conformal_p={decision.task_shift_score:.6g} "
+            f"false_alarm_rate={decision.threshold:.4f} "
             f"decision={'EXPAND' if decision.expand else 'REUSE'}"
         )
         return decision
