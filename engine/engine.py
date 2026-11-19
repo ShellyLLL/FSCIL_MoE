@@ -799,17 +799,21 @@ class Runner:
 
     def _incremental_support_sizes(self):
         """Return exact total support counts for every configured incremental Session."""
-        manifest = self.data_manager.get_support_manifest()
         sizes = set()
-        for session_key, class_map in manifest.get("sessions", {}).items():
-            if int(session_key) == 0:
-                continue
-            size = sum(len(source_ids) for source_ids in class_map.values())
-            if size > 0:
-                sizes.add(int(size))
+        if hasattr(self, "data_manager") and hasattr(self.data_manager, "get_support_manifest"):
+            manifest = self.data_manager.get_support_manifest()
+            for session_key, class_map in manifest.get("sessions", {}).items():
+                if int(session_key) == 0:
+                    continue
+                size = sum(len(source_ids) for source_ids in class_map.values())
+                if size > 0:
+                    sizes.add(int(size))
         if not sizes:
             dataset_cfg = self.cfg.DATASET
-            sizes.add(int(dataset_cfg.NUM_INC_CLS) * int(dataset_cfg.NUM_INC_SHOT))
+            configured = _cfg_value(dataset_cfg, "SESSION_SUPPORT_SIZES", [])
+            sizes.update(int(value) for value in configured)
+            if not sizes:
+                sizes.add(int(dataset_cfg.NUM_INC_CLS) * int(dataset_cfg.NUM_INC_SHOT))
         return sorted(sizes)
 
     @torch.no_grad()
@@ -840,7 +844,12 @@ class Runner:
         for size in support_sizes:
             group_q90 = []
             for _ in range(groups):
-                indices = torch.randperm(cpu_scores.numel(), generator=generator)[:int(size)]
+                # Each Monte-Carlo pseudo-Session is sampled from the held-out
+                # Base source pool. Sampling with replacement also supports a
+                # configured Session larger than the finite holdout pool.
+                indices = torch.randint(
+                    cpu_scores.numel(), (int(size),), generator=generator
+                )
                 group_q90.append(torch.quantile(cpu_scores[indices], 0.90))
             thresholds[int(size)] = float(torch.quantile(
                 torch.stack(group_q90), quantile
@@ -1296,10 +1305,6 @@ class Runner:
                     optimizer.zero_grad(set_to_none=True)
                     # Every current-Session example is positive route supervision
                     # and contributes to global classification over all seen classes.
-                    _, route_aux = self.model_without_dp.extract_img_feature_train(all_images)
-                    aux_by_block = {
-                        block: aux for (block, _), aux in zip(self._moe_adapters(), route_aux)
-                    }
                     logits, targets = self._global_incremental_logits(
                         all_images, all_labels, all_source_ids, bank, scale
                     )
