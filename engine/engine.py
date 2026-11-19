@@ -559,7 +559,7 @@ class Runner:
         self, adapter, expert_id, values, epochs, sample_weights=None,
         calibration_values=None, calibration_weights=None,
     ):
-        """Fit a reference-space linear AE with independent held-out error calibration."""
+        """Fit a reference-space linear AE with independent, unweighted conformal holdout calibration."""
         descriptor = adapter.descriptors[int(expert_id)]
         descriptor.float()
         values = values.detach().float()
@@ -734,10 +734,6 @@ class Runner:
             with torch.no_grad():
                 fit_responsibilities = torch.stack([
                     adapter.expert_responsibility(fit_values, expert_id)
-                    for expert_id in range(adapter.num_experts)
-                ], dim=-1)
-                reference_responsibilities = torch.stack([
-                    adapter.expert_responsibility(reference_values, expert_id)
                     for expert_id in range(adapter.num_experts)
                 ], dim=-1)
             for expert_id in range(adapter.num_experts):
@@ -1194,9 +1190,6 @@ class Runner:
                 # weighted by the exact deployed responsibility of its paired
                 # incremental expert.  No current class is filtered out.
                 ae_fit_weights = adapter.expert_responsibility(ae_fit_values, expert_id)
-                ae_calibration_weights = adapter.expert_responsibility(
-                    ae_calibration_values, expert_id
-                )
             ae_loss = self._train_descriptor(
                 adapter, expert_id, ae_fit_values, ae_epochs,
                 sample_weights=ae_fit_weights,
