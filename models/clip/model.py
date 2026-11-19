@@ -754,11 +754,18 @@ class VisualMoEAdapter(nn.Module):
         # upstream adapter updates and keeps historical expert anchors valid.
         if route_input is None:
             expert_tokens = self.layer_norm(x)
+        elif route_input.ndim == 2 and route_input.shape == x[0].shape:
+            # Backward-compatible CLS-only entry for direct adapter unit use.
+            # Production dual-stream ViT always supplies the complete frozen
+            # reference token sequence below.
+            expert_tokens = self.layer_norm(x)
+            route_features = self.layer_norm(route_input)
         else:
             if route_input.shape != x.shape:
                 raise ValueError("Reference expert tokens must match adapted token shape.")
             expert_tokens = self.layer_norm(route_input)
-        route_features = expert_tokens[0]
+        if route_input is None or route_input.ndim == 3:
+            route_features = expert_tokens[0]
         logits, weights = self.routing_outputs(route_features)
         residual, norms, output_energies = torch.zeros_like(x), [], []
         for column, expert_id in enumerate(range(self.num_experts)):
