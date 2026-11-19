@@ -993,6 +993,44 @@ class Runner:
                 adapter, reference_values, reference_labels, support_sizes, block_idx
             )
 
+    @torch.no_grad()
+    def _refresh_block_expansion_threshold(self, block_idx):
+        """Recalibrate the changed deployed RD pool on the frozen Base holdout.
+
+        The Base source identities are fixed at Base fitting and checkpointed.
+        Whenever an expert is added, the minimum-over-pool statistic changes;
+        therefore the old threshold is invalid and must be recomputed using
+        the same Base holdout and the complete current descriptor pool.
+        """
+        if not self.base_calibration_source_ids:
+            raise RuntimeError("Cannot refresh dynamic-pool thresholds without the fixed Base calibration sources.")
+        if not hasattr(self, "data_manager") or not hasattr(
+            self.data_manager, "get_base_source_dataloader"
+        ):
+            # Lightweight isolated unit fixtures have no dataset manager.
+            # Production Runner always owns one and must take the calibrated path.
+            if hasattr(self, "data_manager"):
+                raise RuntimeError("DatasetManager lacks the Base calibration source loader.")
+            return
+        loader = self.data_manager.get_base_source_dataloader(
+            self.base_calibration_source_ids
+        )
+        features = self.model_without_dp.collect_blockwise_cls_features(loader)
+        item = features[int(block_idx)]
+        adapter = self._adapter_by_block(block_idx)
+        sizes = sorted(self.expansion_thresholds.get(int(block_idx), {}).keys())
+        if not sizes:
+            sizes = self._incremental_support_sizes()
+        refreshed = self._calibrate_session_expansion_thresholds(
+            adapter, item["cls_in"], item["labels"], sizes, int(block_idx)
+        )
+        self.expansion_thresholds[int(block_idx)] = refreshed
+        print(
+            f"=> [Session-Threshold][B{int(block_idx)}] refreshed for "
+            f"{adapter.num_experts} deployed experts using fixed Base holdout "
+            f"(n={len(self.base_calibration_source_ids)})."
+        )
+
     def _collect_class_anchors(self, loader):
         """Store compact per-class anchors in both stable route and adapted expert-input spaces."""
         feature_map = self.model_without_dp.collect_blockwise_cls_features(loader)
@@ -1488,6 +1526,9 @@ class Runner:
                 )
                 descriptor.update_reference(session_errors)
             adapter.freeze_all()
+            # Adding an RD changes min_k z_{i,k}; the previous Base threshold
+            # is no longer calibrated for this expert pool.
+            self._refresh_block_expansion_threshold(block_idx)
             ae_loss = float(rd_history[-1])
             fit_class_ids = sorted(int(value) for value in torch.unique(
                 local_labels[descriptor_fit_mask], sorted=True
