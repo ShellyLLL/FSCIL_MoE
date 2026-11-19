@@ -193,7 +193,7 @@ def lifecycle_route_snapshot(model, images):
 
 
 class UnifiedDynamicMoETests(unittest.TestCase):
-    def test_incremental_session_trains_all_current_classes_as_positive_route_responsibilities(self):
+    def test_incremental_session_jointly_trains_ce_rd_pd_on_all_support_sources(self):
         torch.manual_seed(239)
         runner, model = build_lifecycle_runner()
         model.eval()
@@ -849,6 +849,20 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         self.assertTrue(restored.descriptors[2].is_anchored)
         self.assertEqual(restored.descriptors[2].anchor_expert_id, 0)
         self.assertEqual(restored.descriptors[2].residual_rank, source.descriptors[2].residual_rank)
+
+    def test_base_threshold_calibration_is_session_q95_and_support_size_specific(self):
+        runner, model = build_lifecycle_runner()
+        runner.cfg.TRAINER.BiMC.VISUAL_MOE.EXPANSION_CALIBRATION_GROUPS = 64
+        adapter = model.clip_model.visual.transformer.resblocks[0].moe_adapter
+        values = torch.arange(80, dtype=torch.float32).reshape(10, 8)
+        adapter.descriptor_scores = lambda x, require_ready=True: torch.stack(
+            [x[:, 0], x[:, 0] + 1.0], dim=-1
+        )
+        first = runner._calibrate_session_expansion_thresholds(adapter, values, [4, 8], 0)
+        second = runner._calibrate_session_expansion_thresholds(adapter, values, [4, 8], 0)
+        self.assertEqual(set(first), {4, 8})
+        self.assertEqual(first, second)
+        self.assertGreater(first[8], first[4])
 
     def test_session_expansion_uses_q90_of_best_historical_rd_scores(self):
         model = BiMC.__new__(BiMC)
