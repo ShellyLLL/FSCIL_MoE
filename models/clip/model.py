@@ -748,16 +748,15 @@ class VisualMoEAdapter(nn.Module):
     def forward(self, x, route_input=None):
         if x.ndim != 3:
             raise ValueError("VisualMoEAdapter expects [tokens, batch, dim].")
-        # Historical Base experts retain the adapted input distribution on
-        # which they were trained. Newly expanded experts consume the frozen
-        # reference stream, making their input/PD anchors invariant to upstream
-        # adapter updates. Every gate is computed in the reference CLS space.
-        adapted_tokens = self.layer_norm(x)
+        # Every expert and router column consumes the frozen-reference token
+        # stream. The adapted stream is only the residual destination. This
+        # keeps Base and incremental expert input distributions invariant to
+        # upstream adapter updates, so all historical input anchors remain valid.
         if route_input is None:
-            reference_tokens = adapted_tokens
+            reference_tokens = self.layer_norm(x)
         elif route_input.ndim == 2 and route_input.shape == x[0].shape:
             # Backward-compatible CLS-only entry for direct adapter unit use.
-            reference_tokens = adapted_tokens
+            reference_tokens = self.layer_norm(x)
             route_features = self.layer_norm(route_input)
         else:
             if route_input.shape != x.shape:
@@ -768,8 +767,7 @@ class VisualMoEAdapter(nn.Module):
         logits, weights = self.routing_outputs(route_features)
         residual, norms, output_energies = torch.zeros_like(x), [], []
         for column, expert_id in enumerate(range(self.num_experts)):
-            expert_tokens = adapted_tokens if expert_id < self.base_expert_count else reference_tokens
-            expert_output = self.experts[expert_id](expert_tokens)
+            expert_output = self.experts[expert_id](reference_tokens)
             weighted = expert_output * weights[:, column].unsqueeze(0).unsqueeze(-1)
             residual = residual + weighted
             norms.append(weighted.detach().float().pow(2).mean().sqrt())
