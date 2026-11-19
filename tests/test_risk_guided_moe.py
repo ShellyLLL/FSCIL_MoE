@@ -276,30 +276,32 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         self.assertGreater((adapted_after - adapted_before).abs().max().item(), 0.0)
         torch.testing.assert_close(reference_before, reference_after, rtol=0, atol=0)
 
-    def test_dual_path_routes_and_incremental_experts_use_frozen_reference_stream(self):
+    def test_dual_path_routes_and_all_expert_generations_use_frozen_reference_stream(self):
         torch.manual_seed(223)
         model = TinyVisualCLIP().eval()
         images = torch.randn(2, 3, 8, 8)
         adapter = model.visual.transformer.resblocks[0].moe_adapter
         adapter.add_expert(session_id=1, reduction=2)
-        router_inputs, incremental_inputs = [], []
-        router_handle = adapter.router.register_forward_pre_hook(
+        router_inputs, expert_inputs, handles = [], [], []
+        handles.append(adapter.router.register_forward_pre_hook(
             lambda _module, args: router_inputs.append(args[0].detach().clone())
-        )
-        expert_handle = adapter.experts[-1].register_forward_pre_hook(
-            lambda _module, args: incremental_inputs.append(args[0].detach().clone())
-        )
+        ))
+        for expert in adapter.experts:
+            handles.append(expert.register_forward_pre_hook(
+                lambda _module, args: expert_inputs.append(args[0].detach().clone())
+            ))
         try:
             adapted, reference, aux = model.visual(
                 images, return_moe_aux=True, return_reference=True
             )
         finally:
-            router_handle.remove()
-            expert_handle.remove()
+            for handle in handles:
+                handle.remove()
         self.assertEqual(len(router_inputs), 1)
-        self.assertEqual(len(incremental_inputs), 1)
+        self.assertEqual(len(expert_inputs), adapter.num_experts)
         torch.testing.assert_close(router_inputs[0], aux[0]["cls_in"])
-        torch.testing.assert_close(incremental_inputs[0][0], aux[0]["expert_in"])
+        for expert_input in expert_inputs:
+            torch.testing.assert_close(expert_input[0], aux[0]["expert_in"])
         self.assertFalse(reference.requires_grad)
         self.assertEqual(tuple(adapted.shape), tuple(reference.shape))
         self.assertEqual(tuple(aux[0]["cls_in"].shape), (images.size(0), 8))
