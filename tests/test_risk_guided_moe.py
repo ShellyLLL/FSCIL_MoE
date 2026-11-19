@@ -111,8 +111,6 @@ def build_lifecycle_runner():
             NUM_BASE_EXPERTS=2,
             INCREMENTAL_REDUCTION=2,
             EXPANSION_Z_THRESHOLD=1.0,
-            EXPANSION_FALSE_POSITIVE_RATE=0.05,
-            TASK_EXPANSION_FALSE_POSITIVE_RATE=0.25,
         ),
         OPTIM=optim_cfg,
         INCREMENTAL=incremental_cfg,
@@ -136,8 +134,6 @@ def build_lifecycle_runner():
     runner = Runner.__new__(Runner)
     runner.cfg = cfg
     runner.device = torch.device("cpu")
-    runner.expansion_thresholds = {0: 1.0, 1: 1.0}
-    runner.task_expansion_thresholds = {0: 0.0, 1: 0.0}
     runner.model = model
     runner.model_without_dp = model
     runner._text_prototypes = lambda _names, class_index: (
@@ -196,7 +192,6 @@ class UnifiedDynamicMoETests(unittest.TestCase):
     def test_incremental_session_trains_all_current_classes_as_positive_route_responsibilities(self):
         torch.manual_seed(239)
         runner, model = build_lifecycle_runner()
-        runner.task_expansion_thresholds = {0: 0.25, 1: 0.25}
         model.eval()
         base_support = lifecycle_batch(
             0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 6000
@@ -296,7 +291,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         self.assertEqual(tuple(adapted.shape), tuple(reference.shape))
         self.assertEqual(tuple(aux[0]["cls_in"].shape), (images.size(0), 8))
 
-    def test_base_ae_and_expansion_threshold_use_disjoint_heldout_sources(self):
+    def test_base_ae_uses_disjoint_reference_sources_without_task_threshold_calibration(self):
         torch.manual_seed(233)
         runner, model = build_lifecycle_runner()
         supports = [
@@ -305,54 +300,13 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             lifecycle_batch(2, torch.tensor([0., 0., 1., 0., 0., 0., 0., 0.]), 5020),
         ]
         runner._train_base_descriptors(supports)
-        self.assertEqual(set(runner._base_calibration_features), {0, 1})
-        self.assertEqual(set(runner._base_ae_calibration_features), {0, 1})
-        for block_idx, adapter in runner._moe_adapters():
-            threshold_holdout = runner._base_calibration_features[block_idx]
-            ae_holdout = runner._base_ae_calibration_features[block_idx]
-            self.assertEqual(threshold_holdout["labels"].numel(), 6)
-            self.assertEqual(ae_holdout["labels"].numel(), 9)
-            self.assertEqual(set(threshold_holdout["labels"].tolist()), {0, 1, 2})
-            self.assertEqual(set(ae_holdout["labels"].tolist()), {0, 1, 2})
-            self.assertTrue(all(
-                int((threshold_holdout["labels"] == class_id).sum().item()) == 2
-                and int((ae_holdout["labels"] == class_id).sum().item()) == 3
-                for class_id in (0, 1, 2)
-            ))
-            self.assertFalse(torch.isin(
-                threshold_holdout["source_ids"], ae_holdout["source_ids"]
-            ).any())
-            self.assertTrue(all(
-                int(descriptor.error_count.item()) == 9
-                and float(descriptor.effective_error_count.item()) > 0
-                for descriptor in adapter.descriptors
-            ))
-        runner._calibrate_expansion_thresholds(supports)
-        self.assertEqual(set(runner.expansion_thresholds), {0, 1})
-        self.assertEqual(set(runner.task_expansion_thresholds), {0, 1})
-        self.assertTrue(all(torch.isfinite(torch.tensor(value))
-                            for value in runner.expansion_thresholds.values()))
-        self.assertTrue(all(
-            0.0 <= value <= 1.0
-            for value in runner.task_expansion_thresholds.values()
-        ))
-        alpha = 0.05
-        for block_idx, adapter in runner._moe_adapters():
-            holdout = runner._base_calibration_features[block_idx]
-            values = holdout["cls_in"]
-            labels = holdout["labels"]
-            scores = adapter.descriptor_scores(values)
-            class_scores = torch.stack([
-                scores[labels.eq(class_id)].median(dim=0).values.min()
-                for class_id in torch.unique(labels, sorted=True)
-            ]).sort().values
-            rank = min(class_scores.numel(), int(torch.ceil(
-                torch.tensor((class_scores.numel() + 1) * (1.0 - alpha))
-            ).item()))
-            torch.testing.assert_close(
-                torch.tensor(runner.expansion_thresholds[block_idx]),
-                class_scores[max(0, rank - 1)],
-            )
+        for _, adapter in runner._moe_adapters():
+            adapter.assert_descriptors_ready()
+            for descriptor in adapter.descriptors:
+                self.assertEqual(int(descriptor.error_count.item()), 9)
+                self.assertGreater(float(descriptor.effective_error_count.item()), 0.0)
+                self.assertTrue(torch.isfinite(descriptor.error_mean))
+                self.assertTrue(torch.isfinite(descriptor.error_std))
 
     def test_old_route_suppression_only_updates_new_sigmoid_gate(self):
         torch.manual_seed(17)
@@ -701,8 +655,6 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             runner.acc_list = [50.0]
             runner.task_acc_list = [[50.0]]
             runner.session_diagnostics = [{"session": 0}]
-            runner.expansion_thresholds = {0: 1.25, 1: 1.5}
-            runner.task_expansion_thresholds = {0: 0.2, 1: 0.3}
             model.base_enhanced_visual_prototype = torch.tensor([[1.0, 0.0, 0.0, 0.0,
                                                          0.0, 0.0, 0.0, 0.0]])
             runner._train_base_descriptors([lifecycle_batch(
@@ -727,9 +679,9 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             }
             checkpoint_path = runner.save_checkpoint(0, [state])
             payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-            self.assertEqual(payload["schema_version"], 21)
-            self.assertEqual(payload["expansion_thresholds"], {0: 1.25, 1: 1.5})
-            self.assertEqual(payload["task_expansion_thresholds"], {0: 0.2, 1: 0.3})
+            self.assertEqual(payload["schema_version"], 22)
+            self.assertNotIn("expansion_thresholds", payload)
+            self.assertNotIn("task_expansion_thresholds", payload)
             self.assertNotIn("descriptor_error_priors", payload)
             self.assertIn("reference_image_proto", payload["task_states"][0])
 
@@ -749,8 +701,6 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             )
             restored._load_resume_checkpoint_if_requested()
             self.assertEqual(restored._resume_completed_session, 0)
-            self.assertEqual(restored.expansion_thresholds, {0: 1.25, 1: 1.5})
-            self.assertEqual(restored.task_expansion_thresholds, {0: 0.2, 1: 0.3})
             self.assertEqual(len(restored._resume_state_dict_list), 1)
             torch.testing.assert_close(
                 restored_model.base_enhanced_visual_prototype, model.base_enhanced_visual_prototype
@@ -770,7 +720,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         torch.testing.assert_close(source(x)[0], restored(x)[0], rtol=0, atol=0)
         self.assertEqual(restored.num_experts, 3)
 
-    def test_task_level_expansion_aggregates_novel_class_fraction(self):
+    def test_task_level_expansion_uses_minimum_descriptor_then_session_median(self):
         model = BiMC.__new__(BiMC)
         nn.Module.__init__(model)
         adapter = VisualMoEAdapter(8, num_experts=2, reduction=2, descriptor_dim=4)
@@ -784,40 +734,29 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         model.clip_model.visual = visual
         model.device = "cpu"
         model.cfg = SimpleNamespace(TRAINER=SimpleNamespace(BiMC=SimpleNamespace(
-            VISUAL_MOE=SimpleNamespace(EXPANSION_Z_THRESHOLD=1.0))))
+            VISUAL_MOE=SimpleNamespace(EXPANSION_Z_THRESHOLD=0.8))))
         for descriptor in adapter.descriptors:
             descriptor.update_reference(torch.tensor([0.1, 0.11, 0.09, 0.1]))
         features = {0: {"cls_in": torch.randn(4, 8),
                         "labels": torch.tensor([2, 2, 3, 3])}}
-
         adapter.descriptor_scores = lambda x, require_ready=True: torch.tensor(
             [[0.2, 0.3], [0.2, 0.3], [1.5, 1.6], [1.5, 1.6]])
-        decision = model.plan_layer_expansion(0, features, [2, 3], 1.0, 0.25)
+        decision = model.plan_layer_expansion(0, features, [2, 3], 0.8)
         self.assertTrue(decision.expand)
-        self.assertEqual(decision.novel_classes, [3])
-        self.assertAlmostEqual(decision.task_novelty_score, 0.5)
-        self.assertAlmostEqual(decision.task_novelty_threshold, 0.25)
-
-        # Different samples in one class are summarized per descriptor before
-        # the minimum across descriptors is taken.
-        crossing_features = {
-            0: {"cls_in": torch.randn(8, 8),
-                "labels": torch.tensor([2, 2, 2, 2, 3, 3, 3, 3])}
-        }
+        self.assertAlmostEqual(decision.task_shift_score, 0.85, places=5)
+        self.assertEqual(decision.support_count, 4)
+        self.assertEqual(decision.threshold, 0.8)
         adapter.descriptor_scores = lambda x, require_ready=True: torch.tensor(
-            [[0.2, 2.0], [2.0, 0.2], [2.0, 2.0], [2.0, 2.0],
-             [0.2, 0.2], [0.2, 0.2], [0.2, 0.2], [0.2, 0.2]])
-        decision = model.plan_layer_expansion(0, crossing_features, [2, 3], 1.0, 0.25)
-        self.assertTrue(decision.expand)
-        self.assertEqual(decision.novel_classes, [2])
-        self.assertAlmostEqual(decision.class_scores[2], 2.0, places=5)
-
-        adapter.descriptor_scores = lambda x, require_ready=True: torch.tensor(
-            [[1.5, 0.2], [1.5, 0.2], [0.2, 1.5], [0.2, 1.5]])
-        decision = model.plan_layer_expansion(0, features, [2, 3], 1.0, 0.25)
+            [[0.2, 2.0], [0.2, 2.0], [0.2, 2.0], [2.0, 2.0],
+             [0.2, 0.2], [0.2, 0.2], [0.2, 0.2], [2.0, 2.0]])
+        crossing = {0: {"cls_in": torch.randn(8, 8),
+                        "labels": torch.tensor([2, 2, 2, 2, 3, 3, 3, 3])}}
+        decision = model.plan_layer_expansion(0, crossing, [2, 3], 1.0)
         self.assertFalse(decision.expand)
-        self.assertEqual(decision.novel_classes, [])
-        self.assertAlmostEqual(decision.task_novelty_score, 0.0)
+        self.assertAlmostEqual(decision.task_shift_score, 0.2, places=5)
+        adapter.descriptor_scores = lambda x, require_ready=True: torch.full((4, 2), 0.2)
+        decision = model.plan_layer_expansion(0, features, [2, 3], 0.2)
+        self.assertFalse(decision.expand)
 
     def test_semantic_guided_calibration_uses_only_base_description_to_retrieve_enhanced_visual(self):
         runner = Runner.__new__(Runner)
@@ -1026,9 +965,8 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         # rather than causing a duplicate expert in the next pass.
         session1_features = model.collect_blockwise_cls_features([session1_support])
         for block in model.expandable_blocks():
-            decision = model.plan_layer_expansion(block, session1_features, [1], 1.0, 0.0)
+            decision = model.plan_layer_expansion(block, session1_features, [1], 1.0)
             self.assertFalse(decision.expand)
-            self.assertEqual(decision.novel_classes, [])
 
         session1_anchors = runner._collect_class_anchors([session1_support])
         with torch.no_grad():
@@ -1094,7 +1032,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
 
         session2_features = model.collect_blockwise_cls_features([session2_support])
         for block in model.expandable_blocks():
-            decision = model.plan_layer_expansion(block, session2_features, [2], 1.0, 0.0)
+            decision = model.plan_layer_expansion(block, session2_features, [2], 1.0)
             self.assertFalse(decision.expand)
             self.assertEqual(decision.novel_classes, [])
 
@@ -1162,8 +1100,6 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             )
             self.assertTrue(result["trained"])
             self.assertEqual(
-                [entry["novel_classes"] for entry in result["expanded"]],
-                [[session_id], [session_id]],
             )
             self.assertEqual(
                 [adapter.num_experts for _, adapter in runner._moe_adapters()],
@@ -1175,9 +1111,8 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             )
             for block in model.expandable_blocks():
                 features = model.collect_blockwise_cls_features([support])
-                decision = model.plan_layer_expansion(block, features, [session_id], 1.0, 0.0)
+                decision = model.plan_layer_expansion(block, features, [session_id], 1.0)
                 self.assertFalse(decision.expand)
-                self.assertEqual(decision.novel_classes, [])
             states.append(make_lifecycle_state(
                 runner, model, session_id, support, session_id
             ))
@@ -1277,7 +1212,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             "labels": torch.tensor([7, 7, 7, 7]),
         }}
         with self.assertRaises((FloatingPointError, ValueError)):
-            model.plan_layer_expansion(0, features, [7], 1.0, 0.0)
+            model.plan_layer_expansion(0, features, [7], 1.0)
 
     def test_duplicate_source_ids_are_query_exclusive_and_cross_class_collisions_fail(self):
         feature = torch.tensor([
