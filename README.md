@@ -67,14 +67,14 @@ Lifecycle:
    holdout estimates that descriptor's reconstruction-error mean and standard
    deviation. It does not calibrate the task-level expansion threshold.
 3. At each incremental Session, collect frozen-reference CLS input
-   features for every support sample. For each sample, calculate its
-   standardized reconstruction-error score under every deployed descriptor,
-   then take the minimum across descriptors as that sample's best-coverage
-   score. The layer-level Session score is the median of these sample scores.
-   Expand exactly one expert when this task score is strictly greater than the
-   fixed Z-score threshold (default 1.5); otherwise reuse the deployed experts.
-   No class-level novelty labels, class proportions, pseudo-Sessions, or
-   separately calibrated task thresholds are used.
+   features for every support source. Each descriptor converts its independent,
+   unweighted holdout errors into finite-sample upper-tail conformal p-values.
+   The maximum p-value across deployed experts tests whether at least one
+   existing expert covers each sample; this remains valid as the expert pool
+   grows. The lower-median sample p-value is converted into an exact binomial
+   order-statistic p-value. Expand one expert when this task p-value is below
+   the configured false-alarm rate (default 0.05); otherwise reuse the pool.
+   No pseudo-Sessions or task-threshold calibration are used.
 4. Train the new expert and its router column on all current-Session samples.
    Every current-Session sample is positive router supervision and participates
    in the global seen-class visual-prototype classification objective. Old-class
