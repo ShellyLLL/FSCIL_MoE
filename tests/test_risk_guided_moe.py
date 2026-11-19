@@ -103,14 +103,18 @@ def build_lifecycle_runner():
         EPOCHS=8,
         LOGIT_SCALE=20.0,
         OLD_SUPPRESSION_WEIGHT=10.0,
-        ROUTE_WEIGHT=1.0,
+        RD_WEIGHT=1.0,
     )
     bimc_cfg = SimpleNamespace(
         VISUAL_MOE=SimpleNamespace(
             ENABLE=True,
             NUM_BASE_EXPERTS=2,
             INCREMENTAL_REDUCTION=2,
-            EXPANSION_FALSE_ALARM_RATE=0.50,
+            INCREMENTAL_DROPOUT=0.1,
+            EXPANSION_THRESHOLD_QUANTILE=0.95,
+            EXPANSION_CALIBRATION_GROUPS=20,
+            EXPANSION_CALIBRATION_SEED=271,
+            SESSION_SUPPORT_SIZES=[8, 16],
         ),
         OPTIM=optim_cfg,
         INCREMENTAL=incremental_cfg,
@@ -122,7 +126,7 @@ def build_lifecycle_runner():
     )
     cfg = SimpleNamespace(
         TRAINER=SimpleNamespace(BiMC=bimc_cfg),
-        DATASET=SimpleNamespace(NUM_INC_CLS=1, NUM_INC_SHOT=5),
+        DATASET=SimpleNamespace(NUM_INC_CLS=1, NUM_INC_SHOT=8, SESSION_SUPPORT_SIZES=[8, 16]),
     )
     model = BiMC.__new__(BiMC)
     nn.Module.__init__(model)
@@ -775,9 +779,9 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             checkpoint_path = runner.save_checkpoint(0, [state])
             payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
             self.assertEqual(payload["schema_version"], 26)
-            self.assertNotIn("expansion_thresholds", payload)
-            self.assertNotIn("task_expansion_thresholds", payload)
-            self.assertNotIn("descriptor_error_priors", payload)
+            self.assertIn("expansion_thresholds", payload)
+            self.assertEqual(payload["schema_version"], 27)
+            self.assertEqual(payload["expansion_thresholds"], runner.expansion_thresholds)
             self.assertIn("reference_image_proto", payload["task_states"][0])
 
             restored, restored_model = build_lifecycle_runner()
@@ -816,7 +820,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             )
 
             mismatched, _ = build_lifecycle_runner()
-            mismatched.cfg.TRAINER.BiMC.VISUAL_MOE.EXPANSION_FALSE_ALARM_RATE = 0.10
+            mismatched.cfg.TRAINER.BiMC.VISUAL_MOE.EXPANSION_THRESHOLD_QUANTILE = 0.90
             mismatched.cfg.TRAINER.BiMC.CHECKPOINT = SimpleNamespace(
                 ENABLE=True, DIR=directory, RESUME=str(checkpoint_path),
                 SAVE_EVERY_SESSION=True
@@ -841,7 +845,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         self.assertEqual(restored.descriptors[2].anchor_expert_id, 0)
         self.assertEqual(restored.descriptors[2].residual_rank, source.descriptors[2].residual_rank)
 
-    def test_task_level_expansion_uses_conformal_expert_pool_and_exact_median_test(self):
+    def test_session_expansion_uses_q90_of_best_historical_rd_scores(self):
         model = BiMC.__new__(BiMC)
         nn.Module.__init__(model)
         adapter = VisualMoEAdapter(8, num_experts=2, reduction=2, descriptor_dim=4)
@@ -855,36 +859,31 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         model.clip_model.visual = visual
         model.device = "cpu"
         model.cfg = SimpleNamespace(TRAINER=SimpleNamespace(BiMC=SimpleNamespace(
-            VISUAL_MOE=SimpleNamespace(EXPANSION_FALSE_ALARM_RATE=0.05))))
+            VISUAL_MOE=SimpleNamespace(EXPANSION_THRESHOLD_QUANTILE=0.95))))
         for descriptor in adapter.descriptors:
             descriptor.update_reference(torch.tensor([0.1, 0.11, 0.09, 0.1]))
-        features = {0: {"cls_in": torch.randn(4, 8),
-                        "labels": torch.tensor([2, 2, 3, 3]),
-                        "source_ids": torch.tensor([10, 11, 12, 13])}}
-
-        # A sample is covered when at least one deployed expert has a large
-        # upper-tail p-value. The two low-p samples yield a significant lower
-        # median task test for N=4.
-        adapter.descriptor_coverage_pvalues = lambda x, require_ready=True: torch.tensor(
-            [[0.90, 0.80], [0.90, 0.80], [0.01, 0.02], [0.01, 0.02]])
-        decision = model.plan_layer_expansion(0, features, [2, 3], 0.05)
+        features = {0: {
+            "cls_in": torch.randn(8, 8),
+            "labels": torch.tensor([2, 2, 2, 2, 3, 3, 3, 3]),
+            "source_ids": torch.arange(10, 18),
+        }}
+        adapter.descriptor_scores = lambda x, require_ready=True: torch.tensor([
+            [0.1, 0.2], [0.2, 0.3], [0.3, 0.4], [0.4, 0.5],
+            [2.0, 3.0], [2.1, 3.1], [2.2, 3.2], [4.0, 5.0],
+        ])
+        decision = model.plan_layer_expansion(0, features, [2, 3], 1.0)
+        expected_q90 = torch.quantile(torch.tensor([0.1, 0.2, 0.3, 0.4, 2.0, 2.1, 2.2, 4.0]), 0.90)
         self.assertTrue(decision.expand)
-        self.assertAlmostEqual(decision.task_shift_score, 0.00233648, places=7)
-        self.assertEqual(decision.support_count, 4)
-        self.assertEqual(decision.threshold, 0.05)
+        self.assertAlmostEqual(decision.task_shift_score, float(expected_q90), places=6)
+        self.assertEqual(decision.support_count, 8)
+        self.assertEqual(decision.threshold, 1.0)
 
-        # Increasing expert count cannot make an uncovered sample appear
-        # covered unless at least one valid expert p-value supports coverage.
-        for session_id in range(1, 5):
-            adapter.add_expert(session_id=session_id, reduction=2)
-            adapter.descriptors[-1].update_reference(torch.tensor([0.1, 0.11, 0.09, 0.1]))
-        adapter.descriptor_coverage_pvalues = lambda x, require_ready=True: torch.full((4, 6), 0.90)
-        decision = model.plan_layer_expansion(0, features, [2, 3], 0.05)
+        # Session decisions aggregate all samples: class labels do not create
+        # separate tests or separate expert expansion decisions.
+        adapter.descriptor_scores = lambda x, require_ready=True: torch.full((8, 2), 0.25)
+        decision = model.plan_layer_expansion(0, features, [2, 3], 0.5)
         self.assertFalse(decision.expand)
-
-        adapter.descriptor_coverage_pvalues = lambda x, require_ready=True: torch.full((4, 6), 0.90)
-        decision = model.plan_layer_expansion(0, features, [2, 3], 0.05)
-        self.assertFalse(decision.expand)
+        self.assertEqual(decision.support_count, 8)
 
     def test_semantic_guided_calibration_uses_only_base_description_to_retrieve_enhanced_visual(self):
         runner = Runner.__new__(Runner)
