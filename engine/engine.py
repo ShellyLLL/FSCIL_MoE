@@ -97,7 +97,7 @@ class Runner:
         return getattr(self.cfg.TRAINER.BiMC, "CHECKPOINT", None)
 
     def _expansion_policy(self):
-        """Checkpointed contract for robust task-level AE shift detection."""
+        """Checkpointed contract for Base-calibrated Session-Q90/Q95 expansion."""
         moe_cfg = self._visual_moe_cfg()
         model_cfg = _cfg_value(self.cfg, "MODEL", None)
         backbone_cfg = _cfg_value(model_cfg, "BACKBONE", None)
@@ -872,12 +872,12 @@ class Runner:
         return thresholds
 
     def _train_base_descriptors(self, extract_loader):
-        """Fit Base AEs and independent reconstruction-error reference statistics.
+        """Fit Base RDs and calibrate support-size-specific Session thresholds.
 
         Each descriptor is fitted on Base reference CLS inputs weighted by its
         deployed Base-Softmax responsibility. A disjoint source-level holdout
-        estimates that descriptor's reconstruction-error mean and standard
-        deviation. No pseudo-Sessions or task-threshold calibration are used.
+        estimates standardized reconstruction-error statistics and supplies
+        Base pseudo-Sessions for the Q95 threshold calibration.
         """
         epochs = int(_cfg_value(self.cfg.TRAINER.BiMC.OPTIM, "BASE_DESCRIPTOR_EPOCHS", 8))
         print(f"\n========== Fit Base AE Distribution Descriptors ({epochs} epochs) ==========")
@@ -1204,7 +1204,7 @@ class Runner:
 
     def _train_incremental_task_impl(self, task_id, train_loader, extract_loader, class_index,
                                       current_class_name, old_states):
-        """Task-level expansion; each new expert and descriptor models the full Session."""
+        """Session-level Q90 expansion; each new expert and RD models the full Session."""
         optim_cfg = self.cfg.TRAINER.BiMC.OPTIM
         incremental_cfg = self.cfg.TRAINER.BiMC.INCREMENTAL
         epochs = int(incremental_cfg.EPOCHS)
@@ -1222,7 +1222,7 @@ class Runner:
         expansion_features = self.model_without_dp.collect_blockwise_cls_features(extract_loader)
         expected_classes = sorted(int(value) for value in class_index)
         if not expansion_features:
-            raise RuntimeError("Task-level expansion received no blockwise reference features.")
+            raise RuntimeError("Session-level expansion received no blockwise reference features.")
         reference_labels = sorted(int(value) for value in torch.unique(
             next(iter(expansion_features.values()))["labels"], sorted=True
         ).tolist())
@@ -1348,7 +1348,7 @@ class Runner:
                     loss = classification + pd_weight * old_suppression + rd_weight * rd_loss
                     if not bool(torch.isfinite(loss).item()):
                         raise FloatingPointError(
-                            "Non-finite task-level global visual-prototype incremental loss."
+                            "Non-finite Session-level global visual-prototype incremental loss."
                         )
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(
