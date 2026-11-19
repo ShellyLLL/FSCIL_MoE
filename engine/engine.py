@@ -1405,7 +1405,7 @@ class Runner:
                 "session_q95_threshold": float(decision.threshold),
                 "classification_samples_per_epoch": samples_per_epoch,
                 "classification_samples_total": int(classification_samples_total),
-                "rd_training_samples": int(ae_fit_values.size(0)),
+                "rd_training_samples": int(local_values.size(0)),
                 "rd_reference_samples": calibration_count,
                 "rd_effective_reference_count": float(
                     adapter.descriptors[expert_id].effective_error_count.item()
