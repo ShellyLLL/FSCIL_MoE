@@ -100,8 +100,13 @@ class Runner:
         moe_cfg = self._visual_moe_cfg()
         model_cfg = _cfg_value(self.cfg, "MODEL", None)
         backbone_cfg = _cfg_value(model_cfg, "BACKBONE", None)
+        trainer_cfg = self.cfg.TRAINER.BiMC
+        optim_cfg = _cfg_value(trainer_cfg, "OPTIM", None)
+        incremental_cfg = _cfg_value(trainer_cfg, "INCREMENTAL", None)
+        loss_cfg = _cfg_value(trainer_cfg, "LOSS", None)
+        dataset_cfg = _cfg_value(self.cfg, "DATASET", None)
         return {
-            "version": 4,
+            "version": 5,
             "decision_unit": "incremental_session",
             "sample_score": "maximum_upper_tail_conformal_pvalue_over_deployed_experts",
             "task_score": "exact_binomial_lower_median_pvalue",
@@ -121,7 +126,42 @@ class Runner:
             "incremental_gate_bias_init": float(_cfg_value(moe_cfg, "INCREMENTAL_GATE_BIAS_INIT", -1.0)),
             "base_scale_init": float(_cfg_value(moe_cfg, "BASE_SCALE_INIT", 1.0)),
             "backbone_name": str(_cfg_value(backbone_cfg, "NAME", "unknown")),
-            "precision": str(_cfg_value(self.cfg.TRAINER.BiMC, "PREC", "fp32")),
+            "precision": str(_cfg_value(trainer_cfg, "PREC", "fp32")),
+            "freeze_visual_backbone": bool(_cfg_value(trainer_cfg, "FREEZE_VISUAL_BACKBONE", True)),
+            "freeze_text_encoder": bool(_cfg_value(trainer_cfg, "FREEZE_TEXT_ENCODER", True)),
+            "semantic_temperature": float(_cfg_value(moe_cfg, "SEMANTIC_TEMPERATURE", 0.07)),
+            "semantic_calibration_max_alpha": float(_cfg_value(moe_cfg, "SEMANTIC_CALIBRATION_MAX_ALPHA", 0.5)),
+            "prototype_reliability_k": float(_cfg_value(moe_cfg, "PROTOTYPE_RELIABILITY_K", 5.0)),
+            "incremental_training": {
+                "epochs": int(_cfg_value(incremental_cfg, "EPOCHS", 6)),
+                "logit_scale": float(_cfg_value(incremental_cfg, "LOGIT_SCALE", 100.0)),
+                "old_suppression_weight": float(_cfg_value(incremental_cfg, "OLD_SUPPRESSION_WEIGHT", 1.0)),
+                "route_weight": float(_cfg_value(incremental_cfg, "ROUTE_WEIGHT", 1.0)),
+            },
+            "optimizer": {
+                "base_epochs": int(_cfg_value(optim_cfg, "BASE_EPOCHS", 50)),
+                "base_descriptor_epochs": int(_cfg_value(optim_cfg, "BASE_DESCRIPTOR_EPOCHS", 8)),
+                "incremental_descriptor_epochs": int(_cfg_value(optim_cfg, "INCREMENTAL_DESCRIPTOR_EPOCHS", 5)),
+                "lr_base_moe": float(_cfg_value(optim_cfg, "LR_BASE_MOE", 1e-4)),
+                "lr_incremental_expert": float(_cfg_value(optim_cfg, "LR_INCREMENTAL_EXPERT", 3e-4)),
+                "lr_incremental_router": float(_cfg_value(optim_cfg, "LR_INCREMENTAL_ROUTER", 3e-4)),
+                "lr_descriptor": float(_cfg_value(optim_cfg, "LR_DESCRIPTOR", 1e-3)),
+                "weight_decay": float(_cfg_value(optim_cfg, "WEIGHT_DECAY", 1e-4)),
+                "betas": list(_cfg_value(optim_cfg, "BETAS", (0.9, 0.999))),
+            },
+            "loss": {
+                "ce_weight": float(_cfg_value(loss_cfg, "CE_WEIGHT", 1.0)),
+                "load_balance_weight": float(_cfg_value(loss_cfg, "LB_WEIGHT", 0.01)),
+                "kd_weight": float(_cfg_value(loss_cfg, "KD_WEIGHT", 0.5)),
+            },
+            "data_protocol": {
+                "seed": int(_cfg_value(self.cfg, "SEED", 1)),
+                "num_init_classes": int(_cfg_value(dataset_cfg, "NUM_INIT_CLS", -1)),
+                "num_incremental_classes": int(_cfg_value(dataset_cfg, "NUM_INC_CLS", -1)),
+                "base_shot": int(_cfg_value(dataset_cfg, "NUM_BASE_SHOT", -1)),
+                "incremental_shot": int(_cfg_value(dataset_cfg, "NUM_INC_SHOT", -1)),
+                "support_manifest_seed": int(_cfg_value(dataset_cfg, "SUPPORT_MANIFEST_SEED", -1)),
+            },
         }
 
     @staticmethod
@@ -323,9 +363,9 @@ class Runner:
         if missing:
             raise ValueError(f"Resume checkpoint is missing required fields: {missing}")
         schema = int(payload["schema_version"])
-        if schema != 24:
+        if schema != 25:
             raise ValueError(
-                "This branch uses robust task-level AE expansion checkpoint schema (24); "
+                "This branch uses robust task-level AE expansion checkpoint schema (25); "
                 "older class-level and pseudo-Session calibration checkpoints are incompatible."
             )
         checkpoint_policy = payload.get("expansion_policy")
@@ -523,7 +563,7 @@ class Runner:
         directory.mkdir(parents=True, exist_ok=True)
         topology = self.model_without_dp.export_moe_topology()
         payload = {
-            "schema_version": 24,
+            "schema_version": 25,
             "completed_session": int(completed_session),
             "model_state": self._cpu_copy(self.model_without_dp.state_dict()),
             "moe_topology": topology,
