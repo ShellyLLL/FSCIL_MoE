@@ -119,7 +119,7 @@ class Runner:
             "expert_training_scope": "all_current_session_samples",
             "descriptor_training_scope": "source_disjoint_fit_partition_of_current_session_reference_cls",
             "descriptor_calibration_scope": "source_disjoint_heldout_partition_of_current_session_reference_cls",
-            "router_learning_signal": "global_CE_plus_old_route_PD",
+            "router_learning_signal": "global_CE_plus_old_route_and_expert_residual_PD",
             "visual_moe_enabled": bool(_cfg_value(moe_cfg, "ENABLE", False)),
             "insert_blocks": [int(value) for value in _cfg_value(moe_cfg, "INSERT_BLOCKS", [])],
             "num_base_experts": int(_cfg_value(moe_cfg, "NUM_BASE_EXPERTS", 4)),
