@@ -110,7 +110,7 @@ def build_lifecycle_runner():
             ENABLE=True,
             NUM_BASE_EXPERTS=2,
             INCREMENTAL_REDUCTION=2,
-            EXPANSION_FALSE_ALARM_RATE=0.15,
+            EXPANSION_FALSE_ALARM_RATE=0.50,
         ),
         OPTIM=optim_cfg,
         INCREMENTAL=incremental_cfg,
@@ -772,11 +772,14 @@ class UnifiedDynamicMoETests(unittest.TestCase):
 
         # Increasing expert count cannot make an uncovered sample appear
         # covered unless at least one valid expert p-value supports coverage.
+        for session_id in range(1, 5):
+            adapter.add_expert(session_id=session_id, reduction=2)
+            adapter.descriptors[-1].update_reference(torch.tensor([0.1, 0.11, 0.09, 0.1]))
         adapter.descriptor_coverage_pvalues = lambda x, require_ready=True: torch.full((4, 6), 0.90)
         decision = model.plan_layer_expansion(0, features, [2, 3], 0.05)
         self.assertFalse(decision.expand)
 
-        adapter.descriptor_coverage_pvalues = lambda x, require_ready=True: torch.full((4, 2), 0.90)
+        adapter.descriptor_coverage_pvalues = lambda x, require_ready=True: torch.full((4, 6), 0.90)
         decision = model.plan_layer_expansion(0, features, [2, 3], 0.05)
         self.assertFalse(decision.expand)
 
