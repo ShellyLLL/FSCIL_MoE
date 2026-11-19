@@ -110,7 +110,7 @@ def build_lifecycle_runner():
             ENABLE=True,
             NUM_BASE_EXPERTS=2,
             INCREMENTAL_REDUCTION=2,
-            EXPANSION_FALSE_ALARM_RATE=0.05,
+            EXPANSION_FALSE_ALARM_RATE=0.15,
         ),
         OPTIM=optim_cfg,
         INCREMENTAL=incremental_cfg,
