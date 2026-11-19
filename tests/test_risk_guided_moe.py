@@ -697,7 +697,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             }
             checkpoint_path = runner.save_checkpoint(0, [state])
             payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-            self.assertEqual(payload["schema_version"], 24)
+            self.assertEqual(payload["schema_version"], 25)
             self.assertNotIn("expansion_thresholds", payload)
             self.assertNotIn("task_expansion_thresholds", payload)
             self.assertNotIn("descriptor_error_priors", payload)
@@ -737,6 +737,15 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             torch.testing.assert_close(
                 restored_features, expected_features, rtol=0, atol=0
             )
+
+            mismatched, _ = build_lifecycle_runner()
+            mismatched.cfg.TRAINER.BiMC.VISUAL_MOE.EXPANSION_FALSE_ALARM_RATE = 0.10
+            mismatched.cfg.TRAINER.BiMC.CHECKPOINT = SimpleNamespace(
+                ENABLE=True, DIR=directory, RESUME=str(checkpoint_path),
+                SAVE_EVERY_SESSION=True
+            )
+            with self.assertRaisesRegex(ValueError, "expansion policy does not match"):
+                mismatched._load_resume_checkpoint_if_requested()
 
     def test_topology_roundtrip_preserves_experts_and_descriptors(self):
         torch.manual_seed(11)
