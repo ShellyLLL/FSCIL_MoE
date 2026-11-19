@@ -61,11 +61,11 @@ Lifecycle:
    residual expert adapters. Historical experts and routers remain frozen but
    participate in every later forward pass.
 2. Base experts and the Base router are trained on Base classes. After Base
-   training, class-level raw CLS features are partitioned into disjoint AE-fit,
-   AE-error-reference and expansion-threshold source sets. Each expert's
-   centered low-rank linear AE is fitted using its deployed Base-Softmax
-   responsibility. The per-layer threshold is calibrated on the independent
-   Base holdout.
+   training, frozen-reference CLS sources are partitioned into disjoint AE-fit
+   and AE-error-reference sets. Each expert's centered low-rank linear AE is
+   fitted using its deployed Base-Softmax responsibility. The independent
+   holdout estimates that descriptor's reconstruction-error mean and standard
+   deviation. It does not calibrate the task-level expansion threshold.
 3. At each incremental Session, collect frozen-reference CLS input
    features for every support sample. For each sample, calculate its
    standardized reconstruction-error score under every deployed descriptor,
