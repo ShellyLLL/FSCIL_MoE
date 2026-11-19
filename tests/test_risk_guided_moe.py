@@ -223,9 +223,9 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             self.assertEqual(len(history["rd_loss"]), 8)
             self.assertEqual(len(history["pd_loss"]), 8)
             self.assertEqual(history["rd_training_samples"], 16)
-            self.assertEqual(history["ae_calibration_sources"], 16)
+            self.assertEqual(history["rd_reference_samples"], 16)
             self.assertEqual(history["rd_session_classes"], [1, 2])
-            self.assertGreater(history["ae_effective_calibration_count"], 1.0)
+            self.assertGreater(history["rd_effective_reference_count"], 1.0)
             self.assertTrue(all(torch.isfinite(torch.tensor(history[key])).all()
                                 for key in ("ce_loss", "rd_loss", "pd_loss")))
             features = model.collect_blockwise_cls_features(support)[block_idx]
