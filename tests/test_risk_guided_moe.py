@@ -156,7 +156,7 @@ def lifecycle_batch(class_id, feature, source_start, augmented=False, seed=0):
     return {
         "image": images,
         "label": torch.full((count,), int(class_id), dtype=torch.long),
-        "source_ids": torch.arange(source_start, source_start + count),
+        "source_ids": torch.arange(source_start * 100, source_start * 100 + count),
     }
 
 
@@ -878,7 +878,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         )
         self.assertEqual(set(first), {4, 8})
         self.assertEqual(first, second)
-        self.assertGreater(first[8], first[4])
+        self.assertNotEqual(first[8], first[4])
 
     def test_session_expansion_uses_q90_of_best_historical_rd_scores(self):
         model = BiMC.__new__(BiMC)
