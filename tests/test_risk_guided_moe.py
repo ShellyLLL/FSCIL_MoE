@@ -146,8 +146,7 @@ def build_lifecycle_runner():
     return runner, model
 
 
-def lifecycle_batch(class_id, feature, source_start, augmented=False, seed=0):
-    count = 32
+def lifecycle_batch(class_id, feature, source_start, augmented=False, seed=0, count=16):
     images = feature.reshape(1, 8).repeat(count, 1).clone()
     generator = torch.Generator().manual_seed(seed if augmented else source_start)
     perturbation = torch.randn(images.shape, generator=generator) * (0.03 if not augmented else 0.30)
@@ -196,7 +195,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         runner, model = build_lifecycle_runner()
         model.eval()
         base_support = lifecycle_batch(
-            0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 6000
+            0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 6000, count=32
         )
         runner._train_base_descriptors([base_support])
         base_state = make_lifecycle_state(runner, model, 0, base_support, 0)
@@ -216,12 +215,12 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         self.assertEqual([item["block_idx"] for item in result["expanded"]], [0, 1])
         for block_idx, adapter in runner._moe_adapters():
             history = result["training"][block_idx]
-            self.assertEqual(history["classification_samples_per_epoch"], [64] * 8)
-            self.assertEqual(history["classification_samples_total"], 512)
+            self.assertEqual(history["classification_samples_per_epoch"], [32] * 8)
+            self.assertEqual(history["classification_samples_total"], 256)
             self.assertEqual(len(history["ce_loss"]), 8)
             self.assertEqual(len(history["rd_loss"]), 8)
             self.assertEqual(len(history["pd_loss"]), 8)
-            self.assertEqual(history["rd_training_samples"], 60)
+            self.assertEqual(history["rd_training_samples"], 28)
             self.assertEqual(history["rd_reference_samples"], 4)
             self.assertEqual(history["rd_session_classes"], [1, 2])
             self.assertGreater(history["rd_effective_reference_count"], 1.0)
@@ -1235,7 +1234,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         runner, model = build_lifecycle_runner()
         model.eval()
         base_support = lifecycle_batch(
-            0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 1000
+            0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 1000, count=32
         )
         runner._train_base_descriptors([base_support])
         states = [make_lifecycle_state(runner, model, 0, base_support, 0)]
@@ -1285,7 +1284,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         runner, model = build_lifecycle_runner()
         model.eval()
         base_support = lifecycle_batch(
-            0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 2000
+            0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 2000, count=32
         )
         runner._train_base_descriptors([base_support])
         base_state = make_lifecycle_state(runner, model, 0, base_support, 0)
@@ -1396,7 +1395,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         torch.manual_seed(127)
         runner, model = build_lifecycle_runner()
         base_support = lifecycle_batch(
-            0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 3000
+            0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 3000, count=32
         )
         runner._train_base_descriptors([base_support])
         # A single source cannot produce a query-exclusive same-class prototype.
@@ -1421,7 +1420,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         torch.manual_seed(131)
         runner, model = build_lifecycle_runner()
         base_support = lifecycle_batch(
-            0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 4000
+            0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 4000, count=32
         )
         runner._train_base_descriptors([base_support])
         base_state = make_lifecycle_state(runner, model, 0, base_support, 0)
