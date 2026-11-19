@@ -852,6 +852,8 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         runner, model = build_lifecycle_runner()
         runner.cfg.TRAINER.BiMC.VISUAL_MOE.EXPANSION_CALIBRATION_GROUPS = 64
         adapter = model.clip_model.visual.transformer.resblocks[0].moe_adapter
+        for descriptor in adapter.descriptors:
+            descriptor.update_reference(torch.tensor([0.1, 0.11, 0.09, 0.1]))
         values = torch.arange(80, dtype=torch.float32).reshape(10, 8)
         adapter.descriptor_scores = lambda x, require_ready=True: torch.stack(
             [x[:, 0], x[:, 0] + 1.0], dim=-1
