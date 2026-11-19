@@ -876,7 +876,7 @@ class Runner:
         generator = torch.Generator(device="cpu").manual_seed(
             int(_cfg_value(moe_cfg, "EXPANSION_CALIBRATION_SEED", 20261119)) + int(block_idx)
         )
-        thresholds = {
+        thresholds = {}
         for size in support_sizes:
             size = int(size)
             quotient, remainder = divmod(size, configured_classes)
