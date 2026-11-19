@@ -136,7 +136,7 @@ class QuickGELU(nn.Module):
 
 
 class RepresentationDescriptor(nn.Module):
-    """Centered tied-weight low-rank linear AE with independent conformal error references."""
+    """Centered tied-weight low-rank AE with standardized reconstruction-error statistics."""
     def __init__(self, d_model, descriptor_dim=64, eps=1e-4, buffer_size=500):
         super().__init__()
         self.d_model = int(d_model)
@@ -341,24 +341,6 @@ class RepresentationDescriptor(nn.Module):
             raise RuntimeError("AE descriptor has no valid independent weighted reference errors.")
         return (self.reconstruction_error(x) - self.error_mean) / self.error_std.clamp_min(self.eps)
 
-    @torch.no_grad()
-    def upper_tail_p_value(self, x):
-        """Finite-sample conformal p-values from independent, unweighted errors."""
-        if not self.is_ready():
-            raise RuntimeError("AE descriptor has no valid independent reference errors.")
-        count = int(self.error_count.item())
-        weights = self.error_weight_history if count == self.buffer_size else self.error_weight_history[:count]
-        if not torch.allclose(weights, torch.ones_like(weights), rtol=1e-5, atol=1e-7):
-            raise RuntimeError(
-                "Conformal expansion calibration requires unweighted exchangeable holdout errors."
-            )
-        calibration = self.error_history if count == self.buffer_size else self.error_history[:count]
-        query = self.reconstruction_error(x).reshape(-1, 1)
-        # The +1 correction makes the upper-tail rank a valid finite-sample
-        # conformal p-value; ties are counted conservatively as exceedances.
-        exceedances = (calibration.reshape(1, -1) >= query).sum(dim=1)
-        return (1.0 + exceedances.float()) / float(count + 1)
-
     def is_ready(self):
         return (
             int(self.error_count.item()) >= 2
@@ -394,17 +376,21 @@ class ExpandableRouter(nn.Module):
 
 
 class BottleneckExpert(nn.Module):
-    def __init__(self, d_model, reduction=4, zero_init_up=False):
+    def __init__(self, d_model, reduction=4, zero_init_up=False, dropout=0.0):
         super().__init__()
+        dropout = float(dropout)
+        if not 0.0 <= dropout < 1.0:
+            raise ValueError("Expert dropout must be in [0, 1).")
         hidden_dim = max(1, int(d_model) // max(1, int(reduction)))
         self.c_fc, self.gelu = nn.Linear(d_model, hidden_dim), QuickGELU()
+        self.dropout = nn.Dropout(dropout)
         self.c_proj = nn.Linear(hidden_dim, d_model)
         if zero_init_up:
             nn.init.zeros_(self.c_proj.weight)
             nn.init.zeros_(self.c_proj.bias)
 
     def forward(self, x):
-        return self.c_proj(self.gelu(self.c_fc(x)))
+        return self.c_proj(self.dropout(self.gelu(self.c_fc(x))))
 
 
 class VisualMoEAdapter(nn.Module):
@@ -412,7 +398,8 @@ class VisualMoEAdapter(nn.Module):
 
     def __init__(self, d_model, num_experts=4, reduction=4, residual_scale_init=1.0,
                  descriptor_dim=64, descriptor_eps=1e-4, descriptor_buffer_size=500,
-                 incremental_gate_bias_init=-1.0, descriptor_residual_rank=16):
+                 incremental_gate_bias_init=-1.0, descriptor_residual_rank=16,
+                 incremental_dropout=0.0):
         super().__init__()
         self.d_model, self.base_expert_count = int(d_model), int(num_experts)
         self.default_reduction, self.descriptor_dim = int(reduction), int(descriptor_dim)
@@ -420,6 +407,9 @@ class VisualMoEAdapter(nn.Module):
         self.descriptor_buffer_size = int(descriptor_buffer_size)
         self.descriptor_residual_rank = max(1, min(int(descriptor_residual_rank), self.d_model))
         self.incremental_gate_bias_init = float(incremental_gate_bias_init)
+        self.incremental_dropout = float(incremental_dropout)
+        if not 0.0 <= self.incremental_dropout < 1.0:
+            raise ValueError("INCREMENTAL_DROPOUT must be in [0, 1).")
         self.register_buffer("base_feature_std", torch.ones(self.d_model, dtype=torch.float32))
         self.register_buffer("base_feature_stats_ready", torch.zeros((), dtype=torch.bool))
         self.layer_norm = LayerNorm(self.d_model)
@@ -451,11 +441,6 @@ class VisualMoEAdapter(nn.Module):
         if require_ready:
             self.assert_descriptors_ready()
         return torch.stack([descriptor.standardized_score(x) for descriptor in self.descriptors], dim=-1)
-
-    def descriptor_coverage_pvalues(self, x, require_ready=True):
-        if require_ready:
-            self.assert_descriptors_ready()
-        return torch.stack([descriptor.upper_tail_p_value(x) for descriptor in self.descriptors], dim=-1)
 
     def expansion_statistics(self, x):
         scores = self.descriptor_scores(x, require_ready=True)
@@ -562,7 +547,7 @@ class VisualMoEAdapter(nn.Module):
         self.train()
 
     def add_expert(self, session_id, reduction=None, gate_bias_init=None,
-                   anchor_expert_id=None, descriptor_residual_rank=None):
+                   anchor_expert_id=None, descriptor_residual_rank=None, dropout=None):
         self.freeze_all()
         reduction = self.default_reduction if reduction is None else int(reduction)
         anchor_expert_id = 0 if anchor_expert_id is None else int(anchor_expert_id)
@@ -574,8 +559,10 @@ class VisualMoEAdapter(nn.Module):
             self.descriptor_residual_rank if descriptor_residual_rank is None
             else int(descriptor_residual_rank)
         )
-        self.experts.append(BottleneckExpert(self.d_model, reduction, zero_init_up=True).to(
-            device=self.residual_scale.device, dtype=self.residual_scale.dtype))
+        expert_dropout = self.incremental_dropout if dropout is None else float(dropout)
+        self.experts.append(BottleneckExpert(
+            self.d_model, reduction, zero_init_up=True, dropout=expert_dropout
+        ).to(device=self.residual_scale.device, dtype=self.residual_scale.dtype))
         descriptor = RepresentationDescriptor(
             self.d_model, self.descriptor_dim, self.descriptor_eps, self.descriptor_buffer_size
         ).to(device=self.residual_scale.device)
@@ -606,12 +593,13 @@ class VisualMoEAdapter(nn.Module):
 
     def export_topology(self):
         return {
-            "version": 3,
+            "version": 4,
             "d_model": self.d_model,
             "base_expert_count": self.base_expert_count,
             "experts": [
                 {
                     "reduction": max(1, self.d_model // expert.c_fc.out_features),
+                    "dropout": float(expert.dropout.p),
                     "birth_session": int(self.expert_birth_sessions[index]),
                     "descriptor_anchor_id": int(self.descriptors[index].anchor_expert_id),
                     "descriptor_residual_rank": int(self.descriptors[index].residual_rank),
@@ -623,7 +611,7 @@ class VisualMoEAdapter(nn.Module):
     def rebuild_topology(self, topology):
         if topology is None:
             topology = {
-                "version": 3,
+                "version": 4,
                 "d_model": self.d_model,
                 "base_expert_count": self.base_expert_count,
                 "experts": [
@@ -634,7 +622,7 @@ class VisualMoEAdapter(nn.Module):
             }
         if not isinstance(topology, dict):
             raise ValueError("MoE topology must be a mapping.")
-        if int(topology.get("version", 3)) != 3:
+        if int(topology.get("version", 4)) != 4:
             raise ValueError("Unsupported MoE topology version.")
         if int(topology.get("d_model", self.d_model)) != self.d_model:
             raise ValueError("MoE topology d_model mismatch.")
@@ -654,11 +642,16 @@ class VisualMoEAdapter(nn.Module):
                 "descriptor_residual_rank",
                 0 if index < self.base_expert_count else self.descriptor_residual_rank,
             )
+            dropout = spec.get("dropout", 0.0 if index < self.base_expert_count else self.incremental_dropout)
             if isinstance(reduction, bool) or int(reduction) < 1:
                 raise ValueError(f"MoE topology expert {index} has invalid reduction.")
             if isinstance(birth_session, bool) or int(birth_session) < 0:
                 raise ValueError(f"MoE topology expert {index} has invalid birth session.")
+            if not 0.0 <= float(dropout) < 1.0:
+                raise ValueError(f"MoE topology expert {index} has invalid dropout.")
             if index < self.base_expert_count:
+                if float(dropout) != 0.0:
+                    raise ValueError("Base experts must have dropout=0.0.")
                 if int(birth_session) != 0:
                     raise ValueError("Base experts must have birth_session=0.")
                 if int(anchor_id) != -1 or int(residual_rank) != 0:
@@ -672,13 +665,13 @@ class VisualMoEAdapter(nn.Module):
                     )
                 if isinstance(residual_rank, bool) or int(residual_rank) < 1:
                     raise ValueError(f"Incremental descriptor {index} has invalid residual rank.")
-            validated.append((int(reduction), int(birth_session), int(anchor_id), int(residual_rank)))
+            validated.append((int(reduction), int(birth_session), int(anchor_id), int(residual_rank), float(dropout)))
 
         # Build the complete topology only after every expert/anchor specification is valid.
         self.experts, self.descriptors = nn.ModuleList(), nn.ModuleList()
         self.router, self.expert_birth_sessions = ExpandableRouter(self.d_model), []
-        for index, (reduction, birth_session, anchor_id, residual_rank) in enumerate(validated):
-            self.experts.append(BottleneckExpert(self.d_model, reduction))
+        for index, (reduction, birth_session, anchor_id, residual_rank, dropout) in enumerate(validated):
+            self.experts.append(BottleneckExpert(self.d_model, reduction, dropout=dropout))
             descriptor = RepresentationDescriptor(
                 self.d_model, self.descriptor_dim, self.descriptor_eps, self.descriptor_buffer_size
             )
@@ -1066,6 +1059,7 @@ def build_model(state_dict: dict, cfg=None):
         descriptor_buffer_size = getattr(moe_cfg, "DESCRIPTOR_BUFFER_SIZE", 500)
         descriptor_residual_rank = getattr(moe_cfg, "DESCRIPTOR_RESIDUAL_RANK", 16)
         incremental_gate_bias_init = getattr(moe_cfg, "INCREMENTAL_GATE_BIAS_INIT", -1.0)
+        incremental_dropout = getattr(moe_cfg, "INCREMENTAL_DROPOUT", 0.1)
         for idx in moe_cfg.INSERT_BLOCKS:
             if idx < 0: idx = len(model.visual.transformer.resblocks) + idx
             block = model.visual.transformer.resblocks[idx]
@@ -1079,6 +1073,7 @@ def build_model(state_dict: dict, cfg=None):
                 descriptor_buffer_size=descriptor_buffer_size,
                 incremental_gate_bias_init=incremental_gate_bias_init,
                 descriptor_residual_rank=descriptor_residual_rank,
+                incremental_dropout=incremental_dropout,
             )
         convert_weights(model)
     return model.eval()
