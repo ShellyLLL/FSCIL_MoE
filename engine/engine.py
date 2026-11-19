@@ -55,6 +55,7 @@ class Runner:
         self.acc_list, self.task_acc_list = [], []
         self.session_diagnostics = []
         self.expansion_thresholds = {}
+        self.base_calibration_source_ids = []
         self.evaluator = AccuracyEvaluator(self.data_manager.class_index_in_task)
         self._resume_completed_session = -1
         self._resume_state_dict_list = []
@@ -107,15 +108,17 @@ class Runner:
         loss_cfg = _cfg_value(trainer_cfg, "LOSS", None)
         dataset_cfg = _cfg_value(self.cfg, "DATASET", None)
         return {
-            "version": 7,
+            "version": 8,
             "decision_unit": "incremental_session",
-            "sample_score": "minimum_standardized_reconstruction_error_over_deployed_RDs",
+            "sample_score": "minimum_standardized_reconstruction_error_over_current_deployed_RDs",
+            "threshold_refresh": "recalibrate_base_pseudo_sessions_after_every_expert_pool_change",
             "session_score": "session_q90_of_sample_scores",
             "decision": "session_q90_greater_than_base_holdout_q95_for_same_support_size",
             "threshold_quantile": float(_cfg_value(moe_cfg, "EXPANSION_THRESHOLD_QUANTILE", 0.95)),
             "calibration_groups": int(_cfg_value(moe_cfg, "EXPANSION_CALIBRATION_GROUPS", 256)),
             "expert_training_scope": "all_current_session_samples",
-            "descriptor_training_scope": "all_current_session_reference_cls",
+            "descriptor_training_scope": "source_disjoint_fit_partition_of_current_session_reference_cls",
+            "descriptor_calibration_scope": "source_disjoint_heldout_partition_of_current_session_reference_cls",
             "router_learning_signal": "global_CE_plus_old_route_PD",
             "visual_moe_enabled": bool(_cfg_value(moe_cfg, "ENABLE", False)),
             "insert_blocks": [int(value) for value in _cfg_value(moe_cfg, "INSERT_BLOCKS", [])],
@@ -364,14 +367,15 @@ class Runner:
         required = (
             "schema_version", "completed_session", "model_state", "task_states",
             "support_manifest", "moe_topology", "expansion_policy", "expansion_thresholds",
+            "base_calibration_source_ids",
         )
         missing = [key for key in required if key not in payload]
         if missing:
             raise ValueError(f"Resume checkpoint is missing required fields: {missing}")
         schema = int(payload["schema_version"])
-        if schema != 27:
+        if schema != 28:
             raise ValueError(
-                "This branch uses Base-calibrated Session-Q90 expansion checkpoint schema (27); "
+                "This branch uses dynamic-pool Base-recalibrated Session-Q90 expansion checkpoint schema (28); "
                 "older conformal/median expansion checkpoints are incompatible."
             )
         checkpoint_policy = payload.get("expansion_policy")
@@ -418,6 +422,12 @@ class Runner:
             int(block): {int(size): float(value) for size, value in by_size.items()}
             for block, by_size in thresholds.items()
         }
+        self.base_calibration_source_ids = [
+            int(value) for value in payload["base_calibration_source_ids"]
+        ]
+        if (not self.base_calibration_source_ids
+                or len(set(self.base_calibration_source_ids)) != len(self.base_calibration_source_ids)):
+            raise ValueError("Checkpoint Base calibration source ids must be non-empty and unique.")
         if any(
             size <= 0 or not np.isfinite(value)
             for by_size in self.expansion_thresholds.values()
@@ -600,8 +610,9 @@ class Runner:
         directory.mkdir(parents=True, exist_ok=True)
         topology = self.model_without_dp.export_moe_topology()
         payload = {
-            "schema_version": 27,
+            "schema_version": 28,
             "completed_session": int(completed_session),
+            "base_calibration_source_ids": list(self.base_calibration_source_ids),
             "expansion_thresholds": self._cpu_copy(self.expansion_thresholds),
             "model_state": self._cpu_copy(self.model_without_dp.state_dict()),
             "moe_topology": topology,
@@ -934,6 +945,11 @@ class Runner:
                 min_fit_per_class=5, min_calibration_per_class=3,
             )
             fit_mask = ~reference_mask
+            current_holdout_ids = [int(value) for value in source_ids[reference_mask].tolist()]
+            if not self.base_calibration_source_ids:
+                self.base_calibration_source_ids = current_holdout_ids
+            elif self.base_calibration_source_ids != current_holdout_ids:
+                raise RuntimeError("Base calibration source identities changed across MoE blocks.")
             fit_values = values[fit_mask]
             reference_values = values[reference_mask]
             fit_labels = labels[fit_mask]
