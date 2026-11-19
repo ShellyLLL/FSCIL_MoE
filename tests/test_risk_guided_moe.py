@@ -113,7 +113,7 @@ def build_lifecycle_runner():
             EXPANSION_THRESHOLD_QUANTILE=0.95,
             EXPANSION_CALIBRATION_GROUPS=20,
             EXPANSION_CALIBRATION_SEED=271,
-            SESSION_SUPPORT_SIZES=[16],
+            SESSION_SUPPORT_SIZES=[16, 32],
         ),
         OPTIM=optim_cfg,
         INCREMENTAL=incremental_cfg,
@@ -125,7 +125,7 @@ def build_lifecycle_runner():
     )
     cfg = SimpleNamespace(
         TRAINER=SimpleNamespace(BiMC=bimc_cfg),
-        DATASET=SimpleNamespace(NUM_INC_CLS=1, NUM_INC_SHOT=16, SESSION_SUPPORT_SIZES=[16]),
+        DATASET=SimpleNamespace(NUM_INC_CLS=1, NUM_INC_SHOT=16, SESSION_SUPPORT_SIZES=[16, 32]),
     )
     model = BiMC.__new__(BiMC)
     nn.Module.__init__(model)
@@ -301,9 +301,9 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         torch.manual_seed(233)
         runner, model = build_lifecycle_runner()
         supports = [
-            lifecycle_batch(0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 5000),
-            lifecycle_batch(1, torch.tensor([0., 1., 0., 0., 0., 0., 0., 0.]), 5010),
-            lifecycle_batch(2, torch.tensor([0., 0., 1., 0., 0., 0., 0., 0.]), 5020),
+            lifecycle_batch(0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 5000, count=40),
+            lifecycle_batch(1, torch.tensor([0., 1., 0., 0., 0., 0., 0., 0.]), 5010, count=40),
+            lifecycle_batch(2, torch.tensor([0., 0., 1., 0., 0., 0., 0., 0.]), 5020, count=40),
         ]
         runner._train_base_descriptors(supports)
         for _, adapter in runner._moe_adapters():
@@ -769,7 +769,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             model.base_enhanced_visual_prototype = torch.tensor([[1.0, 0.0, 0.0, 0.0,
                                                          0.0, 0.0, 0.0, 0.0]])
             runner._train_base_descriptors([lifecycle_batch(
-                0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 7000
+                0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 7000, count=40
             )])
             prototype = torch.tensor([[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]])
             anchor_var = torch.full_like(prototype, 0.1)
@@ -1051,7 +1051,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         runner, model = build_lifecycle_runner()
         model.eval()
 
-        base_support = lifecycle_batch(0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 100)
+        base_support = lifecycle_batch(0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 100, count=40)
         runner._train_base_descriptors([base_support])
         base_anchors = runner._collect_class_anchors([base_support])
         with torch.no_grad():
