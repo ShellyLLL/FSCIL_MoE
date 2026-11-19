@@ -1189,8 +1189,19 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             "creation_session": 1,
         }
 
-        old_images = torch.cat([base_support["image"][:1], session1_support["image"][:1]], dim=0)
-        old_labels = torch.tensor([0, 1])
+        base_queries = lifecycle_batch(
+            0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 2900
+        )
+        session1_queries = lifecycle_batch(
+            1, torch.tensor([0., 1., 0., 0., 0., 0., 0., 0.]), 2910
+        )
+        old_images = torch.cat([base_queries["image"], session1_queries["image"]], dim=0)
+        old_support_images = torch.cat(
+            [base_support["image"], session1_support["image"]], dim=0
+        )
+        old_labels = torch.tensor(
+            [0] * base_queries["image"].size(0) + [1] * session1_queries["image"].size(0)
+        )
         old_prototypes = torch.cat([base_proto, session1_proto], dim=0)
 
         def old_predictions():
@@ -1439,6 +1450,25 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         self.assertGreater(before_accuracy, 0)
         self.assertEqual(after_accuracy, before_accuracy)
         self.assertTrue(torch.isfinite(per_sample_cosine).all())
+        with torch.no_grad():
+            current_support_features = F.normalize(
+                model.extract_img_feature(old_support_images).float(), dim=-1
+            )
+            current_old_prototypes = torch.stack([
+                F.normalize(
+                    current_support_features[:base_support["image"].size(0)].mean(0),
+                    dim=-1,
+                ),
+                F.normalize(
+                    current_support_features[base_support["image"].size(0):].mean(0),
+                    dim=-1,
+                ),
+            ])
+        prototype_alignment = F.cosine_similarity(
+            old_prototypes.float(), current_old_prototypes.float(), dim=-1
+        )
+        self.assertTrue(torch.isfinite(prototype_alignment).all())
+        self.assertGreaterEqual(float(prototype_alignment.min().item()), 0.98)
         self.assertGreaterEqual(feature_cosine, 0.98)
         self.assertTrue(all(torch.isfinite(torch.tensor(route_deltas))))
         self.assertLess(max(route_deltas), 0.10)
