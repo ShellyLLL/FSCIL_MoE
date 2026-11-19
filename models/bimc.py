@@ -14,7 +14,7 @@ class LayerExpansionDecision:
     """Robust task-level distribution-shift decision for one transformer layer."""
     block_idx: int
     expand: bool
-    task_shift_score: float
+    session_q90: float
     threshold: float
     support_count: int
 
@@ -290,7 +290,7 @@ class BiMC(nn.Module):
         decision = LayerExpansionDecision(
             block_idx=block_idx,
             expand=score > tau,
-            task_shift_score=score,
+            session_q90=score,
             threshold=tau,
             support_count=int(values.size(0)),
         )
