@@ -54,10 +54,6 @@ class Runner:
         self.model_without_dp = self.model.module if self.is_distributed else self.model
         self.acc_list, self.task_acc_list = [], []
         self.session_diagnostics = []
-        self.expansion_thresholds = {}
-        self.task_expansion_thresholds = {}
-        self._base_threshold_holdout_counts = {}
-        self._base_calibration_features = {}
         self.evaluator = AccuracyEvaluator(self.data_manager.class_index_in_task)
         self._resume_completed_session = -1
         self._resume_state_dict_list = []
@@ -88,23 +84,15 @@ class Runner:
         return getattr(self.cfg.TRAINER.BiMC, "CHECKPOINT", None)
 
     def _expansion_policy(self):
-        """Checkpointed contract for task-level expansion and full-task training."""
+        """Checkpointed contract for robust task-level AE shift detection."""
         moe_cfg = self._visual_moe_cfg()
-        dataset_cfg = getattr(self.cfg, "DATASET", None)
         return {
-            "version": 1,
+            "version": 2,
             "decision_unit": "incremental_session",
-            "class_score": "min_descriptor_of_per_class_median_z",
-            "task_score": "fraction_of_novel_classes",
-            "task_threshold": "cross_fitted_base_pseudo_session_conformal",
-            "class_false_positive_rate": float(_cfg_value(
-                moe_cfg, "EXPANSION_FALSE_POSITIVE_RATE", 0.05
-            )),
-            "task_false_positive_rate": float(_cfg_value(
-                moe_cfg, "TASK_EXPANSION_FALSE_POSITIVE_RATE", 0.10
-            )),
-            "pseudo_session_size": int(_cfg_value(dataset_cfg, "NUM_INC_CLS", 0)),
-            "threshold_shot_count": int(_cfg_value(dataset_cfg, "NUM_INC_SHOT", 5)),
+            "sample_score": "minimum_zscore_over_all_existing_descriptors",
+            "task_score": "median_over_all_current_session_support_samples",
+            "decision": "task_score_greater_than_fixed_zscore_threshold",
+            "threshold": float(_cfg_value(moe_cfg, "EXPANSION_Z_THRESHOLD", 1.5)),
             "expert_training_scope": "all_current_session_samples",
             "descriptor_training_scope": "all_current_session_reference_cls",
             "router_positive_scope": "all_current_session_samples",
@@ -303,17 +291,16 @@ class Runner:
             raise ValueError("Resume checkpoint must contain a dictionary payload.")
         required = (
             "schema_version", "completed_session", "model_state", "task_states",
-            "support_manifest", "moe_topology", "expansion_thresholds",
-            "task_expansion_thresholds", "expansion_policy",
+            "support_manifest", "moe_topology", "expansion_policy",
         )
         missing = [key for key in required if key not in payload]
         if missing:
             raise ValueError(f"Resume checkpoint is missing required fields: {missing}")
         schema = int(payload["schema_version"])
-        if schema != 21:
+        if schema != 22:
             raise ValueError(
-                "This branch uses task-level dynamic expansion checkpoint schema (21); "
-                "class-level expansion checkpoints are incompatible."
+                "This branch uses robust task-level AE expansion checkpoint schema (22); "
+                "older class-level and pseudo-Session calibration checkpoints are incompatible."
             )
         checkpoint_policy = payload.get("expansion_policy")
         if checkpoint_policy != self._expansion_policy():
@@ -356,32 +343,6 @@ class Runner:
         self.model_without_dp.load_state_dict(payload["model_state"], strict=True)
         for _, adapter in self._moe_adapters():
             adapter.freeze_all()
-        thresholds = payload.get("expansion_thresholds")
-        if not isinstance(thresholds, dict):
-            raise TypeError("Checkpoint expansion_thresholds must be a mapping.")
-        self.expansion_thresholds = {
-            int(key): float(value) for key, value in thresholds.items()
-        }
-        task_thresholds = payload.get("task_expansion_thresholds")
-        if not isinstance(task_thresholds, dict):
-            raise TypeError("Checkpoint task_expansion_thresholds must be a mapping.")
-        self.task_expansion_thresholds = {
-            int(key): float(value) for key, value in task_thresholds.items()
-        }
-        if not all(np.isfinite(value) for value in self.expansion_thresholds.values()):
-            raise ValueError("Checkpoint class expansion thresholds must be finite.")
-        if not all(np.isfinite(value) and 0.0 <= value <= 1.0
-                   for value in self.task_expansion_thresholds.values()):
-            raise ValueError("Checkpoint task expansion thresholds must be finite and in [0, 1].")
-        if bool(self._visual_moe_cfg().ENABLE):
-            expected_blocks = {int(block) for block in self.model_without_dp.expandable_blocks()}
-            if (set(self.expansion_thresholds) != expected_blocks
-                    or set(self.task_expansion_thresholds) != expected_blocks):
-                raise ValueError(
-                    "Checkpoint class/task thresholds do not cover the deployed MoE blocks: "
-                    f"class={set(self.expansion_thresholds)}, "
-                    f"task={set(self.task_expansion_thresholds)}, expected={expected_blocks}."
-                )
         checkpoint_class_ids = []
         for session_index, state in enumerate(payload["task_states"]):
             required_state = ("class_ids", "image_proto", "reference_image_proto",
@@ -534,7 +495,7 @@ class Runner:
         directory.mkdir(parents=True, exist_ok=True)
         topology = self.model_without_dp.export_moe_topology()
         payload = {
-            "schema_version": 21,
+            "schema_version": 22,
             "completed_session": int(completed_session),
             "model_state": self._cpu_copy(self.model_without_dp.state_dict()),
             "moe_topology": topology,
@@ -544,8 +505,6 @@ class Runner:
             "acc_list": list(self.acc_list),
             "task_acc_list": copy.deepcopy(self.task_acc_list),
             "session_diagnostics": self._cpu_copy(self.session_diagnostics),
-            "expansion_thresholds": {int(key): float(value) for key, value in self.expansion_thresholds.items()},
-            "task_expansion_thresholds": {int(key): float(value) for key, value in self.task_expansion_thresholds.items()},
             "expansion_policy": self._expansion_policy(),
             "rng_state": self._rng_state(),
             "config": self.cfg.dump() if hasattr(self.cfg, "dump") else str(self.cfg),
@@ -721,218 +680,72 @@ class Runner:
         return mask
 
     def _train_base_descriptors(self, extract_loader):
+        """Fit Base AEs and independent reconstruction-error reference statistics.
+
+        Each descriptor is fitted on Base reference CLS inputs weighted by its
+        deployed Base-Softmax responsibility. A disjoint source-level holdout
+        estimates that descriptor's reconstruction-error mean and standard
+        deviation. No pseudo-Sessions or task-threshold calibration are used.
+        """
         epochs = int(_cfg_value(self.cfg.TRAINER.BiMC.OPTIM, "BASE_DESCRIPTOR_EPOCHS", 8))
         print(f"\n========== Fit Base AE Distribution Descriptors ({epochs} epochs) ==========")
         feature_map = self.model_without_dp.collect_blockwise_cls_features(extract_loader)
-        self._base_calibration_features = {}
-        self._base_ae_calibration_features = {}
-        self._base_threshold_holdout_counts = {}
         for block_idx, adapter in self._moe_adapters():
             item = feature_map[block_idx]
             values = item["cls_in"].to(self.device)
             labels = item["labels"].to(self.device)
             source_ids = item["source_ids"].to(self.device)
-            # Three disjoint source sets: AE error reference, threshold calibration,
-            # and descriptor fitting. Every class contributes to both holdouts.
-            ae_mask = self._make_calibration_mask(
+            # Independent error-reference sources are held out from AE fitting.
+            # Every Base class contributes to both partitions.
+            reference_mask = self._make_calibration_mask(
                 labels, source_ids, min_calibration_count=3,
                 min_fit_per_class=5, min_calibration_per_class=3,
             )
-            remaining = ~ae_mask
-            # Match Base threshold-calibration shots to the incremental support
-            # shot count whenever Base data permits.  This makes the class
-            # median statistic comparable between Base calibration and Sessions.
-            incremental_shot = int(_cfg_value(
-                getattr(self.cfg, "DATASET", None), "NUM_INC_SHOT", 5
-            ))
-            remaining_counts = [
-                int(torch.unique(source_ids[remaining & labels.eq(class_id)]).numel())
-                for class_id in torch.unique(labels, sorted=True)
-            ]
-            threshold_per_class = min(
-                incremental_shot,
-                min((count - 3 for count in remaining_counts), default=0),
-            )
-            if threshold_per_class < 2:
-                raise RuntimeError(
-                    f"Block {block_idx} cannot reserve at least two Base threshold "
-                    "holdout sources per class after AE calibration and fit reserves."
-                )
-            threshold_local = self._make_calibration_mask(
-                labels[remaining], source_ids[remaining],
-                min_calibration_count=threshold_per_class * len(remaining_counts),
-                min_fit_per_class=3,
-                min_calibration_per_class=threshold_per_class,
-            )
-            threshold_mask = torch.zeros_like(ae_mask)
-            threshold_mask[remaining] = threshold_local
-            fit_mask = ~(ae_mask | threshold_mask)
-            ae_values = values[ae_mask]
-            ae_labels = labels[ae_mask]
-            ae_sources = source_ids[ae_mask]
-            threshold_values = values[threshold_mask]
-            threshold_labels = labels[threshold_mask]
-            threshold_sources = source_ids[threshold_mask]
+            fit_mask = ~reference_mask
             fit_values = values[fit_mask]
-            self._base_ae_calibration_features[int(block_idx)] = {
-                "cls_in": ae_values.detach().cpu(),
-                "labels": ae_labels.detach().cpu(),
-                "source_ids": ae_sources.detach().cpu(),
-            }
-            self._base_calibration_features[int(block_idx)] = {
-                "cls_in": threshold_values.detach().cpu(),
-                "labels": threshold_labels.detach().cpu(),
-                "source_ids": threshold_sources.detach().cpu(),
-            }
-            self._base_threshold_holdout_counts[int(block_idx)] = int(threshold_per_class)
+            reference_values = values[reference_mask]
+            fit_labels = labels[fit_mask]
+            reference_labels = labels[reference_mask]
+            expected_classes = sorted(int(value) for value in torch.unique(
+                labels, sorted=True
+            ).tolist())
+            if (sorted(int(value) for value in torch.unique(
+                    fit_labels, sorted=True).tolist()) != expected_classes
+                    or sorted(int(value) for value in torch.unique(
+                        reference_labels, sorted=True
+                    ).tolist()) != expected_classes):
+                raise RuntimeError(
+                    f"Block {block_idx} Base AE fit/reference partitions must cover every Base class."
+                )
             with torch.no_grad():
                 fit_responsibilities = torch.stack([
                     adapter.expert_responsibility(fit_values, expert_id)
                     for expert_id in range(adapter.num_experts)
                 ], dim=-1)
-                calibration_responsibilities = torch.stack([
-                    adapter.expert_responsibility(ae_values, expert_id)
+                reference_responsibilities = torch.stack([
+                    adapter.expert_responsibility(reference_values, expert_id)
                     for expert_id in range(adapter.num_experts)
                 ], dim=-1)
             for expert_id in range(adapter.num_experts):
                 loss = self._train_descriptor(
                     adapter, expert_id, fit_values, epochs,
                     fit_responsibilities[:, expert_id],
-                    calibration_values=ae_values,
-                    calibration_weights=calibration_responsibilities[:, expert_id],
+                    calibration_values=reference_values,
+                    calibration_weights=reference_responsibilities[:, expert_id],
                 )
                 descriptor = adapter.descriptors[expert_id]
                 if int(descriptor.error_count.item()) < 2:
-                    raise RuntimeError("Base descriptor calibration requires at least two independent held-out errors.")
-                print(f"=> [AE-Descriptor][B{block_idx}][E{expert_id}] loss={loss:.6f} "
-                      f"reference_n={int(descriptor.error_count.item())} "
-                      f"mean={descriptor.error_mean.item():.6f} std={descriptor.error_std.item():.6f}")
+                    raise RuntimeError(
+                        "Base descriptor requires at least two independent reconstruction-error references."
+                    )
+                print(
+                    f"=> [AE-Descriptor][B{block_idx}][E{expert_id}] "
+                    f"loss={loss:.6f} reference_n={int(descriptor.error_count.item())} "
+                    f"mean={descriptor.error_mean.item():.6f} "
+                    f"std={descriptor.error_std.item():.6f}"
+                )
             adapter.assert_descriptors_ready()
             adapter.freeze_all()
-    @torch.no_grad()
-    def _calibrate_expansion_thresholds(self, extract_loader):
-        """Calibrate class alarms and task thresholds on held-out Base pseudo-Sessions.
-
-        Class scores use a finite-sample one-sided conformal threshold. Task
-        thresholds are calibrated on disjoint pseudo-Sessions of Base classes;
-        each pseudo-Session is scored against a leave-group-out class threshold,
-        so its classes are not evaluated against a threshold fitted from those
-        same classes. Pseudo-Session size and per-class holdout shots match the
-        incremental protocol whenever Base data permits.
-        """
-        alpha_class = float(getattr(
-            self._visual_moe_cfg(), "EXPANSION_FALSE_POSITIVE_RATE", 0.05
-        ))
-        alpha_task = float(getattr(
-            self._visual_moe_cfg(), "TASK_EXPANSION_FALSE_POSITIVE_RATE", 0.10
-        ))
-        if not 0.0 < alpha_class < 1.0 or not 0.0 < alpha_task < 1.0:
-            raise ValueError("Class/task expansion false-positive rates must be in (0, 1).")
-        if not getattr(self, "_base_calibration_features", None):
-            raise RuntimeError("Base class-score holdout features must be prepared before threshold calibration.")
-
-        dataset_cfg = getattr(self.cfg, "DATASET", None)
-        pseudo_session_size = int(_cfg_value(dataset_cfg, "NUM_INC_CLS", 0))
-        if pseudo_session_size < 1:
-            raise ValueError("Task-level threshold calibration requires DATASET.NUM_INC_CLS >= 1.")
-
-        class_thresholds, task_thresholds = {}, {}
-        for block_idx, adapter in self._moe_adapters():
-            item = self._base_calibration_features[int(block_idx)]
-            values = item["cls_in"].to(self.device)
-            labels = item["labels"].to(self.device)
-            if values.size(0) < 3:
-                raise RuntimeError(f"Block {block_idx} has fewer than three held-out Base representations.")
-            descriptor_scores = adapter.descriptor_scores(values)
-            class_ids = torch.unique(labels, sorted=True)
-            class_score_tensor = torch.stack([
-                torch.stack([
-                    descriptor_scores[labels.eq(class_id), expert_id].median()
-                    for expert_id in range(adapter.num_experts)
-                ]).min()
-                for class_id in class_ids
-            ])
-            if (class_score_tensor.numel() < 3 or not torch.isfinite(class_score_tensor).all()
-                    or any(not labels.eq(class_id).any() for class_id in class_ids)):
-                raise RuntimeError(f"Block {block_idx} has insufficient finite Base classes for threshold calibration.")
-            class_score_by_id = {
-                int(class_id): float(class_score_tensor[row].item())
-                for row, class_id in enumerate(class_ids.tolist())
-            }
-
-            ordered_class_scores = class_score_tensor.float().sort().values
-            class_rank = min(
-                ordered_class_scores.numel(),
-                int(math.ceil((ordered_class_scores.numel() + 1) * (1.0 - alpha_class))),
-            )
-            class_threshold = ordered_class_scores[class_rank - 1]
-            class_thresholds[int(block_idx)] = float(class_threshold.item())
-
-            # Deterministic, non-overlapping class groups form Base pseudo-Sessions.
-            ordered_class_ids = sorted(
-                class_score_by_id,
-                key=lambda class_id: hashlib.sha256(
-                    f"fscil-task-calibration:{class_id}".encode("utf-8")
-                ).digest(),
-            )
-            groups = [
-                ordered_class_ids[start:start + pseudo_session_size]
-                for start in range(0, len(ordered_class_ids) - pseudo_session_size + 1,
-                                   pseudo_session_size)
-            ]
-            minimum_groups = int(math.ceil(1.0 / alpha_task) - 1)
-            if len(groups) < minimum_groups:
-                raise RuntimeError(
-                    f"Block {block_idx} has {len(groups)} Base pseudo-Sessions of "
-                    f"{pseudo_session_size} classes, insufficient for task false-positive "
-                    f"rate {alpha_task:.3f}; at least {minimum_groups} are required."
-                )
-
-            pseudo_task_scores = []
-            for group in groups:
-                group_set = set(group)
-                reference_scores = torch.tensor([
-                    score for class_id, score in class_score_by_id.items()
-                    if class_id not in group_set
-                ], dtype=torch.float32)
-                if reference_scores.numel() < 2:
-                    raise RuntimeError("Leave-group-out Base class calibration requires at least two reference classes.")
-                reference_scores = reference_scores.sort().values
-                reference_rank = min(
-                    reference_scores.numel(),
-                    int(math.ceil((reference_scores.numel() + 1) * (1.0 - alpha_class))),
-                )
-                group_class_threshold = float(reference_scores[reference_rank - 1].item())
-                group_novel_count = sum(
-                    class_score_by_id[class_id] > group_class_threshold
-                    for class_id in group
-                )
-                pseudo_task_scores.append(group_novel_count / float(len(group)))
-
-            ordered_task_scores = torch.tensor(
-                pseudo_task_scores, dtype=torch.float32
-            ).sort().values
-            task_rank = min(
-                ordered_task_scores.numel(),
-                int(math.ceil((ordered_task_scores.numel() + 1) * (1.0 - alpha_task))),
-            )
-            task_threshold = ordered_task_scores[task_rank - 1]
-            task_thresholds[int(block_idx)] = float(task_threshold.item())
-            print(
-                f"=> [ExpansionCalibration][B{block_idx}] class_alpha={alpha_class:.3f} "
-                f"n_base_classes={ordered_class_scores.numel()} class_rank={class_rank} "
-                f"class_threshold={class_threshold.item():.4f} "
-                f"pseudo_sessions={len(groups)} pseudo_size={pseudo_session_size} "
-                f"task_alpha={alpha_task:.3f} task_rank={task_rank} "
-                f"task_threshold={task_threshold.item():.4f} "
-                f"threshold_shots={self._base_threshold_holdout_counts.get(int(block_idx), 0)}"
-            )
-
-        expected_blocks = {int(block) for block, _ in self._moe_adapters()}
-        if set(class_thresholds) != expected_blocks or set(task_thresholds) != expected_blocks:
-            raise RuntimeError("Class/task threshold calibration did not cover every MoE block.")
-        self.expansion_thresholds = class_thresholds
-        self.task_expansion_thresholds = task_thresholds
 
     def _collect_class_anchors(self, loader):
         """Store compact per-class anchors in both stable route and adapted expert-input spaces."""
@@ -1172,7 +985,6 @@ class Runner:
         for _, adapter in self._moe_adapters():
             adapter.freeze_all()
         self._train_base_descriptors(extract_loader)
-        self._calibrate_expansion_thresholds(extract_loader)
 
     def train_incremental_task(self, task_id, train_loader, extract_loader, class_index,
                                current_class_name, old_states):
@@ -1204,20 +1016,11 @@ class Runner:
         incremental_cfg = self.cfg.TRAINER.BiMC.INCREMENTAL
         epochs = int(incremental_cfg.EPOCHS)
         scale = float(incremental_cfg.LOGIT_SCALE)
-        class_thresholds = getattr(self, "expansion_thresholds", None)
-        task_thresholds = getattr(self, "task_expansion_thresholds", None)
-        expected_blocks = {int(block) for block in self.model_without_dp.expandable_blocks()}
-        if (not isinstance(class_thresholds, dict) or set(class_thresholds) != expected_blocks
-                or not isinstance(task_thresholds, dict) or set(task_thresholds) != expected_blocks):
-            raise RuntimeError(
-                "Task-level expansion requires Base-calibrated class and pseudo-Session "
-                "thresholds for every MoE block."
-            )
-        if not all(np.isfinite(float(value)) for value in class_thresholds.values()):
-            raise ValueError("Base-calibrated class thresholds must be finite.")
-        if not all(np.isfinite(float(value)) and 0.0 <= float(value) <= 1.0
-                   for value in task_thresholds.values()):
-            raise ValueError("Base-calibrated task thresholds must be finite and in [0, 1].")
+        expansion_threshold = float(_cfg_value(
+            self._visual_moe_cfg(), "EXPANSION_Z_THRESHOLD", 1.5
+        ))
+        if not np.isfinite(expansion_threshold):
+            raise ValueError("Expansion Z-score threshold must be finite.")
 
         ae_epochs = int(_cfg_value(optim_cfg, "INCREMENTAL_DESCRIPTOR_EPOCHS", 5))
         decisions, expanded, histories = [], [], {}
@@ -1246,16 +1049,14 @@ class Runner:
                 block_idx,
                 expansion_features,
                 class_index,
-                float(class_thresholds[int(block_idx)]),
-                float(task_thresholds[int(block_idx)]),
+                expansion_threshold,
             )
             decisions.append({
                 "block_idx": int(block_idx),
                 "expand": bool(decision.expand),
-                "class_scores": dict(decision.class_scores),
-                "novel_classes": list(decision.novel_classes),
-                "task_novelty_score": float(decision.task_novelty_score),
-                "task_novelty_threshold": float(decision.task_novelty_threshold),
+                "task_shift_score": float(decision.task_shift_score),
+                "task_shift_threshold": float(decision.threshold),
+                "support_count": int(decision.support_count),
             })
             if not decision.expand:
                 continue
@@ -1394,8 +1195,8 @@ class Runner:
                 "expert_id": int(expert_id),
                 "loss": loss_history,
                 "ae_loss": ae_loss,
-                "novel_classes": list(decision.novel_classes),
-                "task_novelty_score": float(decision.task_novelty_score),
+                "task_shift_score": float(decision.task_shift_score),
+                "task_shift_threshold": float(decision.threshold),
                 "classification_samples_per_epoch": samples_per_epoch,
                 "classification_samples_total": int(classification_samples_total),
                 "router_positive_samples_per_epoch": list(samples_per_epoch),
@@ -1412,8 +1213,8 @@ class Runner:
             expanded.append({
                 "block_idx": int(block_idx),
                 "expert_id": int(expert_id),
-                "novel_classes": list(decision.novel_classes),
-                "task_novelty_score": float(decision.task_novelty_score),
+                "task_shift_score": float(decision.task_shift_score),
+                "task_shift_threshold": float(decision.threshold),
             })
 
         for _, adapter in self._moe_adapters():
