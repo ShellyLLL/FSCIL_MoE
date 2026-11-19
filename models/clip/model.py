@@ -748,27 +748,27 @@ class VisualMoEAdapter(nn.Module):
     def forward(self, x, route_input=None):
         if x.ndim != 3:
             raise ValueError("VisualMoEAdapter expects [tokens, batch, dim].")
-        # Both routing and expert functions consume the frozen-reference token
-        # stream. The adapted stream receives only the resulting residual.
-        # This makes every layer's expert-input distribution invariant to
-        # upstream adapter updates and keeps historical expert anchors valid.
+        # Historical Base experts retain the adapted input distribution on
+        # which they were trained. Newly expanded experts consume the frozen
+        # reference stream, making their input/PD anchors invariant to upstream
+        # adapter updates. Every gate is computed in the reference CLS space.
+        adapted_tokens = self.layer_norm(x)
         if route_input is None:
-            expert_tokens = self.layer_norm(x)
+            reference_tokens = adapted_tokens
         elif route_input.ndim == 2 and route_input.shape == x[0].shape:
             # Backward-compatible CLS-only entry for direct adapter unit use.
-            # Production dual-stream ViT always supplies the complete frozen
-            # reference token sequence below.
-            expert_tokens = self.layer_norm(x)
+            reference_tokens = adapted_tokens
             route_features = self.layer_norm(route_input)
         else:
             if route_input.shape != x.shape:
                 raise ValueError("Reference expert tokens must match adapted token shape.")
-            expert_tokens = self.layer_norm(route_input)
+            reference_tokens = self.layer_norm(route_input)
         if route_input is None or route_input.ndim == 3:
-            route_features = expert_tokens[0]
+            route_features = reference_tokens[0]
         logits, weights = self.routing_outputs(route_features)
         residual, norms, output_energies = torch.zeros_like(x), [], []
         for column, expert_id in enumerate(range(self.num_experts)):
+            expert_tokens = adapted_tokens if expert_id < self.base_expert_count else reference_tokens
             expert_output = self.experts[expert_id](expert_tokens)
             weighted = expert_output * weights[:, column].unsqueeze(0).unsqueeze(-1)
             residual = residual + weighted
@@ -778,7 +778,7 @@ class VisualMoEAdapter(nn.Module):
         return residual, {"logits": logits, "route_weights": weights,
                           "top_k_indices": weights.argmax(dim=-1, keepdim=True),
                           "cls_in": route_features,
-                          "expert_in": expert_tokens[0],
+                          "expert_in": reference_tokens[0],
                           "expert_residual_norms": torch.stack(norms),
                           "expert_output_energy": torch.stack(output_energies),
                           "token_residual": residual.detach()}
