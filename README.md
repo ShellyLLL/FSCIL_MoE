@@ -65,7 +65,8 @@ Lifecycle:
    and AE-error-reference sets. Each expert's centered low-rank linear AE is
    fitted using its deployed Base-Softmax responsibility. The independent
    holdout estimates that descriptor's reconstruction-error mean and standard
-   deviation. It does not calibrate the task-level expansion threshold.
+   deviation. The same Base holdout pool is then used to form support-size-
+   matched pseudo-Sessions for Session-Q95 threshold calibration in step 3.
 3. At each incremental Session, collect frozen-reference CLS input
    features for every support source. For each sample, compute its standardized
    reconstruction error under every deployed RD and retain the minimum score:
