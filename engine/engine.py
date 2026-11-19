@@ -841,11 +841,6 @@ class Runner:
             raise ValueError(f"Block {block_idx} Base holdout is insufficient for Session calibration.")
         if not support_sizes:
             raise ValueError("No incremental support-set sizes were supplied for Base threshold calibration.")
-        if max(support_sizes) > heldout_values.size(0):
-            raise ValueError(
-                f"Block {block_idx} Base holdout has {heldout_values.size(0)} sources, "
-                f"but Session calibration requires groups of {max(support_sizes)}."
-            )
         scores = adapter.descriptor_scores(heldout_values, require_ready=True).min(dim=1).values
         generator = torch.Generator(device="cpu").manual_seed(
             int(_cfg_value(moe_cfg, "EXPANSION_CALIBRATION_SEED", 20261119)) + int(block_idx)
