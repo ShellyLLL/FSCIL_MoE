@@ -723,6 +723,20 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             torch.testing.assert_close(
                 restored_model.base_enhanced_visual_prototype, model.base_enhanced_visual_prototype
             )
+            self.assertTrue(all(
+                not parameter.requires_grad
+                for _, adapter in restored._moe_adapters()
+                for parameter in adapter.parameters()
+            ))
+            probe = torch.randn(3, 3, 8, 8)
+            model.eval()
+            restored_model.eval()
+            with torch.no_grad():
+                expected_features = model.extract_img_feature(probe)
+                restored_features = restored_model.extract_img_feature(probe)
+            torch.testing.assert_close(
+                restored_features, expected_features, rtol=0, atol=0
+            )
 
     def test_topology_roundtrip_preserves_experts_and_descriptors(self):
         torch.manual_seed(11)
