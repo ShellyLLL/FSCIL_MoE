@@ -944,9 +944,10 @@ class Runner:
             )
             fit_mask = ~reference_mask
             current_holdout_ids = [int(value) for value in source_ids[reference_mask].tolist()]
-            if not self.base_calibration_source_ids:
+            existing_holdout_ids = getattr(self, "base_calibration_source_ids", [])
+            if not existing_holdout_ids:
                 self.base_calibration_source_ids = current_holdout_ids
-            elif self.base_calibration_source_ids != current_holdout_ids:
+            elif existing_holdout_ids != current_holdout_ids:
                 raise RuntimeError("Base calibration source identities changed across MoE blocks.")
             fit_values = values[fit_mask]
             reference_values = values[reference_mask]
