@@ -1083,15 +1083,16 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             block: {key: value.detach().clone() for key, value in adapter.state_dict().items()}
             for block, adapter in runner._moe_adapters()
         }
-        baseline_block1 = model.collect_blockwise_cls_features([session1_support])[1][
-            "cls_in"
-        ].clone()
+        baseline_block1_features = model.collect_blockwise_cls_features([session1_support])[1]
+        baseline_block1 = baseline_block1_features["cls_in"].clone()
+        baseline_block1_expert_input = baseline_block1_features["expert_in"].clone()
         captured_block1 = {}
         original_plan = model.plan_layer_expansion
 
         def capture_downstream_plan(block_idx, features, class_index, threshold=None):
             if int(block_idx) == 1:
                 captured_block1["cls_in"] = features[1]["cls_in"].detach().clone()
+                captured_block1["expert_in"] = features[1]["expert_in"].detach().clone()
             return original_plan(
                 block_idx, features, class_index, threshold
             )
@@ -1108,6 +1109,9 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         self.assertEqual([adapter.num_experts for _, adapter in runner._moe_adapters()], [3, 3])
         self.assertTrue(captured_block1)
         torch.testing.assert_close(baseline_block1, captured_block1["cls_in"], rtol=0, atol=0)
+        torch.testing.assert_close(
+            baseline_block1_expert_input, captured_block1["expert_in"], rtol=0, atol=0
+        )
         for block, adapter in runner._moe_adapters():
             adapter.assert_descriptors_ready()
             for key, old_value in before_session1[block].items():
