@@ -1501,8 +1501,15 @@ class Runner:
                             "Non-finite Session-level global visual-prototype incremental loss."
                         )
                     loss.backward()
+                    # CE/PD gradients update the new functional expert/router;
+                    # RD gradients update only the descriptor residual. Clip
+                    # these objective groups independently so large CE/PD
+                    # gradients cannot suppress the distribution learner.
                     torch.nn.utils.clip_grad_norm_(
-                        adapter.newest_parameters(include_descriptor=True), 1.0
+                        adapter.newest_parameters(include_descriptor=False), 1.0
+                    )
+                    torch.nn.utils.clip_grad_norm_(
+                        descriptor.trainable_parameters(), 1.0
                     )
                     optimizer.step()
                     batch_size = int(all_labels.numel())
