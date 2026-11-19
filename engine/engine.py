@@ -1037,7 +1037,7 @@ class Runner:
         )
 
     def _collect_class_anchors(self, loader):
-        """Store compact per-class anchors in both stable route and adapted expert-input spaces."""
+        """Store compact per-class anchors in the shared frozen-reference input space."""
         feature_map = self.model_without_dp.collect_blockwise_cls_features(loader)
         anchors = {}
         for block_idx, item in feature_map.items():
