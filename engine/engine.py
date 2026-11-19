@@ -377,7 +377,7 @@ class Runner:
         checkpoint_policy = payload.get("expansion_policy")
         if checkpoint_policy != self._expansion_policy():
             raise ValueError(
-                "Checkpoint expansion policy does not match the configured task-level "
+                "Checkpoint expansion policy does not match the configured Session-level "
                 f"contract: {checkpoint_policy} versus {self._expansion_policy()}."
             )
         if not isinstance(payload["model_state"], dict):
