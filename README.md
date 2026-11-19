@@ -96,15 +96,7 @@ Lifecycle:
    direction using a calibration strength controlled by semantic confidence
    and support-prototype reliability. Only novel visual prototypes are
    calibrated; historical prototypes remain unchanged.
-6. After expert training and freezing, compute each novel class's adapted
-   visual support prototype. Encode its class description with the frozen
-   CLIP text encoder. Description-semantic similarity retrieves related Base
-   description semantics and their corresponding Base **adapted visual**
-   prototypes. Blend the novel visual prototype with this retrieved visual
-   direction using a calibration strength controlled by semantic confidence
-   and support-prototype reliability. Only novel visual prototypes are
-   calibrated; historical prototypes remain unchanged.
-7. Merge all seen-class visual prototypes into one global visual classifier.
+6. Merge all seen-class visual prototypes into one global visual classifier.
    Training uses source-exclusive leave-one-out novel visual prototypes to
    prevent support-query leakage. Inference uses one current CLIP+MoE feature
    path and the global visual prototype bank. AE is not used at inference;
