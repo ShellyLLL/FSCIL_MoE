@@ -1242,14 +1242,34 @@ class Runner:
             )
             anchor_sets = self._all_old_anchor_sets(old_states, block_idx)
             anchor_mean, anchor_var = anchor_sets["route_mean"], anchor_sets["route_var"]
+            descriptor = adapter.descriptors[expert_id]
+            descriptor.set_trainable(True)
+            descriptor.train()
+            descriptor_noise_scale = float(_cfg_value(
+                self._visual_moe_cfg(), "DESCRIPTOR_DENOISE_SCALE", 0.05
+            ))
+            descriptor_residual_weight = float(_cfg_value(
+                self._visual_moe_cfg(), "DESCRIPTOR_RESIDUAL_WEIGHT", 1e-3
+            ))
+            rd_weight = float(_cfg_value(incremental_cfg, "RD_WEIGHT", 1.0))
+            if (not np.isfinite(descriptor_noise_scale) or descriptor_noise_scale < 0
+                    or not np.isfinite(descriptor_residual_weight) or descriptor_residual_weight < 0
+                    or not np.isfinite(rd_weight) or rd_weight < 0):
+                raise ValueError("RD noise, residual and objective weights must be finite and non-negative.")
+            noise_std = adapter.base_feature_std.to(self.device).reshape(1, -1) * descriptor_noise_scale
+            source_to_row = {
+                int(source_id): row for row, source_id in enumerate(local_item["source_ids"].tolist())
+            }
             optimizer = optim.AdamW([
                 {"params": adapter.experts[-1].parameters(),
                  "lr": float(optim_cfg.LR_INCREMENTAL_EXPERT)},
                 {"params": adapter.router.columns[-1].parameters(),
                  "lr": float(optim_cfg.LR_INCREMENTAL_ROUTER)},
+                {"params": descriptor.trainable_parameters(),
+                 "lr": float(_cfg_value(optim_cfg, "LR_DESCRIPTOR", 1e-3))},
             ], weight_decay=float(optim_cfg.WEIGHT_DECAY))
 
-            loss_history = []
+            loss_history, ce_history, rd_history, pd_history = [], [], [], []
             classification_samples_total = 0
             samples_per_epoch = []
             observed_train_classes = set()
@@ -1257,7 +1277,7 @@ class Runner:
                 bank = self._build_incremental_bank(
                     extract_loader, class_index, old_states)
                 self.model.train()
-                total, count = 0.0, 0
+                total, ce_total, rd_total, pd_total, count = 0.0, 0.0, 0.0, 0.0, 0
                 epoch_samples = 0
                 for batch in train_loader:
                     all_images, all_labels = self.parse_batch(batch)
@@ -1280,11 +1300,6 @@ class Runner:
                     aux_by_block = {
                         block: aux for (block, _), aux in zip(self._moe_adapters(), route_aux)
                     }
-                    route_logits = aux_by_block[int(block_idx)]["logits"][:, -1]
-                    route_targets = torch.ones_like(route_logits)
-                    route_responsibility = F.binary_cross_entropy_with_logits(
-                        route_logits, route_targets
-                    )
                     logits, targets = self._global_incremental_logits(
                         all_images, all_labels, all_source_ids, bank, scale
                     )
@@ -1292,13 +1307,23 @@ class Runner:
                     old_suppression = adapter.old_route_suppression_loss(
                         anchor_mean, anchor_var
                     )
-                    loss = (
-                        classification
-                        + float(getattr(incremental_cfg, "ROUTE_WEIGHT", 1.0))
-                        * route_responsibility
-                        + float(getattr(incremental_cfg, "OLD_SUPPRESSION_WEIGHT", 1.0))
-                        * old_suppression
-                    )
+                    try:
+                        rd_rows = torch.as_tensor(
+                            [source_to_row[int(source_id)] for source_id in all_source_ids.tolist()],
+                            device=self.device, dtype=torch.long,
+                        )
+                    except KeyError as error:
+                        raise KeyError(
+                            f"Training source {error.args[0]} is absent from the Session RD feature cache."
+                        ) from error
+                    rd_clean = local_values[rd_rows]
+                    rd_noisy = rd_clean + torch.randn_like(rd_clean) * noise_std
+                    rd_reconstruction = descriptor(rd_noisy)
+                    rd_reconstruction_loss = F.mse_loss(rd_reconstruction, rd_clean)
+                    rd_residual_loss = descriptor.residual_output(rd_clean).square().mean()
+                    rd_loss = rd_reconstruction_loss + descriptor_residual_weight * rd_residual_loss
+                    pd_weight = float(getattr(incremental_cfg, "OLD_SUPPRESSION_WEIGHT", 1.0))
+                    loss = classification + pd_weight * old_suppression + rd_weight * rd_loss
                     if not bool(torch.isfinite(loss).item()):
                         raise FloatingPointError(
                             "Non-finite task-level global visual-prototype incremental loss."
@@ -1308,6 +1333,9 @@ class Runner:
                     optimizer.step()
                     batch_size = int(all_labels.numel())
                     total += float(loss.item()) * batch_size
+                    ce_total += float(classification.item()) * batch_size
+                    rd_total += float(rd_loss.item()) * batch_size
+                    pd_total += float(old_suppression.item()) * batch_size
                     count += batch_size
                     epoch_samples += batch_size
                     classification_samples_total += batch_size
@@ -1321,52 +1349,34 @@ class Runner:
                     )
                 samples_per_epoch.append(int(epoch_samples))
                 loss_history.append(total / count)
-            adapter.freeze_all()
+                ce_history.append(ce_total / count)
+                rd_history.append(rd_total / count)
+                pd_history.append(pd_total / count)
 
-            # Fit and calibrate the paired descriptor on all current-Session
-            # reference CLS features, with disjoint source identities per class.
-            local_labels = local_item["labels"].to(self.device)
-            local_sources = local_item["source_ids"].to(self.device)
-            if sorted(int(value) for value in torch.unique(local_labels, sorted=True).tolist()) != expected_classes:
-                raise RuntimeError(
-                    f"Block {block_idx} descriptor data do not cover all current Session classes."
-                )
-            calibration_mask = self._make_calibration_mask(
-                local_labels, local_sources,
-                min_calibration_count=2, min_fit_per_class=3,
-                min_calibration_per_class=2,
-            )
-            fit_mask = ~calibration_mask
-            ae_fit_values = local_values[fit_mask]
-            ae_calibration_values = local_values[calibration_mask]
-            ae_fit_labels = local_labels[fit_mask]
-            ae_calibration_labels = local_labels[calibration_mask]
-            fit_class_ids = sorted(int(value) for value in torch.unique(
-                ae_fit_labels, sorted=True
-            ).tolist())
-            calibration_class_ids = sorted(int(value) for value in torch.unique(
-                ae_calibration_labels, sorted=True
-            ).tolist())
-            if fit_class_ids != expected_classes or calibration_class_ids != expected_classes:
-                raise RuntimeError(
-                    f"Block {block_idx} AE fit/calibration split must include every current class."
-                )
+            # The paired RD is optimized jointly with the new expert/router,
+            # but only its zero-output low-rank residual receives RD gradients.
+            # Its reference statistics are estimated from the full Session.
+            descriptor.eval()
             with torch.no_grad():
-                # The descriptor models the complete Session distribution,
-                # weighted by the exact deployed responsibility of its paired
-                # incremental expert.  No current class is filtered out.
-                ae_fit_weights = adapter.expert_responsibility(ae_fit_values, expert_id)
-            ae_loss = self._train_descriptor(
-                adapter, expert_id, ae_fit_values, ae_epochs,
-                sample_weights=ae_fit_weights,
-                calibration_values=ae_calibration_values,
-            )
+                session_errors = descriptor.reconstruction_error(local_values)
+                descriptor.update_reference(session_errors)
             adapter.freeze_all()
+            ae_loss = float(rd_history[-1])
+            calibration_count = int(local_values.size(0))
+            local_labels = local_item["labels"].to(self.device)
+            fit_class_ids = sorted(int(value) for value in torch.unique(
+                local_labels, sorted=True
+            ).tolist())
+            calibration_class_ids = fit_class_ids
+
             histories[block_idx] = {
                 "expert_id": int(expert_id),
                 "descriptor_anchor_id": int(anchor_expert_id),
                 "descriptor_anchor_q90": [float(value) for value in anchor_q90.detach().cpu().tolist()],
                 "loss": loss_history,
+                "ce_loss": ce_history,
+                "rd_loss": rd_history,
+                "pd_loss": pd_history,
                 "ae_loss": ae_loss,
                 "task_shift_score": float(decision.task_shift_score),
                 "task_false_alarm_rate": float(decision.threshold),
@@ -1375,7 +1385,7 @@ class Runner:
                 "router_positive_samples_per_epoch": list(samples_per_epoch),
                 "router_positive_fraction": 1.0,
                 "ae_fit_samples": int(ae_fit_values.size(0)),
-                "ae_calibration_sources": int(calibration_mask.sum().item()),
+                "ae_calibration_sources": calibration_count,
                 "ae_effective_calibration_count": float(
                     adapter.descriptors[expert_id].effective_error_count.item()
                 ),
