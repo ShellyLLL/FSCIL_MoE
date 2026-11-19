@@ -52,7 +52,7 @@ class TinyLifecycleBlock(nn.Module):
 
     def forward_dual(self, adapted_tokens, reference_tokens):
         residual, aux = self.moe_adapter(
-            adapted_tokens, route_input=reference_tokens[0]
+            adapted_tokens, route_input=reference_tokens
         )
         return adapted_tokens + residual, reference_tokens, aux
 
