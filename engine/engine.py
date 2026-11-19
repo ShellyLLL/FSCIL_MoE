@@ -864,8 +864,9 @@ class Runner:
         if heldout_labels.numel() != heldout_values.size(0):
             raise ValueError("Base holdout labels must align with reference features.")
         classes = torch.unique(heldout_labels, sorted=True)
-        if classes.numel() < 2:
-            raise ValueError("Session threshold calibration requires multiple Base classes.")
+        configured_classes = int(self.cfg.DATASET.NUM_INC_CLS)
+        if configured_classes < 1 or classes.numel() < configured_classes:
+            raise ValueError("Base holdout has fewer classes than an incremental Session.")
         class_rows = {
             int(class_id): torch.nonzero(heldout_labels.eq(class_id), as_tuple=False).flatten().cpu()
             for class_id in classes.tolist()
@@ -875,10 +876,7 @@ class Runner:
         generator = torch.Generator(device="cpu").manual_seed(
             int(_cfg_value(moe_cfg, "EXPANSION_CALIBRATION_SEED", 20261119)) + int(block_idx)
         )
-        thresholds = {}
-        configured_classes = int(self.cfg.DATASET.NUM_INC_CLS)
-        if configured_classes < 1:
-            raise ValueError("NUM_INC_CLS must be positive for Session threshold calibration.")
+        thresholds = {
         for size in support_sizes:
             size = int(size)
             quotient, remainder = divmod(size, configured_classes)
