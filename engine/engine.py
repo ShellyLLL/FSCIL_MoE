@@ -116,8 +116,6 @@ class Runner:
             "calibration_groups": int(_cfg_value(moe_cfg, "EXPANSION_CALIBRATION_GROUPS", 256)),
             "expert_training_scope": "all_current_session_samples",
             "descriptor_training_scope": "all_current_session_reference_cls",
-            "expert_training_scope": "all_current_session_samples",
-            "descriptor_training_scope": "all_current_session_reference_cls",
             "router_positive_scope": "all_current_session_samples",
             "visual_moe_enabled": bool(_cfg_value(moe_cfg, "ENABLE", False)),
             "insert_blocks": [int(value) for value in _cfg_value(moe_cfg, "INSERT_BLOCKS", [])],
@@ -145,7 +143,7 @@ class Runner:
                 "epochs": int(_cfg_value(incremental_cfg, "EPOCHS", 6)),
                 "logit_scale": float(_cfg_value(incremental_cfg, "LOGIT_SCALE", 100.0)),
                 "old_suppression_weight": float(_cfg_value(incremental_cfg, "OLD_SUPPRESSION_WEIGHT", 1.0)),
-                "route_weight": float(_cfg_value(incremental_cfg, "ROUTE_WEIGHT", 1.0)),
+                "rd_weight": float(_cfg_value(incremental_cfg, "RD_WEIGHT", 1.0)),
             },
             "optimizer": {
                 "base_epochs": int(_cfg_value(optim_cfg, "BASE_EPOCHS", 50)),
@@ -799,6 +797,60 @@ class Runner:
                 raise RuntimeError(f"AE calibration split left too few fitting sources for class {class_id}.")
         return mask
 
+    def _incremental_support_sizes(self):
+        """Return exact total support counts for every configured incremental Session."""
+        manifest = self.data_manager.get_support_manifest()
+        sizes = set()
+        for session_key, class_map in manifest.get("sessions", {}).items():
+            if int(session_key) == 0:
+                continue
+            size = sum(len(source_ids) for source_ids in class_map.values())
+            if size > 0:
+                sizes.add(int(size))
+        if not sizes:
+            dataset_cfg = self.cfg.DATASET
+            sizes.add(int(dataset_cfg.NUM_INC_CLS) * int(dataset_cfg.NUM_INC_SHOT))
+        return sorted(sizes)
+
+    @torch.no_grad()
+    def _calibrate_session_expansion_thresholds(self, adapter, heldout_values, support_sizes, block_idx):
+        """Calibrate one Session-Q95 threshold per support-set size from Base holdout CLS."""
+        moe_cfg = self._visual_moe_cfg()
+        quantile = float(_cfg_value(moe_cfg, "EXPANSION_THRESHOLD_QUANTILE", 0.95))
+        groups = int(_cfg_value(moe_cfg, "EXPANSION_CALIBRATION_GROUPS", 256))
+        if not 0.0 < quantile < 1.0 or groups < 20:
+            raise ValueError("Session threshold calibration requires Q in (0,1) and at least 20 groups.")
+        heldout_values = torch.as_tensor(heldout_values, device=self.device).float()
+        if (heldout_values.ndim != 2 or heldout_values.size(0) < 2
+                or not torch.isfinite(heldout_values).all()):
+            raise ValueError(f"Block {block_idx} Base holdout is insufficient for Session calibration.")
+        if not support_sizes:
+            raise ValueError("No incremental support-set sizes were supplied for Base threshold calibration.")
+        if max(support_sizes) > heldout_values.size(0):
+            raise ValueError(
+                f"Block {block_idx} Base holdout has {heldout_values.size(0)} sources, "
+                f"but Session calibration requires groups of {max(support_sizes)}."
+            )
+        scores = adapter.descriptor_scores(heldout_values, require_ready=True).min(dim=1).values
+        generator = torch.Generator(device="cpu").manual_seed(
+            int(_cfg_value(moe_cfg, "EXPANSION_CALIBRATION_SEED", 20261119)) + int(block_idx)
+        )
+        thresholds = {}
+        cpu_scores = scores.detach().cpu()
+        for size in support_sizes:
+            group_q90 = []
+            for _ in range(groups):
+                indices = torch.randperm(cpu_scores.numel(), generator=generator)[:int(size)]
+                group_q90.append(torch.quantile(cpu_scores[indices], 0.90))
+            thresholds[int(size)] = float(torch.quantile(
+                torch.stack(group_q90), quantile
+            ).item())
+        print(
+            f"=> [Session-Threshold][B{block_idx}] "
+            + " ".join(f"N={size}:Q95={value:.6f}" for size, value in sorted(thresholds.items()))
+        )
+        return thresholds
+
     def _train_base_descriptors(self, extract_loader):
         """Fit Base AEs and independent reconstruction-error reference statistics.
 
@@ -810,6 +862,8 @@ class Runner:
         epochs = int(_cfg_value(self.cfg.TRAINER.BiMC.OPTIM, "BASE_DESCRIPTOR_EPOCHS", 8))
         print(f"\n========== Fit Base AE Distribution Descriptors ({epochs} epochs) ==========")
         feature_map = self.model_without_dp.collect_blockwise_cls_features(extract_loader)
+        support_sizes = self._incremental_support_sizes()
+        self.expansion_thresholds = {}
         for block_idx, adapter in self._moe_adapters():
             item = feature_map[block_idx]
             values = item["cls_in"].to(self.device)
@@ -862,6 +916,9 @@ class Runner:
                 )
             adapter.assert_descriptors_ready()
             adapter.freeze_all()
+            self.expansion_thresholds[int(block_idx)] = self._calibrate_session_expansion_thresholds(
+                adapter, reference_values, support_sizes, block_idx
+            )
 
     def _collect_class_anchors(self, loader):
         """Store compact per-class anchors in both stable route and adapted expert-input spaces."""
@@ -1132,11 +1189,8 @@ class Runner:
         incremental_cfg = self.cfg.TRAINER.BiMC.INCREMENTAL
         epochs = int(incremental_cfg.EPOCHS)
         scale = float(incremental_cfg.LOGIT_SCALE)
-        expansion_threshold = float(_cfg_value(
-            self._visual_moe_cfg(), "EXPANSION_FALSE_ALARM_RATE", 0.05
-        ))
-        if not np.isfinite(expansion_threshold):
-            raise ValueError("Expansion Z-score threshold must be finite.")
+        if not self.expansion_thresholds:
+            raise RuntimeError("Base Session-Q95 expansion thresholds have not been calibrated.")
 
         ae_epochs = int(_cfg_value(optim_cfg, "INCREMENTAL_DESCRIPTOR_EPOCHS", 5))
         decisions, expanded, histories = [], [], {}
@@ -1165,7 +1219,9 @@ class Runner:
                 block_idx,
                 expansion_features,
                 class_index,
-                expansion_threshold,
+                self.expansion_thresholds.get(int(block_idx), {}).get(
+                    int(expansion_features[int(block_idx)]["cls_in"].size(0))
+                ),
             )
             decisions.append({
                 "block_idx": int(block_idx),
