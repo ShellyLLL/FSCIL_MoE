@@ -728,7 +728,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
                 for _, adapter in restored._moe_adapters()
                 for parameter in adapter.parameters()
             ))
-            probe = torch.randn(3, 3, 8, 8)
+            probe = torch.randn(3, 8)
             model.eval()
             restored_model.eval()
             with torch.no_grad():
