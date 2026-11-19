@@ -1399,7 +1399,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             adapter.assert_descriptors_ready()
             self.assertTrue(all(not parameter.requires_grad for parameter in adapter.parameters()))
 
-    def test_ae_calibration_failure_rolls_back_expansions_across_all_blocks(self):
+    def test_full_session_rd_reference_failure_rolls_back_expansions_across_all_blocks(self):
         torch.manual_seed(131)
         runner, model = build_lifecycle_runner()
         base_support = lifecycle_batch(
@@ -1414,28 +1414,24 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             1, torch.tensor([0., 1., 0., 0., 0., 0., 0., 0.]), 4010,
             augmented=True, seed=137,
         )
-        original_fit = runner._train_descriptor
+        original_update = RepresentationDescriptor.update_reference
         calls = {"count": 0}
 
-        def fail_second_layer(adapter, expert_id, values, epochs, sample_weights=None,
-                              calibration_values=None, calibration_weights=None):
-            calls["count"] += 1
-            if calls["count"] == 2:
-                raise RuntimeError("injected AE calibration failure")
-            return original_fit(
-                adapter, expert_id, values, epochs, sample_weights,
-                calibration_values=calibration_values,
-                calibration_weights=calibration_weights,
-            )
+        def fail_second_new_rd_reference(descriptor, errors, weights=None):
+            if descriptor.is_anchored:
+                calls["count"] += 1
+                if calls["count"] == 2:
+                    raise RuntimeError("injected full-Session RD reference failure")
+            return original_update(descriptor, errors, weights)
 
-        runner._train_descriptor = fail_second_layer
+        RepresentationDescriptor.update_reference = fail_second_new_rd_reference
         try:
-            with self.assertRaisesRegex(RuntimeError, "injected AE calibration failure"):
+            with self.assertRaisesRegex(RuntimeError, "injected full-Session RD reference failure"):
                 runner.train_incremental_task(
                     1, [train], [support], [1], ["class_1"], [base_state]
                 )
         finally:
-            runner._train_descriptor = original_fit
+            RepresentationDescriptor.update_reference = original_update
         self.assertEqual(calls["count"], 2)
         self.assertEqual(
             [adapter.num_experts for _, adapter in runner._moe_adapters()], [2, 2]
