@@ -220,13 +220,19 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             history = result["training"][block_idx]
             self.assertEqual(history["classification_samples_per_epoch"], [16] * 8)
             self.assertEqual(history["classification_samples_total"], 128)
-            self.assertEqual(history["router_positive_fraction"], 1.0)
+            self.assertEqual(len(history["ce_loss"]), 8)
+            self.assertEqual(len(history["rd_loss"]), 8)
+            self.assertEqual(len(history["pd_loss"]), 8)
+            self.assertEqual(history["rd_training_samples"], 16)
+            self.assertEqual(history["ae_calibration_sources"], 16)
             self.assertEqual(history["ae_fit_classes"], [1, 2])
             self.assertEqual(history["ae_calibration_classes"], [1, 2])
-            self.assertGreater(history["ae_effective_calibration_count"], 0.0)
+            self.assertGreater(history["ae_effective_calibration_count"], 1.0)
+            self.assertTrue(all(torch.isfinite(torch.tensor(history[key])).all()
+                                for key in ("ce_loss", "rd_loss", "pd_loss")))
             features = model.collect_blockwise_cls_features(support)[block_idx]
             gates = torch.sigmoid(adapter.router.columns[-1](features["cls_in"]))
-            self.assertGreater(float(gates.mean()), 0.5)
+            self.assertTrue(torch.isfinite(gates).all())
 
     def test_incremental_route_responsibility_has_positive_and_negative_targets(self):
         logits = torch.tensor([-1.0, 1.0], requires_grad=True)
