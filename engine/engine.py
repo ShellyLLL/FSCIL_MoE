@@ -1543,6 +1543,24 @@ class Runner:
                     descriptor_calibration_values
                 )
                 descriptor.update_reference(session_errors)
+                rd_fit_z = descriptor.standardized_score(descriptor_fit_values)
+                rd_calibration_z = descriptor.standardized_score(descriptor_calibration_values)
+                rd_session_z = descriptor.standardized_score(local_values)
+                rd_calibration_diagnostics = {
+                    "fit_q90": float(torch.quantile(rd_fit_z, 0.90).item()),
+                    "calibration_q90": float(torch.quantile(rd_calibration_z, 0.90).item()),
+                    "session_q90": float(torch.quantile(rd_session_z, 0.90).item()),
+                    "error_mean": float(descriptor.error_mean.item()),
+                    "error_std": float(descriptor.error_std.item()),
+                }
+            print(
+                f"=> [RD-Calibration][B{block_idx}][E{expert_id}] "
+                f"fit_q90={rd_calibration_diagnostics['fit_q90']:.4f} "
+                f"heldout_q90={rd_calibration_diagnostics['calibration_q90']:.4f} "
+                f"session_q90={rd_calibration_diagnostics['session_q90']:.4f} "
+                f"error_mean={rd_calibration_diagnostics['error_mean']:.8g} "
+                f"error_std={rd_calibration_diagnostics['error_std']:.8g}"
+            )
             adapter.freeze_all()
             # Adding an RD changes min_k z_{i,k}; the previous Base threshold
             # is no longer calibrated for this expert pool.
