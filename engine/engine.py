@@ -1378,7 +1378,7 @@ class Runner:
                 for class_id in torch.unique(local_labels, sorted=True).tolist()
             ]
             calibration_per_class = max(
-                2, int(math.ceil(0.25 * min(class_source_counts)))
+                2, int(math.ceil(0.40 * min(class_source_counts)))
             )
             calibration_mask = self._make_calibration_mask(
                 local_labels, local_sources,
