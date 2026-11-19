@@ -383,6 +383,8 @@ class BottleneckExpert(nn.Module):
             raise ValueError("Expert dropout must be in [0, 1).")
         hidden_dim = max(1, int(d_model) // max(1, int(reduction)))
         self.c_fc, self.gelu = nn.Linear(d_model, hidden_dim), QuickGELU()
+        nn.init.kaiming_normal_(self.c_fc.weight, nonlinearity="relu")
+        nn.init.zeros_(self.c_fc.bias)
         self.dropout = nn.Dropout(dropout)
         self.c_proj = nn.Linear(hidden_dim, d_model)
         if zero_init_up:
