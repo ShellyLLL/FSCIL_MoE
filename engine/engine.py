@@ -956,6 +956,14 @@ class Runner:
                 "class_ids": torch.tensor(class_ids, dtype=torch.long),
                 "route_mean": route_mean,
                 "route_var": route_var,
+                "expert_mean": torch.stack([
+                    item["expert_in"].float()[labels.eq(class_id)].mean(0)
+                    for class_id in torch.unique(labels, sorted=True)
+                ]).cpu().half(),
+                "expert_var": torch.stack([
+                    item["expert_in"].float()[labels.eq(class_id)].var(0, unbiased=False).clamp_min(1e-6)
+                    for class_id in torch.unique(labels, sorted=True)
+                ]).cpu().half(),
                 # Keep the old names as read-only aliases for diagnostics.
                 "mean": route_mean,
                 "var": route_var,
@@ -963,7 +971,7 @@ class Runner:
         return anchors
 
     def _all_old_anchor_sets(self, old_states, block_idx):
-        route_means, route_variances = [], []
+        route_means, route_variances, expert_means, expert_variances = [], [], [], []
         for state in old_states:
             bank = state.get("anchor_by_block", {}).get(int(block_idx))
             if bank is None:
@@ -974,13 +982,21 @@ class Runner:
                 raise ValueError(f"Block {block_idx} old-class anchors must include reference route statistics.")
             route_means.append(torch.as_tensor(route_mean, device=self.device).float())
             route_variances.append(torch.as_tensor(route_var, device=self.device).float())
+            expert_mean, expert_var = bank.get("expert_mean"), bank.get("expert_var")
+            if expert_mean is None or expert_var is None:
+                raise ValueError(f"Block {block_idx} old-class anchors lack adapted expert-input statistics.")
+            expert_means.append(torch.as_tensor(expert_mean, device=self.device).float())
+            expert_variances.append(torch.as_tensor(expert_var, device=self.device).float())
         if not route_means:
             return {
                 "route_mean": None, "route_var": None,
+                "expert_mean": None, "expert_var": None,
             }
         return {
             "route_mean": torch.cat(route_means, dim=0),
             "route_var": torch.cat(route_variances, dim=0),
+            "expert_mean": torch.cat(expert_means, dim=0),
+            "expert_var": torch.cat(expert_variances, dim=0),
         }
 
     def _all_old_anchors(self, old_states, block_idx):
@@ -1256,6 +1272,9 @@ class Runner:
             )
             anchor_sets = self._all_old_anchor_sets(old_states, block_idx)
             anchor_mean, anchor_var = anchor_sets["route_mean"], anchor_sets["route_var"]
+            expert_anchor_mean, expert_anchor_var = (
+                anchor_sets["expert_mean"], anchor_sets["expert_var"]
+            )
             descriptor = adapter.descriptors[expert_id]
             descriptor.set_trainable(True)
             descriptor.train()
@@ -1320,8 +1339,9 @@ class Runner:
                         all_images, all_labels, all_source_ids, bank, scale
                     )
                     classification = F.cross_entropy(logits, targets)
-                    old_suppression = adapter.old_route_suppression_loss(
-                        anchor_mean, anchor_var
+                    old_suppression = adapter.old_feature_preservation_loss(
+                        anchor_mean, anchor_var,
+                        expert_anchor_mean, expert_anchor_var,
                     )
                     try:
                         rd_rows = torch.as_tensor(
@@ -1407,6 +1427,9 @@ class Runner:
                 ),
                 "rd_session_classes": calibration_class_ids,
                 "old_anchor_gate_mean": adapter.old_anchor_response(anchor_mean, anchor_var),
+                "old_anchor_residual_norm": adapter.old_anchor_residual_response(
+                    anchor_mean, anchor_var, expert_anchor_mean, expert_anchor_var
+                ),
             }
             expanded.append({
                 "block_idx": int(block_idx),
