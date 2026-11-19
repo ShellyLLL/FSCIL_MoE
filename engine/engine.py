@@ -89,12 +89,12 @@ class Runner:
         model_cfg = _cfg_value(self.cfg, "MODEL", None)
         backbone_cfg = _cfg_value(model_cfg, "BACKBONE", None)
         return {
-            "version": 3,
+            "version": 4,
             "decision_unit": "incremental_session",
-            "sample_score": "minimum_weighted_standardized_reconstruction_error",
-            "task_score": "median_over_all_current_session_support_samples",
-            "decision": "task_score_greater_than_fixed_zscore_threshold",
-            "threshold": float(_cfg_value(moe_cfg, "EXPANSION_Z_THRESHOLD", 1.5)),
+            "sample_score": "maximum_upper_tail_conformal_pvalue_over_deployed_experts",
+            "task_score": "exact_binomial_lower_median_pvalue",
+            "decision": "task_pvalue_less_than_false_alarm_rate",
+            "false_alarm_rate": float(_cfg_value(moe_cfg, "EXPANSION_FALSE_ALARM_RATE", 0.05)),
             "expert_training_scope": "all_current_session_samples",
             "descriptor_training_scope": "all_current_session_reference_cls",
             "router_positive_scope": "all_current_session_samples",
@@ -311,9 +311,9 @@ class Runner:
         if missing:
             raise ValueError(f"Resume checkpoint is missing required fields: {missing}")
         schema = int(payload["schema_version"])
-        if schema != 23:
+        if schema != 24:
             raise ValueError(
-                "This branch uses robust task-level AE expansion checkpoint schema (23); "
+                "This branch uses robust task-level AE expansion checkpoint schema (24); "
                 "older class-level and pseudo-Session calibration checkpoints are incompatible."
             )
         checkpoint_policy = payload.get("expansion_policy")
@@ -509,7 +509,7 @@ class Runner:
         directory.mkdir(parents=True, exist_ok=True)
         topology = self.model_without_dp.export_moe_topology()
         payload = {
-            "schema_version": 23,
+            "schema_version": 24,
             "completed_session": int(completed_session),
             "model_state": self._cpu_copy(self.model_without_dp.state_dict()),
             "moe_topology": topology,
@@ -745,7 +745,6 @@ class Runner:
                     adapter, expert_id, fit_values, epochs,
                     fit_responsibilities[:, expert_id],
                     calibration_values=reference_values,
-                    calibration_weights=reference_responsibilities[:, expert_id],
                 )
                 descriptor = adapter.descriptors[expert_id]
                 if int(descriptor.error_count.item()) < 2:
@@ -1069,7 +1068,7 @@ class Runner:
                 "block_idx": int(block_idx),
                 "expand": bool(decision.expand),
                 "task_shift_score": float(decision.task_shift_score),
-                "task_shift_threshold": float(decision.threshold),
+                "task_false_alarm_rate": float(decision.threshold),
                 "support_count": int(decision.support_count),
             })
             if not decision.expand:
@@ -1202,7 +1201,6 @@ class Runner:
                 adapter, expert_id, ae_fit_values, ae_epochs,
                 sample_weights=ae_fit_weights,
                 calibration_values=ae_calibration_values,
-                calibration_weights=ae_calibration_weights,
             )
             adapter.freeze_all()
             histories[block_idx] = {
@@ -1210,7 +1208,7 @@ class Runner:
                 "loss": loss_history,
                 "ae_loss": ae_loss,
                 "task_shift_score": float(decision.task_shift_score),
-                "task_shift_threshold": float(decision.threshold),
+                "task_false_alarm_rate": float(decision.threshold),
                 "classification_samples_per_epoch": samples_per_epoch,
                 "classification_samples_total": int(classification_samples_total),
                 "router_positive_samples_per_epoch": list(samples_per_epoch),
