@@ -938,10 +938,13 @@ class Runner:
             adapter.set_base_feature_stats(values)
             # Independent error-reference sources are held out from AE fitting.
             # Every Base class contributes to both partitions.
+            base_class_count = int(torch.unique(labels, sorted=True).numel())
+            per_class_session_capacity = max(3, max(support_sizes))
             reference_mask = self._make_calibration_mask(
                 labels, source_ids,
-                min_calibration_count=max(3, max(support_sizes)),
-                min_fit_per_class=5, min_calibration_per_class=3,
+                min_calibration_count=per_class_session_capacity * base_class_count,
+                min_fit_per_class=5,
+                min_calibration_per_class=per_class_session_capacity,
             )
             fit_mask = ~reference_mask
             current_holdout_ids = [int(value) for value in source_ids[reference_mask].tolist()]
