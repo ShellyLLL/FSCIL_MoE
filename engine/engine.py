@@ -108,7 +108,7 @@ class Runner:
         loss_cfg = _cfg_value(trainer_cfg, "LOSS", None)
         dataset_cfg = _cfg_value(self.cfg, "DATASET", None)
         return {
-            "version": 8,
+            "version": 9,
             "decision_unit": "incremental_session",
             "sample_score": "minimum_standardized_reconstruction_error_over_current_deployed_RDs",
             "threshold_refresh": "recalibrate_base_pseudo_sessions_after_every_expert_pool_change",
@@ -117,6 +117,7 @@ class Runner:
             "threshold_quantile": float(_cfg_value(moe_cfg, "EXPANSION_THRESHOLD_QUANTILE", 0.95)),
             "calibration_groups": int(_cfg_value(moe_cfg, "EXPANSION_CALIBRATION_GROUPS", 256)),
             "expert_training_scope": "all_current_session_samples",
+            "expert_input_space": "frozen_reference_vit_tokens_for_all_expert_generations",
             "gradient_clipping": "separate_functional_and_descriptor_groups_norm_1.0",
             "descriptor_training_scope": "source_disjoint_fit_partition_of_current_session_reference_cls",
             "descriptor_calibration_scope": "source_disjoint_heldout_partition_of_current_session_reference_cls",
@@ -374,9 +375,9 @@ class Runner:
         if missing:
             raise ValueError(f"Resume checkpoint is missing required fields: {missing}")
         schema = int(payload["schema_version"])
-        if schema != 28:
+        if schema != 29:
             raise ValueError(
-                "This branch uses dynamic-pool Base-recalibrated Session-Q90 expansion checkpoint schema (28); "
+                "This branch uses frozen-reference expert-input dynamic-pool checkpoint schema (29); "
                 "older conformal/median expansion checkpoints are incompatible."
             )
         checkpoint_policy = payload.get("expansion_policy")
@@ -611,7 +612,7 @@ class Runner:
         directory.mkdir(parents=True, exist_ok=True)
         topology = self.model_without_dp.export_moe_topology()
         payload = {
-            "schema_version": 28,
+            "schema_version": 29,
             "completed_session": int(completed_session),
             "base_calibration_source_ids": list(self.base_calibration_source_ids),
             "expansion_thresholds": self._cpu_copy(self.expansion_thresholds),
