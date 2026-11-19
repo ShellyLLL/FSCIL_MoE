@@ -869,8 +869,13 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         adapter.descriptor_scores = lambda x, require_ready=True: torch.stack(
             [x[:, 0], x[:, 0] + 1.0], dim=-1
         )
-        first = runner._calibrate_session_expansion_thresholds(adapter, values, [4, 8], 0)
-        second = runner._calibrate_session_expansion_thresholds(adapter, values, [4, 8], 0)
+        labels = torch.tensor([0] * 5 + [1] * 5)
+        first = runner._calibrate_session_expansion_thresholds(
+            adapter, values, labels, [4, 8], 0
+        )
+        second = runner._calibrate_session_expansion_thresholds(
+            adapter, values, labels, [4, 8], 0
+        )
         self.assertEqual(set(first), {4, 8})
         self.assertEqual(first, second)
         self.assertGreater(first[8], first[4])
