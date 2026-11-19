@@ -70,6 +70,18 @@ class Runner:
                 result.append((block_idx, adapter))
         return result
 
+    def _assert_moe_frozen(self, context):
+        for block_idx, adapter in self._moe_adapters():
+            trainable = [
+                name for name, parameter in adapter.named_parameters()
+                if parameter.requires_grad
+            ]
+            if trainable or adapter.training:
+                raise RuntimeError(
+                    f"MoE block {block_idx} is not fully frozen at {context}: "
+                    f"trainable={trainable}, training_mode={adapter.training}."
+                )
+
     def _adapter_by_block(self, block_idx):
         block = self.model_without_dp.clip_model.visual.transformer.resblocks[int(block_idx)]
         adapter = getattr(block, "moe_adapter", None)
@@ -357,6 +369,7 @@ class Runner:
         self.model_without_dp.load_state_dict(payload["model_state"], strict=True)
         for _, adapter in self._moe_adapters():
             adapter.freeze_all()
+        self._assert_moe_frozen("checkpoint restore")
         checkpoint_class_ids = []
         for session_index, state in enumerate(payload["task_states"]):
             required_state = ("class_ids", "image_proto", "reference_image_proto",
@@ -505,6 +518,7 @@ class Runner:
     def save_checkpoint(self, completed_session, state_dict_list):
         if not self._checkpoint_enabled():
             return None
+        self._assert_moe_frozen("checkpoint save")
         directory = self._checkpoint_dir()
         directory.mkdir(parents=True, exist_ok=True)
         topology = self.model_without_dp.export_moe_topology()
@@ -1224,6 +1238,7 @@ class Runner:
 
         for _, adapter in self._moe_adapters():
             adapter.freeze_all()
+        self._assert_moe_frozen("incremental Session completion")
         return {
             "trained": bool(expanded),
             "decisions": decisions,
