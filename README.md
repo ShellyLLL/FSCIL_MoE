@@ -66,23 +66,24 @@ Lifecycle:
    centered low-rank linear AE is fitted using its deployed Base-Softmax
    responsibility. The per-layer threshold is calibrated on the independent
    Base holdout.
-3. For each incremental class and layer, calculate the median standardized
-   reconstruction-error score for every deployed descriptor, then take the
-   minimum across descriptors. A class is marked novel when this score exceeds
-   the Base-calibrated class threshold. Aggregate the number of novel classes
-   into a task novelty fraction. The layer expands only when this fraction
-   exceeds a separately calibrated Base pseudo-Session threshold. At most one
-   zero-up-initialized expert and one independent sigmoid router column are
-   added per layer per session.
+3. At each incremental Session, collect frozen-reference CLS input
+   features for every support sample. For each sample, calculate its
+   standardized reconstruction-error score under every deployed descriptor,
+   then take the minimum across descriptors as that sample's best-coverage
+   score. The layer-level Session score is the median of these sample scores.
+   Expand exactly one expert when this task score is strictly greater than the
+   fixed Z-score threshold (default 1.5); otherwise reuse the deployed experts.
+   No class-level novelty labels, class proportions, pseudo-Sessions, or
+   separately calibrated task thresholds are used.
 4. Train the new expert and its router column on all current-Session samples.
    Every current-Session sample is positive router supervision and participates
    in the global seen-class visual-prototype classification objective. Old-class
    route anchors suppress new-expert interference. All historical experts,
    router columns and the ViT remain frozen.
-5. Fit the new expert's paired AE on all current-Session raw reference CLS
-   features. Fit and calibration partitions use disjoint source identities,
-   and every current class contributes to both. The AE is used for future
-   task-level expansion decisions, not classification.
+5. Fit the new expert's paired AE on all current-Session frozen-reference
+   CLS features. A source-exclusive holdout estimates its reconstruction-error
+   mean and standard deviation. The AE is used for future task-level expansion
+   decisions, not classification.
 6. After expert training and freezing, compute each novel class's adapted
    visual support prototype. Encode its class description with the frozen
    CLIP text encoder. Description-semantic similarity retrieves related Base
