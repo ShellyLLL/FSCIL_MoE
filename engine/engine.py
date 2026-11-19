@@ -1370,9 +1370,9 @@ class Runner:
             # Session support source.
             calibration_mask = self._make_calibration_mask(
                 local_labels, local_sources,
-                min_calibration_count=max(2, int(torch.unique(local_labels).numel())),
+                min_calibration_count=max(4, 2 * int(torch.unique(local_labels).numel())),
                 min_fit_per_class=3,
-                min_calibration_per_class=1,
+                min_calibration_per_class=2,
             )
             descriptor_fit_mask = ~calibration_mask
             descriptor_calibration_mask = calibration_mask
