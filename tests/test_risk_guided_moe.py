@@ -113,7 +113,7 @@ def build_lifecycle_runner():
             EXPANSION_THRESHOLD_QUANTILE=0.95,
             EXPANSION_CALIBRATION_GROUPS=20,
             EXPANSION_CALIBRATION_SEED=271,
-            SESSION_SUPPORT_SIZES=[32],
+            SESSION_SUPPORT_SIZES=[16],
         ),
         OPTIM=optim_cfg,
         INCREMENTAL=incremental_cfg,
@@ -125,7 +125,7 @@ def build_lifecycle_runner():
     )
     cfg = SimpleNamespace(
         TRAINER=SimpleNamespace(BiMC=bimc_cfg),
-        DATASET=SimpleNamespace(NUM_INC_CLS=1, NUM_INC_SHOT=32, SESSION_SUPPORT_SIZES=[32]),
+        DATASET=SimpleNamespace(NUM_INC_CLS=1, NUM_INC_SHOT=16, SESSION_SUPPORT_SIZES=[16]),
     )
     model = BiMC.__new__(BiMC)
     nn.Module.__init__(model)
@@ -195,7 +195,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         runner, model = build_lifecycle_runner()
         model.eval()
         base_support = lifecycle_batch(
-            0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 6000, count=32
+            0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 6000, count=40
         )
         runner._train_base_descriptors([base_support])
         base_state = make_lifecycle_state(runner, model, 0, base_support, 0)
@@ -1234,7 +1234,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         runner, model = build_lifecycle_runner()
         model.eval()
         base_support = lifecycle_batch(
-            0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 1000, count=32
+            0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 1000, count=40
         )
         runner._train_base_descriptors([base_support])
         states = [make_lifecycle_state(runner, model, 0, base_support, 0)]
@@ -1284,7 +1284,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         runner, model = build_lifecycle_runner()
         model.eval()
         base_support = lifecycle_batch(
-            0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 2000, count=32
+            0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 2000, count=40
         )
         runner._train_base_descriptors([base_support])
         base_state = make_lifecycle_state(runner, model, 0, base_support, 0)
@@ -1395,7 +1395,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         torch.manual_seed(127)
         runner, model = build_lifecycle_runner()
         base_support = lifecycle_batch(
-            0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 3000, count=32
+            0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 3000, count=40
         )
         runner._train_base_descriptors([base_support])
         # A single source cannot produce a query-exclusive same-class prototype.
@@ -1420,7 +1420,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         torch.manual_seed(131)
         runner, model = build_lifecycle_runner()
         base_support = lifecycle_batch(
-            0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 4000, count=32
+            0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 4000, count=40
         )
         runner._train_base_descriptors([base_support])
         base_state = make_lifecycle_state(runner, model, 0, base_support, 0)
