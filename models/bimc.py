@@ -253,21 +253,11 @@ class BiMC(nn.Module):
 
     @torch.no_grad()
     def plan_layer_expansion(self, block_idx, features, class_index, threshold=None):
-        """Conformal task-level shift test, calibrated for the deployed expert pool.
-
-        Each descriptor produces an upper-tail conformal p-value from its
-        independent, unweighted holdout errors. The maximum across descriptors
-        tests the null that at least one deployed expert covers a sample; this
-        remains valid as the number of experts changes. A lower-median order
-        statistic across independent Session support sources is then converted
-        to an exact binomial-tail p-value.
-        """
+        """Session-level novelty test: Q90(min historical-RD standardized error)."""
         block_idx = int(block_idx)
-        alpha = float(getattr(
-            self.cfg.TRAINER.BiMC.VISUAL_MOE, "EXPANSION_FALSE_ALARM_RATE", 0.05
-        ) if threshold is None else threshold)
-        if not 0.0 < alpha < 1.0:
-            raise ValueError("Expansion false-alarm rate must be strictly between zero and one.")
+        if threshold is None or not math.isfinite(float(threshold)):
+            raise ValueError("A finite Base-calibrated Session Q95 threshold is required.")
+        tau = float(threshold)
         if block_idx not in features:
             raise KeyError(f"Block {block_idx} did not produce support features.")
 
@@ -287,47 +277,26 @@ class BiMC(nn.Module):
                 or sources.numel() != values.size(0) or not torch.isfinite(values).all()):
             raise ValueError(f"Block {block_idx} received empty, misaligned or non-finite support features.")
         if torch.unique(sources).numel() != sources.numel():
-            raise ValueError(
-                "Task-level conformal aggregation requires one independent support row per source id."
-            )
+            raise ValueError("Session-level expansion requires one deterministic reference row per support source.")
 
-        coverage_pvalues = adapter.descriptor_coverage_pvalues(values)
-        if (coverage_pvalues.ndim != 2
-                or coverage_pvalues.size(0) != values.size(0)
-                or coverage_pvalues.size(1) != adapter.num_experts
-                or not torch.isfinite(coverage_pvalues).all()
-                or (coverage_pvalues < 0).any()
-                or (coverage_pvalues > 1).any()):
-            raise FloatingPointError(f"Block {block_idx} produced invalid conformal coverage p-values.")
-
-        # H0(sample): at least one existing expert covers this sample.
-        # max(p_k) is super-uniform under this union null, regardless of
-        # dependence or the number of deployed experts.
-        sample_novelty_pvalues = coverage_pvalues.max(dim=1).values.float()
-        n = int(sample_novelty_pvalues.numel())
-        order = (n - 1) // 2  # lower median: ceil(n/2)-th order statistic
-        median_pvalue = torch.sort(sample_novelty_pvalues).values[order]
-        k = (n + 1) // 2
-        x = float(median_pvalue.item())
-        task_pvalue = sum(
-            math.comb(n, j) * (x ** j) * ((1.0 - x) ** (n - j))
-            for j in range(k, n + 1)
-        )
-        task_pvalue = min(1.0, max(0.0, float(task_pvalue)))
-        if not math.isfinite(task_pvalue):
-            raise FloatingPointError(f"Block {block_idx} produced a non-finite task p-value.")
-
+        # For every support sample, use the best-fitting deployed RD.  Classes
+        # are deliberately not grouped or scored independently.
+        per_expert_z = adapter.descriptor_scores(values, require_ready=True)
+        sample_novelty = per_expert_z.min(dim=1).values
+        session_q90 = torch.quantile(sample_novelty, 0.90)
+        score = float(session_q90.item())
+        if not math.isfinite(score):
+            raise FloatingPointError(f"Block {block_idx} produced a non-finite Session Q90.")
         decision = LayerExpansionDecision(
             block_idx=block_idx,
-            expand=task_pvalue < alpha,
-            task_shift_score=task_pvalue,
-            threshold=alpha,
-            support_count=n,
+            expand=score > tau,
+            task_shift_score=score,
+            threshold=tau,
+            support_count=int(values.size(0)),
         )
         print(
-            f"=> [Task-Expansion][B{block_idx}] support_n={n} "
-            f"task_conformal_p={decision.task_shift_score:.6g} "
-            f"false_alarm_rate={decision.threshold:.4f} "
+            f"=> [Session-Expansion][B{block_idx}] support_n={decision.support_count} "
+            f"session_q90={score:.6f} base_q95={tau:.6f} "
             f"decision={'EXPAND' if decision.expand else 'REUSE'}"
         )
         return decision
@@ -342,6 +311,7 @@ class BiMC(nn.Module):
             reduction=reduction,
             anchor_expert_id=anchor_expert_id,
             descriptor_residual_rank=residual_rank,
+            dropout=float(getattr(moe_cfg, "INCREMENTAL_DROPOUT", 0.1)),
         )
 
     def export_moe_topology(self):
