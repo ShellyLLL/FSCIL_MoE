@@ -93,7 +93,6 @@ class TinyLifecycleCLIP(nn.Module):
 def build_lifecycle_runner():
     optim_cfg = SimpleNamespace(
         BASE_DESCRIPTOR_EPOCHS=30,
-        INCREMENTAL_DESCRIPTOR_EPOCHS=30,
         LR_DESCRIPTOR=0.03,
         LR_INCREMENTAL_EXPERT=0.08,
         LR_INCREMENTAL_ROUTER=0.08,
