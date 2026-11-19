@@ -533,6 +533,83 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         self.assertTrue(all(not p.requires_grad for d in adapter.descriptors for p in d.parameters()))
         self.assertEqual(adapter.expert_birth_sessions, [0, 0, 3])
 
+    def test_incremental_rd_reuses_nearest_historical_anchor_with_zero_up_residual(self):
+        torch.manual_seed(271)
+        adapter = VisualMoEAdapter(
+            8, num_experts=2, reduction=2, descriptor_dim=4,
+            descriptor_buffer_size=16, descriptor_residual_rank=3,
+        )
+        for descriptor in adapter.descriptors:
+            descriptor.update_reference(torch.tensor([0.1, 0.11, 0.09, 0.1]))
+        adapter.descriptors[0].standardized_score = lambda x: torch.full(
+            (x.size(0),), 2.0, device=x.device
+        )
+        adapter.descriptors[1].standardized_score = lambda x: torch.full(
+            (x.size(0),), -1.0, device=x.device
+        )
+        session_features = torch.randn(7, 8)
+        anchor_id, anchor_q90 = adapter.select_descriptor_anchor(session_features)
+        self.assertEqual(anchor_id, 1)
+        torch.testing.assert_close(anchor_q90, torch.tensor([2.0, -1.0]))
+
+        probe = torch.randn(9, 8)
+        historical_anchor = adapter.descriptors[anchor_id]
+        expected = historical_anchor(probe).detach().clone()
+        expert_id = adapter.add_expert(
+            session_id=1, reduction=2, anchor_expert_id=anchor_id
+        )
+        descriptor = adapter.descriptors[expert_id]
+        self.assertTrue(descriptor.is_anchored)
+        self.assertEqual(descriptor.anchor_expert_id, anchor_id)
+        self.assertEqual(descriptor.residual_rank, 3)
+        torch.testing.assert_close(descriptor(probe), expected, rtol=0, atol=0)
+        self.assertEqual(int(torch.count_nonzero(descriptor.residual_up.weight).item()), 0)
+        self.assertFalse(descriptor.basis.requires_grad)
+        self.assertTrue(all(not parameter.requires_grad for parameter in descriptor.trainable_parameters()))
+        descriptor.set_trainable(True)
+        self.assertTrue(all(parameter.requires_grad for parameter in descriptor.trainable_parameters()))
+        self.assertFalse(descriptor.basis.requires_grad)
+        descriptor.set_trainable(False)
+
+        # Anchoring a later RD to an already adapted historical RD preserves
+        # the complete chained reconstruction function, not just its base basis.
+        chained_expected = descriptor(probe).detach().clone()
+        chained_id = adapter.add_expert(
+            session_id=2, reduction=2, anchor_expert_id=expert_id
+        )
+        torch.testing.assert_close(
+            adapter.descriptors[chained_id](probe), chained_expected, rtol=0, atol=0
+        )
+        self.assertEqual(adapter.descriptors[chained_id].anchor_expert_id, expert_id)
+
+    def test_anchored_rd_training_updates_only_low_rank_residual_and_calibrates(self):
+        torch.manual_seed(277)
+        runner, model = build_lifecycle_runner()
+        adapter = model.clip_model.visual.transformer.resblocks[0].moe_adapter
+        fit_values = torch.randn(30, 8) + torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.])
+        calibration_values = torch.randn(8, 8) + torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.])
+        adapter.set_base_feature_stats(fit_values)
+        anchor = adapter.descriptors[0]
+        anchor_basis_before = anchor.basis.detach().clone()
+        anchor_center_before = anchor.center.detach().clone()
+        expert_id = adapter.add_expert(session_id=1, anchor_expert_id=0)
+        descriptor = adapter.descriptors[expert_id]
+        basis_before = descriptor.basis.detach().clone()
+
+        loss = runner._train_descriptor(
+            adapter, expert_id, fit_values, epochs=8,
+            sample_weights=torch.ones(fit_values.size(0)),
+            calibration_values=calibration_values,
+        )
+        self.assertTrue(torch.isfinite(torch.tensor(loss)))
+        self.assertTrue(descriptor.is_ready())
+        torch.testing.assert_close(descriptor.basis, basis_before, rtol=0, atol=0)
+        torch.testing.assert_close(anchor.basis, anchor_basis_before, rtol=0, atol=0)
+        torch.testing.assert_close(anchor.center, anchor_center_before, rtol=0, atol=0)
+        self.assertGreater(float(descriptor.residual_up.weight.abs().sum().item()), 0.0)
+        self.assertTrue(all(not parameter.requires_grad for parameter in descriptor.parameters()))
+        self.assertTrue(all(parameter.grad is None for parameter in descriptor.parameters()))
+
     def test_descriptor_scores_reject_uncalibrated_deployed_experts(self):
         adapter = VisualMoEAdapter(8, num_experts=2, reduction=2)
         with self.assertRaisesRegex(RuntimeError, "uncalibrated descriptors"):
@@ -697,7 +774,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             }
             checkpoint_path = runner.save_checkpoint(0, [state])
             payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-            self.assertEqual(payload["schema_version"], 25)
+            self.assertEqual(payload["schema_version"], 26)
             self.assertNotIn("expansion_thresholds", payload)
             self.assertNotIn("task_expansion_thresholds", payload)
             self.assertNotIn("descriptor_error_priors", payload)
@@ -760,6 +837,9 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         x = torch.randn(3, 2, 8)
         torch.testing.assert_close(source(x)[0], restored(x)[0], rtol=0, atol=0)
         self.assertEqual(restored.num_experts, 3)
+        self.assertTrue(restored.descriptors[2].is_anchored)
+        self.assertEqual(restored.descriptors[2].anchor_expert_id, 0)
+        self.assertEqual(restored.descriptors[2].residual_rank, source.descriptors[2].residual_rank)
 
     def test_task_level_expansion_uses_conformal_expert_pool_and_exact_median_test(self):
         model = BiMC.__new__(BiMC)

@@ -106,7 +106,7 @@ class Runner:
         loss_cfg = _cfg_value(trainer_cfg, "LOSS", None)
         dataset_cfg = _cfg_value(self.cfg, "DATASET", None)
         return {
-            "version": 5,
+            "version": 6,
             "decision_unit": "incremental_session",
             "sample_score": "maximum_upper_tail_conformal_pvalue_over_deployed_experts",
             "task_score": "exact_binomial_lower_median_pvalue",
@@ -123,6 +123,10 @@ class Runner:
             "descriptor_dim": int(_cfg_value(moe_cfg, "DESCRIPTOR_DIM", 64)),
             "descriptor_eps": float(_cfg_value(moe_cfg, "DESCRIPTOR_EPS", 1e-4)),
             "descriptor_buffer_size": int(_cfg_value(moe_cfg, "DESCRIPTOR_BUFFER_SIZE", 500)),
+            "descriptor_initialization": "nearest_session_q90_historical_rd_plus_zero_up_low_rank_residual",
+            "descriptor_residual_rank": int(_cfg_value(moe_cfg, "DESCRIPTOR_RESIDUAL_RANK", 16)),
+            "descriptor_denoise_scale": float(_cfg_value(moe_cfg, "DESCRIPTOR_DENOISE_SCALE", 0.05)),
+            "descriptor_residual_weight": float(_cfg_value(moe_cfg, "DESCRIPTOR_RESIDUAL_WEIGHT", 1e-3)),
             "incremental_gate_bias_init": float(_cfg_value(moe_cfg, "INCREMENTAL_GATE_BIAS_INIT", -1.0)),
             "base_scale_init": float(_cfg_value(moe_cfg, "BASE_SCALE_INIT", 1.0)),
             "backbone_name": str(_cfg_value(backbone_cfg, "NAME", "unknown")),
@@ -363,10 +367,10 @@ class Runner:
         if missing:
             raise ValueError(f"Resume checkpoint is missing required fields: {missing}")
         schema = int(payload["schema_version"])
-        if schema != 25:
+        if schema != 26:
             raise ValueError(
-                "This branch uses robust task-level AE expansion checkpoint schema (25); "
-                "older class-level and pseudo-Session calibration checkpoints are incompatible."
+                "This branch uses anchored low-rank residual RD checkpoint schema (26); "
+                "older independently initialized descriptor checkpoints are incompatible."
             )
         checkpoint_policy = payload.get("expansion_policy")
         if checkpoint_policy != self._expansion_policy():
@@ -563,7 +567,7 @@ class Runner:
         directory.mkdir(parents=True, exist_ok=True)
         topology = self.model_without_dp.export_moe_topology()
         payload = {
-            "schema_version": 25,
+            "schema_version": 26,
             "completed_session": int(completed_session),
             "model_state": self._cpu_copy(self.model_without_dp.state_dict()),
             "moe_topology": topology,
@@ -613,7 +617,7 @@ class Runner:
         self, adapter, expert_id, values, epochs, sample_weights=None,
         calibration_values=None, calibration_weights=None,
     ):
-        """Fit a reference-space linear AE with independent, unweighted conformal holdout calibration."""
+        """Fit a Base RD or a denoising low-rank residual on a frozen historical RD anchor."""
         descriptor = adapter.descriptors[int(expert_id)]
         descriptor.float()
         values = values.detach().float()
@@ -627,12 +631,32 @@ class Runner:
         if (weights.numel() != values.size(0) or not torch.isfinite(weights).all()
                 or (weights < 0).any() or not bool((weights.sum() > 0).item())):
             raise ValueError("AE sample weights must align with features and have positive finite mass.")
-        descriptor.set_center(values, weights)
-        for parameter in descriptor.parameters():
-            parameter.requires_grad = True
+
+        if descriptor.is_anchored:
+            if not bool(adapter.base_feature_stats_ready.item()):
+                raise RuntimeError("Anchored RD training requires frozen Base feature statistics.")
+            denoise_scale = float(_cfg_value(
+                self._visual_moe_cfg(), "DESCRIPTOR_DENOISE_SCALE", 0.05
+            ))
+            residual_weight = float(_cfg_value(
+                self._visual_moe_cfg(), "DESCRIPTOR_RESIDUAL_WEIGHT", 1e-3
+            ))
+            if (not np.isfinite(denoise_scale) or denoise_scale < 0
+                    or not np.isfinite(residual_weight) or residual_weight < 0):
+                raise ValueError("RD denoising and residual regularization weights must be finite and non-negative.")
+            noise_std = adapter.base_feature_std.to(values.device).reshape(1, -1) * denoise_scale
+        else:
+            descriptor.set_center(values, weights)
+            denoise_scale, residual_weight = 0.0, 0.0
+            noise_std = None
+
+        descriptor.set_trainable(True)
         descriptor.train()
+        trainable_parameters = descriptor.trainable_parameters()
+        if not trainable_parameters:
+            raise RuntimeError("RD training has no trainable descriptor parameters.")
         optimizer = optim.AdamW(
-            descriptor.parameters(),
+            trainable_parameters,
             lr=float(_cfg_value(self.cfg.TRAINER.BiMC.OPTIM, "LR_DESCRIPTOR", 1e-3)),
             weight_decay=0.0,
         )
@@ -641,13 +665,24 @@ class Runner:
             permutation = torch.randperm(values.size(0), device=values.device)
             for indices in permutation.split(max(3, min(256, values.size(0)))):
                 optimizer.zero_grad(set_to_none=True)
-                reconstruction = descriptor(values[indices])
-                per_sample = (reconstruction - values[indices]).square().mean(dim=-1)
+                clean = values[indices]
+                noisy = clean if noise_std is None else clean + torch.randn_like(clean) * noise_std
+                reconstruction = descriptor(noisy)
+                per_sample = (reconstruction - clean).square().mean(dim=-1)
                 batch_weights = weights[indices]
                 reconstruction_loss = (
                     (per_sample * batch_weights).sum() / batch_weights.sum().clamp_min(1e-8)
                 )
-                loss = reconstruction_loss + 1e-3 * descriptor.orthogonality_loss()
+                orthogonality = descriptor.orthogonality_loss()
+                residual_penalty = (
+                    descriptor.residual_output(clean).square().mean()
+                    if descriptor.is_anchored else clean.new_zeros(())
+                )
+                loss = (
+                    reconstruction_loss
+                    + 1e-3 * orthogonality
+                    + residual_weight * residual_penalty
+                )
                 if not bool(torch.isfinite(loss).item()):
                     raise FloatingPointError("Non-finite AE reconstruction loss.")
                 loss.backward()
@@ -668,17 +703,15 @@ class Runner:
                     "finite independent held-out representations."
                 )
             errors = descriptor.reconstruction_error(reference_values)
-            weights = torch.ones_like(errors) if calibration_weights is None else torch.as_tensor(
+            calibration_weights = torch.ones_like(errors) if calibration_weights is None else torch.as_tensor(
                 calibration_weights, device=errors.device, dtype=torch.float32
             ).reshape(-1)
-            if weights.numel() != errors.numel():
+            if calibration_weights.numel() != errors.numel():
                 raise ValueError("AE calibration responsibilities must align with held-out sources.")
-            descriptor.update_reference(errors, weights)
+            descriptor.update_reference(errors, calibration_weights)
             if int(descriptor.error_count.item()) < 2:
                 raise RuntimeError("AE descriptors require at least two independent calibration errors.")
-        for parameter in descriptor.parameters():
-            parameter.requires_grad = False
-            parameter.grad = None
+        descriptor.set_trainable(False)
         if not descriptor.is_ready():
             raise RuntimeError("AE descriptor did not reach a valid independent reference-statistics state.")
         return float(loss.item())
@@ -763,6 +796,7 @@ class Runner:
             values = item["cls_in"].to(self.device)
             labels = item["labels"].to(self.device)
             source_ids = item["source_ids"].to(self.device)
+            adapter.set_base_feature_stats(values)
             # Independent error-reference sources are held out from AE fitting.
             # Every Base class contributes to both partitions.
             reference_mask = self._make_calibration_mask(
@@ -1125,7 +1159,12 @@ class Runner:
                 continue
 
             adapter = self._adapter_by_block(block_idx)
-            expert_id = self.model_without_dp.add_expert(block_idx, task_id)
+            local_item = expansion_features[int(block_idx)]
+            local_values = local_item["cls_in"].to(self.device).float()
+            anchor_expert_id, anchor_q90 = adapter.select_descriptor_anchor(local_values)
+            expert_id = self.model_without_dp.add_expert(
+                block_idx, task_id, anchor_expert_id=anchor_expert_id
+            )
             anchor_sets = self._all_old_anchor_sets(old_states, block_idx)
             anchor_mean, anchor_var = anchor_sets["route_mean"], anchor_sets["route_var"]
             optimizer = optim.AdamW([
@@ -1211,8 +1250,6 @@ class Runner:
 
             # Fit and calibrate the paired descriptor on all current-Session
             # reference CLS features, with disjoint source identities per class.
-            local_item = expansion_features[int(block_idx)]
-            local_values = local_item["cls_in"].to(self.device)
             local_labels = local_item["labels"].to(self.device)
             local_sources = local_item["source_ids"].to(self.device)
             if sorted(int(value) for value in torch.unique(local_labels, sorted=True).tolist()) != expected_classes:
@@ -1252,6 +1289,8 @@ class Runner:
             adapter.freeze_all()
             histories[block_idx] = {
                 "expert_id": int(expert_id),
+                "descriptor_anchor_id": int(anchor_expert_id),
+                "descriptor_anchor_q90": [float(value) for value in anchor_q90.detach().cpu().tolist()],
                 "loss": loss_history,
                 "ae_loss": ae_loss,
                 "task_shift_score": float(decision.task_shift_score),
@@ -1272,6 +1311,8 @@ class Runner:
             expanded.append({
                 "block_idx": int(block_idx),
                 "expert_id": int(expert_id),
+                "descriptor_anchor_id": int(anchor_expert_id),
+                "descriptor_anchor_q90": [float(value) for value in anchor_q90.detach().cpu().tolist()],
                 "task_shift_score": float(decision.task_shift_score),
                 "task_false_alarm_rate": float(decision.threshold),
             })

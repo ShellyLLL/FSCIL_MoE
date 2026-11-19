@@ -1,6 +1,7 @@
 
 from collections import OrderedDict
 from typing import Tuple, Union
+import weakref
 
 import numpy as np
 import torch
@@ -146,6 +147,12 @@ class RepresentationDescriptor(nn.Module):
         basis, _ = torch.linalg.qr(torch.randn(self.d_model, self.descriptor_dim), mode="reduced")
         self.basis = nn.Parameter(basis)
         self.register_buffer("center", torch.zeros(self.d_model, dtype=torch.float32))
+        self.residual_down = None
+        self.residual_up = None
+        self.residual_activation = QuickGELU()
+        self.anchor_expert_id = -1
+        self.residual_rank = 0
+        self._anchor_ref = None
         self.register_buffer("error_history", torch.zeros(self.buffer_size, dtype=torch.float32))
         self.register_buffer("error_weight_history", torch.zeros(self.buffer_size, dtype=torch.float32))
         self.register_buffer("effective_error_count", torch.zeros((), dtype=torch.float32))
@@ -154,8 +161,59 @@ class RepresentationDescriptor(nn.Module):
         self.register_buffer("error_mean", torch.zeros((), dtype=torch.float32))
         self.register_buffer("error_std", torch.ones((), dtype=torch.float32))
 
+    @property
+    def is_anchored(self):
+        return self._anchor_ref is not None
+
+    def initialize_from_anchor(self, anchor, anchor_expert_id, residual_rank):
+        """Reuse a frozen historical RD and add a zero-output low-rank residual."""
+        anchor_expert_id = int(anchor_expert_id)
+        if anchor is self or anchor.d_model != self.d_model or anchor.descriptor_dim != self.descriptor_dim:
+            raise ValueError("RD anchor must be a distinct descriptor with matching dimensions.")
+        if self.is_anchored:
+            raise RuntimeError("A representation descriptor can only be anchored once.")
+        rank = min(max(1, int(residual_rank)), self.d_model)
+        with torch.no_grad():
+            self.center.copy_(anchor.center)
+            self.basis.copy_(anchor.basis)
+        self.basis.requires_grad_(False)
+        self.basis.grad = None
+        for parameter in anchor.parameters():
+            parameter.requires_grad_(False)
+            parameter.grad = None
+        anchor.eval()
+        self._anchor_ref = weakref.ref(anchor)
+        self.anchor_expert_id = anchor_expert_id
+        self.residual_rank = rank
+        device, dtype = self.basis.device, self.basis.dtype
+        self.residual_down = nn.Linear(self.d_model, rank, bias=False).to(device=device, dtype=dtype)
+        self.residual_up = nn.Linear(rank, self.d_model, bias=False).to(device=device, dtype=dtype)
+        nn.init.kaiming_normal_(self.residual_down.weight, nonlinearity="relu")
+        nn.init.zeros_(self.residual_up.weight)
+
+    def trainable_parameters(self):
+        if self.is_anchored:
+            return list(self.residual_down.parameters()) + list(self.residual_up.parameters())
+        return [self.basis]
+
+    def set_trainable(self, enabled):
+        for parameter in self.parameters():
+            parameter.requires_grad_(False)
+            parameter.grad = None
+        if enabled:
+            for parameter in self.trainable_parameters():
+                parameter.requires_grad_(True)
+
+    def residual_output(self, x):
+        if not self.is_anchored:
+            return torch.zeros_like(x, dtype=torch.float32)
+        centered = x.float() - self.center
+        return self.residual_up(self.residual_activation(self.residual_down(centered)))
+
     @torch.no_grad()
     def set_center(self, values, weights=None):
+        if self.is_anchored:
+            raise RuntimeError("An anchored RD keeps its historical center frozen.")
         values = torch.as_tensor(values, device=self.center.device, dtype=torch.float32)
         if values.ndim != 2 or values.size(1) != self.d_model or not torch.isfinite(values).all():
             raise ValueError("AE center requires finite [samples, d_model] representations.")
@@ -171,18 +229,27 @@ class RepresentationDescriptor(nn.Module):
 
     @torch.no_grad()
     def retract_basis_(self):
-        """Retract the learned basis onto the Stiefel manifold after each optimizer step."""
+        """Retract a trainable Base basis onto the Stiefel manifold."""
+        if self.is_anchored:
+            return
         q, r = torch.linalg.qr(self.basis.float(), mode="reduced")
         diagonal = torch.diagonal(r)
         signs = torch.where(diagonal < 0, -torch.ones_like(diagonal), torch.ones_like(diagonal))
         self.basis.copy_((q * signs.unsqueeze(0)).to(dtype=self.basis.dtype))
 
     def forward(self, x):
+        if self.is_anchored:
+            anchor = self._anchor_ref()
+            if anchor is None:
+                raise RuntimeError("Historical RD anchor is no longer available.")
+            return anchor(x) + self.residual_output(x)
         centered = x.float() - self.center
         basis = self.basis.float()
         return self.center + (centered @ basis) @ basis.t()
 
     def orthogonality_loss(self):
+        if self.is_anchored:
+            return self.basis.new_zeros(())
         basis = self.basis.float()
         gram = basis.t() @ basis
         identity = torch.eye(self.descriptor_dim, device=basis.device, dtype=basis.dtype)
@@ -341,17 +408,20 @@ class BottleneckExpert(nn.Module):
 
 
 class VisualMoEAdapter(nn.Module):
-    """Unified expert pool, descriptors and expandable soft router."""
+    """Unified expert pool, anchored distribution descriptors and expandable router."""
 
     def __init__(self, d_model, num_experts=4, reduction=4, residual_scale_init=1.0,
                  descriptor_dim=64, descriptor_eps=1e-4, descriptor_buffer_size=500,
-                 incremental_gate_bias_init=-1.0):
+                 incremental_gate_bias_init=-1.0, descriptor_residual_rank=16):
         super().__init__()
         self.d_model, self.base_expert_count = int(d_model), int(num_experts)
         self.default_reduction, self.descriptor_dim = int(reduction), int(descriptor_dim)
         self.descriptor_eps = float(descriptor_eps)
         self.descriptor_buffer_size = int(descriptor_buffer_size)
+        self.descriptor_residual_rank = max(1, min(int(descriptor_residual_rank), self.d_model))
         self.incremental_gate_bias_init = float(incremental_gate_bias_init)
+        self.register_buffer("base_feature_std", torch.ones(self.d_model, dtype=torch.float32))
+        self.register_buffer("base_feature_stats_ready", torch.zeros((), dtype=torch.bool))
         self.layer_norm = LayerNorm(self.d_model)
         self.residual_scale = nn.Parameter(torch.ones(1) * float(residual_scale_init))
         self.experts = nn.ModuleList([BottleneckExpert(self.d_model, reduction)
@@ -390,6 +460,27 @@ class VisualMoEAdapter(nn.Module):
     def expansion_statistics(self, x):
         scores = self.descriptor_scores(x, require_ready=True)
         return scores, scores.mean(dim=0)
+
+    @torch.no_grad()
+    def set_base_feature_stats(self, values):
+        values = torch.as_tensor(values, device=self.base_feature_std.device, dtype=torch.float32)
+        if values.ndim != 2 or values.size(1) != self.d_model or values.size(0) < 2:
+            raise ValueError("Base feature statistics require at least two [d_model] reference rows.")
+        if not torch.isfinite(values).all():
+            raise ValueError("Base feature statistics must be finite.")
+        std = values.std(dim=0, unbiased=False).clamp_min(self.descriptor_eps)
+        self.base_feature_std.copy_(std)
+        self.base_feature_stats_ready.fill_(True)
+
+    @torch.no_grad()
+    def select_descriptor_anchor(self, session_features):
+        """Select the historical RD with the lowest Session-level 90th-percentile z-score."""
+        scores = self.descriptor_scores(session_features, require_ready=True).float()
+        if scores.ndim != 2 or scores.size(0) == 0 or not torch.isfinite(scores).all():
+            raise ValueError("RD anchor selection requires finite [session, experts] scores.")
+        upper_scores = torch.quantile(scores, 0.90, dim=0)
+        anchor_id = int(torch.argmin(upper_scores).item())
+        return anchor_id, upper_scores.detach()
 
     @torch.no_grad()
     def update_descriptor_stats(self, errors, expert_id):
@@ -467,18 +558,31 @@ class VisualMoEAdapter(nn.Module):
             for parameter in module.parameters():
                 parameter.requires_grad = True
         if descriptor:
-            for parameter in self.descriptors[-1].parameters():
-                parameter.requires_grad = True
+            self.descriptors[-1].set_trainable(True)
         self.train()
 
-    def add_expert(self, session_id, reduction=None, gate_bias_init=None):
+    def add_expert(self, session_id, reduction=None, gate_bias_init=None,
+                   anchor_expert_id=None, descriptor_residual_rank=None):
         self.freeze_all()
         reduction = self.default_reduction if reduction is None else int(reduction)
+        anchor_expert_id = 0 if anchor_expert_id is None else int(anchor_expert_id)
+        if anchor_expert_id < 0 or anchor_expert_id >= self.num_experts:
+            raise ValueError(
+                f"RD anchor expert id {anchor_expert_id} is outside the historical pool."
+            )
+        residual_rank = (
+            self.descriptor_residual_rank if descriptor_residual_rank is None
+            else int(descriptor_residual_rank)
+        )
         self.experts.append(BottleneckExpert(self.d_model, reduction, zero_init_up=True).to(
             device=self.residual_scale.device, dtype=self.residual_scale.dtype))
-        self.descriptors.append(RepresentationDescriptor(
+        descriptor = RepresentationDescriptor(
             self.d_model, self.descriptor_dim, self.descriptor_eps, self.descriptor_buffer_size
-        ).to(device=self.residual_scale.device))
+        ).to(device=self.residual_scale.device)
+        descriptor.initialize_from_anchor(
+            self.descriptors[anchor_expert_id], anchor_expert_id, residual_rank
+        )
+        self.descriptors.append(descriptor)
         self.router.add_column(
             self.incremental_gate_bias_init if gate_bias_init is None else float(gate_bias_init)
         )
@@ -490,7 +594,7 @@ class VisualMoEAdapter(nn.Module):
     def newest_parameters(self, include_descriptor=False):
         parameters = list(self.experts[-1].parameters()) + list(self.router.columns[-1].parameters())
         if include_descriptor:
-            parameters += list(self.descriptors[-1].parameters())
+            parameters += self.descriptors[-1].trainable_parameters()
         return parameters
 
     def historical_named_parameters(self):
@@ -501,19 +605,36 @@ class VisualMoEAdapter(nn.Module):
                 yield name, parameter
 
     def export_topology(self):
-        return {"version": 2, "d_model": self.d_model, "base_expert_count": self.base_expert_count,
-                "experts": [{"reduction": max(1, self.d_model // expert.c_fc.out_features),
-                             "birth_session": int(self.expert_birth_sessions[index])}
-                            for index, expert in enumerate(self.experts)]}
+        return {
+            "version": 3,
+            "d_model": self.d_model,
+            "base_expert_count": self.base_expert_count,
+            "experts": [
+                {
+                    "reduction": max(1, self.d_model // expert.c_fc.out_features),
+                    "birth_session": int(self.expert_birth_sessions[index]),
+                    "descriptor_anchor_id": int(self.descriptors[index].anchor_expert_id),
+                    "descriptor_residual_rank": int(self.descriptors[index].residual_rank),
+                }
+                for index, expert in enumerate(self.experts)
+            ],
+        }
 
     def rebuild_topology(self, topology):
         if topology is None:
-            topology = {"d_model": self.d_model, "base_expert_count": self.base_expert_count,
-                        "experts": [{"reduction": self.default_reduction, "birth_session": 0}
-                                    for _ in range(self.base_expert_count)]}
+            topology = {
+                "version": 3,
+                "d_model": self.d_model,
+                "base_expert_count": self.base_expert_count,
+                "experts": [
+                    {"reduction": self.default_reduction, "birth_session": 0,
+                     "descriptor_anchor_id": -1, "descriptor_residual_rank": 0}
+                    for _ in range(self.base_expert_count)
+                ],
+            }
         if not isinstance(topology, dict):
             raise ValueError("MoE topology must be a mapping.")
-        if int(topology.get("version", 2)) != 2:
+        if int(topology.get("version", 3)) != 3:
             raise ValueError("Unsupported MoE topology version.")
         if int(topology.get("d_model", self.d_model)) != self.d_model:
             raise ValueError("MoE topology d_model mismatch.")
@@ -522,27 +643,52 @@ class VisualMoEAdapter(nn.Module):
         specs = list(topology.get("experts", []))
         if len(specs) < self.base_expert_count:
             raise ValueError("MoE topology has fewer experts than the base pool.")
+        validated = []
         for index, spec in enumerate(specs):
             if not isinstance(spec, dict):
                 raise ValueError(f"MoE topology expert {index} must be a mapping.")
             reduction = spec.get("reduction", self.default_reduction)
             birth_session = spec.get("birth_session", 0)
+            anchor_id = spec.get("descriptor_anchor_id", -1 if index < self.base_expert_count else 0)
+            residual_rank = spec.get(
+                "descriptor_residual_rank",
+                0 if index < self.base_expert_count else self.descriptor_residual_rank,
+            )
             if isinstance(reduction, bool) or int(reduction) < 1:
                 raise ValueError(f"MoE topology expert {index} has invalid reduction.")
             if isinstance(birth_session, bool) or int(birth_session) < 0:
                 raise ValueError(f"MoE topology expert {index} has invalid birth session.")
-            if index < self.base_expert_count and int(birth_session) != 0:
-                raise ValueError("Base experts must have birth_session=0.")
-        # Validate the complete topology before mutating live modules.
+            if index < self.base_expert_count:
+                if int(birth_session) != 0:
+                    raise ValueError("Base experts must have birth_session=0.")
+                if int(anchor_id) != -1 or int(residual_rank) != 0:
+                    raise ValueError("Base descriptors cannot have a historical RD anchor or residual branch.")
+            else:
+                if int(birth_session) <= 0:
+                    raise ValueError("Incremental experts must have a positive birth session.")
+                if int(anchor_id) < 0 or int(anchor_id) >= index:
+                    raise ValueError(
+                        f"Incremental descriptor {index} must reference an earlier expert as its anchor."
+                    )
+                if isinstance(residual_rank, bool) or int(residual_rank) < 1:
+                    raise ValueError(f"Incremental descriptor {index} has invalid residual rank.")
+            validated.append((int(reduction), int(birth_session), int(anchor_id), int(residual_rank)))
+
+        # Build the complete topology only after every expert/anchor specification is valid.
         self.experts, self.descriptors = nn.ModuleList(), nn.ModuleList()
         self.router, self.expert_birth_sessions = ExpandableRouter(self.d_model), []
-        for spec in specs:
-            reduction = int(spec.get("reduction", self.default_reduction))
+        for index, (reduction, birth_session, anchor_id, residual_rank) in enumerate(validated):
             self.experts.append(BottleneckExpert(self.d_model, reduction))
-            self.descriptors.append(RepresentationDescriptor(
-                self.d_model, self.descriptor_dim, self.descriptor_eps, self.descriptor_buffer_size))
+            descriptor = RepresentationDescriptor(
+                self.d_model, self.descriptor_dim, self.descriptor_eps, self.descriptor_buffer_size
+            )
+            if anchor_id >= 0:
+                descriptor.initialize_from_anchor(
+                    self.descriptors[anchor_id], anchor_id, residual_rank
+                )
+            self.descriptors.append(descriptor)
             self.router.add_column()
-            self.expert_birth_sessions.append(int(spec.get("birth_session", 0)))
+            self.expert_birth_sessions.append(birth_session)
         device, dtype = self.residual_scale.device, self.residual_scale.dtype
         self.experts.to(device=device, dtype=dtype)
         self.router.to(device=device, dtype=dtype)
@@ -918,6 +1064,7 @@ def build_model(state_dict: dict, cfg=None):
         descriptor_dim = getattr(moe_cfg, "DESCRIPTOR_DIM", 64)
         descriptor_eps = getattr(moe_cfg, "DESCRIPTOR_EPS", 1e-4)
         descriptor_buffer_size = getattr(moe_cfg, "DESCRIPTOR_BUFFER_SIZE", 500)
+        descriptor_residual_rank = getattr(moe_cfg, "DESCRIPTOR_RESIDUAL_RANK", 16)
         incremental_gate_bias_init = getattr(moe_cfg, "INCREMENTAL_GATE_BIAS_INIT", -1.0)
         for idx in moe_cfg.INSERT_BLOCKS:
             if idx < 0: idx = len(model.visual.transformer.resblocks) + idx
@@ -931,6 +1078,7 @@ def build_model(state_dict: dict, cfg=None):
                 descriptor_eps=descriptor_eps,
                 descriptor_buffer_size=descriptor_buffer_size,
                 incremental_gate_bias_init=incremental_gate_bias_init,
+                descriptor_residual_rank=descriptor_residual_rank,
             )
         convert_weights(model)
     return model.eval()

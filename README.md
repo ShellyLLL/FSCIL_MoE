@@ -50,9 +50,9 @@ python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/t
 
 The branch implements the unified FSCIL method model:
 task-level AE distribution-shift detection, on-demand residual expert expansion,
-Base-Softmax plus incremental-Sigmoid routing, selective training/freeze,
-semantic-guided novel visual prototype calibration, and one global visual
-prototype classifier.
+Base-Softmax plus incremental-Sigmoid routing, historical-RD-anchored low-rank
+residual descriptor adaptation, selective training/freeze, semantic-guided novel
+visual prototype calibration, and one global visual prototype classifier.
 
 Lifecycle:
 
@@ -80,10 +80,16 @@ Lifecycle:
    in the global seen-class visual-prototype classification objective. Old-class
    route anchors suppress new-expert interference. All historical experts,
    router columns and the ViT remain frozen.
-5. Fit the new expert's paired AE on all current-Session frozen-reference
-   CLS features. A source-exclusive holdout estimates its reconstruction-error
-   mean and standard deviation. The AE is used for future task-level expansion
-   decisions, not classification.
+5. Select the historical RD anchor whose current-Session 90th-percentile
+   standardized reconstruction error is lowest. The new RD reuses that frozen
+   descriptor function and adds a zero-output, low-rank residual branch
+   (Kaiming-initialized down projection, zero-initialized up projection). Train
+   only this residual on the current Session's reference CLS fit sources with
+   light Base-statistics-scaled input noise and residual-energy regularization.
+   A source-exclusive holdout calibrates the new RD's reconstruction-error
+   reference statistics. Historical RD anchors remain frozen, and the new RD
+   becomes an independent reusable descriptor for later Sessions. The AE path
+   is used for future task-level expansion decisions, not classification.
 6. After expert training and freezing, compute each novel class's adapted
    visual support prototype. Encode its class description with the frozen
    CLIP text encoder. Description-semantic similarity retrieves related Base

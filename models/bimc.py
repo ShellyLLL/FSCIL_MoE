@@ -332,10 +332,17 @@ class BiMC(nn.Module):
         )
         return decision
 
-    def add_expert(self, block_idx, session_id):
+    def add_expert(self, block_idx, session_id, anchor_expert_id=None):
         adapter = self.clip_model.visual.transformer.resblocks[int(block_idx)].moe_adapter
-        reduction = int(getattr(self.cfg.TRAINER.BiMC.VISUAL_MOE, "INCREMENTAL_REDUCTION", 8))
-        return adapter.add_expert(session_id=session_id, reduction=reduction)
+        moe_cfg = self.cfg.TRAINER.BiMC.VISUAL_MOE
+        reduction = int(getattr(moe_cfg, "INCREMENTAL_REDUCTION", 8))
+        residual_rank = int(getattr(moe_cfg, "DESCRIPTOR_RESIDUAL_RANK", 16))
+        return adapter.add_expert(
+            session_id=session_id,
+            reduction=reduction,
+            anchor_expert_id=anchor_expert_id,
+            descriptor_residual_rank=residual_rank,
+        )
 
     def export_moe_topology(self):
         return {str(index): block.moe_adapter.export_topology()
