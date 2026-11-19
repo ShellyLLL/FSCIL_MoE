@@ -1373,11 +1373,18 @@ class Runner:
             # Source-level split: descriptor optimization and its error-scale
             # calibration are disjoint, while CE and routing still use every
             # Session support source.
+            class_source_counts = [
+                int(torch.unique(local_sources[local_labels.eq(class_id)]).numel())
+                for class_id in torch.unique(local_labels, sorted=True).tolist()
+            ]
+            calibration_per_class = max(
+                2, int(math.ceil(0.25 * min(class_source_counts)))
+            )
             calibration_mask = self._make_calibration_mask(
                 local_labels, local_sources,
-                min_calibration_count=max(4, 2 * int(torch.unique(local_labels).numel())),
+                min_calibration_count=calibration_per_class * int(torch.unique(local_labels).numel()),
                 min_fit_per_class=3,
-                min_calibration_per_class=2,
+                min_calibration_per_class=calibration_per_class,
             )
             descriptor_fit_mask = ~calibration_mask
             descriptor_calibration_mask = calibration_mask
