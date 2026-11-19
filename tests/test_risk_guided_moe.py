@@ -886,6 +886,31 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertNotEqual(first[8], first[4])
 
+    def test_dynamic_pool_change_refreshes_threshold_on_fixed_base_sources(self):
+        torch.manual_seed(227)
+        runner, model = build_lifecycle_runner()
+        base_holdout = lifecycle_batch(
+            0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 8800, count=40
+        )
+        runner.base_calibration_source_ids = base_holdout["source_ids"].tolist()
+        runner.data_manager = SimpleNamespace(
+            get_base_source_dataloader=lambda source_ids: [base_holdout]
+        )
+        adapter = model.clip_model.visual.transformer.resblocks[0].moe_adapter
+        for descriptor in adapter.descriptors:
+            descriptor.update_reference(torch.tensor([0.1, 0.2, 0.3, 0.4]))
+        runner.expansion_thresholds = {0: {16: 0.0}}
+        adapter.add_expert(session_id=1, reduction=2, anchor_expert_id=0)
+        adapter.descriptors[-1].update_reference(torch.tensor([0.1, 0.2, 0.3, 0.4]))
+        adapter.freeze_all()
+        runner._refresh_block_expansion_threshold(0)
+        self.assertEqual(adapter.num_experts, 3)
+        self.assertIn(16, runner.expansion_thresholds[0])
+        self.assertTrue(torch.isfinite(torch.tensor(runner.expansion_thresholds[0][16])))
+        self.assertEqual(
+            runner.base_calibration_source_ids, base_holdout["source_ids"].tolist()
+        )
+
     def test_session_expansion_uses_q90_of_best_historical_rd_scores(self):
         model = BiMC.__new__(BiMC)
         nn.Module.__init__(model)
