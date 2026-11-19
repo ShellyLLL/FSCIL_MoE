@@ -299,7 +299,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         self.assertEqual(tuple(adapted.shape), tuple(reference.shape))
         self.assertEqual(tuple(aux[0]["cls_in"].shape), (images.size(0), 8))
 
-    def test_base_ae_uses_disjoint_reference_sources_without_task_threshold_calibration(self):
+    def test_base_rd_uses_disjoint_reference_sources_and_calibrates_session_thresholds(self):
         torch.manual_seed(233)
         runner, model = build_lifecycle_runner()
         supports = [
