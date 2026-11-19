@@ -834,7 +834,9 @@ class Runner:
         return sorted(sizes)
 
     @torch.no_grad()
-    def _calibrate_session_expansion_thresholds(self, adapter, heldout_values, support_sizes, block_idx):
+    def _calibrate_session_expansion_thresholds(
+        self, adapter, heldout_values, heldout_labels, support_sizes, block_idx
+    ):
         """Calibrate one Session-Q95 threshold per support-set size from Base holdout CLS."""
         moe_cfg = self._visual_moe_cfg()
         quantile = float(_cfg_value(moe_cfg, "EXPANSION_THRESHOLD_QUANTILE", 0.95))
@@ -847,21 +849,55 @@ class Runner:
             raise ValueError(f"Block {block_idx} Base holdout is insufficient for Session calibration.")
         if not support_sizes:
             raise ValueError("No incremental support-set sizes were supplied for Base threshold calibration.")
+        heldout_labels = torch.as_tensor(heldout_labels, device=heldout_values.device).long().reshape(-1)
+        if heldout_labels.numel() != heldout_values.size(0):
+            raise ValueError("Base holdout labels must align with reference features.")
+        classes = torch.unique(heldout_labels, sorted=True)
+        if classes.numel() < 2:
+            raise ValueError("Session threshold calibration requires multiple Base classes.")
+        class_rows = {
+            int(class_id): torch.nonzero(heldout_labels.eq(class_id), as_tuple=False).flatten().cpu()
+            for class_id in classes.tolist()
+        }
         scores = adapter.descriptor_scores(heldout_values, require_ready=True).min(dim=1).values
+        cpu_scores = scores.detach().cpu()
         generator = torch.Generator(device="cpu").manual_seed(
             int(_cfg_value(moe_cfg, "EXPANSION_CALIBRATION_SEED", 20261119)) + int(block_idx)
         )
         thresholds = {}
-        cpu_scores = scores.detach().cpu()
+        configured_classes = int(self.cfg.DATASET.NUM_INC_CLS)
+        if configured_classes < 1:
+            raise ValueError("NUM_INC_CLS must be positive for Session threshold calibration.")
         for size in support_sizes:
-            group_q90 = []
-            for _ in range(groups):
-                # Each Monte-Carlo pseudo-Session is sampled from the held-out
-                # Base source pool. Sampling with replacement also supports a
-                # configured Session larger than the finite holdout pool.
-                indices = torch.randint(
-                    cpu_scores.numel(), (int(size),), generator=generator
+            size = int(size)
+            quotient, remainder = divmod(size, configured_classes)
+            per_class_counts = [quotient + (1 if index < remainder else 0)
+                                for index in range(configured_classes)]
+            if configured_classes > len(class_rows):
+                raise ValueError("Base holdout has fewer classes than an incremental Session.")
+            if any(
+                count > min(class_rows[class_id].numel() for class_id in class_rows)
+                for count in per_class_counts if count > 0
+            ):
+                raise ValueError(
+                    f"Base holdout cannot form a class-balanced Session of {size} samples "
+                    f"across {configured_classes} classes without within-Session replacement."
                 )
+            group_q90 = []
+            class_ids = list(class_rows)
+            for _ in range(groups):
+                selected_class_indices = torch.randperm(
+                    len(class_ids), generator=generator
+                )[:configured_classes].tolist()
+                selected_classes = [class_ids[index] for index in selected_class_indices]
+                sampled_rows = []
+                for class_position, class_id in enumerate(selected_classes):
+                    count = per_class_counts[class_position]
+                    if count:
+                        rows = class_rows[class_id]
+                        order = torch.randperm(rows.numel(), generator=generator)[:count]
+                        sampled_rows.extend(rows[order].tolist())
+                indices = torch.as_tensor(sampled_rows, dtype=torch.long)
                 group_q90.append(torch.quantile(cpu_scores[indices], 0.90))
             thresholds[int(size)] = float(torch.quantile(
                 torch.stack(group_q90), quantile
@@ -938,7 +974,7 @@ class Runner:
             adapter.assert_descriptors_ready()
             adapter.freeze_all()
             self.expansion_thresholds[int(block_idx)] = self._calibrate_session_expansion_thresholds(
-                adapter, reference_values, support_sizes, block_idx
+                adapter, reference_values, reference_labels, support_sizes, block_idx
             )
 
     def _collect_class_anchors(self, loader):
