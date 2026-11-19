@@ -109,8 +109,8 @@ class BiMC(nn.Module):
                     # Descriptors are opened only by their reconstruction-only
                     # training stage; classification never owns their gradient.
                     # The same affine normalization is applied to reference
-                    # router/AE inputs and adapted expert inputs. Freeze it so
-                    # the reference distribution cannot drift during Base training.
+                    # router/AE/expert inputs. Freeze it so the shared
+                    # reference distribution cannot drift during Base training.
                     param.requires_grad = (
                         ".descriptors." not in name and ".layer_norm." not in name
                     )
