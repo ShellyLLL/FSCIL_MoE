@@ -1,7 +1,6 @@
 
 import json
 from dataclasses import dataclass
-from typing import Dict, List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,13 +10,12 @@ import models.clip.clip as clip
 
 @dataclass
 class LayerExpansionDecision:
-    """Task-level decision with per-class evidence retained for diagnostics."""
+    """Robust task-level distribution-shift decision for one transformer layer."""
     block_idx: int
     expand: bool
-    class_scores: Dict[int, float]
-    novel_classes: List[int]
-    task_novelty_score: float
-    task_novelty_threshold: float
+    task_shift_score: float
+    threshold: float
+    support_count: int
 
 
 def build_loo_cache_from_embeddings(features, labels, source_ids, class_index=None):
@@ -253,80 +251,66 @@ class BiMC(nn.Module):
                 if getattr(block, "moe_adapter", None) is not None]
 
     @torch.no_grad()
-    def plan_layer_expansion(
-        self, block_idx, features, class_index, threshold=None, task_threshold=None,
-    ):
-        """Decide whether the complete current Session has a novel distribution.
+    def plan_layer_expansion(self, block_idx, features, class_index, threshold=None):
+        """Detect task-level shift using the complete Session support set.
 
-        A class score is the minimum across deployed descriptors of the
-        per-descriptor median standardized reconstruction error.  The task
-        score is the fraction of current classes whose score exceeds the
-        Base-calibrated class threshold.  Expansion is decided only from the
-        separately Base-calibrated pseudo-Session task threshold.
+        For each support sample, the best existing descriptor is the one with
+        the minimum standardized reconstruction error. The Session score is
+        the median of these per-sample best-descriptor scores. A layer expands
+        only when this robust task score exceeds the fixed Z-score threshold.
         """
         block_idx = int(block_idx)
-        class_threshold = float(getattr(
-            self.cfg.TRAINER.BiMC.VISUAL_MOE, "EXPANSION_Z_THRESHOLD", 1.0
+        configured_threshold = float(getattr(
+            self.cfg.TRAINER.BiMC.VISUAL_MOE, "EXPANSION_Z_THRESHOLD", 1.5
         ) if threshold is None else threshold)
-        moe_cfg = self.cfg.TRAINER.BiMC.VISUAL_MOE
-        if task_threshold is None:
-            raise RuntimeError(
-                "Task-level expansion requires a separately Base-calibrated pseudo-Session threshold."
-            )
-        task_threshold = float(task_threshold)
-        if not np.isfinite(class_threshold):
-            raise ValueError("Base-calibrated class novelty threshold must be finite.")
-        if not np.isfinite(task_threshold) or not 0.0 <= task_threshold <= 1.0:
-            raise ValueError("Base-calibrated task novelty threshold must be finite and in [0, 1].")
+        if not np.isfinite(configured_threshold):
+            raise ValueError("Expansion Z-score threshold must be finite.")
         if block_idx not in features:
             raise KeyError(f"Block {block_idx} did not produce support features.")
 
         adapter = self.clip_model.visual.transformer.resblocks[block_idx].moe_adapter
         adapter.assert_descriptors_ready()
-        values = features[block_idx]["cls_in"].to(self.device)
-        labels = features[block_idx]["labels"].to(self.device)
-        scores = adapter.descriptor_scores(values)
-
+        item = features[block_idx]
+        values = torch.as_tensor(item["cls_in"], device=self.device).float()
+        labels = torch.as_tensor(item["labels"], device=self.device, dtype=torch.long).reshape(-1)
         expected = sorted(int(value) for value in class_index)
         observed = sorted(int(value) for value in torch.unique(labels, sorted=True).tolist())
         if observed != expected:
             raise RuntimeError(
                 f"Block {block_idx} received classes {observed}, expected {expected}."
             )
-        if scores.ndim != 2 or scores.size(1) != adapter.num_experts or not torch.isfinite(scores).all():
-            raise FloatingPointError(f"Block {block_idx} produced invalid descriptor Z-scores.")
+        if (values.ndim != 2 or values.size(0) == 0 or labels.numel() != values.size(0)
+                or not torch.isfinite(values).all()):
+            raise ValueError(f"Block {block_idx} received empty, misaligned or non-finite support features.")
 
-        class_ids = torch.unique(labels, sorted=True)
-        class_descriptor_scores = torch.stack([
-            torch.stack([
-                scores[labels.eq(class_id), expert_id].median()
-                for expert_id in range(adapter.num_experts)
-            ])
-            for class_id in class_ids
-        ])
-        class_min_scores = class_descriptor_scores.min(dim=1).values
-        class_scores = {
-            int(class_id): float(class_min_scores[row].item())
-            for row, class_id in enumerate(class_ids.tolist())
-        }
-        novel_classes = [
-            class_id for class_id, score in class_scores.items()
-            if score > class_threshold
-        ]
-        task_score = len(novel_classes) / float(len(expected))
-        expand = task_score > task_threshold
+        descriptor_scores = adapter.descriptor_scores(values)
+        if (descriptor_scores.ndim != 2
+                or descriptor_scores.size(0) != values.size(0)
+                or descriptor_scores.size(1) != adapter.num_experts
+                or not torch.isfinite(descriptor_scores).all()):
+            raise FloatingPointError(
+                f"Block {block_idx} produced invalid descriptor Z-scores."
+            )
+
+        # One existing expert is sufficient to cover an individual sample.
+        sample_shift_scores = descriptor_scores.min(dim=1).values.float()
+        # torch.quantile(..., 0.5) implements the conventional median, including
+        # averaging the two central values when the support count is even.
+        task_shift_score = torch.quantile(sample_shift_scores, 0.5)
+        if not bool(torch.isfinite(task_shift_score).item()):
+            raise FloatingPointError(f"Block {block_idx} produced a non-finite task shift score.")
+
         decision = LayerExpansionDecision(
             block_idx=block_idx,
-            expand=bool(expand),
-            class_scores=class_scores,
-            novel_classes=novel_classes,
-            task_novelty_score=float(task_score),
-            task_novelty_threshold=task_threshold,
+            expand=bool((task_shift_score > configured_threshold).item()),
+            task_shift_score=float(task_shift_score.item()),
+            threshold=configured_threshold,
+            support_count=int(values.size(0)),
         )
         print(
-            f"=> [Task-Expansion][B{block_idx}] novel_classes={novel_classes} "
-            f"task_novelty={task_score:.3f} threshold={task_threshold:.3f} "
-            f"class_threshold={class_threshold:.4f} "
+            f"=> [Task-Expansion][B{block_idx}] support_n={decision.support_count} "
+            f"median_best_z={decision.task_shift_score:.4f} "
+            f"threshold={decision.threshold:.4f} "
             f"decision={'EXPAND' if decision.expand else 'REUSE'}"
         )
         return decision
