@@ -1286,6 +1286,12 @@ class Runner:
                 bank = self._build_incremental_bank(
                     extract_loader, class_index, old_states)
                 self.model.train()
+                # Frozen historical experts stay in eval mode; only the
+                # newest residual adapter uses its configured dropout.
+                for _, layer_adapter in self._moe_adapters():
+                    layer_adapter.eval()
+                adapter.experts[-1].train()
+                descriptor.train()
                 total, ce_total, rd_total, pd_total, count = 0.0, 0.0, 0.0, 0.0, 0
                 epoch_samples = 0
                 for batch in train_loader:
@@ -1387,9 +1393,7 @@ class Runner:
                 "task_false_alarm_rate": float(decision.threshold),
                 "classification_samples_per_epoch": samples_per_epoch,
                 "classification_samples_total": int(classification_samples_total),
-                "router_positive_samples_per_epoch": list(samples_per_epoch),
-                "router_positive_fraction": 1.0,
-                "ae_fit_samples": int(ae_fit_values.size(0)),
+                "rd_training_samples": int(ae_fit_values.size(0)),
                 "ae_calibration_sources": calibration_count,
                 "ae_effective_calibration_count": float(
                     adapter.descriptors[expert_id].effective_error_count.item()
