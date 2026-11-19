@@ -86,6 +86,8 @@ class Runner:
     def _expansion_policy(self):
         """Checkpointed contract for robust task-level AE shift detection."""
         moe_cfg = self._visual_moe_cfg()
+        model_cfg = _cfg_value(self.cfg, "MODEL", None)
+        backbone_cfg = _cfg_value(model_cfg, "BACKBONE", None)
         return {
             "version": 3,
             "decision_unit": "incremental_session",
@@ -106,7 +108,7 @@ class Runner:
             "descriptor_buffer_size": int(_cfg_value(moe_cfg, "DESCRIPTOR_BUFFER_SIZE", 500)),
             "incremental_gate_bias_init": float(_cfg_value(moe_cfg, "INCREMENTAL_GATE_BIAS_INIT", -1.0)),
             "base_scale_init": float(_cfg_value(moe_cfg, "BASE_SCALE_INIT", 1.0)),
-            "backbone_name": str(self.cfg.MODEL.BACKBONE.NAME),
+            "backbone_name": str(_cfg_value(backbone_cfg, "NAME", "unknown")),
             "precision": str(_cfg_value(self.cfg.TRAINER.BiMC, "PREC", "fp32")),
         }
 
