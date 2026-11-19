@@ -793,7 +793,8 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             }
             checkpoint_path = runner.save_checkpoint(0, [state])
             payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-            self.assertEqual(payload["schema_version"], 27)
+            self.assertEqual(payload["schema_version"], 28)
+            self.assertTrue(payload["base_calibration_source_ids"])
             self.assertIn("expansion_thresholds", payload)
             self.assertEqual(payload["expansion_thresholds"], runner.expansion_thresholds)
             self.assertIn("reference_image_proto", payload["task_states"][0])
