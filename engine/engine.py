@@ -38,7 +38,7 @@ def _cfg_value(node, name, default):
 
 
 class Runner:
-    """FSCIL runner with task-level AE shift detection, dynamic experts and semantic visual prototypes."""
+    """FSCIL runner with Session-Q90 RD detection, dynamic experts and semantic visual prototypes."""
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -110,7 +110,7 @@ class Runner:
             "version": 7,
             "decision_unit": "incremental_session",
             "sample_score": "minimum_standardized_reconstruction_error_over_deployed_RDs",
-            "task_score": "session_q90_of_sample_scores",
+            "session_score": "session_q90_of_sample_scores",
             "decision": "session_q90_greater_than_base_holdout_q95_for_same_support_size",
             "threshold_quantile": float(_cfg_value(moe_cfg, "EXPANSION_THRESHOLD_QUANTILE", 0.95)),
             "calibration_groups": int(_cfg_value(moe_cfg, "EXPANSION_CALIBRATION_GROUPS", 256)),
