@@ -54,6 +54,7 @@ class Runner:
         self.model_without_dp = self.model.module if self.is_distributed else self.model
         self.acc_list, self.task_acc_list = [], []
         self.session_diagnostics = []
+        self.expansion_thresholds = {}
         self.evaluator = AccuracyEvaluator(self.data_manager.class_index_in_task)
         self._resume_completed_session = -1
         self._resume_state_dict_list = []
@@ -106,12 +107,15 @@ class Runner:
         loss_cfg = _cfg_value(trainer_cfg, "LOSS", None)
         dataset_cfg = _cfg_value(self.cfg, "DATASET", None)
         return {
-            "version": 6,
+            "version": 7,
             "decision_unit": "incremental_session",
-            "sample_score": "maximum_upper_tail_conformal_pvalue_over_deployed_experts",
-            "task_score": "exact_binomial_lower_median_pvalue",
-            "decision": "task_pvalue_less_than_false_alarm_rate",
-            "false_alarm_rate": float(_cfg_value(moe_cfg, "EXPANSION_FALSE_ALARM_RATE", 0.05)),
+            "sample_score": "minimum_standardized_reconstruction_error_over_deployed_RDs",
+            "task_score": "session_q90_of_sample_scores",
+            "decision": "session_q90_greater_than_base_holdout_q95_for_same_support_size",
+            "threshold_quantile": float(_cfg_value(moe_cfg, "EXPANSION_THRESHOLD_QUANTILE", 0.95)),
+            "calibration_groups": int(_cfg_value(moe_cfg, "EXPANSION_CALIBRATION_GROUPS", 256)),
+            "expert_training_scope": "all_current_session_samples",
+            "descriptor_training_scope": "all_current_session_reference_cls",
             "expert_training_scope": "all_current_session_samples",
             "descriptor_training_scope": "all_current_session_reference_cls",
             "router_positive_scope": "all_current_session_samples",
@@ -128,6 +132,7 @@ class Runner:
             "descriptor_denoise_scale": float(_cfg_value(moe_cfg, "DESCRIPTOR_DENOISE_SCALE", 0.05)),
             "descriptor_residual_weight": float(_cfg_value(moe_cfg, "DESCRIPTOR_RESIDUAL_WEIGHT", 1e-3)),
             "incremental_gate_bias_init": float(_cfg_value(moe_cfg, "INCREMENTAL_GATE_BIAS_INIT", -1.0)),
+            "incremental_dropout": float(_cfg_value(moe_cfg, "INCREMENTAL_DROPOUT", 0.1)),
             "base_scale_init": float(_cfg_value(moe_cfg, "BASE_SCALE_INIT", 1.0)),
             "backbone_name": str(_cfg_value(backbone_cfg, "NAME", "unknown")),
             "precision": str(_cfg_value(trainer_cfg, "PREC", "fp32")),
@@ -361,16 +366,16 @@ class Runner:
             raise ValueError("Resume checkpoint must contain a dictionary payload.")
         required = (
             "schema_version", "completed_session", "model_state", "task_states",
-            "support_manifest", "moe_topology", "expansion_policy",
+            "support_manifest", "moe_topology", "expansion_policy", "expansion_thresholds",
         )
         missing = [key for key in required if key not in payload]
         if missing:
             raise ValueError(f"Resume checkpoint is missing required fields: {missing}")
         schema = int(payload["schema_version"])
-        if schema != 26:
+        if schema != 27:
             raise ValueError(
-                "This branch uses anchored low-rank residual RD checkpoint schema (26); "
-                "older independently initialized descriptor checkpoints are incompatible."
+                "This branch uses Base-calibrated Session-Q90 expansion checkpoint schema (27); "
+                "older conformal/median expansion checkpoints are incompatible."
             )
         checkpoint_policy = payload.get("expansion_policy")
         if checkpoint_policy != self._expansion_policy():
@@ -409,6 +414,19 @@ class Runner:
                 "Checkpoint MoE topology blocks do not match configured insertion blocks: "
                 f"{set(topology)} versus {expected_topology_blocks}."
             )
+        thresholds = payload.get("expansion_thresholds")
+        if not isinstance(thresholds, dict) or not thresholds:
+            raise ValueError("Checkpoint is missing Base-calibrated Session expansion thresholds.")
+        self.expansion_thresholds = {
+            int(block): {int(size): float(value) for size, value in by_size.items()}
+            for block, by_size in thresholds.items()
+        }
+        if any(
+            size <= 0 or not np.isfinite(value)
+            for by_size in self.expansion_thresholds.values()
+            for size, value in by_size.items()
+        ):
+            raise ValueError("Checkpoint contains invalid Session expansion thresholds.")
         self.model_without_dp.rebuild_moe_topology(topology)
         self.model_without_dp.load_state_dict(payload["model_state"], strict=True)
         for _, adapter in self._moe_adapters():
@@ -567,8 +585,9 @@ class Runner:
         directory.mkdir(parents=True, exist_ok=True)
         topology = self.model_without_dp.export_moe_topology()
         payload = {
-            "schema_version": 26,
+            "schema_version": 27,
             "completed_session": int(completed_session),
+            "expansion_thresholds": self._cpu_copy(self.expansion_thresholds),
             "model_state": self._cpu_copy(self.model_without_dp.state_dict()),
             "moe_topology": topology,
             "task_states": self._cpu_copy(state_dict_list),
