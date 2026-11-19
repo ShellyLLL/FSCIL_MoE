@@ -316,7 +316,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         for _, adapter in runner._moe_adapters():
             adapter.assert_descriptors_ready()
             for descriptor in adapter.descriptors:
-                self.assertEqual(int(descriptor.error_count.item()), 48)
+                self.assertEqual(int(descriptor.error_count.item()), 16)
                 self.assertGreater(float(descriptor.effective_error_count.item()), 0.0)
                 self.assertTrue(torch.isfinite(descriptor.error_mean))
                 self.assertTrue(torch.isfinite(descriptor.error_std))
@@ -1135,7 +1135,10 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         # rather than causing a duplicate expert in the next pass.
         session1_features = model.collect_blockwise_cls_features([session1_support])
         for block in model.expandable_blocks():
-            decision = model.plan_layer_expansion(block, session1_features, [1], 0.05)
+            decision = model.plan_layer_expansion(
+                block, session1_features, [1],
+                runner.expansion_thresholds[block][int(session1_support["label"].numel())],
+            )
             self.assertFalse(decision.expand)
 
         session1_anchors = runner._collect_class_anchors([session1_support])
@@ -1202,7 +1205,10 @@ class UnifiedDynamicMoETests(unittest.TestCase):
 
         session2_features = model.collect_blockwise_cls_features([session2_support])
         for block in model.expandable_blocks():
-            decision = model.plan_layer_expansion(block, session2_features, [2], 0.05)
+            decision = model.plan_layer_expansion(
+                block, session2_features, [2],
+                runner.expansion_thresholds[block][int(session2_support["label"].numel())],
+            )
             self.assertFalse(decision.expand)
 
         # Checkpoint-style topology reconstruction must preserve the complete
@@ -1278,7 +1284,10 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             )
             for block in model.expandable_blocks():
                 features = model.collect_blockwise_cls_features([support])
-                decision = model.plan_layer_expansion(block, features, [session_id], 0.05)
+                decision = model.plan_layer_expansion(
+                    block, features, [session_id],
+                    runner.expansion_thresholds[block][int(support["label"].numel())],
+                )
                 self.assertFalse(decision.expand)
             states.append(make_lifecycle_state(
                 runner, model, session_id, support, session_id
