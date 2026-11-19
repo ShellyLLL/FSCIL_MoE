@@ -274,6 +274,24 @@ class RepresentationDescriptor(nn.Module):
             raise RuntimeError("AE descriptor has no valid independent weighted reference errors.")
         return (self.reconstruction_error(x) - self.error_mean) / self.error_std.clamp_min(self.eps)
 
+    @torch.no_grad()
+    def upper_tail_p_value(self, x):
+        """Finite-sample conformal p-values from independent, unweighted errors."""
+        if not self.is_ready():
+            raise RuntimeError("AE descriptor has no valid independent reference errors.")
+        count = int(self.error_count.item())
+        weights = self.error_weight_history if count == self.buffer_size else self.error_weight_history[:count]
+        if not torch.allclose(weights, torch.ones_like(weights), rtol=1e-5, atol=1e-7):
+            raise RuntimeError(
+                "Conformal expansion calibration requires unweighted exchangeable holdout errors."
+            )
+        calibration = self.error_history if count == self.buffer_size else self.error_history[:count]
+        query = self.reconstruction_error(x).reshape(-1, 1)
+        # The +1 correction makes the upper-tail rank a valid finite-sample
+        # conformal p-value; ties are counted conservatively as exceedances.
+        exceedances = (calibration.reshape(1, -1) >= query).sum(dim=1)
+        return (1.0 + exceedances.float()) / float(count + 1)
+
     def is_ready(self):
         return (
             int(self.error_count.item()) >= 2
@@ -363,6 +381,11 @@ class VisualMoEAdapter(nn.Module):
         if require_ready:
             self.assert_descriptors_ready()
         return torch.stack([descriptor.standardized_score(x) for descriptor in self.descriptors], dim=-1)
+
+    def descriptor_coverage_pvalues(self, x, require_ready=True):
+        if require_ready:
+            self.assert_descriptors_ready()
+        return torch.stack([descriptor.upper_tail_p_value(x) for descriptor in self.descriptors], dim=-1)
 
     def expansion_statistics(self, x):
         scores = self.descriptor_scores(x, require_ready=True)
