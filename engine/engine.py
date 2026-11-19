@@ -117,6 +117,7 @@ class Runner:
             "threshold_quantile": float(_cfg_value(moe_cfg, "EXPANSION_THRESHOLD_QUANTILE", 0.95)),
             "calibration_groups": int(_cfg_value(moe_cfg, "EXPANSION_CALIBRATION_GROUPS", 256)),
             "expert_training_scope": "all_current_session_samples",
+            "gradient_clipping": "separate_functional_and_descriptor_groups_norm_1.0",
             "descriptor_training_scope": "source_disjoint_fit_partition_of_current_session_reference_cls",
             "descriptor_calibration_scope": "source_disjoint_heldout_partition_of_current_session_reference_cls",
             "router_learning_signal": "global_CE_plus_old_route_and_expert_residual_PD",
