@@ -113,7 +113,7 @@ def build_lifecycle_runner():
             EXPANSION_THRESHOLD_QUANTILE=0.95,
             EXPANSION_CALIBRATION_GROUPS=20,
             EXPANSION_CALIBRATION_SEED=271,
-            SESSION_SUPPORT_SIZES=[8, 16],
+            SESSION_SUPPORT_SIZES=[32],
         ),
         OPTIM=optim_cfg,
         INCREMENTAL=incremental_cfg,
@@ -125,7 +125,7 @@ def build_lifecycle_runner():
     )
     cfg = SimpleNamespace(
         TRAINER=SimpleNamespace(BiMC=bimc_cfg),
-        DATASET=SimpleNamespace(NUM_INC_CLS=1, NUM_INC_SHOT=8, SESSION_SUPPORT_SIZES=[8, 16]),
+        DATASET=SimpleNamespace(NUM_INC_CLS=1, NUM_INC_SHOT=32, SESSION_SUPPORT_SIZES=[32]),
     )
     model = BiMC.__new__(BiMC)
     nn.Module.__init__(model)
@@ -147,13 +147,12 @@ def build_lifecycle_runner():
 
 
 def lifecycle_batch(class_id, feature, source_start, augmented=False, seed=0):
-    count = 8
+    count = 32
     images = feature.reshape(1, 8).repeat(count, 1).clone()
-    if augmented:
-        generator = torch.Generator().manual_seed(seed)
-        perturbation = torch.randn(images.shape, generator=generator) * 0.30
-        perturbation[:, class_id] = 0.0
-        images = images + perturbation
+    generator = torch.Generator().manual_seed(seed if augmented else source_start)
+    perturbation = torch.randn(images.shape, generator=generator) * (0.03 if not augmented else 0.30)
+    perturbation[:, class_id] = 0.0
+    images = images + perturbation
     return {
         "image": images,
         "label": torch.full((count,), int(class_id), dtype=torch.long),
