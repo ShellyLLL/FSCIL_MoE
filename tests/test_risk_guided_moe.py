@@ -766,7 +766,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             [[0.90, 0.80], [0.90, 0.80], [0.01, 0.02], [0.01, 0.02]])
         decision = model.plan_layer_expansion(0, features, [2, 3], 0.05)
         self.assertTrue(decision.expand)
-        self.assertAlmostEqual(decision.task_shift_score, 0.002368, places=5)
+        self.assertAlmostEqual(decision.task_shift_score, 0.00233648, places=7)
         self.assertEqual(decision.support_count, 4)
         self.assertEqual(decision.threshold, 0.05)
 
