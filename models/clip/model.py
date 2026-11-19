@@ -135,7 +135,7 @@ class QuickGELU(nn.Module):
 
 
 class RepresentationDescriptor(nn.Module):
-    """Centered tied-weight low-rank linear AE for expert distribution coverage."""
+    """Centered tied-weight low-rank linear AE with independent conformal error references."""
     def __init__(self, d_model, descriptor_dim=64, eps=1e-4, buffer_size=500):
         super().__init__()
         self.d_model = int(d_model)
