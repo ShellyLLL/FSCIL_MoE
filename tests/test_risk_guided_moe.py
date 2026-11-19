@@ -893,7 +893,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         decision = model.plan_layer_expansion(0, features, [2, 3], 1.0)
         expected_q90 = torch.quantile(torch.tensor([0.1, 0.2, 0.3, 0.4, 2.0, 2.1, 2.2, 4.0]), 0.90)
         self.assertTrue(decision.expand)
-        self.assertAlmostEqual(decision.task_shift_score, float(expected_q90), places=6)
+        self.assertAlmostEqual(decision.session_q90, float(expected_q90), places=6)
         self.assertEqual(decision.support_count, 8)
         self.assertEqual(decision.threshold, 1.0)
 
