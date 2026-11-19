@@ -928,13 +928,11 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         captured_block1 = {}
         original_plan = model.plan_layer_expansion
 
-        def capture_downstream_plan(
-            block_idx, features, class_index, threshold=None, task_threshold=None
-        ):
+        def capture_downstream_plan(block_idx, features, class_index, threshold=None):
             if int(block_idx) == 1:
                 captured_block1["cls_in"] = features[1]["cls_in"].detach().clone()
             return original_plan(
-                block_idx, features, class_index, threshold, task_threshold
+                block_idx, features, class_index, threshold
             )
 
         model.plan_layer_expansion = capture_downstream_plan
@@ -1098,8 +1096,6 @@ class UnifiedDynamicMoETests(unittest.TestCase):
                 [f"class_{session_id}"], states,
             )
             self.assertTrue(result["trained"])
-            self.assertEqual(
-            )
             self.assertEqual(
                 [adapter.num_experts for _, adapter in runner._moe_adapters()],
                 [expected_counts[session_id], expected_counts[session_id]],
