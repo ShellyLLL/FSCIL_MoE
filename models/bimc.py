@@ -11,7 +11,7 @@ import models.clip.clip as clip
 
 @dataclass
 class LayerExpansionDecision:
-    """Robust task-level distribution-shift decision for one transformer layer."""
+    """Base-calibrated Session-Q90 expansion decision for one transformer layer."""
     block_idx: int
     expand: bool
     session_q90: float
