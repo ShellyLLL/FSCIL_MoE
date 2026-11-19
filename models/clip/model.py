@@ -199,54 +199,85 @@ class RepresentationDescriptor(nn.Module):
 
     @torch.no_grad()
     def update_reference(self, errors, weights=None):
-        errors = torch.as_tensor(errors, device=self.error_history.device, dtype=torch.float32).reshape(-1)
-        if errors.numel() == 0 or not torch.isfinite(errors).all():
-            raise ValueError("AE reference update requires non-empty finite errors.")
+        """Atomically update weighted error statistics from independent holdout errors."""
+        errors = torch.as_tensor(
+            errors, device=self.error_history.device, dtype=torch.float32
+        ).reshape(-1)
+        if errors.numel() < 2 or not torch.isfinite(errors).all():
+            raise ValueError("AE reference update requires at least two finite independent errors.")
         weights = torch.ones_like(errors) if weights is None else torch.as_tensor(
             weights, device=errors.device, dtype=torch.float32
         ).reshape(-1)
         if (weights.numel() != errors.numel() or not torch.isfinite(weights).all()
                 or (weights < 0).any() or not bool((weights.sum() > 0).item())):
-            raise ValueError("AE calibration weights must align with errors and have positive mass.")
-        n = errors.numel()
+            raise ValueError("AE calibration weights must align with errors and have positive finite mass.")
+
+        # Construct the prospective ring-buffer state without mutating the live
+        # descriptor. A failed effective-sample-size check must not leave a
+        # partially updated calibration buffer behind.
+        new_history = self.error_history.detach().clone()
+        new_weight_history = self.error_weight_history.detach().clone()
+        old_count = int(self.error_count.item())
+        old_cursor = int(self.error_cursor.item())
+        n = int(errors.numel())
         if n >= self.buffer_size:
-            self.error_history.copy_(errors[-self.buffer_size:])
-            self.error_weight_history.copy_(weights[-self.buffer_size:])
-            self.error_count.fill_(self.buffer_size)
-            self.error_cursor.zero_()
+            new_history.copy_(errors[-self.buffer_size:])
+            new_weight_history.copy_(weights[-self.buffer_size:])
+            new_count = self.buffer_size
+            new_cursor = 0
         else:
-            cursor = int(self.error_cursor.item())
-            positions = (torch.arange(n, device=errors.device) + cursor) % self.buffer_size
-            self.error_history[positions] = errors
-            self.error_weight_history[positions] = weights
-            self.error_count.fill_(min(self.buffer_size, int(self.error_count.item()) + n))
-            self.error_cursor.fill_((cursor + n) % self.buffer_size)
-        count = int(self.error_count.item())
-        values = self.error_history if count == self.buffer_size else self.error_history[:count]
-        mass_weights = self.error_weight_history if count == self.buffer_size else self.error_weight_history[:count]
+            positions = (
+                torch.arange(n, device=errors.device) + old_cursor
+            ) % self.buffer_size
+            new_history[positions] = errors
+            new_weight_history[positions] = weights
+            new_count = min(self.buffer_size, old_count + n)
+            new_cursor = (old_cursor + n) % self.buffer_size
+
+        values = new_history if new_count == self.buffer_size else new_history[:new_count]
+        mass_weights = (
+            new_weight_history if new_count == self.buffer_size
+            else new_weight_history[:new_count]
+        )
         mass = mass_weights.sum()
         squared_mass = mass_weights.square().sum()
-        if not bool((mass > 0).item()) or not bool((squared_mass > 0).item()):
+        if (not bool((mass > 0).item())
+                or not bool((squared_mass > 0).item())):
             raise ValueError("AE calibration responsibility mass must be strictly positive.")
-        mean = (values * mass_weights).sum() / mass
         effective_n = mass.square() / squared_mass
+        # Reliability-weighted unbiased variance is undefined when the
+        # effective sample size is <= 1. Do not silently replace that case
+        # with eps: it would manufacture arbitrarily large standardized scores.
+        if not bool((effective_n > 1.0 + 1e-6).item()):
+            raise ValueError(
+                "AE calibration requires effective sample size greater than one; "
+                f"received {float(effective_n.item()):.6f}."
+            )
+        mean = (values * mass_weights).sum() / mass
         variance = (mass_weights * (values - mean).square()).sum() / mass
-        correction = effective_n / (effective_n - 1.0).clamp_min(1.0)
+        correction = effective_n / (effective_n - 1.0)
+        std = (variance * correction).clamp_min(self.eps ** 2).sqrt()
+        if not torch.isfinite(mean) or not torch.isfinite(std) or not bool((std > 0).item()):
+            raise FloatingPointError("AE calibration produced invalid weighted error statistics.")
+
+        self.error_history.copy_(new_history)
+        self.error_weight_history.copy_(new_weight_history)
+        self.error_count.fill_(new_count)
+        self.error_cursor.fill_(new_cursor)
         self.error_mean.copy_(mean)
-        self.error_std.copy_((variance * correction).clamp_min(self.eps ** 2).sqrt())
+        self.error_std.copy_(std)
         self.effective_error_count.copy_(effective_n)
         return self.error_mean, self.error_std
 
     def standardized_score(self, x):
-        if (int(self.error_count.item()) < 1
-                or float(self.effective_error_count.item()) <= 0.0):
+        if not self.is_ready():
             raise RuntimeError("AE descriptor has no valid independent weighted reference errors.")
         return (self.reconstruction_error(x) - self.error_mean) / self.error_std.clamp_min(self.eps)
 
     def is_ready(self):
         return (
-            int(self.error_count.item()) >= 1
-            and float(self.effective_error_count.item()) > 0.0
+            int(self.error_count.item()) >= 2
+            and float(self.effective_error_count.item()) > 1.0 + 1e-6
             and bool(torch.isfinite(self.error_mean).item())
             and bool(torch.isfinite(self.error_std).item())
             and float(self.error_std.item()) > 0.0
