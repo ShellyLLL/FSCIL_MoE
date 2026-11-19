@@ -67,29 +67,35 @@ Lifecycle:
    holdout estimates that descriptor's reconstruction-error mean and standard
    deviation. It does not calibrate the task-level expansion threshold.
 3. At each incremental Session, collect frozen-reference CLS input
-   features for every support source. Each descriptor converts its independent,
-   unweighted holdout errors into finite-sample upper-tail conformal p-values.
-   The maximum p-value across deployed experts tests whether at least one
-   existing expert covers each sample; this remains valid as the expert pool
-   grows. The lower-median sample p-value is converted into an exact binomial
-   order-statistic p-value. Expand one expert when this task p-value is below
-   the configured false-alarm rate (default 0.05); otherwise reuse the pool.
-   No pseudo-Sessions or task-threshold calibration are used.
-4. Train the new expert and its router column on all current-Session samples.
-   Every current-Session sample is positive router supervision and participates
-   in the global seen-class visual-prototype classification objective. Old-class
-   route anchors suppress new-expert interference. All historical experts,
-   router columns and the ViT remain frozen.
-5. Select the historical RD anchor whose current-Session 90th-percentile
+   features for every support source. For each sample, compute its standardized
+   reconstruction error under every deployed RD and retain the minimum score:
+   u_i,l = min_k z_i,l,k. Aggregate all samples in the Session (without
+   class-wise grouping) using s_l^t = Q_0.90({u_i,l}). Base holdout sources are
+   grouped into pseudo-Sessions matching each configured support-set size;
+   each group is scored with the same Q90 statistic. The per-layer threshold
+   tau_l(N) is the Q0.95 quantile of those Base Session scores. Expand exactly
+   one expert in a layer when s_l^t > tau_l(N); otherwise reuse the pool.
+   The calibrated threshold table is checkpointed and restored with the model.
+4. Select the historical RD anchor whose current-Session 90th-percentile
    standardized reconstruction error is lowest. The new RD reuses that frozen
    descriptor function and adds a zero-output, low-rank residual branch
-   (Kaiming-initialized down projection, zero-initialized up projection). Train
-   only this residual on the current Session's reference CLS fit sources with
-   light Base-statistics-scaled input noise and residual-energy regularization.
-   A source-exclusive holdout calibrates the new RD's reconstruction-error
-   reference statistics. Historical RD anchors remain frozen, and the new RD
-   becomes an independent reusable descriptor for later Sessions. The AE path
-   is used for future task-level expansion decisions, not classification.
+   (Kaiming-initialized down projection, zero-initialized up projection).
+   Initialize the new residual expert with a Kaiming down projection and
+   zero output projection. Train the new expert, its independent sigmoid
+   router and the paired RD residual jointly on all current-Session K-shot
+   samples. The objective is CE + lambda_D RD + lambda_P PD: CE and PD update
+   only the new expert/router, while denoising reconstruction RD updates only
+   the new RD residual. Historical experts, router columns, RD anchors and ViT
+   remain frozen. The trained new RD's error mean/std are estimated from the
+   full current Session and it becomes a reusable historical descriptor.
+5. After expert training and freezing, compute each novel class's adapted
+   visual support prototype. Encode its class description with the frozen
+   CLIP text encoder. Description-semantic similarity retrieves related Base
+   description semantics and their corresponding Base **adapted visual**
+   prototypes. Blend the novel visual prototype with this retrieved visual
+   direction using a calibration strength controlled by semantic confidence
+   and support-prototype reliability. Only novel visual prototypes are
+   calibrated; historical prototypes remain unchanged.
 6. After expert training and freezing, compute each novel class's adapted
    visual support prototype. Encode its class description with the frozen
    CLIP text encoder. Description-semantic similarity retrieves related Base
