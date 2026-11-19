@@ -111,7 +111,7 @@ def build_lifecycle_runner():
             INCREMENTAL_REDUCTION=2,
             INCREMENTAL_DROPOUT=0.1,
             EXPANSION_THRESHOLD_QUANTILE=0.95,
-            EXPANSION_CALIBRATION_GROUPS=20,
+            EXPANSION_CALIBRATION_GROUPS=256,
             EXPANSION_CALIBRATION_SEED=271,
             SESSION_SUPPORT_SIZES=[16, 32],
         ),
@@ -971,7 +971,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             "image_proto": torch.tensor([[0.0, -1.0]]),
             "description_proto": torch.tensor([[0.0, -1.0]]),
         }
-        visual = torch.tensor([[0.0, 1.0]])
+        visual = F.normalize(torch.tensor([[0.8, 0.6]]), dim=-1)
         semantic = torch.tensor([[1.0, 0.0]])
         calibrated, diagnostics = runner._semantic_guided_visual_prototype_calibration(
             visual, semantic, torch.tensor([1]), [base, old_incremental]
@@ -979,6 +979,13 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         self.assertGreater(calibrated[0, 0].item(), visual[0, 0].item())
         self.assertLess(calibrated[0, 1].item(), visual[0, 1].item())
         self.assertGreater(diagnostics["alpha"].item(), 0.0)
+        heldout_query = F.normalize(torch.tensor([[0.95, 0.31]]), dim=-1)
+        raw_similarity = (heldout_query @ visual.t()).item()
+        calibrated_similarity = (heldout_query @ calibrated.t()).item()
+        self.assertGreater(
+            calibrated_similarity, raw_similarity,
+            "semantic calibration should improve alignment to this held-out novel-class direction",
+        )
         changed_incremental = dict(old_incremental)
         changed_incremental["image_proto"] = torch.tensor([[-1.0, 0.0]])
         changed, _ = runner._semantic_guided_visual_prototype_calibration(
@@ -1229,6 +1236,28 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         torch.testing.assert_close(
             predictions_after_session2, predictions_before_session2, rtol=0, atol=0
         )
+        with torch.no_grad():
+            current_support_features = F.normalize(
+                model.extract_img_feature(old_support_images).float(), dim=-1
+            )
+            current_old_prototypes = torch.stack([
+                F.normalize(
+                    current_support_features[:base_support["image"].size(0)].mean(0),
+                    dim=-1,
+                ),
+                F.normalize(
+                    current_support_features[base_support["image"].size(0):].mean(0),
+                    dim=-1,
+                ),
+            ])
+        prototype_alignment = F.cosine_similarity(
+            old_prototypes.float(), current_old_prototypes.float(), dim=-1
+        )
+        self.assertTrue(torch.isfinite(prototype_alignment).all())
+        self.assertGreaterEqual(
+            float(prototype_alignment.min().item()), 0.98,
+            "stored historical prototypes must remain aligned with current old-class support means",
+        )
 
         session2_features = model.collect_blockwise_cls_features([session2_support])
         for block in model.expandable_blocks():
@@ -1353,8 +1382,21 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         )
         session1_state = make_lifecycle_state(runner, model, 1, session1_support, 1)
 
-        old_images = torch.cat([base_support["image"], session1_support["image"]], dim=0)
-        old_labels = torch.tensor([0] * base_support["image"].size(0) + [1] * session1_support["image"].size(0))
+        # Evaluate on disjoint query sources: prototype support images must
+        # never double as the retention test set.
+        base_queries = lifecycle_batch(
+            0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 2900
+        )
+        session1_queries = lifecycle_batch(
+            1, torch.tensor([0., 1., 0., 0., 0., 0., 0., 0.]), 2910
+        )
+        old_images = torch.cat([base_queries["image"], session1_queries["image"]], dim=0)
+        old_support_images = torch.cat(
+            [base_support["image"], session1_support["image"]], dim=0
+        )
+        old_labels = torch.tensor(
+            [0] * base_queries["image"].size(0) + [1] * session1_queries["image"].size(0)
+        )
         old_prototypes = torch.cat([
             base_state["image_proto"], session1_state["image_proto"]
         ], dim=0)
@@ -1394,7 +1436,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             ))
             newest_old_responses.append(float(after[:, -1].mean().item()))
 
-        self.assertEqual(before_accuracy, old_labels.numel())
+        self.assertGreater(before_accuracy, 0)
         self.assertEqual(after_accuracy, before_accuracy)
         self.assertTrue(torch.isfinite(per_sample_cosine).all())
         self.assertGreaterEqual(feature_cosine, 0.98)
@@ -1402,9 +1444,10 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         self.assertLess(max(route_deltas), 0.10)
         self.assertLess(max(newest_old_responses), 0.30)
         print(
-            "[RETENTION] old_feature_cosine=%.6f old_accuracy=%d/%d "
+            "[RETENTION] old_feature_cosine=%.6f old_prototype_alignment=%s old_accuracy=%d/%d "
             "historical_route_mean_abs_delta=%s newest_expert_old_response=%s"
-            % (feature_cosine, after_accuracy, old_labels.numel(),
+            % (feature_cosine, [round(float(value), 6) for value in prototype_alignment.tolist()],
+               after_accuracy, old_labels.numel(),
                [round(value, 6) for value in route_deltas],
                [round(value, 6) for value in newest_old_responses])
         )
