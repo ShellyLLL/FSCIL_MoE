@@ -110,7 +110,7 @@ def build_lifecycle_runner():
             ENABLE=True,
             NUM_BASE_EXPERTS=2,
             INCREMENTAL_REDUCTION=2,
-            EXPANSION_Z_THRESHOLD=1.0,
+            EXPANSION_FALSE_ALARM_RATE=0.05,
         ),
         OPTIM=optim_cfg,
         INCREMENTAL=incremental_cfg,
@@ -697,7 +697,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             }
             checkpoint_path = runner.save_checkpoint(0, [state])
             payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-            self.assertEqual(payload["schema_version"], 23)
+            self.assertEqual(payload["schema_version"], 24)
             self.assertNotIn("expansion_thresholds", payload)
             self.assertNotIn("task_expansion_thresholds", payload)
             self.assertNotIn("descriptor_error_priors", payload)
@@ -738,7 +738,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         torch.testing.assert_close(source(x)[0], restored(x)[0], rtol=0, atol=0)
         self.assertEqual(restored.num_experts, 3)
 
-    def test_task_level_expansion_uses_minimum_descriptor_then_session_median(self):
+    def test_task_level_expansion_uses_conformal_expert_pool_and_exact_median_test(self):
         model = BiMC.__new__(BiMC)
         nn.Module.__init__(model)
         adapter = VisualMoEAdapter(8, num_experts=2, reduction=2, descriptor_dim=4)
@@ -752,28 +752,32 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         model.clip_model.visual = visual
         model.device = "cpu"
         model.cfg = SimpleNamespace(TRAINER=SimpleNamespace(BiMC=SimpleNamespace(
-            VISUAL_MOE=SimpleNamespace(EXPANSION_Z_THRESHOLD=0.8))))
+            VISUAL_MOE=SimpleNamespace(EXPANSION_FALSE_ALARM_RATE=0.05))))
         for descriptor in adapter.descriptors:
             descriptor.update_reference(torch.tensor([0.1, 0.11, 0.09, 0.1]))
         features = {0: {"cls_in": torch.randn(4, 8),
-                        "labels": torch.tensor([2, 2, 3, 3])}}
-        adapter.descriptor_scores = lambda x, require_ready=True: torch.tensor(
-            [[0.2, 0.3], [0.2, 0.3], [1.5, 1.6], [1.5, 1.6]])
-        decision = model.plan_layer_expansion(0, features, [2, 3], 0.8)
+                        "labels": torch.tensor([2, 2, 3, 3]),
+                        "source_ids": torch.tensor([10, 11, 12, 13])}}
+
+        # A sample is covered when at least one deployed expert has a large
+        # upper-tail p-value. The two low-p samples yield a significant lower
+        # median task test for N=4.
+        adapter.descriptor_coverage_pvalues = lambda x, require_ready=True: torch.tensor(
+            [[0.90, 0.80], [0.90, 0.80], [0.01, 0.02], [0.01, 0.02]])
+        decision = model.plan_layer_expansion(0, features, [2, 3], 0.05)
         self.assertTrue(decision.expand)
-        self.assertAlmostEqual(decision.task_shift_score, 0.85, places=5)
+        self.assertAlmostEqual(decision.task_shift_score, 0.002368, places=5)
         self.assertEqual(decision.support_count, 4)
-        self.assertEqual(decision.threshold, 0.8)
-        adapter.descriptor_scores = lambda x, require_ready=True: torch.tensor(
-            [[0.2, 2.0], [0.2, 2.0], [0.2, 2.0], [2.0, 2.0],
-             [0.2, 0.2], [0.2, 0.2], [0.2, 0.2], [2.0, 2.0]])
-        crossing = {0: {"cls_in": torch.randn(8, 8),
-                        "labels": torch.tensor([2, 2, 2, 2, 3, 3, 3, 3])}}
-        decision = model.plan_layer_expansion(0, crossing, [2, 3], 1.0)
+        self.assertEqual(decision.threshold, 0.05)
+
+        # Increasing expert count cannot make an uncovered sample appear
+        # covered unless at least one valid expert p-value supports coverage.
+        adapter.descriptor_coverage_pvalues = lambda x, require_ready=True: torch.full((4, 6), 0.90)
+        decision = model.plan_layer_expansion(0, features, [2, 3], 0.05)
         self.assertFalse(decision.expand)
-        self.assertAlmostEqual(decision.task_shift_score, 0.2, places=5)
-        adapter.descriptor_scores = lambda x, require_ready=True: torch.full((4, 2), 0.2)
-        decision = model.plan_layer_expansion(0, features, [2, 3], 0.2)
+
+        adapter.descriptor_coverage_pvalues = lambda x, require_ready=True: torch.full((4, 2), 0.90)
+        decision = model.plan_layer_expansion(0, features, [2, 3], 0.05)
         self.assertFalse(decision.expand)
 
     def test_semantic_guided_calibration_uses_only_base_description_to_retrieve_enhanced_visual(self):
@@ -981,7 +985,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         # rather than causing a duplicate expert in the next pass.
         session1_features = model.collect_blockwise_cls_features([session1_support])
         for block in model.expandable_blocks():
-            decision = model.plan_layer_expansion(block, session1_features, [1], 1.0)
+            decision = model.plan_layer_expansion(block, session1_features, [1], 0.05)
             self.assertFalse(decision.expand)
 
         session1_anchors = runner._collect_class_anchors([session1_support])
@@ -1048,7 +1052,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
 
         session2_features = model.collect_blockwise_cls_features([session2_support])
         for block in model.expandable_blocks():
-            decision = model.plan_layer_expansion(block, session2_features, [2], 1.0)
+            decision = model.plan_layer_expansion(block, session2_features, [2], 0.05)
             self.assertFalse(decision.expand)
 
         # Checkpoint-style topology reconstruction must preserve the complete
@@ -1124,7 +1128,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             )
             for block in model.expandable_blocks():
                 features = model.collect_blockwise_cls_features([support])
-                decision = model.plan_layer_expansion(block, features, [session_id], 1.0)
+                decision = model.plan_layer_expansion(block, features, [session_id], 0.05)
                 self.assertFalse(decision.expand)
             states.append(make_lifecycle_state(
                 runner, model, session_id, support, session_id
@@ -1225,7 +1229,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             "labels": torch.tensor([7, 7, 7, 7]),
         }}
         with self.assertRaises((FloatingPointError, ValueError)):
-            model.plan_layer_expansion(0, features, [7], 1.0)
+            model.plan_layer_expansion(0, features, [7], 0.05)
 
     def test_duplicate_source_ids_are_query_exclusive_and_cross_class_collisions_fail(self):
         feature = torch.tensor([
