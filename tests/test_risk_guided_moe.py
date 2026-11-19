@@ -276,23 +276,30 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         self.assertGreater((adapted_after - adapted_before).abs().max().item(), 0.0)
         torch.testing.assert_close(reference_before, reference_after, rtol=0, atol=0)
 
-    def test_dual_path_router_uses_reference_cls_while_experts_use_adapted_tokens(self):
+    def test_dual_path_routes_and_incremental_experts_use_frozen_reference_stream(self):
         torch.manual_seed(223)
         model = TinyVisualCLIP().eval()
         images = torch.randn(2, 3, 8, 8)
-        captured = []
         adapter = model.visual.transformer.resblocks[0].moe_adapter
-        handle = adapter.router.register_forward_pre_hook(
-            lambda _module, args: captured.append(args[0].detach().clone())
+        adapter.add_expert(session_id=1, reduction=2)
+        router_inputs, incremental_inputs = [], []
+        router_handle = adapter.router.register_forward_pre_hook(
+            lambda _module, args: router_inputs.append(args[0].detach().clone())
+        )
+        expert_handle = adapter.experts[-1].register_forward_pre_hook(
+            lambda _module, args: incremental_inputs.append(args[0].detach().clone())
         )
         try:
             adapted, reference, aux = model.visual(
                 images, return_moe_aux=True, return_reference=True
             )
         finally:
-            handle.remove()
-        self.assertEqual(len(captured), 1)
-        torch.testing.assert_close(captured[0], aux[0]["cls_in"])
+            router_handle.remove()
+            expert_handle.remove()
+        self.assertEqual(len(router_inputs), 1)
+        self.assertEqual(len(incremental_inputs), 1)
+        torch.testing.assert_close(router_inputs[0], aux[0]["cls_in"])
+        torch.testing.assert_close(incremental_inputs[0][0], aux[0]["expert_in"])
         self.assertFalse(reference.requires_grad)
         self.assertEqual(tuple(adapted.shape), tuple(reference.shape))
         self.assertEqual(tuple(aux[0]["cls_in"].shape), (images.size(0), 8))
@@ -309,7 +316,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         for _, adapter in runner._moe_adapters():
             adapter.assert_descriptors_ready()
             for descriptor in adapter.descriptors:
-                self.assertEqual(int(descriptor.error_count.item()), 9)
+                self.assertEqual(int(descriptor.error_count.item()), 48)
                 self.assertGreater(float(descriptor.effective_error_count.item()), 0.0)
                 self.assertTrue(torch.isfinite(descriptor.error_mean))
                 self.assertTrue(torch.isfinite(descriptor.error_std))
