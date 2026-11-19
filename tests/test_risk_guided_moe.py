@@ -1227,6 +1227,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         features = {0: {
             "cls_in": extreme,
             "labels": torch.tensor([7, 7, 7, 7]),
+            "source_ids": torch.tensor([70, 71, 72, 73]),
         }}
         with self.assertRaises((FloatingPointError, ValueError)):
             model.plan_layer_expansion(0, features, [7], 0.05)
