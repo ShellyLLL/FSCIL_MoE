@@ -482,7 +482,7 @@ class Runner:
                     f"Checkpoint task state {session_index} anchor blocks do not match MoE topology."
                 )
             for block_idx, bank in anchor_by_block.items():
-                anchor_fields = ("class_ids", "route_mean", "route_var")
+                anchor_fields = ("class_ids", "route_mean", "route_var", "expert_mean", "expert_var")
                 missing_anchor = [key for key in anchor_fields if key not in bank]
                 if missing_anchor:
                     raise ValueError(
@@ -497,6 +497,8 @@ class Runner:
                     )
                 route_mean = torch.as_tensor(bank["route_mean"]).float()
                 route_var = torch.as_tensor(bank["route_var"]).float()
+                expert_mean = torch.as_tensor(bank["expert_mean"]).float()
+                expert_var = torch.as_tensor(bank["expert_var"]).float()
                 expected_anchor_dim = self._adapter_by_block(int(block_idx)).d_model
                 if (route_mean.ndim != 2 or route_var.shape != route_mean.shape
                         or route_mean.size(0) != class_ids.numel()
@@ -505,13 +507,17 @@ class Runner:
                         f"Checkpoint task state {session_index} block {block_idx} "
                         "has misaligned reference-route anchor tensors."
                     )
-                for tensor in (route_mean, route_var):
+                if (expert_mean.shape != route_mean.shape or expert_var.shape != route_var.shape):
+                    raise ValueError(
+                        f"Checkpoint task state {session_index} block {block_idx} has misaligned expert-input anchors."
+                    )
+                for tensor in (route_mean, route_var, expert_mean, expert_var):
                     if not torch.isfinite(tensor).all():
                         raise ValueError(
                             f"Checkpoint task state {session_index} block {block_idx} "
                             "contains non-finite anchors."
                         )
-                if (route_var < 0).any():
+                if (route_var < 0).any() or (expert_var < 0).any():
                     raise ValueError(
                         f"Checkpoint task state {session_index} block {block_idx} "
                         "contains negative anchor variances."
