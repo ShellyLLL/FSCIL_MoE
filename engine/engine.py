@@ -116,7 +116,7 @@ class Runner:
             "calibration_groups": int(_cfg_value(moe_cfg, "EXPANSION_CALIBRATION_GROUPS", 256)),
             "expert_training_scope": "all_current_session_samples",
             "descriptor_training_scope": "all_current_session_reference_cls",
-            "router_positive_scope": "all_current_session_samples",
+            "router_learning_signal": "global_CE_plus_old_route_PD",
             "visual_moe_enabled": bool(_cfg_value(moe_cfg, "ENABLE", False)),
             "insert_blocks": [int(value) for value in _cfg_value(moe_cfg, "INSERT_BLOCKS", [])],
             "num_base_experts": int(_cfg_value(moe_cfg, "NUM_BASE_EXPERTS", 4)),
@@ -1236,7 +1236,7 @@ class Runner:
                 "block_idx": int(block_idx),
                 "expand": bool(decision.expand),
                 "task_shift_score": float(decision.task_shift_score),
-                "task_false_alarm_rate": float(decision.threshold),
+                "session_q95_threshold": float(decision.threshold),
                 "support_count": int(decision.support_count),
             })
             if not decision.expand:
@@ -1309,8 +1309,8 @@ class Runner:
                     observed_train_classes.update(int(value) for value in all_labels.unique().tolist())
 
                     optimizer.zero_grad(set_to_none=True)
-                    # Every current-Session example is positive route supervision
-                    # and contributes to global classification over all seen classes.
+                    # Every current-Session example contributes to global
+                    # classification; the new router is learned through CE and PD.
                     logits, targets = self._global_incremental_logits(
                         all_images, all_labels, all_source_ids, bank, scale
                     )
@@ -1340,7 +1340,9 @@ class Runner:
                             "Non-finite task-level global visual-prototype incremental loss."
                         )
                     loss.backward()
-                    torch.nn.utils.clip_grad_norm_(adapter.newest_parameters(), 1.0)
+                    torch.nn.utils.clip_grad_norm_(
+                        adapter.newest_parameters(include_descriptor=True), 1.0
+                    )
                     optimizer.step()
                     batch_size = int(all_labels.numel())
                     total += float(loss.item()) * batch_size
@@ -1390,7 +1392,7 @@ class Runner:
                 "pd_loss": pd_history,
                 "ae_loss": ae_loss,
                 "task_shift_score": float(decision.task_shift_score),
-                "task_false_alarm_rate": float(decision.threshold),
+                "session_q95_threshold": float(decision.threshold),
                 "classification_samples_per_epoch": samples_per_epoch,
                 "classification_samples_total": int(classification_samples_total),
                 "rd_training_samples": int(ae_fit_values.size(0)),
@@ -1408,7 +1410,7 @@ class Runner:
                 "descriptor_anchor_id": int(anchor_expert_id),
                 "descriptor_anchor_q90": [float(value) for value in anchor_q90.detach().cpu().tolist()],
                 "task_shift_score": float(decision.task_shift_score),
-                "task_false_alarm_rate": float(decision.threshold),
+                "session_q95_threshold": float(decision.threshold),
             })
 
         for _, adapter in self._moe_adapters():
