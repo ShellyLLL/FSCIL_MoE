@@ -148,7 +148,6 @@ class Runner:
             "optimizer": {
                 "base_epochs": int(_cfg_value(optim_cfg, "BASE_EPOCHS", 50)),
                 "base_descriptor_epochs": int(_cfg_value(optim_cfg, "BASE_DESCRIPTOR_EPOCHS", 8)),
-                "incremental_descriptor_epochs": int(_cfg_value(optim_cfg, "INCREMENTAL_DESCRIPTOR_EPOCHS", 5)),
                 "lr_base_moe": float(_cfg_value(optim_cfg, "LR_BASE_MOE", 1e-4)),
                 "lr_incremental_expert": float(_cfg_value(optim_cfg, "LR_INCREMENTAL_EXPERT", 3e-4)),
                 "lr_incremental_router": float(_cfg_value(optim_cfg, "LR_INCREMENTAL_ROUTER", 3e-4)),
@@ -524,6 +523,18 @@ class Runner:
         if manifest is None:
             raise ValueError("Resume checkpoint support_manifest must not be null.")
         self.data_manager.load_support_manifest(manifest)
+        expected_threshold_blocks = {int(block) for block in self.model_without_dp.expandable_blocks()}
+        if set(self.expansion_thresholds) != expected_threshold_blocks:
+            raise ValueError(
+                "Checkpoint Session threshold blocks do not match configured MoE insertion blocks."
+            )
+        expected_support_sizes = set(self._incremental_support_sizes())
+        for block_idx, by_size in self.expansion_thresholds.items():
+            if set(by_size) != expected_support_sizes:
+                raise ValueError(
+                    f"Checkpoint block {block_idx} Session thresholds do not cover exact support sizes: "
+                    f"{set(by_size)} versus {expected_support_sizes}."
+                )
         base_proto = payload.get("base_enhanced_visual_prototype")
         if base_proto is None:
             raise ValueError("Checkpoint is missing the frozen Base reference visual prototype bank.")
@@ -1235,7 +1246,7 @@ class Runner:
             decisions.append({
                 "block_idx": int(block_idx),
                 "expand": bool(decision.expand),
-                "task_shift_score": float(decision.task_shift_score),
+                "session_q90": float(decision.task_shift_score),
                 "session_q95_threshold": float(decision.threshold),
                 "support_count": int(decision.support_count),
             })
@@ -1391,7 +1402,7 @@ class Runner:
                 "rd_loss": rd_history,
                 "pd_loss": pd_history,
                 "ae_loss": ae_loss,
-                "task_shift_score": float(decision.task_shift_score),
+                "session_q90": float(decision.task_shift_score),
                 "session_q95_threshold": float(decision.threshold),
                 "classification_samples_per_epoch": samples_per_epoch,
                 "classification_samples_total": int(classification_samples_total),
@@ -1409,7 +1420,7 @@ class Runner:
                 "expert_id": int(expert_id),
                 "descriptor_anchor_id": int(anchor_expert_id),
                 "descriptor_anchor_q90": [float(value) for value in anchor_q90.detach().cpu().tolist()],
-                "task_shift_score": float(decision.task_shift_score),
+                "session_q90": float(decision.task_shift_score),
                 "session_q95_threshold": float(decision.threshold),
             })
 
