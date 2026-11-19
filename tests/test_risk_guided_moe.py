@@ -216,13 +216,13 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         self.assertEqual([item["block_idx"] for item in result["expanded"]], [0, 1])
         for block_idx, adapter in runner._moe_adapters():
             history = result["training"][block_idx]
-            self.assertEqual(history["classification_samples_per_epoch"], [16] * 8)
-            self.assertEqual(history["classification_samples_total"], 128)
+            self.assertEqual(history["classification_samples_per_epoch"], [64] * 8)
+            self.assertEqual(history["classification_samples_total"], 512)
             self.assertEqual(len(history["ce_loss"]), 8)
             self.assertEqual(len(history["rd_loss"]), 8)
             self.assertEqual(len(history["pd_loss"]), 8)
-            self.assertEqual(history["rd_training_samples"], 16)
-            self.assertEqual(history["rd_reference_samples"], 16)
+            self.assertEqual(history["rd_training_samples"], 60)
+            self.assertEqual(history["rd_reference_samples"], 4)
             self.assertEqual(history["rd_session_classes"], [1, 2])
             self.assertGreater(history["rd_effective_reference_count"], 1.0)
             self.assertTrue(all(torch.isfinite(torch.tensor(history[key])).all()
