@@ -1030,7 +1030,7 @@ class Runner:
         epochs = int(incremental_cfg.EPOCHS)
         scale = float(incremental_cfg.LOGIT_SCALE)
         expansion_threshold = float(_cfg_value(
-            self._visual_moe_cfg(), "EXPANSION_Z_THRESHOLD", 1.5
+            self._visual_moe_cfg(), "EXPANSION_FALSE_ALARM_RATE", 0.05
         ))
         if not np.isfinite(expansion_threshold):
             raise ValueError("Expansion Z-score threshold must be finite.")
@@ -1226,7 +1226,7 @@ class Runner:
                 "block_idx": int(block_idx),
                 "expert_id": int(expert_id),
                 "task_shift_score": float(decision.task_shift_score),
-                "task_shift_threshold": float(decision.threshold),
+                "task_false_alarm_rate": float(decision.threshold),
             })
 
         for _, adapter in self._moe_adapters():
