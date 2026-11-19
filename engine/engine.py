@@ -1400,17 +1400,16 @@ class Runner:
                 "ce_loss": ce_history,
                 "rd_loss": rd_history,
                 "pd_loss": pd_history,
-                "ae_loss": ae_loss,
+                "rd_loss_final": ae_loss,
                 "session_q90": float(decision.session_q90),
                 "session_q95_threshold": float(decision.threshold),
                 "classification_samples_per_epoch": samples_per_epoch,
                 "classification_samples_total": int(classification_samples_total),
                 "rd_training_samples": int(ae_fit_values.size(0)),
-                "ae_calibration_sources": calibration_count,
-                "ae_effective_calibration_count": float(
+                "rd_reference_samples": calibration_count,
+                "rd_effective_reference_count": float(
                     adapter.descriptors[expert_id].effective_error_count.item()
                 ),
-                "ae_fit_classes": fit_class_ids,
                 "rd_session_classes": calibration_class_ids,
                 "old_anchor_gate_mean": adapter.old_anchor_response(anchor_mean, anchor_var),
             }
