@@ -939,7 +939,8 @@ class Runner:
             # Independent error-reference sources are held out from AE fitting.
             # Every Base class contributes to both partitions.
             reference_mask = self._make_calibration_mask(
-                labels, source_ids, min_calibration_count=3,
+                labels, source_ids,
+                min_calibration_count=max(3, max(support_sizes)),
                 min_fit_per_class=5, min_calibration_per_class=3,
             )
             fit_mask = ~reference_mask
