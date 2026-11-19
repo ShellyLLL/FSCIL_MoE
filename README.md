@@ -49,7 +49,7 @@ python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/t
 ### Unified AE-driven dynamic FSCIL MoE (method model v1.0)
 
 The branch implements the unified FSCIL method model:
-task-level AE distribution-shift detection, on-demand residual expert expansion,
+Session-level AE distribution-shift detection, on-demand residual expert expansion,
 Base-Softmax plus incremental-Sigmoid routing, historical-RD-anchored low-rank
 residual descriptor adaptation, selective training/freeze, semantic-guided novel
 visual prototype calibration, and one global visual prototype classifier.
