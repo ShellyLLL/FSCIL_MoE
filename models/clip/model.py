@@ -323,8 +323,17 @@ class RepresentationDescriptor(nn.Module):
         mean = (values * mass_weights).sum() / mass
         variance = (mass_weights * (values - mean).square()).sum() / mass
         correction = effective_n / (effective_n - 1.0)
-        std = (variance * correction).clamp_min(self.eps ** 2).sqrt()
-        if not torch.isfinite(mean) or not torch.isfinite(std) or not bool((std > 0).item()):
+        raw_std = (variance * correction).sqrt()
+        # A clamped standard deviation is not a calibrated scale. Accepting it
+        # would turn tiny reconstruction-error differences into enormous z-scores.
+        if (not torch.isfinite(mean) or not torch.isfinite(raw_std)
+                or not bool((raw_std > self.eps).item())):
+            raise ValueError(
+                "AE reference-error distribution is degenerate: unbiased std "
+                f"must exceed DESCRIPTOR_EPS ({self.eps:g}), got {float(raw_std.item()):.8g}."
+            )
+        std = raw_std
+        if not bool((std > 0).item()):
             raise FloatingPointError("AE calibration produced invalid weighted error statistics.")
 
         self.error_history.copy_(new_history)
@@ -347,7 +356,7 @@ class RepresentationDescriptor(nn.Module):
             and float(self.effective_error_count.item()) > 1.0 + 1e-6
             and bool(torch.isfinite(self.error_mean).item())
             and bool(torch.isfinite(self.error_std).item())
-            and float(self.error_std.item()) > 0.0
+            and float(self.error_std.item()) > self.eps
         )
 
 
@@ -508,19 +517,37 @@ class VisualMoEAdapter(nn.Module):
         variance = variance.clamp_min(1e-6)
         return torch.cat([mean, mean + variance.sqrt(), mean - variance.sqrt()], dim=0)
 
-    def old_route_suppression_loss(self, route_anchor_mean, route_anchor_var):
-        """Suppress only the newest sigmoid gate on frozen raw/reference class anchors.
+    def old_feature_preservation_loss(
+        self, route_anchor_mean, route_anchor_var,
+        expert_anchor_mean, expert_anchor_var,
+    ):
+        """Penalize the newest gate and its actual residual on historical class anchors.
 
-        This is the direct implementation of L_old-route in the unified v1.0 model;
-        expert-output residual suppression is intentionally not part of the objective.
+        Route anchors live in the frozen-reference router space; expert
+        anchors live in the adapted, layer-normalized expert-input space.
+        Their paired class means and mean +/- per-dimension standard deviations
+        approximate historical class support without retaining old images.
         """
-        if route_anchor_mean is None or route_anchor_var is None:
-            return self.residual_scale.new_zeros(())
-        anchors = self._anchor_points(route_anchor_mean, route_anchor_var).to(
+        fields = (
+            route_anchor_mean, route_anchor_var,
+            expert_anchor_mean, expert_anchor_var,
+        )
+        if any(value is None for value in fields):
+            raise ValueError("Incremental PD requires route-space and expert-input old-class anchors.")
+        route_anchors = self._anchor_points(route_anchor_mean, route_anchor_var).to(
             device=self.residual_scale.device
         )
-        gate = torch.sigmoid(self.router.columns[-1](anchors))
-        return gate.square().mean()
+        expert_anchors = self._anchor_points(expert_anchor_mean, expert_anchor_var).to(
+            device=self.residual_scale.device
+        )
+        if route_anchors.shape != expert_anchors.shape:
+            raise ValueError("Old route and expert-input anchors must have aligned class rows and dimensions.")
+        gate = torch.sigmoid(self.router.columns[-1](route_anchors))
+        expert_output = self.experts[-1](expert_anchors.unsqueeze(0)).squeeze(0)
+        gated_residual = self.residual_scale.to(expert_output.dtype) * gate * expert_output
+        # The first term keeps the new route closed on old classes. The second
+        # directly penalizes the feature residual that could move old prototypes.
+        return gate.square().mean() + gated_residual.float().square().mean()
 
     @torch.no_grad()
     def old_anchor_response(self, anchor_mean, anchor_var):
@@ -530,6 +557,22 @@ class VisualMoEAdapter(nn.Module):
             device=self.residual_scale.device
         )
         return float(torch.sigmoid(self.router.columns[-1](anchors)).mean().item())
+
+    @torch.no_grad()
+    def old_anchor_residual_response(
+        self, route_anchor_mean, route_anchor_var,
+        expert_anchor_mean, expert_anchor_var,
+    ):
+        route_anchors = self._anchor_points(route_anchor_mean, route_anchor_var).to(
+            device=self.residual_scale.device
+        )
+        expert_anchors = self._anchor_points(expert_anchor_mean, expert_anchor_var).to(
+            device=self.residual_scale.device
+        )
+        gate = torch.sigmoid(self.router.columns[-1](route_anchors))
+        expert_output = self.experts[-1](expert_anchors.unsqueeze(0)).squeeze(0)
+        residual = self.residual_scale.to(expert_output.dtype) * gate * expert_output
+        return float(residual.float().norm(dim=-1).mean().item())
 
     def freeze_all(self):
         for parameter in self.parameters():
