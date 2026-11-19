@@ -1262,6 +1262,9 @@ class Runner:
         incremental_cfg = self.cfg.TRAINER.BiMC.INCREMENTAL
         epochs = int(incremental_cfg.EPOCHS)
         scale = float(incremental_cfg.LOGIT_SCALE)
+        # Validate the Session's class coverage and source-exclusive LOO
+        # support before threshold lookup or any expert topology mutation.
+        self._build_incremental_bank(extract_loader, class_index, old_states)
         if not self.expansion_thresholds:
             raise RuntimeError("Base Session-Q95 expansion thresholds have not been calibrated.")
 
