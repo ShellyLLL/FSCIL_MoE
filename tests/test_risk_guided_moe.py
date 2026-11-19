@@ -986,6 +986,16 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             calibrated_similarity, raw_similarity,
             "semantic calibration should improve alignment to this held-out novel-class direction",
         )
+        # The semantic pull must not collapse the novel class into its nearest
+        # Base class: a held-out novel query must still prefer its calibrated
+        # novel prototype over every historical Base visual prototype.
+        heldout_novel_query = F.normalize(torch.tensor([[0.8, 0.6]]), dim=-1)
+        novel_similarity = (heldout_novel_query @ calibrated.t()).item()
+        base_similarity = (heldout_novel_query @ base["image_proto"].t()).max().item()
+        self.assertGreater(
+            novel_similarity, base_similarity,
+            "prototype calibration must preserve the novel-vs-Base classification margin",
+        )
         changed_incremental = dict(old_incremental)
         changed_incremental["image_proto"] = torch.tensor([[-1.0, 0.0]])
         changed, _ = runner._semantic_guided_visual_prototype_calibration(
