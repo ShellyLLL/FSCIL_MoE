@@ -1212,7 +1212,6 @@ class Runner:
         if not self.expansion_thresholds:
             raise RuntimeError("Base Session-Q95 expansion thresholds have not been calibrated.")
 
-        ae_epochs = int(_cfg_value(optim_cfg, "INCREMENTAL_DESCRIPTOR_EPOCHS", 5))
         decisions, expanded, histories = [], [], {}
         for _, adapter in self._moe_adapters():
             adapter.freeze_all()
@@ -1246,7 +1245,7 @@ class Runner:
             decisions.append({
                 "block_idx": int(block_idx),
                 "expand": bool(decision.expand),
-                "session_q90": float(decision.task_shift_score),
+                "session_q90": float(decision.session_q90),
                 "session_q95_threshold": float(decision.threshold),
                 "support_count": int(decision.support_count),
             })
@@ -1402,7 +1401,7 @@ class Runner:
                 "rd_loss": rd_history,
                 "pd_loss": pd_history,
                 "ae_loss": ae_loss,
-                "session_q90": float(decision.task_shift_score),
+                "session_q90": float(decision.session_q90),
                 "session_q95_threshold": float(decision.threshold),
                 "classification_samples_per_epoch": samples_per_epoch,
                 "classification_samples_total": int(classification_samples_total),
@@ -1412,7 +1411,7 @@ class Runner:
                     adapter.descriptors[expert_id].effective_error_count.item()
                 ),
                 "ae_fit_classes": fit_class_ids,
-                "ae_calibration_classes": calibration_class_ids,
+                "rd_session_classes": calibration_class_ids,
                 "old_anchor_gate_mean": adapter.old_anchor_response(anchor_mean, anchor_var),
             }
             expanded.append({
@@ -1420,7 +1419,7 @@ class Runner:
                 "expert_id": int(expert_id),
                 "descriptor_anchor_id": int(anchor_expert_id),
                 "descriptor_anchor_q90": [float(value) for value in anchor_q90.detach().cpu().tolist()],
-                "session_q90": float(decision.task_shift_score),
+                "session_q90": float(decision.session_q90),
                 "session_q95_threshold": float(decision.threshold),
             })
 
