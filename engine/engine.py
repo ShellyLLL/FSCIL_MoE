@@ -391,7 +391,7 @@ class Runner:
             if not isinstance(anchor_by_block, dict) or not anchor_by_block:
                 raise ValueError(f"Checkpoint task state {session_index} has no per-layer old-class anchors.")
             anchor_blocks = {int(block) for block in anchor_by_block}
-            if bool(self._visual_moe_cfg().ENABLE) and anchor_blocks != expected_topology_blocks:
+            if bool(self._visual_moe_cfg().ENABLE) and anchor_blocks != {int(block) for block in expected_topology_blocks}:
                 raise ValueError(
                     f"Checkpoint task state {session_index} anchor blocks do not match MoE topology."
                 )
