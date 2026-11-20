@@ -668,6 +668,56 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             ))[0], dim=-1)[:, 0],
         ))
 
+    def test_inference_expert_mask_removes_only_selected_residual_without_changing_gates(self):
+        torch.manual_seed(269)
+        adapter = VisualMoEAdapter(
+            8, num_experts=2, reduction=2, incremental_dropout=0.0
+        ).eval()
+        expert_id = adapter.add_expert(session_id=1, reduction=2, dropout=0.0)
+        with torch.no_grad():
+            adapter.experts[expert_id].c_proj.bias.fill_(0.25)
+        adapter.freeze_all()
+        tokens = torch.randn(5, 3, 8)
+        state_keys_before = set(adapter.state_dict())
+
+        with torch.no_grad():
+            full_output, full_aux = adapter(tokens)
+            reference = adapter.layer_norm(tokens)
+            gate = adapter.expert_responsibility(reference[0], expert_id)
+            expert_output = adapter.experts[expert_id](reference)
+            selected_residual = (
+                adapter.residual_scale * expert_output
+                * gate.unsqueeze(0).unsqueeze(-1)
+            )
+            expected_masked = full_output - selected_residual
+
+            adapter.set_inference_expert_mask([expert_id])
+            masked_output, masked_aux = adapter(tokens)
+            torch.testing.assert_close(masked_output, expected_masked, rtol=1e-5, atol=1e-6)
+            torch.testing.assert_close(
+                masked_aux["route_weights"], full_aux["route_weights"], rtol=0, atol=0
+            )
+            self.assertEqual(float(masked_aux["expert_residual_norms"][expert_id]), 0.0)
+            self.assertGreater(float(full_aux["expert_residual_norms"][expert_id]), 0.0)
+            self.assertEqual(set(adapter.state_dict()), state_keys_before)
+
+            adapter.clear_inference_expert_mask()
+            restored_output, restored_aux = adapter(tokens)
+            torch.testing.assert_close(restored_output, full_output, rtol=0, atol=0)
+            torch.testing.assert_close(
+                restored_aux["route_weights"], full_aux["route_weights"], rtol=0, atol=0
+            )
+
+    def test_inference_expert_mask_rejects_training_mode_and_invalid_ids(self):
+        adapter = VisualMoEAdapter(8, num_experts=2, reduction=2)
+        with self.assertRaisesRegex(RuntimeError, "eval mode"):
+            adapter.set_inference_expert_mask([0])
+        adapter.eval()
+        with self.assertRaisesRegex(ValueError, "outside"):
+            adapter.set_inference_expert_mask([adapter.num_experts])
+        with self.assertRaisesRegex(TypeError, "integers"):
+            adapter.set_inference_expert_mask([True])
+
     def test_descriptor_rejects_zero_effective_weight_calibration_state(self):
         descriptor = RepresentationDescriptor(4, descriptor_dim=2, buffer_size=8)
         descriptor.update_reference(torch.tensor([0.1, 0.2, 0.3]))
