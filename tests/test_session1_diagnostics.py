@@ -8,6 +8,9 @@ from tools.session1_diagnostics import (
     classification_diagnostics,
     metric_summary,
     response_posthoc,
+    gradient_objective_diagnostics,
+    prototype_generalization_diagnostics,
+    preserve_diagnostic_state,
 )
 
 
@@ -70,6 +73,117 @@ class Session1DiagnosticsTests(unittest.TestCase):
         )
         self.assertEqual(correctness["B8_E4"]["incorrect"]["sample_count"], 1)
         self.assertEqual(set(raw["B8_E4"]) - {"labels"}, set(RESPONSE_METRICS))
+
+    def test_weighted_gradient_diagnostics_match_training_objective_and_clip(self):
+        ce = torch.tensor([3.0, 4.0])
+        pd = torch.tensor([-1.0, 2.0])
+        result = gradient_objective_diagnostics(
+            ce, pd, pd_weight=0.5, clip_max_norm=1.0
+        )
+        expected = ce + 0.5 * pd
+        expected_norm = torch.linalg.vector_norm(expected).item()
+        self.assertAlmostEqual(
+            result["global_combined_gradient_norm_pre_clip"], expected_norm, places=6
+        )
+        self.assertAlmostEqual(
+            result["global_clip_coefficient"], 1.0 / (expected_norm + 1e-6), places=6
+        )
+        self.assertAlmostEqual(
+            result["ce_weighted_pd_cosine"],
+            float(torch.dot(ce, 0.5 * pd) / (
+                torch.linalg.vector_norm(ce) * torch.linalg.vector_norm(0.5 * pd)
+            )),
+            places=6,
+        )
+        no_clip = gradient_objective_diagnostics(ce, pd, pd_weight=0.0, clip_max_norm=100.0)
+        self.assertEqual(no_clip["global_clip_coefficient"], 1.0)
+
+    def test_prototype_generalization_uses_source_exclusive_loo(self):
+        class_ids = torch.tensor([0, 1, 2])
+        base_ids = torch.tensor([0])
+        novel_ids = torch.tensor([1, 2])
+        global_prototypes = torch.tensor([
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [-1.0, 0.0],
+        ])
+        support_features = torch.tensor([
+            [0.0, 1.0],
+            [0.0, 1.0],
+            [-1.0, 0.0],
+            [-1.0, 0.0],
+        ])
+        support_labels = torch.tensor([1, 1, 2, 2])
+        loo = torch.tensor([
+            [[0.0, 1.0], [-1.0, 0.0]],
+            [[0.0, 1.0], [-1.0, 0.0]],
+            [[0.0, 1.0], [-1.0, 0.0]],
+            [[0.0, 1.0], [-1.0, 0.0]],
+        ])
+        test_features = torch.tensor([
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [-1.0, 0.0],
+        ])
+        test_labels = torch.tensor([0, 1, 2])
+        result = prototype_generalization_diagnostics(
+            support_features, support_labels, loo,
+            test_features, test_labels, global_prototypes, class_ids,
+            old_class_count=1, base_ids=base_ids, novel_ids=novel_ids,
+            logit_scale=10.0,
+        )
+        self.assertAlmostEqual(result["support_loo"]["novel_accuracy"], 1.0)
+        self.assertAlmostEqual(result["test"]["base_accuracy"], 1.0)
+        self.assertAlmostEqual(result["test"]["novel_accuracy"], 1.0)
+        self.assertAlmostEqual(result["novel_support_loo_minus_test_accuracy"], 0.0)
+        self.assertIn("participated in incremental optimization", result["interpretation_limit"])
+
+    def test_prototype_generalization_rejects_misaligned_loo_cache(self):
+        with self.assertRaises(ValueError):
+            prototype_generalization_diagnostics(
+                torch.randn(2, 3), torch.tensor([1, 1]), torch.randn(2, 1, 2),
+                torch.randn(2, 3), torch.tensor([0, 1]),
+                torch.randn(2, 3), torch.tensor([0, 1]),
+                old_class_count=1, base_ids=torch.tensor([0]),
+                novel_ids=torch.tensor([1]), logit_scale=10.0,
+            )
+
+    def test_diagnostic_context_restores_model_parameters_modes_gradients_and_rng(self):
+        class DummyRunner:
+            def __init__(self):
+                self.model = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.Dropout())
+                self.model_without_dp = self.model
+                self.adapter = self.model[0]
+                self.adapter._inference_disabled_expert_ids = frozenset({3})
+            def _moe_adapters(self):
+                return [(0, self.adapter)]
+
+        runner = DummyRunner()
+        runner.model.train()
+        runner.model[1].eval()
+        parameter = runner.adapter.weight
+        parameter.grad = torch.ones_like(parameter)
+        original_weight = parameter.detach().clone()
+        original_grad = parameter.grad.detach().clone()
+        original_modes = [module.training for module in runner.model.modules()]
+        original_rng = torch.get_rng_state().clone()
+        original_mask = runner.adapter._inference_disabled_expert_ids
+
+        with preserve_diagnostic_state(runner):
+            with torch.no_grad():
+                parameter.add_(10.0)
+            parameter.requires_grad_(False)
+            parameter.grad = None
+            runner.model.eval()
+            runner.adapter._inference_disabled_expert_ids = frozenset()
+            torch.rand(5)
+
+        self.assertTrue(torch.equal(parameter, original_weight))
+        self.assertTrue(torch.equal(parameter.grad, original_grad))
+        self.assertTrue(parameter.requires_grad)
+        self.assertEqual([module.training for module in runner.model.modules()], original_modes)
+        self.assertTrue(torch.equal(torch.get_rng_state(), original_rng))
+        self.assertEqual(runner.adapter._inference_disabled_expert_ids, original_mask)
 
 
 if __name__ == "__main__":
