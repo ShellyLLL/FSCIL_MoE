@@ -9,6 +9,14 @@ import argparse
 import csv
 import json
 from pathlib import Path
+import sys
+
+# Make the repository root importable when this file is executed directly as
+# ``python tools/eval_session1_expert_ablation.py``. Python otherwise places
+# only the ``tools`` directory at the front of sys.path.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import numpy as np
 import torch
