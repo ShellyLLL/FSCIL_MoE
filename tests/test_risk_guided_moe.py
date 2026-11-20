@@ -306,6 +306,16 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         self.assertEqual(tuple(adapted.shape), tuple(reference.shape))
         self.assertEqual(tuple(aux[0]["cls_in"].shape), (images.size(0), 8))
 
+    def test_base_session_holdout_capacity_uses_per_class_not_total_support(self):
+        # CUB200: 10 novel classes x 5 shots = 50 total support images,
+        # therefore Base holdout needs 5 sources per Base class, not 50.
+        self.assertEqual(Runner._base_session_holdout_per_class([50], 10), 5)
+        self.assertEqual(Runner._base_session_holdout_per_class([25], 5), 5)
+        self.assertEqual(Runner._base_session_holdout_per_class([16], 1), 16)
+        self.assertEqual(Runner._base_session_holdout_per_class([50, 60], 10), 6)
+        with self.assertRaisesRegex(ValueError, "positive Session class count"):
+            Runner._base_session_holdout_per_class([50], 0)
+
     def test_base_rd_uses_disjoint_reference_sources_and_calibrates_session_thresholds(self):
         torch.manual_seed(233)
         runner, model = build_lifecycle_runner()
