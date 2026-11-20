@@ -26,8 +26,9 @@ from main import setup_cfg
 from engine.engine import Runner
 from tools.session1_diagnostics import (
     collect_features_and_expert_stats, collect_historical_anchor_responses,
-    collect_gradient_diagnostics, compare_anchor_responses_to_base_test,
-    metric_summary, response_posthoc, classification_diagnostics,
+    collect_gradient_diagnostics, collect_support_generalization_diagnostics,
+    compare_anchor_responses_to_base_test, metric_summary, response_posthoc,
+    classification_diagnostics,
 )
 
 
@@ -308,6 +309,12 @@ def main():
     anchor_vs_base_test = compare_anchor_responses_to_base_test(
         anchor_response, details["A_full"]["expert_response_by_class"], base_ids
     )
+    full_merged = variant_states["A_full"][0]
+    support_generalization = collect_support_generalization_diagnostics(
+        runner, support_loader, test_loader,
+        full_merged["class_ids"], task_states0, base_ids, novel_ids,
+        logit_scale=float(cfg.TRAINER.BiMC.INCREMENTAL.LOGIT_SCALE),
+    )
     gradient_diagnostics = collect_gradient_diagnostics(
         runner, support_loader, class_ids, task_states0, expanded, current_session=1,
     )
@@ -316,11 +323,13 @@ def main():
         "fixed_full_query_prototype_only_counterfactual": prototype_only_comparison,
         "historical_pd_anchor_response": anchor_response,
         "historical_anchor_vs_base_test": anchor_vs_base_test,
+        "support_test_generalization": support_generalization,
         "ce_pd_gradient_diagnostics": gradient_diagnostics,
         "interpretation_notes": {
             "auc_positive_class": "Novel; values near 0.5 indicate weak Base/Novel ranking separation.",
             "patch_residual": "RMS of actual expert residual over patch tokens before subsequent Transformer blocks.",
-            "gradient_cosine": "Computed on newly trainable expert/router parameters; no optimizer step is executed.",
+            "gradient_cosine": "Computed on newest expert/router parameters. The report includes the configured PD weight, CE+weighted-PD combined gradient, and the global clip coefficient used by training; no optimizer step is executed.",
+            "support_test_generalization": "Support queries use source-exclusive LOO novel prototypes; held-out test queries use the same full raw visual prototype bank. Support queries participated in optimization, so the gap is an overfitting indicator rather than an independent validation estimate.",
             "dropout_repeatability": "Repeated PD evaluations with newest expert in train mode.",
         },
     }
