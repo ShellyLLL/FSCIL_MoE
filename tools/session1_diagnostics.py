@@ -769,11 +769,6 @@ def _aggregate_gradient_rows(rows):
     return output
 
 
-def _module_runtime_snapshot(runner):
-    """Private compatibility alias retained for downstream diagnostic notebooks."""
-    return preserve_diagnostic_state
-
-
 def collect_gradient_diagnostics(
     runner, support_loader, class_index, old_states, expanded,
     current_session=1, max_batches=8, dropout_repeats=5, clip_max_norm=1.0,
