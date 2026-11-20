@@ -89,10 +89,12 @@ def preserve_diagnostic_state(runner):
         )
         for parameter in parameters
     ]
-    adapter_state = [
+    model_state = {
+        key: value.detach().clone() for key, value in model.state_dict().items()
+    }
+    adapter_masks = [
         (
             adapter,
-            {key: value.detach().clone() for key, value in adapter.state_dict().items()},
             frozenset(getattr(adapter, "_inference_disabled_expert_ids", frozenset())),
         )
         for adapter in adapters
@@ -106,12 +108,12 @@ def preserve_diagnostic_state(runner):
     try:
         yield
     finally:
-        # The diagnostic path is inference-only. Restore adapter tensors as a
-        # defensive guarantee, even if a future diagnostic accidentally writes
-        # a parameter or persistent buffer.
+        # Restore the complete model state, not merely the adapter subset.
+        # This protects all parameters and persistent buffers against accidental
+        # writes introduced by future diagnostic extensions.
         with torch.no_grad():
-            for adapter, state, mask in adapter_state:
-                adapter.load_state_dict(state, strict=True)
+            model.load_state_dict(model_state, strict=True)
+            for adapter, mask in adapter_masks:
                 adapter._inference_disabled_expert_ids = mask
 
             for parameter, requires_grad, gradient in parameter_state:
