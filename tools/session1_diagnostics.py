@@ -85,12 +85,12 @@ def preserve_diagnostic_state(runner):
         (
             parameter,
             bool(parameter.requires_grad),
-            None if parameter.grad is None else parameter.grad.detach().clone(),
+            None if parameter.grad is None else parameter.grad.detach().cpu().clone(),
         )
         for parameter in parameters
     ]
     model_state = {
-        key: value.detach().clone() for key, value in model.state_dict().items()
+        key: value.detach().cpu().clone() for key, value in model.state_dict().items()
     }
     adapter_masks = [
         (
