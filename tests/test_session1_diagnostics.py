@@ -10,6 +10,7 @@ from tools.session1_diagnostics import (
     response_posthoc,
     gradient_objective_diagnostics,
     prototype_generalization_diagnostics,
+    preserve_diagnostic_state,
 )
 
 
@@ -146,6 +147,43 @@ class Session1DiagnosticsTests(unittest.TestCase):
                 old_class_count=1, base_ids=torch.tensor([0]),
                 novel_ids=torch.tensor([1]), logit_scale=10.0,
             )
+
+    def test_diagnostic_context_restores_model_parameters_modes_gradients_and_rng(self):
+        class DummyRunner:
+            def __init__(self):
+                self.model = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.Dropout())
+                self.model_without_dp = self.model
+                self.adapter = self.model[0]
+                self.adapter._inference_disabled_expert_ids = frozenset({3})
+            def _moe_adapters(self):
+                return [(0, self.adapter)]
+
+        runner = DummyRunner()
+        runner.model.train()
+        runner.model[1].eval()
+        parameter = runner.adapter.weight
+        parameter.grad = torch.ones_like(parameter)
+        original_weight = parameter.detach().clone()
+        original_grad = parameter.grad.detach().clone()
+        original_modes = [module.training for module in runner.model.modules()]
+        original_rng = torch.get_rng_state().clone()
+        original_mask = runner.adapter._inference_disabled_expert_ids
+
+        with preserve_diagnostic_state(runner):
+            with torch.no_grad():
+                parameter.add_(10.0)
+            parameter.requires_grad_(False)
+            parameter.grad = None
+            runner.model.eval()
+            runner.adapter._inference_disabled_expert_ids = frozenset()
+            torch.rand(5)
+
+        self.assertTrue(torch.equal(parameter, original_weight))
+        self.assertTrue(torch.equal(parameter.grad, original_grad))
+        self.assertTrue(parameter.requires_grad)
+        self.assertEqual([module.training for module in runner.model.modules()], original_modes)
+        self.assertTrue(torch.equal(torch.get_rng_state(), original_rng))
+        self.assertEqual(runner.adapter._inference_disabled_expert_ids, original_mask)
 
 
 if __name__ == "__main__":
