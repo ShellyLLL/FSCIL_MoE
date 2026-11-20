@@ -312,8 +312,17 @@ def main():
         writer = csv.DictWriter(file, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
+    def json_default(value):
+        if isinstance(value, (np.ndarray,)):
+            return value.tolist()
+        if isinstance(value, (np.integer, np.floating)):
+            return value.item()
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu().tolist()
+        raise TypeError(f"Cannot JSON-serialize {type(value).__name__}.")
+
     with (output / "details.json").open("w", encoding="utf-8") as file:
-        json.dump(details, file, ensure_ascii=False, indent=2)
+        json.dump(details, file, ensure_ascii=False, indent=2, default=json_default)
     print(f"Saved ablation report to {output.resolve()}")
 
 
