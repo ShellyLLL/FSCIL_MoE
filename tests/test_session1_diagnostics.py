@@ -23,7 +23,6 @@ class Session1DiagnosticsTests(unittest.TestCase):
     def test_binary_auc_handles_order_and_ties(self):
         self.assertAlmostEqual(binary_auc([False, False, True, True], [0, 1, 2, 3]), 1.0)
         self.assertAlmostEqual(binary_auc([False, True], [1, 1]), 0.5)
-        self.assertAlmostEqual(binary_auc([True, True], [1, 2]), 0.5) if False else None
         self.assertIsNone(binary_auc([True, True], [1, 2]))
 
     def test_classification_diagnostics_maps_global_ids_and_margin(self):
