@@ -433,6 +433,8 @@ class VisualMoEAdapter(nn.Module):
         ])
         self.router = ExpandableRouter(self.d_model, self.base_expert_count)
         self.expert_birth_sessions = [0] * self.base_expert_count
+        # Runtime-only diagnostic mask. It is deliberately excluded from state_dict.
+        self._inference_disabled_expert_ids = frozenset()
 
     @property
     def num_experts(self):
@@ -573,6 +575,40 @@ class VisualMoEAdapter(nn.Module):
         expert_output = self.experts[-1](expert_anchors.unsqueeze(0)).squeeze(0)
         residual = self.residual_scale.to(expert_output.dtype) * gate * expert_output
         return float(residual.float().norm(dim=-1).mean().item())
+
+    def set_inference_expert_mask(self, disabled_expert_ids):
+        """Disable selected expert residuals for evaluation-only ablations.
+
+        Router logits and responsibilities are intentionally unchanged. This
+        isolates each expert's residual contribution without retraining or
+        changing the checkpointed model state.
+        """
+        if self.training:
+            raise RuntimeError("Inference expert masks can only be set while the adapter is in eval mode.")
+        if disabled_expert_ids is None:
+            values = ()
+        elif isinstance(disabled_expert_ids, int) and not isinstance(disabled_expert_ids, bool):
+            values = (disabled_expert_ids,)
+        else:
+            try:
+                values = tuple(disabled_expert_ids)
+            except TypeError as error:
+                raise TypeError("disabled_expert_ids must be an integer or an iterable of integers.") from error
+        normalized = set()
+        for value in values:
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError("Inference expert ids must be integers (booleans are not accepted).")
+            expert_id = int(value)
+            if expert_id < 0 or expert_id >= self.num_experts:
+                raise ValueError(
+                    f"Inference mask expert id {expert_id} is outside [0, {self.num_experts})."
+                )
+            normalized.add(expert_id)
+        self._inference_disabled_expert_ids = frozenset(normalized)
+
+    def clear_inference_expert_mask(self):
+        """Restore the complete expert pool without changing model parameters."""
+        self._inference_disabled_expert_ids = frozenset()
 
     def freeze_all(self):
         for parameter in self.parameters():
@@ -715,6 +751,7 @@ class VisualMoEAdapter(nn.Module):
         # Build the complete topology only after every expert/anchor specification is valid.
         self.experts, self.descriptors = nn.ModuleList(), nn.ModuleList()
         self.router, self.expert_birth_sessions = ExpandableRouter(self.d_model), []
+        self._inference_disabled_expert_ids = frozenset()
         for index, (reduction, birth_session, anchor_id, residual_rank, dropout) in enumerate(validated):
             self.experts.append(BottleneckExpert(self.d_model, reduction, dropout=dropout))
             descriptor = RepresentationDescriptor(
@@ -765,13 +802,21 @@ class VisualMoEAdapter(nn.Module):
         if route_input is None or route_input.ndim == 3:
             route_features = reference_tokens[0]
         logits, weights = self.routing_outputs(route_features)
+        disabled = self._inference_disabled_expert_ids
+        if disabled and self.training:
+            raise RuntimeError("Inference expert masks must be cleared before training.")
         residual, norms, output_energies = torch.zeros_like(x), [], []
         for column, expert_id in enumerate(range(self.num_experts)):
             expert_output = self.experts[expert_id](reference_tokens)
+            output_energies.append(expert_output.float().pow(2).mean())
+            if expert_id in disabled:
+                # Keep diagnostic tensor alignment while excluding only this
+                # expert's residual. Its router gate is not renormalized.
+                norms.append(expert_output.detach().float().new_zeros(()))
+                continue
             weighted = expert_output * weights[:, column].unsqueeze(0).unsqueeze(-1)
             residual = residual + weighted
             norms.append(weighted.detach().float().pow(2).mean().sqrt())
-            output_energies.append(expert_output.float().pow(2).mean())
         residual = self.residual_scale.to(residual.dtype) * residual
         return residual, {"logits": logits, "route_weights": weights,
                           "top_k_indices": weights.argmax(dim=-1, keepdim=True),
