@@ -1,0 +1,305 @@
+#!/usr/bin/env python
+"""Counterfactual Session-1 expert ablation on an existing FSCIL checkpoint.
+
+This script does not train or mutate checkpoint parameters. Each variant masks
+only selected Session-1 expert residuals at inference, then rebuilds the novel
+visual prototypes under that same encoder before global evaluation.
+"""
+import argparse
+import csv
+import json
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+from main import setup_cfg
+from engine.engine import Runner
+
+
+def load_payload(path):
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def install_payload(runner, payload):
+    model = runner.model_without_dp
+    model.rebuild_moe_topology(payload["moe_topology"])
+    model.load_state_dict(payload["model_state"], strict=True)
+    for _, adapter in runner._moe_adapters():
+        adapter.freeze_all()
+        adapter.clear_inference_expert_mask()
+    model.base_enhanced_visual_prototype = payload.get(
+        "base_enhanced_visual_prototype"
+    )
+    if model.base_enhanced_visual_prototype is not None:
+        model.base_enhanced_visual_prototype = model.base_enhanced_visual_prototype.to(
+            runner.device
+        )
+    model.eval()
+
+
+def set_masks(runner, disabled):
+    disabled = {int(block): set(map(int, ids)) for block, ids in disabled.items()}
+    for block, adapter in runner._moe_adapters():
+        adapter.eval()
+        adapter.set_inference_expert_mask(disabled.get(block, set()))
+
+
+def metric_summary(values):
+    values = torch.as_tensor(values, dtype=torch.float32)
+    return {
+        "mean": float(values.mean()),
+        "median": float(values.median()),
+        "q90": float(torch.quantile(values, 0.90)),
+    }
+
+
+@torch.no_grad()
+def collect_features_and_expert_stats(runner, loader, current_session):
+    model = runner.model_without_dp
+    feature_rows, label_rows = [], []
+    stats = {}
+    for block, adapter in runner._moe_adapters():
+        born_ids = [
+            idx for idx, birth in enumerate(adapter.expert_birth_sessions)
+            if int(birth) == int(current_session) and idx >= adapter.base_expert_count
+        ]
+        for expert_id in born_ids:
+            stats[(block, expert_id)] = {"gate": [], "relative_residual": []}
+
+    model.eval()
+    for batch in loader:
+        images, labels = runner.parse_batch(batch)
+        features, aux_list = model.extract_img_feature_train(images)
+        feature_rows.append(F.normalize(features.float(), dim=-1).cpu())
+        label_rows.append(labels.cpu())
+        for (block, adapter), aux in zip(runner._moe_adapters(), aux_list):
+            for expert_id in range(adapter.base_expert_count, adapter.num_experts):
+                if int(adapter.expert_birth_sessions[expert_id]) != int(current_session):
+                    continue
+                gate = aux["route_weights"][:, expert_id].float()
+                expert_out = adapter.experts[expert_id](aux["expert_in"].float())
+                contribution = (
+                    adapter.residual_scale.float()
+                    * gate.unsqueeze(-1) * expert_out.float()
+                )
+                denominator = aux["expert_in"].float().norm(dim=-1).clamp_min(1e-8)
+                relative = contribution.norm(dim=-1) / denominator
+                stats[(block, expert_id)]["gate"].append(gate.cpu())
+                stats[(block, expert_id)]["relative_residual"].append(relative.cpu())
+
+    features = torch.cat(feature_rows)
+    labels = torch.cat(label_rows)
+    summarized = {}
+    for key, item in stats.items():
+        gates = torch.cat(item["gate"]) if item["gate"] else torch.empty(0)
+        residuals = (
+            torch.cat(item["relative_residual"])
+            if item["relative_residual"] else torch.empty(0)
+        )
+        summarized[f"B{key[0]}_E{key[1]}"] = {
+            "gate": metric_summary(gates),
+            "relative_residual": metric_summary(residuals),
+        }
+    return features, labels, summarized
+
+
+def accuracy_by_group(runner, logits, labels, class_ids, base_ids, novel_ids):
+    result = runner.evaluator.calc_accuracy(
+        logits, labels, 1, class_ids=class_ids
+    )
+    base_mask = torch.isin(labels, base_ids)
+    novel_mask = torch.isin(labels, novel_ids)
+
+    def accuracy(mask):
+        if not bool(mask.any()):
+            return float("nan")
+        pred_columns = logits[mask].argmax(dim=1)
+        pred_ids = class_ids[pred_columns]
+        return float(pred_ids.eq(labels[mask]).float().mean().item() * 100.0)
+
+    return {
+        "global_mean_acc": float(result["mean_acc"]),
+        "task_acc": [float(x) for x in result["task_acc"]],
+        "base_global_accuracy": accuracy(base_mask),
+        "novel_global_accuracy": accuracy(novel_mask),
+        "error_flow": result.get("error_flow"),
+    }
+
+
+@torch.no_grad()
+def evaluate_variant(runner, session0_states, support_loader, test_loader,
+                     class_names, class_ids, disabled, base_ids, novel_ids):
+    model = runner.model_without_dp
+    set_masks(runner, disabled)
+
+    # Rebuild the novel class visual prototype with the exact masked encoder.
+    # Historical prototypes remain the immutable Session-0 checkpoint values.
+    novel_state = runner._build_and_refine_task_state(
+        class_names, support_loader, class_ids, session0_states
+    )
+    merged = runner.merge_dicts(session0_states + [novel_state])
+
+    features, labels, expert_stats = collect_features_and_expert_stats(
+        runner, test_loader, current_session=1
+    )
+    prototypes = F.normalize(merged["image_proto"].to(runner.device).float(), dim=-1)
+    logits = 100.0 * features.to(runner.device) @ prototypes.t()
+    class_tensor = torch.as_tensor(
+        merged["class_ids"], device=runner.device, dtype=torch.long
+    )
+    metrics = accuracy_by_group(
+        runner, logits, labels.to(runner.device), class_tensor,
+        torch.as_tensor(base_ids, device=runner.device),
+        torch.as_tensor(novel_ids, device=runner.device),
+    )
+    metrics["expert_response"] = expert_stats
+    metrics["prototype_calibration"] = {
+        "alpha_mean": float(torch.as_tensor(novel_state["calibration_alpha"]).float().mean()),
+        "semantic_confidence_mean": float(
+            torch.as_tensor(novel_state["semantic_confidence"]).float().mean()
+        ),
+        "visual_reliability_mean": float(
+            torch.as_tensor(novel_state["visual_prototype_reliability"]).float().mean()
+        ),
+    }
+    return metrics, features, labels
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_cfg", required=True)
+    parser.add_argument("--train_cfg", required=True)
+    parser.add_argument("--session0", required=True)
+    parser.add_argument("--session1", required=True)
+    parser.add_argument("--output", default="diagnostics/session1_expert_ablation")
+    parser.add_argument("--device", default="")
+    args = parser.parse_args()
+
+    overrides = [
+        "TRAINER.BiMC.CHECKPOINT.RESUME", args.session1,
+        "TRAINER.BiMC.END_SESSION", "1",
+    ]
+    if args.device:
+        overrides += ["DEVICE.DEVICE_NAME", args.device]
+    cfg = setup_cfg(args.data_cfg, args.train_cfg, overrides)
+    runner = Runner(cfg)
+    if runner._resume_completed_session != 1:
+        raise RuntimeError("Expected Session-1 checkpoint to be loaded.")
+
+    payload0, payload1 = load_payload(args.session0), load_payload(args.session1)
+    if int(payload0["completed_session"]) != 0 or int(payload1["completed_session"]) != 1:
+        raise ValueError("The supplied checkpoint files must be Session 00 and Session 01.")
+    if payload0["support_manifest"] != payload1["support_manifest"]:
+        raise ValueError("Session-0 and Session-1 checkpoints use different support manifests.")
+
+    task_states0 = payload0["task_states"]
+    task_states1 = payload1["task_states"]
+    if len(task_states0) != 1 or len(task_states1) != 2:
+        raise ValueError("Expected one Base state in Session 00 and two task states in Session 01.")
+
+    base_ids = torch.as_tensor(task_states0[0]["class_ids"], dtype=torch.long)
+    novel_ids = torch.as_tensor(task_states1[1]["class_ids"], dtype=torch.long)
+    if set(base_ids.tolist()) & set(novel_ids.tolist()):
+        raise ValueError("Base and Session-1 class IDs overlap.")
+
+    support_loader = runner.data_manager.get_dataloader(
+        1, source="train", mode="test", accumulate_past=False
+    )
+    test_loader = runner.data_manager.get_dataloader(
+        1, source="test", mode="test"
+    )
+    class_names = np.array(runner.data_manager.class_names)[
+        runner.data_manager.class_index_in_task[1]
+    ].tolist()
+    class_ids = runner.data_manager.class_index_in_task[1]
+
+    install_payload(runner, payload1)
+    expanded = {}
+    for block, adapter in runner._moe_adapters():
+        ids = [
+            idx for idx, birth in enumerate(adapter.expert_birth_sessions)
+            if int(birth) == 1 and idx >= adapter.base_expert_count
+        ]
+        if ids:
+            expanded[block] = ids
+    if not expanded:
+        raise RuntimeError("Session-1 checkpoint contains no Session-1-born experts.")
+    if set(expanded) != {8, 9}:
+        raise RuntimeError(
+            f"Expected Session-1 expansion in B8/B9 from the supplied diagnostics, got {expanded}."
+        )
+    if any(len(ids) != 1 for ids in expanded.values()):
+        raise RuntimeError(f"Expected exactly one Session-1 expert per expanded block, got {expanded}.")
+
+    variants = {
+        "A_full": {},
+        "B_disable_B8": {8: expanded[8]},
+        "C_disable_B9": {9: expanded[9]},
+        "D_disable_B8_B9": expanded,
+    }
+    baseline_features = None
+    rows, details = [], {}
+    for name, masks in variants.items():
+        metrics, features, labels = evaluate_variant(
+            runner, task_states0, support_loader, test_loader,
+            class_names, class_ids, masks, base_ids, novel_ids
+        )
+        if baseline_features is None:
+            baseline_features = features
+            baseline_labels = labels
+        else:
+            if not torch.equal(labels, baseline_labels):
+                raise RuntimeError("Evaluation sample order changed between ablation variants.")
+            cosine_distance = 1.0 - F.cosine_similarity(
+                baseline_features, features, dim=-1
+            )
+            base_mask = torch.isin(labels, base_ids)
+            novel_mask = torch.isin(labels, novel_ids)
+            metrics["feature_drift_vs_full"] = {
+                "all": metric_summary(cosine_distance),
+                "base": metric_summary(cosine_distance[base_mask]),
+                "novel": metric_summary(cosine_distance[novel_mask]),
+            }
+        current_base = metrics["base_global_accuracy"]
+        current_novel = metrics["novel_global_accuracy"]
+        mean_acc = (current_base + current_novel) / 2.0
+        baseline_base_acc = float(payload0["task_acc_list"][0][0])
+        pd = max(0.0, baseline_base_acc - current_base) / 2.0
+        metrics["derived"] = {
+            "mean_acc": mean_acc,
+            "average_accuracy": (baseline_base_acc + mean_acc) / 2.0,
+            "performance_drop": pd,
+        }
+        details[name] = metrics
+        rows.append({
+            "variant": name,
+            "global_mean_acc": metrics["global_mean_acc"],
+            "base_global_accuracy": current_base,
+            "novel_global_accuracy": current_novel,
+            "AA_two_sessions": metrics["derived"]["average_accuracy"],
+            "PD_two_sessions": pd,
+        })
+        print(
+            f"[{name}] global={metrics['global_mean_acc']:.3f} "
+            f"base={current_base:.3f} novel={current_novel:.3f} "
+            f"AA={metrics['derived']['average_accuracy']:.3f} PD={pd:.3f}"
+        )
+
+    output = Path(args.output)
+    output.mkdir(parents=True, exist_ok=True)
+    with (output / "summary.csv").open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    with (output / "details.json").open("w", encoding="utf-8") as file:
+        json.dump(details, file, ensure_ascii=False, indent=2)
+    print(f"Saved ablation report to {output.resolve()}")
+
+
+if __name__ == "__main__":
+    main()
