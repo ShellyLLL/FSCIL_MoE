@@ -31,7 +31,7 @@ jobs:
           python -m pip install "numpy<2" scikit-learn==1.3.2 yacs==0.1.8 tqdm==4.66.1 ftfy==6.1.1 regex==2023.10.3 Pillow packaging
 
       - name: Compile Python sources
-        run: python -m compileall -q engine models tests
+        run: python -m compileall -q engine models tests tools
 
       - name: Run unified MoE unit tests
         run: python -m unittest discover -s tests -p "test_risk_guided_moe.py" -v
