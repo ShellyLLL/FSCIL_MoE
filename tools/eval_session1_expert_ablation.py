@@ -67,54 +67,159 @@ def metric_summary(values):
 
 
 @torch.no_grad()
-def collect_features_and_expert_stats(runner, loader, current_session):
+def collect_features_and_expert_stats(
+    runner, loader, current_session, base_ids, novel_ids
+):
+    """Collect final features and post-hoc Base/Novel response statistics.
+
+    Labels are used only after the model forward pass to partition diagnostic
+    measurements. They are never passed to the router or expert modules.
+
+    The reported residual is the exact per-expert CLS-token contribution:
+        residual_scale * deployed_gate * expert(expert_input_cls)
+    This matches the CLS contribution used by the adapter forward path.
+    """
     model = runner.model_without_dp
     feature_rows, label_rows = [], []
+    base_ids = torch.as_tensor(base_ids, dtype=torch.long).detach().cpu().reshape(-1)
+    novel_ids = torch.as_tensor(novel_ids, dtype=torch.long).detach().cpu().reshape(-1)
+
     stats = {}
     for block, adapter in runner._moe_adapters():
         born_ids = [
             idx for idx, birth in enumerate(adapter.expert_birth_sessions)
-            if int(birth) == int(current_session) and idx >= adapter.base_expert_count
+            if int(birth) == int(current_session)
+            and idx >= adapter.base_expert_count
         ]
         for expert_id in born_ids:
-            stats[(block, expert_id)] = {"gate": [], "relative_residual": []}
+            stats[(block, expert_id)] = {
+                group: {
+                    "gate": [],
+                    "residual_norm": [],
+                    "relative_residual": [],
+                }
+                for group in ("all", "base", "novel")
+            }
 
     model.eval()
     for batch in loader:
         images, labels = runner.parse_batch(batch)
         features, aux_list = model.extract_img_feature_train(images)
+
+        labels_cpu = labels.detach().to(device="cpu", dtype=torch.long).reshape(-1)
+        if features.size(0) != labels_cpu.numel():
+            raise RuntimeError(
+                "Feature batch and label batch have different sample counts: "
+                f"{features.size(0)} vs {labels_cpu.numel()}."
+            )
+
+        # Ground-truth labels are used only for post-hoc diagnostic grouping.
+        base_mask = torch.isin(labels_cpu, base_ids)
+        novel_mask = torch.isin(labels_cpu, novel_ids)
+        overlap_mask = base_mask & novel_mask
+        unassigned_mask = ~(base_mask | novel_mask)
+        if bool(overlap_mask.any()):
+            raise RuntimeError(
+                "Base and Novel diagnostic class IDs overlap for labels "
+                f"{labels_cpu[overlap_mask].unique().tolist()}."
+            )
+        if bool(unassigned_mask.any()):
+            raise RuntimeError(
+                "Session-1 test loader contains labels outside the Base/Novel "
+                f"diagnostic split: {labels_cpu[unassigned_mask].unique().tolist()}."
+            )
+
+        group_masks = {
+            "all": torch.ones_like(base_mask, dtype=torch.bool),
+            "base": base_mask,
+            "novel": novel_mask,
+        }
+
         feature_rows.append(F.normalize(features.float(), dim=-1).cpu())
-        label_rows.append(labels.cpu())
-        for (block, adapter), aux in zip(runner._moe_adapters(), aux_list):
+        label_rows.append(labels_cpu)
+
+        adapters = runner._moe_adapters()
+        if len(adapters) != len(aux_list):
+            raise RuntimeError(
+                "MoE adapter order does not match the returned auxiliary outputs."
+            )
+
+        for (block, adapter), aux in zip(adapters, aux_list):
+            if aux is None:
+                raise RuntimeError(f"Missing MoE diagnostics for transformer block {block}.")
+
+            route_weights = aux["route_weights"].float()
+            expert_input = aux["expert_in"].float()  # [batch, dim], CLS token
+            if route_weights.size(0) != labels_cpu.numel():
+                raise RuntimeError(
+                    f"B{block} router batch size does not match labels."
+                )
+            if expert_input.ndim != 2 or expert_input.size(0) != labels_cpu.numel():
+                raise RuntimeError(
+                    f"B{block} expert_in must be [batch, dim] and align with labels; "
+                    f"got {tuple(expert_input.shape)}."
+                )
+
             for expert_id in range(adapter.base_expert_count, adapter.num_experts):
                 if int(adapter.expert_birth_sessions[expert_id]) != int(current_session):
                     continue
-                gate = aux["route_weights"][:, expert_id].float()
-                expert_out = adapter.experts[expert_id](aux["expert_in"].float())
+
+                # route_weights contains the exact deployed gate used by forward:
+                # Base columns are Softmax; incremental columns are independent Sigmoid.
+                gate = route_weights[:, expert_id]
+                expert_output = adapter.experts[expert_id](expert_input)
                 contribution = (
                     adapter.residual_scale.float()
-                    * gate.unsqueeze(-1) * expert_out.float()
+                    * gate.unsqueeze(-1)
+                    * expert_output.float()
                 )
-                denominator = aux["expert_in"].float().norm(dim=-1).clamp_min(1e-8)
-                relative = contribution.norm(dim=-1) / denominator
-                stats[(block, expert_id)]["gate"].append(gate.cpu())
-                stats[(block, expert_id)]["relative_residual"].append(relative.cpu())
+
+                residual_norm = torch.linalg.vector_norm(contribution, ord=2, dim=-1)
+                input_norm = torch.linalg.vector_norm(
+                    expert_input.float(), ord=2, dim=-1
+                ).clamp_min(1e-8)
+                relative_residual = residual_norm / input_norm
+
+                gate_cpu = gate.detach().cpu()
+                residual_norm_cpu = residual_norm.detach().cpu()
+                relative_residual_cpu = relative_residual.detach().cpu()
+
+                for group, mask in group_masks.items():
+                    stats[(block, expert_id)][group]["gate"].append(gate_cpu[mask])
+                    stats[(block, expert_id)][group]["residual_norm"].append(
+                        residual_norm_cpu[mask]
+                    )
+                    stats[(block, expert_id)][group]["relative_residual"].append(
+                        relative_residual_cpu[mask]
+                    )
+
+    if not feature_rows:
+        raise RuntimeError("The Session-1 test loader produced no samples.")
 
     features = torch.cat(feature_rows)
     labels = torch.cat(label_rows)
     summarized = {}
-    for key, item in stats.items():
-        gates = torch.cat(item["gate"]) if item["gate"] else torch.empty(0)
-        residuals = (
-            torch.cat(item["relative_residual"])
-            if item["relative_residual"] else torch.empty(0)
-        )
-        summarized[f"B{key[0]}_E{key[1]}"] = {
-            "gate": metric_summary(gates),
-            "relative_residual": metric_summary(residuals),
-        }
-    return features, labels, summarized
 
+    for (block, expert_id), groups in stats.items():
+        expert_name = f"B{block}_E{expert_id}"
+        summarized[expert_name] = {}
+
+        for group, metrics in groups.items():
+            group_values = {}
+            for metric_name, chunks in metrics.items():
+                values = torch.cat(chunks) if chunks else torch.empty(0)
+                if values.numel() == 0:
+                    raise RuntimeError(
+                        f"No {group} samples were collected for {expert_name}."
+                    )
+                group_values[metric_name] = metric_summary(values)
+
+            group_values["sample_count"] = int(
+                sum(chunk.numel() for chunk in metrics["gate"])
+            )
+            summarized[expert_name][group] = group_values
+
+    return features, labels, summarized
 
 def accuracy_by_group(runner, logits, labels, class_ids, base_ids, novel_ids):
     result = runner.evaluator.calc_accuracy(
@@ -158,7 +263,11 @@ def evaluate_variant(runner, session0_states, support_loader, test_loader,
     merged = runner.merge_dicts(session0_states + [novel_state])
 
     features, labels, expert_stats = collect_features_and_expert_stats(
-        runner, test_loader, current_session=1
+        runner,
+        test_loader,
+        current_session=1,
+        base_ids=base_ids,
+        novel_ids=novel_ids,
     )
     prototypes = F.normalize(merged["image_proto"].to(runner.device).float(), dim=-1)
     logits = 100.0 * features.to(runner.device) @ prototypes.t()
@@ -320,6 +429,43 @@ def main():
         writer = csv.DictWriter(file, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
+
+    # A compact table makes the post-hoc Base/Novel response comparison easy
+    # to inspect without parsing the nested details.json structure.
+    response_rows = []
+    for expert_name, groups in details["A_full"]["expert_response"].items():
+        for group_name, values in groups.items():
+            row = {
+                "expert": expert_name,
+                "group": group_name,
+                "sample_count": values["sample_count"],
+            }
+            for metric_name in ("gate", "residual_norm", "relative_residual"):
+                for statistic in ("mean", "median", "q90"):
+                    row[f"{metric_name}_{statistic}"] = values[metric_name][statistic]
+            response_rows.append(row)
+
+    response_fields = [
+        "expert", "group", "sample_count",
+        "gate_mean", "gate_median", "gate_q90",
+        "residual_norm_mean", "residual_norm_median", "residual_norm_q90",
+        "relative_residual_mean", "relative_residual_median", "relative_residual_q90",
+    ]
+    with (output / "expert_response_by_group.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as file:
+        writer = csv.DictWriter(file, fieldnames=response_fields)
+        writer.writeheader()
+        writer.writerows(response_rows)
+
+    print("Expert response by label group (labels used only post hoc):")
+    for row in response_rows:
+        print(
+            f"  {row['expert']} [{row['group']}] n={row['sample_count']} "
+            f"gate_mean={row['gate_mean']:.6f} "
+            f"residual_norm_mean={row['residual_norm_mean']:.6f} "
+            f"relative_residual_mean={row['relative_residual_mean']:.6f}"
+        )
     def json_default(value):
         if isinstance(value, (np.ndarray,)):
             return value.tolist()
