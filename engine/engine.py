@@ -827,6 +827,23 @@ class Runner:
                 raise RuntimeError(f"AE calibration split left too few fitting sources for class {class_id}.")
         return mask
 
+    @staticmethod
+    def _base_session_holdout_per_class(support_sizes, session_class_count):
+        """Convert total Session support counts into per-class Base holdout capacity.
+
+        Threshold pseudo-Sessions contain support_size examples distributed
+        across session_class_count classes. The Base descriptor split must
+        reserve the largest per-class count, not the total Session count, from
+        every Base class.
+        """
+        sizes = [int(value) for value in support_sizes]
+        class_count = int(session_class_count)
+        if not sizes or any(value < 1 for value in sizes):
+            raise ValueError("Base Session calibration requires positive support-set sizes.")
+        if class_count < 1:
+            raise ValueError("Base Session calibration requires a positive Session class count.")
+        return max(3, max((size + class_count - 1) // class_count for size in sizes))
+
     def _incremental_support_sizes(self):
         """Return exact total support counts for every configured incremental Session."""
         sizes = set()
@@ -941,7 +958,10 @@ class Runner:
             # Independent error-reference sources are held out from AE fitting.
             # Every Base class contributes to both partitions.
             base_class_count = int(torch.unique(labels, sorted=True).numel())
-            per_class_session_capacity = max(3, max(support_sizes))
+            session_class_count = int(self.cfg.DATASET.NUM_INC_CLS)
+            per_class_session_capacity = self._base_session_holdout_per_class(
+                support_sizes, session_class_count
+            )
             reference_mask = self._make_calibration_mask(
                 labels, source_ids,
                 min_calibration_count=per_class_session_capacity * base_class_count,
