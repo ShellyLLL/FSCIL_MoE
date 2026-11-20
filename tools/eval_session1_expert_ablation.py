@@ -248,6 +248,10 @@ def main():
             "all": metric_summary(cosine_distance),
             "base": metric_summary(cosine_distance[base_mask]),
             "novel": metric_summary(cosine_distance[novel_mask]),
+            "by_class": {
+                str(int(class_id)): metric_summary(cosine_distance[labels.eq(int(class_id))])
+                for class_id in torch.unique(labels, sorted=True).tolist()
+            },
         }
         current_base = metrics["base_global_accuracy"]
         current_novel = metrics["novel_global_accuracy"]
@@ -286,6 +290,19 @@ def main():
             base_ids.to(runner.device), novel_ids.to(runner.device),
         )
 
+    # Fixed-query counterfactual: hold A_full query features fixed and vary
+    # only the prototype bank produced by each expert-mask variant.
+    full_features = variant_features["A_full"].to(runner.device)
+    prototype_only_comparison = {}
+    for name, (merged, _) in variant_states.items():
+        prototypes = F.normalize(merged["image_proto"].to(runner.device).float(), dim=-1)
+        logits = 100.0 * full_features @ prototypes.t()
+        prototype_only_comparison[name], _ = classification_diagnostics(
+            logits, session0_labels.to(runner.device),
+            torch.as_tensor(merged["class_ids"], device=runner.device, dtype=torch.long),
+            base_ids.to(runner.device), novel_ids.to(runner.device),
+        )
+
     install_payload(runner, payload1)
     anchor_response = collect_historical_anchor_responses(runner, task_states0, expanded)
     anchor_vs_base_test = compare_anchor_responses_to_base_test(
@@ -296,6 +313,7 @@ def main():
     )
     details["diagnostic_analysis"] = {
         "fixed_full_prototype_query_encoder_counterfactual": fixed_proto_comparison,
+        "fixed_full_query_prototype_only_counterfactual": prototype_only_comparison,
         "historical_pd_anchor_response": anchor_response,
         "historical_anchor_vs_base_test": anchor_vs_base_test,
         "ce_pd_gradient_diagnostics": gradient_diagnostics,
