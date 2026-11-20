@@ -8,6 +8,8 @@ from tools.session1_diagnostics import (
     classification_diagnostics,
     metric_summary,
     response_posthoc,
+    gradient_objective_diagnostics,
+    prototype_generalization_diagnostics,
 )
 
 
@@ -70,6 +72,80 @@ class Session1DiagnosticsTests(unittest.TestCase):
         )
         self.assertEqual(correctness["B8_E4"]["incorrect"]["sample_count"], 1)
         self.assertEqual(set(raw["B8_E4"]) - {"labels"}, set(RESPONSE_METRICS))
+
+    def test_weighted_gradient_diagnostics_match_training_objective_and_clip(self):
+        ce = torch.tensor([3.0, 4.0])
+        pd = torch.tensor([-1.0, 2.0])
+        result = gradient_objective_diagnostics(
+            ce, pd, pd_weight=0.5, clip_max_norm=1.0
+        )
+        expected = ce + 0.5 * pd
+        expected_norm = torch.linalg.vector_norm(expected).item()
+        self.assertAlmostEqual(
+            result["global_combined_gradient_norm_pre_clip"], expected_norm, places=6
+        )
+        self.assertAlmostEqual(
+            result["global_clip_coefficient"], 1.0 / (expected_norm + 1e-6), places=6
+        )
+        self.assertAlmostEqual(
+            result["ce_weighted_pd_cosine"],
+            float(torch.dot(ce, 0.5 * pd) / (
+                torch.linalg.vector_norm(ce) * torch.linalg.vector_norm(0.5 * pd)
+            )),
+            places=6,
+        )
+        no_clip = gradient_objective_diagnostics(ce, pd, pd_weight=0.0, clip_max_norm=100.0)
+        self.assertEqual(no_clip["global_clip_coefficient"], 1.0)
+
+    def test_prototype_generalization_uses_source_exclusive_loo(self):
+        class_ids = torch.tensor([0, 1, 2])
+        base_ids = torch.tensor([0])
+        novel_ids = torch.tensor([1, 2])
+        global_prototypes = torch.tensor([
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [-1.0, 0.0],
+        ])
+        support_features = torch.tensor([
+            [0.0, 1.0],
+            [0.0, 1.0],
+            [-1.0, 0.0],
+            [-1.0, 0.0],
+        ])
+        support_labels = torch.tensor([1, 1, 2, 2])
+        loo = torch.tensor([
+            [[0.0, 1.0], [-1.0, 0.0]],
+            [[0.0, 1.0], [-1.0, 0.0]],
+            [[0.0, 1.0], [-1.0, 0.0]],
+            [[0.0, 1.0], [-1.0, 0.0]],
+        ])
+        test_features = torch.tensor([
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [-1.0, 0.0],
+        ])
+        test_labels = torch.tensor([0, 1, 2])
+        result = prototype_generalization_diagnostics(
+            support_features, support_labels, loo,
+            test_features, test_labels, global_prototypes, class_ids,
+            old_class_count=1, base_ids=base_ids, novel_ids=novel_ids,
+            logit_scale=10.0,
+        )
+        self.assertAlmostEqual(result["support_loo"]["novel_accuracy"], 1.0)
+        self.assertAlmostEqual(result["test"]["base_accuracy"], 1.0)
+        self.assertAlmostEqual(result["test"]["novel_accuracy"], 1.0)
+        self.assertAlmostEqual(result["novel_support_loo_minus_test_accuracy"], 0.0)
+        self.assertIn("participated in incremental optimization", result["interpretation_limit"])
+
+    def test_prototype_generalization_rejects_misaligned_loo_cache(self):
+        with self.assertRaises(ValueError):
+            prototype_generalization_diagnostics(
+                torch.randn(2, 3), torch.tensor([1, 1]), torch.randn(2, 1, 2),
+                torch.randn(2, 3), torch.tensor([0, 1]),
+                torch.randn(2, 3), torch.tensor([0, 1]),
+                old_class_count=1, base_ids=torch.tensor([0]),
+                novel_ids=torch.tensor([1]), logit_scale=10.0,
+            )
 
 
 if __name__ == "__main__":
