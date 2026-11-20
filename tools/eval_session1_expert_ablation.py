@@ -122,11 +122,16 @@ def accuracy_by_group(runner, logits, labels, class_ids, base_ids, novel_ids):
         pred_ids = class_ids[pred_columns]
         return float(pred_ids.eq(labels[mask]).float().mean().item() * 100.0)
 
+    task_acc = [float(x) for x in result["task_acc"]]
+    if len(task_acc) != 2:
+        raise RuntimeError(f"Expected two task accuracies for Session 1, got {task_acc}.")
     return {
         "global_mean_acc": float(result["mean_acc"]),
-        "task_acc": [float(x) for x in result["task_acc"]],
-        "base_global_accuracy": accuracy(base_mask),
-        "novel_global_accuracy": accuracy(novel_mask),
+        "task_acc": task_acc,
+        "base_global_accuracy": task_acc[0],
+        "novel_global_accuracy": task_acc[1],
+        "base_sample_accuracy": accuracy(base_mask),
+        "novel_sample_accuracy": accuracy(novel_mask),
         "error_flow": result.get("error_flow"),
     }
 
@@ -242,29 +247,40 @@ def main():
         "C_disable_B9": {9: expanded[9]},
         "D_disable_B8_B9": expanded,
     }
-    baseline_features = None
+
+    # Establish the true pre-incremental feature reference on the exact same
+    # deterministic Session-1 test loader, using the Session-00 model weights.
+    install_payload(runner, payload0)
+    base_feature_rows, base_label_rows = [], []
+    with torch.no_grad():
+        for batch in test_loader:
+            images, labels = runner.parse_batch(batch)
+            base_feature_rows.append(F.normalize(
+                runner.model_without_dp.extract_img_feature(images).float(), dim=-1
+            ).cpu())
+            base_label_rows.append(labels.cpu())
+    session0_features = torch.cat(base_feature_rows)
+    session0_labels = torch.cat(base_label_rows)
+    install_payload(runner, payload1)
+
     rows, details = [], {}
     for name, masks in variants.items():
         metrics, features, labels = evaluate_variant(
             runner, task_states0, support_loader, test_loader,
             class_names, class_ids, masks, base_ids, novel_ids
         )
-        if baseline_features is None:
-            baseline_features = features
-            baseline_labels = labels
-        else:
-            if not torch.equal(labels, baseline_labels):
-                raise RuntimeError("Evaluation sample order changed between ablation variants.")
-            cosine_distance = 1.0 - F.cosine_similarity(
-                baseline_features, features, dim=-1
-            )
-            base_mask = torch.isin(labels, base_ids)
-            novel_mask = torch.isin(labels, novel_ids)
-            metrics["feature_drift_vs_full"] = {
-                "all": metric_summary(cosine_distance),
-                "base": metric_summary(cosine_distance[base_mask]),
-                "novel": metric_summary(cosine_distance[novel_mask]),
-            }
+        if not torch.equal(labels, session0_labels):
+            raise RuntimeError("Evaluation sample order changed between Session-0 and Session-1 models.")
+        cosine_distance = 1.0 - F.cosine_similarity(
+            session0_features, features, dim=-1
+        )
+        base_mask = torch.isin(labels, base_ids)
+        novel_mask = torch.isin(labels, novel_ids)
+        metrics["feature_drift_vs_session0"] = {
+            "all": metric_summary(cosine_distance),
+            "base": metric_summary(cosine_distance[base_mask]),
+            "novel": metric_summary(cosine_distance[novel_mask]),
+        }
         current_base = metrics["base_global_accuracy"]
         current_novel = metrics["novel_global_accuracy"]
         mean_acc = (current_base + current_novel) / 2.0
