@@ -1243,7 +1243,8 @@ class Runner:
         if global_full.size(0) != global_ids.numel():
             raise RuntimeError("Global visual prototypes and class ids lost row alignment.")
         return {
-            "classes": classes, "labels": labels, "source_ids": sources,
+            "classes": classes, "features": features, "labels": labels,
+            "source_ids": sources,
             "novel_full": novel_full, "novel_loo": novel_loo,
             "global_full": global_full, "global_ids": global_ids,
             "old_class_count": old_ids.numel(),
