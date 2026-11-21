@@ -591,9 +591,9 @@ def collect_support_generalization_diagnostics(
     with preserve_diagnostic_state(runner):
         runner.model.eval()
         _set_masks(runner, {})
+        # _build_incremental_bank validates cache["loo_valid"] before returning.
+        # The public bank contains features/prototypes, not the temporary validity mask.
         bank = runner._build_incremental_bank(support_loader, novel_ids, old_states)
-        if not bool(bank["loo_valid"].all().item()):
-            raise RuntimeError("Support generalization diagnostics require valid source-exclusive LOO.")
         test_features, test_labels, _, _ = runner.model_without_dp.inference_all_img_feature(
             test_loader
         )
