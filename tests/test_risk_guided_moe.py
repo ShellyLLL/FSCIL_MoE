@@ -220,6 +220,14 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             self.assertEqual(len(history["ce_loss"]), 8)
             self.assertEqual(len(history["rd_loss"]), 8)
             self.assertEqual(len(history["pd_loss"]), 8)
+            self.assertEqual(len(history["gradient_projection"]), 8)
+            for projection_epoch in history["gradient_projection"]:
+                for group in ("expert", "router"):
+                    self.assertEqual(projection_epoch[group]["batch_count"], 2)
+                    self.assertTrue(0.0 <= projection_epoch[group]["conflict_rate"] <= 1.0)
+                    self.assertTrue(torch.isfinite(torch.tensor(
+                        projection_epoch[group]["projection_coefficient_mean"]
+                    )))
             self.assertEqual(history["rd_training_samples"], 18)
             self.assertEqual(history["rd_reference_samples"], 14)
             self.assertEqual(history["rd_session_classes"], [1, 2])
@@ -332,6 +340,47 @@ class UnifiedDynamicMoETests(unittest.TestCase):
                 self.assertGreater(float(descriptor.effective_error_count.item()), 0.0)
                 self.assertTrue(torch.isfinite(descriptor.error_mean))
                 self.assertTrue(torch.isfinite(descriptor.error_std))
+
+    def test_gem_projection_removes_conflicting_ce_component_per_parameter_group(self):
+        primary = (torch.tensor([1.0, 2.0]), torch.tensor([3.0]))
+        preservation = (torch.tensor([-1.0, 0.0]), torch.tensor([0.0]))
+        projected, diagnostics = Runner._project_conflicting_gradients(
+            primary, preservation
+        )
+        self.assertTrue(diagnostics["applied"])
+        torch.testing.assert_close(projected[0], torch.tensor([0.0, 2.0]))
+        torch.testing.assert_close(projected[1], primary[1])
+        before_dot = sum(
+            float((left * right).sum())
+            for left, right in zip(primary, preservation)
+        )
+        after_dot = sum(
+            float((left * right).sum())
+            for left, right in zip(projected, preservation)
+        )
+        self.assertLess(before_dot, 0.0)
+        self.assertAlmostEqual(after_dot, 0.0, places=6)
+
+        # Adding a positive-weight PD gradient after projection makes the
+        # first-order directional derivative of the preservation objective
+        # non-negative (and strictly positive when PD is non-zero).
+        pd_weight = 0.7
+        update = tuple(
+            left + pd_weight * right for left, right in zip(projected, preservation)
+        )
+        update_dot = sum(
+            float((left * right).sum()) for left, right in zip(update, preservation)
+        )
+        pd_norm_sq = sum(float(right.square().sum()) for right in preservation)
+        self.assertAlmostEqual(update_dot, pd_weight * pd_norm_sq, places=6)
+
+        aligned_primary = (torch.tensor([1.0, 0.0]),)
+        aligned_pd = (torch.tensor([2.0, 0.0]),)
+        unchanged, aligned_diagnostics = Runner._project_conflicting_gradients(
+            aligned_primary, aligned_pd
+        )
+        self.assertFalse(aligned_diagnostics["applied"])
+        torch.testing.assert_close(unchanged[0], aligned_primary[0])
 
     def test_old_feature_pd_updates_new_gate_and_expert_but_not_history(self):
         torch.manual_seed(17)

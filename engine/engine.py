@@ -176,6 +176,101 @@ class Runner:
         }
 
     @staticmethod
+    def _project_conflicting_gradients(primary_gradients, preservation_gradients, eps=1e-24):
+        """Project a primary gradient away from a conflicting preservation gradient.
+
+        This is the single-constraint GEM update: if <g_primary, g_preserve> < 0,
+        remove the component of the primary gradient that would increase the
+        preservation objective to first order. The projection is applied
+        independently to each functional parameter group (expert and router).
+        """
+        primary_gradients = tuple(primary_gradients)
+        preservation_gradients = tuple(preservation_gradients)
+        if len(primary_gradients) != len(preservation_gradients):
+            raise ValueError("Primary and preservation gradient groups must align.")
+
+        reference = next(
+            (value for value in primary_gradients + preservation_gradients if value is not None),
+            None,
+        )
+        if reference is None:
+            return primary_gradients, {
+                "applied": False, "projection_coefficient": 0.0,
+                "ce_pd_dot_before": 0.0, "ce_pd_dot_after": 0.0,
+                "ce_gradient_norm": 0.0, "projected_ce_gradient_norm": 0.0,
+                "preservation_gradient_norm": 0.0,
+                "ce_pd_cosine_before": None, "ce_pd_cosine_after": None,
+            }
+
+        dot = torch.zeros((), device=reference.device, dtype=torch.float64)
+        primary_norm_sq = torch.zeros_like(dot)
+        preservation_norm_sq = torch.zeros_like(dot)
+        for primary, preservation in zip(primary_gradients, preservation_gradients):
+            if primary is not None:
+                primary64 = primary.detach().to(dtype=torch.float64)
+                primary_norm_sq += primary64.square().sum()
+            if preservation is not None:
+                preservation64 = preservation.detach().to(dtype=torch.float64)
+                preservation_norm_sq += preservation64.square().sum()
+            if primary is not None and preservation is not None:
+                dot += (
+                    primary.detach().to(dtype=torch.float64)
+                    * preservation.detach().to(dtype=torch.float64)
+                ).sum()
+
+        applied = bool((dot < 0).item() and (preservation_norm_sq > float(eps)).item())
+        coefficient = float((dot / preservation_norm_sq).item()) if applied else 0.0
+        projected = []
+        for primary, preservation in zip(primary_gradients, preservation_gradients):
+            if primary is None:
+                projected.append(None)
+            elif applied and preservation is not None:
+                projected.append(primary - coefficient * preservation)
+            else:
+                projected.append(primary)
+
+        projected_dot = torch.zeros_like(dot)
+        projected_norm_sq = torch.zeros_like(dot)
+        for primary, preservation in zip(projected, preservation_gradients):
+            if primary is not None:
+                projected_norm_sq += primary.detach().to(dtype=torch.float64).square().sum()
+            if primary is not None and preservation is not None:
+                projected_dot += (
+                    primary.detach().to(dtype=torch.float64)
+                    * preservation.detach().to(dtype=torch.float64)
+                ).sum()
+
+        primary_norm = torch.sqrt(primary_norm_sq)
+        preservation_norm = torch.sqrt(preservation_norm_sq)
+        projected_norm = torch.sqrt(projected_norm_sq)
+        cosine_before = (
+            float((dot / (primary_norm * preservation_norm)).item())
+            if bool((primary_norm > 0).item() and (preservation_norm > 0).item())
+            else None
+        )
+        cosine_after = (
+            float((projected_dot / (projected_norm * preservation_norm)).item())
+            if bool((projected_norm > 0).item() and (preservation_norm > 0).item())
+            else None
+        )
+        if any(
+            value is not None and not bool(torch.isfinite(value).all().item())
+            for value in projected
+        ):
+            raise FloatingPointError("Gradient conflict projection produced non-finite gradients.")
+        return tuple(projected), {
+            "applied": applied,
+            "projection_coefficient": coefficient,
+            "ce_pd_dot_before": float(dot.item()),
+            "ce_pd_dot_after": float(projected_dot.item()),
+            "ce_gradient_norm": float(primary_norm.item()),
+            "projected_ce_gradient_norm": float(projected_norm.item()),
+            "preservation_gradient_norm": float(preservation_norm.item()),
+            "ce_pd_cosine_before": cosine_before,
+            "ce_pd_cosine_after": cosine_after,
+        }
+
+    @staticmethod
     def _cpu_copy(value):
         if isinstance(value, torch.Tensor):
             return value.detach().cpu().clone()
@@ -1455,6 +1550,7 @@ class Runner:
             ], weight_decay=float(optim_cfg.WEIGHT_DECAY))
 
             loss_history, ce_history, rd_history, pd_history = [], [], [], []
+            gradient_projection_history = []
             classification_samples_total = 0
             samples_per_epoch = []
             observed_train_classes = set()
@@ -1469,6 +1565,7 @@ class Runner:
                 adapter.experts[-1].train()
                 descriptor.train()
                 total, ce_total, rd_total, pd_total, count = 0.0, 0.0, 0.0, 0.0, 0
+                projection_rows = {"expert": [], "router": []}
                 epoch_samples = 0
                 for batch in train_loader:
                     all_images, all_labels = self.parse_batch(batch)
@@ -1486,7 +1583,8 @@ class Runner:
 
                     optimizer.zero_grad(set_to_none=True)
                     # Every current-Session example contributes to global
-                    # classification; the new router is learned through CE and PD.
+                    # classification; historical anchors provide the explicit
+                    # old-feature preservation objective.
                     logits, targets = self._global_incremental_logits(
                         all_images, all_labels, all_source_ids, bank, scale
                     )
@@ -1511,29 +1609,86 @@ class Runner:
                     rd_clean = local_values[rd_rows[rd_fit_mask]]
                     if rd_clean.numel():
                         rd_noisy = rd_clean + torch.randn_like(rd_clean) * noise_std
-                        rd_reconstruction = descriptor(rd_noisy)
-                        rd_reconstruction_loss = F.mse_loss(rd_reconstruction, rd_clean)
+                        rd_reconstruction = F.mse_loss(
+                            descriptor(rd_noisy), rd_clean
+                        )
                         rd_residual_loss = descriptor.residual_output(rd_clean).square().mean()
-                        rd_loss = rd_reconstruction_loss + descriptor_residual_weight * rd_residual_loss
+                        rd_loss = rd_reconstruction + descriptor_residual_weight * rd_residual_loss
                     else:
                         rd_loss = classification.new_zeros(())
                     pd_weight = float(getattr(incremental_cfg, "OLD_SUPPRESSION_WEIGHT", 1.0))
+                    if not np.isfinite(pd_weight) or pd_weight < 0:
+                        raise ValueError("OLD_SUPPRESSION_WEIGHT must be finite and non-negative.")
                     loss = classification + pd_weight * old_suppression + rd_weight * rd_loss
                     if not bool(torch.isfinite(loss).item()):
                         raise FloatingPointError(
                             "Non-finite Session-level global visual-prototype incremental loss."
                         )
-                    loss.backward()
-                    # CE/PD gradients update the new functional expert/router;
-                    # RD gradients update only the descriptor residual. Clip
-                    # these objective groups independently so large CE/PD
-                    # gradients cannot suppress the distribution learner.
-                    torch.nn.utils.clip_grad_norm_(
-                        adapter.newest_parameters(include_descriptor=False), 1.0
+
+                    # Resolve CE/PD conflict independently for the newest
+                    # expert and router. The projected CE component cannot
+                    # increase the old-feature preservation objective to
+                    # first order; the PD component is then added explicitly.
+                    expert_parameters = list(adapter.experts[-1].parameters())
+                    router_parameters = list(adapter.router.columns[-1].parameters())
+                    functional_parameters = expert_parameters + router_parameters
+                    ce_gradients = torch.autograd.grad(
+                        classification, functional_parameters,
+                        retain_graph=True, allow_unused=True,
                     )
-                    torch.nn.utils.clip_grad_norm_(
-                        descriptor.trainable_parameters(), 1.0
+                    pd_gradients = torch.autograd.grad(
+                        old_suppression, functional_parameters,
+                        retain_graph=False, allow_unused=True,
                     )
+                    expert_count = len(expert_parameters)
+                    projected_expert_ce, expert_projection = self._project_conflicting_gradients(
+                        ce_gradients[:expert_count], pd_gradients[:expert_count]
+                    )
+                    projected_router_ce, router_projection = self._project_conflicting_gradients(
+                        ce_gradients[expert_count:], pd_gradients[expert_count:]
+                    )
+                    for parameter, ce_gradient, pd_gradient in zip(
+                        expert_parameters, projected_expert_ce, pd_gradients[:expert_count]
+                    ):
+                        if ce_gradient is None and pd_gradient is None:
+                            parameter.grad = None
+                        else:
+                            combined_gradient = (
+                                torch.zeros_like(parameter) if ce_gradient is None else ce_gradient
+                            )
+                            if pd_gradient is not None:
+                                combined_gradient = combined_gradient + pd_weight * pd_gradient
+                            parameter.grad = combined_gradient.detach()
+                    for parameter, ce_gradient, pd_gradient in zip(
+                        router_parameters, projected_router_ce, pd_gradients[expert_count:]
+                    ):
+                        if ce_gradient is None and pd_gradient is None:
+                            parameter.grad = None
+                        else:
+                            combined_gradient = (
+                                torch.zeros_like(parameter) if ce_gradient is None else ce_gradient
+                            )
+                            if pd_gradient is not None:
+                                combined_gradient = combined_gradient + pd_weight * pd_gradient
+                            parameter.grad = combined_gradient.detach()
+
+                    descriptor_parameters = descriptor.trainable_parameters()
+                    if rd_loss.requires_grad:
+                        rd_gradients = torch.autograd.grad(
+                            rd_weight * rd_loss, descriptor_parameters,
+                            allow_unused=True,
+                        )
+                        for parameter, gradient in zip(descriptor_parameters, rd_gradients):
+                            parameter.grad = None if gradient is None else gradient.detach()
+                    else:
+                        for parameter in descriptor_parameters:
+                            parameter.grad = None
+
+                    projection_rows["expert"].append(expert_projection)
+                    projection_rows["router"].append(router_projection)
+                    # RD remains isolated to the descriptor parameter group.
+                    torch.nn.utils.clip_grad_norm_(functional_parameters, 1.0)
+                    torch.nn.utils.clip_grad_norm_(descriptor_parameters, 1.0)
                     optimizer.step()
                     batch_size = int(all_labels.numel())
                     total += float(loss.item()) * batch_size
@@ -1556,6 +1711,27 @@ class Runner:
                 ce_history.append(ce_total / count)
                 rd_history.append(rd_total / count)
                 pd_history.append(pd_total / count)
+                def summarize_projection(rows):
+                    conflicts = [row for row in rows if row["applied"]]
+                    before = [row["ce_pd_cosine_before"] for row in rows
+                              if row["ce_pd_cosine_before"] is not None]
+                    after = [row["ce_pd_cosine_after"] for row in rows
+                             if row["ce_pd_cosine_after"] is not None]
+                    return {
+                        "batch_count": len(rows),
+                        "conflict_count": len(conflicts),
+                        "conflict_rate": float(len(conflicts) / max(1, len(rows))),
+                        "projection_coefficient_mean": (
+                            float(np.mean([row["projection_coefficient"] for row in conflicts]))
+                            if conflicts else 0.0
+                        ),
+                        "ce_pd_cosine_before_mean": float(np.mean(before)) if before else None,
+                        "ce_pd_cosine_after_mean": float(np.mean(after)) if after else None,
+                    }
+                gradient_projection_history.append({
+                    group: summarize_projection(rows)
+                    for group, rows in projection_rows.items()
+                })
 
             # The paired RD is optimized only on the fit partition. Its
             # standardized error scale is calibrated on disjoint source IDs.
@@ -1603,6 +1779,7 @@ class Runner:
                 "ce_loss": ce_history,
                 "rd_loss": rd_history,
                 "pd_loss": pd_history,
+                "gradient_projection": gradient_projection_history,
                 "rd_loss_final": ae_loss,
                 "session_q90": float(decision.session_q90),
                 "session_q95_threshold": float(decision.threshold),

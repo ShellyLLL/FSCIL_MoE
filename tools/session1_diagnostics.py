@@ -714,14 +714,16 @@ def _gradient_vector(gradients, parameters):
 
 def _gradient_relation(
     ce_gradient, pd_gradient, pd_weight, global_clip_coefficient,
-    global_combined_norm, clip_max_norm,
+    global_combined_norm, clip_max_norm, update_gradient=None,
 ):
     ce_norm = torch.linalg.vector_norm(ce_gradient)
     pd_norm = torch.linalg.vector_norm(pd_gradient)
     weighted_pd = float(pd_weight) * pd_gradient
     weighted_pd_norm = torch.linalg.vector_norm(weighted_pd)
     combined = ce_gradient + weighted_pd
-    group_combined_norm = torch.linalg.vector_norm(combined)
+    group_combined_norm = torch.linalg.vector_norm(
+        combined if update_gradient is None else update_gradient
+    )
 
     denominator = ce_norm * pd_norm
     weighted_denominator = ce_norm * weighted_pd_norm
@@ -809,12 +811,11 @@ def collect_gradient_diagnostics(
     runner, support_loader, class_index, old_states, expanded,
     current_session=1, max_batches=8, dropout_repeats=5, clip_max_norm=1.0,
 ):
-    """Measure the actual weighted CE+PD functional gradient without optimizer steps.
+    """Measure the exact conflict-projected CE+PD update without optimizer steps.
 
-    CE and weighted PD gradients are combined over the newest expert/router
-    parameters before applying the same global norm clip used in training.
-    The RD objective belongs to the separate descriptor parameter group and is
-    reported as out-of-scope for this functional-gradient comparison.
+    CE is projected away from conflicting PD directions independently for
+    newest expert and router parameters, then weighted PD is added. The RD
+    objective remains isolated to the descriptor parameter group.
     """
     output = {}
     with preserve_diagnostic_state(runner):
@@ -888,6 +889,12 @@ def collect_gradient_diagnostics(
                     retain_graph=False, allow_unused=True,
                 )
                 expert_count = len(expert_parameters)
+                projected_expert_ce, expert_projection = runner._project_conflicting_gradients(
+                    ce_gradients[:expert_count], pd_gradients[:expert_count]
+                )
+                projected_router_ce, router_projection = runner._project_conflicting_gradients(
+                    ce_gradients[expert_count:], pd_gradients[expert_count:]
+                )
                 ce_expert = _gradient_vector(
                     ce_gradients[:expert_count], expert_parameters
                 )
@@ -900,26 +907,38 @@ def collect_gradient_diagnostics(
                 pd_router = _gradient_vector(
                     pd_gradients[expert_count:], router_parameters
                 )
+                projected_expert = _gradient_vector(
+                    projected_expert_ce, expert_parameters
+                )
+                projected_router = _gradient_vector(
+                    projected_router_ce, router_parameters
+                )
+                expert_update = projected_expert + pd_weight * pd_expert
+                router_update = projected_router + pd_weight * pd_router
                 ce_combined = torch.cat([ce_expert, ce_router])
                 pd_combined = torch.cat([pd_expert, pd_router])
-                weighted_combined = ce_combined + pd_weight * pd_combined
-                global_norm = float(torch.linalg.vector_norm(weighted_combined).item())
+                projected_update = torch.cat([expert_update, router_update])
+                global_norm = float(torch.linalg.vector_norm(projected_update).item())
                 clip_coefficient = min(
                     1.0, float(clip_max_norm) / (global_norm + 1e-6)
                 )
                 batch_rows.append({
                     "expert": _gradient_relation(
                         ce_expert, pd_expert, pd_weight, clip_coefficient,
-                        global_norm, clip_max_norm,
+                        global_norm, clip_max_norm, update_gradient=expert_update,
                     ),
                     "router": _gradient_relation(
                         ce_router, pd_router, pd_weight, clip_coefficient,
-                        global_norm, clip_max_norm,
+                        global_norm, clip_max_norm, update_gradient=router_update,
                     ),
                     "combined": _gradient_relation(
                         ce_combined, pd_combined, pd_weight, clip_coefficient,
-                        global_norm, clip_max_norm,
+                        global_norm, clip_max_norm, update_gradient=projected_update,
                     ),
+                    "projection": {
+                        "expert": expert_projection,
+                        "router": router_projection,
+                    },
                     "classification_loss": float(classification.detach()),
                     "pd_loss": float(old_suppression.detach()),
                     "weighted_pd_loss": float(pd_weight * old_suppression.detach()),
@@ -959,12 +978,50 @@ def collect_gradient_diagnostics(
                 "functional_gradient_clip": {
                     "parameter_group": "newest expert + newest router column",
                     "max_norm": float(clip_max_norm),
-                    "applied_to": "gradient(CE + pd_weight * PD)",
+                    "applied_to": "gradient(projected_CE + pd_weight * PD); CE projection is independent for expert and router groups",
                     "rd_parameter_group": "newest descriptor trainable parameters",
                     "rd_clip_max_norm": 1.0,
                     "rd_gradient_included_in_functional_comparison": False,
                 },
                 "gradient_alignment": _aggregate_gradient_rows(batch_rows),
+                "gradient_projection": {
+                    "method": "GEM-style projection of conflicting CE gradients against PD gradients, independently for newest expert and router",
+                    "expert": {
+                        "conflict_rate": metric_summary([
+                            float(row["projection"]["expert"]["applied"]) for row in batch_rows
+                        ]),
+                        "projection_coefficient": metric_summary([
+                            row["projection"]["expert"]["projection_coefficient"] for row in batch_rows
+                        ]),
+                        "ce_pd_cosine_before": metric_summary([
+                            row["projection"]["expert"]["ce_pd_cosine_before"] for row in batch_rows
+                            if row["projection"]["expert"]["ce_pd_cosine_before"] is not None
+                        ]),
+                        "ce_pd_cosine_after": metric_summary([
+                            row["projection"]["expert"]["ce_pd_cosine_after"] for row in batch_rows
+                            if row["projection"]["expert"]["ce_pd_cosine_after"] is not None
+                        ]),
+                    },
+                    "router": {
+                        "conflict_rate": metric_summary([
+                            float(row["projection"]["router"]["applied"]) for row in batch_rows
+                        ]),
+                        "projection_coefficient": metric_summary([
+                            row["projection"]["router"]["projection_coefficient"] for row in batch_rows
+                        ]),
+                        "ce_pd_cosine_before": metric_summary([
+                            row["projection"]["router"]["ce_pd_cosine_before"] for row in batch_rows
+                            if row["projection"]["router"]["ce_pd_cosine_before"] is not None
+                        ]),
+                        "ce_pd_cosine_after": metric_summary([
+                            row["projection"]["router"]["ce_pd_cosine_after"] for row in batch_rows
+                            if row["projection"]["router"]["ce_pd_cosine_after"] is not None
+                        ]),
+                    },
+                    "projected_update_norm": metric_summary([
+                        row["combined"]["combined_gradient_norm_pre_clip"] for row in batch_rows
+                    ]),
+                },
                 "classification_loss": metric_summary(
                     [row["classification_loss"] for row in batch_rows]
                 ),
