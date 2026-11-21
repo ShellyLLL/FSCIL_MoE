@@ -212,6 +212,10 @@ def main():
     parser.add_argument("--session1", required=True)
     parser.add_argument("--output", default="diagnostics/session1_expert_ablation")
     parser.add_argument("--device", default="")
+    parser.add_argument(
+        "--resume-diagnostics", action="store_true",
+        help="Reuse saved A-D ablations and continue unfinished diagnostic stages.",
+    )
     args = parser.parse_args()
 
     overrides = [
@@ -270,149 +274,190 @@ def main():
     if any(len(ids) != 1 for ids in expanded.values()):
         raise RuntimeError(f"Expected exactly one Session-1 expert per expanded block, got {expanded}.")
 
-    variants = {
-        "A_full": {},
-        "B_disable_B8": {8: expanded[8]},
-        "C_disable_B9": {9: expanded[9]},
-        "D_disable_B8_B9": expanded,
-    }
-
-    # Establish the true pre-incremental feature reference on the exact same
-    # deterministic Session-1 test loader, using the Session-00 model weights.
-    install_payload(runner, payload0)
-    base_feature_rows, base_label_rows = [], []
-    with torch.no_grad():
-        for batch in test_loader:
-            images, labels = runner.parse_batch(batch)
-            base_feature_rows.append(F.normalize(
-                runner.model_without_dp.extract_img_feature(images).float(), dim=-1
-            ).cpu())
-            base_label_rows.append(labels.cpu())
-    session0_features = torch.cat(base_feature_rows)
-    session0_labels = torch.cat(base_label_rows)
-    install_payload(runner, payload1)
-
-    rows, details, variant_features, variant_states = [], {}, {}, {}
-    for name, masks in variants.items():
-        metrics, features, labels, merged, novel_state = evaluate_variant(
-            runner, task_states0, support_loader, test_loader,
-            class_names, class_ids, masks, base_ids, novel_ids
+    output = Path(args.output)
+    if args.resume_diagnostics:
+        details_path = output / "details.json"
+        summary_path = output / "summary.csv"
+        if not details_path.is_file() or not summary_path.is_file():
+            raise FileNotFoundError(
+                "--resume-diagnostics requires existing details.json and summary.csv "
+                f"under {output.resolve()}."
+            )
+        with details_path.open("r", encoding="utf-8") as file:
+            details = json.load(file)
+        with summary_path.open("r", newline="", encoding="utf-8") as file:
+            rows = list(csv.DictReader(file))
+        expected_variants = {
+            "A_full", "B_disable_B8", "C_disable_B9", "D_disable_B8_B9"
+        }
+        if set(details).intersection(expected_variants) != expected_variants:
+            raise ValueError("Saved details.json is missing one or more A-D ablation results.")
+        if {row.get("variant") for row in rows} != expected_variants:
+            raise ValueError("Saved summary.csv does not contain the expected A-D ablation rows.")
+        analysis = details.get("diagnostic_analysis")
+        if not isinstance(analysis, dict):
+            raise ValueError("Saved details.json lacks diagnostic_analysis metadata.")
+        completed = analysis.get("completed_stages", [])
+        if "expert_ablation" not in completed:
+            raise ValueError("Saved report does not confirm completed expert ablations.")
+        analysis["status"] = "in_progress"
+        analysis.pop("failed_stage", None)
+        analysis.pop("error", None)
+        print(
+            f"Reusing saved A-D ablations from {output.resolve()}; "
+            "only unfinished diagnostic stages will run."
         )
-        variant_features[name] = features
-        variant_states[name] = (merged, novel_state)
-        if not torch.equal(labels, session0_labels):
-            raise RuntimeError("Evaluation sample order changed between Session-0 and Session-1 models.")
-        cosine_distance = 1.0 - F.cosine_similarity(
-            session0_features, features, dim=-1
-        )
-        base_mask = torch.isin(labels, base_ids)
-        novel_mask = torch.isin(labels, novel_ids)
-        metrics["feature_drift_vs_session0"] = {
-            "all": metric_summary(cosine_distance),
-            "base": metric_summary(cosine_distance[base_mask]),
-            "novel": metric_summary(cosine_distance[novel_mask]),
-            "by_class": {
-                str(int(class_id)): metric_summary(cosine_distance[labels.eq(int(class_id))])
-                for class_id in torch.unique(labels, sorted=True).tolist()
+        write_diagnostic_reports(output, rows, details)
+    else:
+        variants = {
+            "A_full": {},
+            "B_disable_B8": {8: expanded[8]},
+            "C_disable_B9": {9: expanded[9]},
+            "D_disable_B8_B9": expanded,
+        }
+
+        # Establish the true pre-incremental feature reference on the exact same
+        # deterministic Session-1 test loader, using the Session-00 model weights.
+        install_payload(runner, payload0)
+        base_feature_rows, base_label_rows = [], []
+        with torch.no_grad():
+            for batch in test_loader:
+                images, labels = runner.parse_batch(batch)
+                base_feature_rows.append(F.normalize(
+                    runner.model_without_dp.extract_img_feature(images).float(), dim=-1
+                ).cpu())
+                base_label_rows.append(labels.cpu())
+        session0_features = torch.cat(base_feature_rows)
+        session0_labels = torch.cat(base_label_rows)
+        install_payload(runner, payload1)
+
+        rows, details, variant_features, variant_states = [], {}, {}, {}
+        for name, masks in variants.items():
+            metrics, features, labels, merged, novel_state = evaluate_variant(
+                runner, task_states0, support_loader, test_loader,
+                class_names, class_ids, masks, base_ids, novel_ids
+            )
+            variant_features[name] = features
+            variant_states[name] = (merged, novel_state)
+            if not torch.equal(labels, session0_labels):
+                raise RuntimeError("Evaluation sample order changed between Session-0 and Session-1 models.")
+            cosine_distance = 1.0 - F.cosine_similarity(
+                session0_features, features, dim=-1
+            )
+            base_mask = torch.isin(labels, base_ids)
+            novel_mask = torch.isin(labels, novel_ids)
+            metrics["feature_drift_vs_session0"] = {
+                "all": metric_summary(cosine_distance),
+                "base": metric_summary(cosine_distance[base_mask]),
+                "novel": metric_summary(cosine_distance[novel_mask]),
+                "by_class": {
+                    str(int(class_id)): metric_summary(cosine_distance[labels.eq(int(class_id))])
+                    for class_id in torch.unique(labels, sorted=True).tolist()
+                },
+            }
+            current_base = metrics["base_global_accuracy"]
+            current_novel = metrics["novel_global_accuracy"]
+            mean_acc = (current_base + current_novel) / 2.0
+            baseline_base_acc = float(payload0["task_acc_list"][0][0])
+            pd = max(0.0, baseline_base_acc - current_base) / 2.0
+            metrics["derived"] = {
+                "mean_acc": mean_acc,
+                "average_accuracy": (baseline_base_acc + mean_acc) / 2.0,
+                "performance_drop": pd,
+            }
+            details[name] = metrics
+            rows.append({
+                "variant": name,
+                "global_mean_acc": metrics["global_mean_acc"],
+                "base_global_accuracy": current_base,
+                "novel_global_accuracy": current_novel,
+                "AA_two_sessions": metrics["derived"]["average_accuracy"],
+                "PD_two_sessions": pd,
+            })
+            print(
+                f"[{name}] global={metrics['global_mean_acc']:.3f} "
+                f"base={current_base:.3f} novel={current_novel:.3f} "
+                f"AA={metrics['derived']['average_accuracy']:.3f} PD={pd:.3f}"
+            )
+
+        # Fixed-prototype counterfactual isolates query-encoder changes.
+        full_merged, _ = variant_states["A_full"]
+        fixed_prototypes = F.normalize(full_merged["image_proto"].to(runner.device).float(), dim=-1)
+        fixed_class_ids = torch.as_tensor(full_merged["class_ids"], device=runner.device, dtype=torch.long)
+        fixed_proto_comparison = {}
+        for name, features in variant_features.items():
+            logits = 100.0 * features.to(runner.device) @ fixed_prototypes.t()
+            fixed_proto_comparison[name], _ = classification_diagnostics(
+                logits, session0_labels.to(runner.device), fixed_class_ids,
+                base_ids.to(runner.device), novel_ids.to(runner.device),
+            )
+
+        # Fixed-query counterfactual: hold A_full query features fixed and vary
+        # only the prototype bank produced by each expert-mask variant.
+        full_features = variant_features["A_full"].to(runner.device)
+        prototype_only_comparison = {}
+        for name, (merged, _) in variant_states.items():
+            prototypes = F.normalize(merged["image_proto"].to(runner.device).float(), dim=-1)
+            logits = 100.0 * full_features @ prototypes.t()
+            prototype_only_comparison[name], _ = classification_diagnostics(
+                logits, session0_labels.to(runner.device),
+                torch.as_tensor(merged["class_ids"], device=runner.device, dtype=torch.long),
+                base_ids.to(runner.device), novel_ids.to(runner.device),
+            )
+
+        output = Path(args.output)
+        analysis = {
+            "status": "in_progress",
+            "completed_stages": ["expert_ablation"],
+            "fixed_full_prototype_query_encoder_counterfactual": fixed_proto_comparison,
+            "fixed_full_query_prototype_only_counterfactual": prototype_only_comparison,
+            "interpretation_notes": {
+                "auc_positive_class": "Novel; values near 0.5 indicate weak Base/Novel ranking separation.",
+                "patch_residual": "RMS of actual expert residual over patch tokens before subsequent Transformer blocks.",
+                "gradient_cosine": "Computed on newest expert/router parameters. The report includes the configured PD weight, CE+weighted-PD combined gradient, and the global clip coefficient used by training; no optimizer step is executed.",
+                "support_test_generalization": "Support queries use source-exclusive LOO novel prototypes; held-out test queries use the same full raw visual prototype bank. Support queries participated in optimization, so the gap is an overfitting indicator rather than an independent validation estimate.",
+                "dropout_repeatability": "Repeated PD evaluations with newest expert in train mode.",
             },
         }
-        current_base = metrics["base_global_accuracy"]
-        current_novel = metrics["novel_global_accuracy"]
-        mean_acc = (current_base + current_novel) / 2.0
-        baseline_base_acc = float(payload0["task_acc_list"][0][0])
-        pd = max(0.0, baseline_base_acc - current_base) / 2.0
-        metrics["derived"] = {
-            "mean_acc": mean_acc,
-            "average_accuracy": (baseline_base_acc + mean_acc) / 2.0,
-            "performance_drop": pd,
-        }
-        details[name] = metrics
-        rows.append({
-            "variant": name,
-            "global_mean_acc": metrics["global_mean_acc"],
-            "base_global_accuracy": current_base,
-            "novel_global_accuracy": current_novel,
-            "AA_two_sessions": metrics["derived"]["average_accuracy"],
-            "PD_two_sessions": pd,
-        })
-        print(
-            f"[{name}] global={metrics['global_mean_acc']:.3f} "
-            f"base={current_base:.3f} novel={current_novel:.3f} "
-            f"AA={metrics['derived']['average_accuracy']:.3f} PD={pd:.3f}"
-        )
+        details["diagnostic_analysis"] = analysis
+        # Persist the expensive ablation results before running secondary diagnostics.
+        # If a later diagnostic fails, the already-computed metrics remain available.
+        write_diagnostic_reports(output, rows, details)
 
-    # Fixed-prototype counterfactual isolates query-encoder changes.
-    full_merged, _ = variant_states["A_full"]
-    fixed_prototypes = F.normalize(full_merged["image_proto"].to(runner.device).float(), dim=-1)
-    fixed_class_ids = torch.as_tensor(full_merged["class_ids"], device=runner.device, dtype=torch.long)
-    fixed_proto_comparison = {}
-    for name, features in variant_features.items():
-        logits = 100.0 * features.to(runner.device) @ fixed_prototypes.t()
-        fixed_proto_comparison[name], _ = classification_diagnostics(
-            logits, session0_labels.to(runner.device), fixed_class_ids,
-            base_ids.to(runner.device), novel_ids.to(runner.device),
-        )
-
-    # Fixed-query counterfactual: hold A_full query features fixed and vary
-    # only the prototype bank produced by each expert-mask variant.
-    full_features = variant_features["A_full"].to(runner.device)
-    prototype_only_comparison = {}
-    for name, (merged, _) in variant_states.items():
-        prototypes = F.normalize(merged["image_proto"].to(runner.device).float(), dim=-1)
-        logits = 100.0 * full_features @ prototypes.t()
-        prototype_only_comparison[name], _ = classification_diagnostics(
-            logits, session0_labels.to(runner.device),
-            torch.as_tensor(merged["class_ids"], device=runner.device, dtype=torch.long),
-            base_ids.to(runner.device), novel_ids.to(runner.device),
-        )
-
-    output = Path(args.output)
-    analysis = {
-        "status": "in_progress",
-        "completed_stages": ["expert_ablation"],
-        "fixed_full_prototype_query_encoder_counterfactual": fixed_proto_comparison,
-        "fixed_full_query_prototype_only_counterfactual": prototype_only_comparison,
-        "interpretation_notes": {
-            "auc_positive_class": "Novel; values near 0.5 indicate weak Base/Novel ranking separation.",
-            "patch_residual": "RMS of actual expert residual over patch tokens before subsequent Transformer blocks.",
-            "gradient_cosine": "Computed on newest expert/router parameters. The report includes the configured PD weight, CE+weighted-PD combined gradient, and the global clip coefficient used by training; no optimizer step is executed.",
-            "support_test_generalization": "Support queries use source-exclusive LOO novel prototypes; held-out test queries use the same full raw visual prototype bank. Support queries participated in optimization, so the gap is an overfitting indicator rather than an independent validation estimate.",
-            "dropout_repeatability": "Repeated PD evaluations with newest expert in train mode.",
-        },
-    }
-    details["diagnostic_analysis"] = analysis
-    # Persist the expensive ablation results before running secondary diagnostics.
-    # If a later diagnostic fails, the already-computed metrics remain available.
-    write_diagnostic_reports(output, rows, details)
 
     current_stage = "historical_anchor_response"
     try:
-        install_payload(runner, payload1)
-        anchor_response = collect_historical_anchor_responses(runner, task_states0, expanded)
-        anchor_vs_base_test = compare_anchor_responses_to_base_test(
-            anchor_response, details["A_full"]["expert_response_by_class"], base_ids
-        )
-        analysis["historical_pd_anchor_response"] = anchor_response
-        analysis["historical_anchor_vs_base_test"] = anchor_vs_base_test
-        analysis["completed_stages"].append(current_stage)
-        write_diagnostic_reports(output, rows, details)
+        if current_stage not in analysis["completed_stages"]:
+            install_payload(runner, payload1)
+            anchor_response = collect_historical_anchor_responses(
+                runner, task_states0, expanded
+            )
+            anchor_vs_base_test = compare_anchor_responses_to_base_test(
+                anchor_response, details["A_full"]["expert_response_by_class"], base_ids
+            )
+            analysis["historical_pd_anchor_response"] = anchor_response
+            analysis["historical_anchor_vs_base_test"] = anchor_vs_base_test
+            analysis["completed_stages"].append(current_stage)
+            write_diagnostic_reports(output, rows, details)
 
         current_stage = "support_test_generalization"
-        support_generalization = collect_support_generalization_diagnostics(
-            runner, support_loader, test_loader,
-            class_ids, task_states0, base_ids, novel_ids,
-            logit_scale=float(cfg.TRAINER.BiMC.INCREMENTAL.LOGIT_SCALE),
-        )
-        analysis["support_test_generalization"] = support_generalization
-        analysis["completed_stages"].append(current_stage)
-        write_diagnostic_reports(output, rows, details)
+        if current_stage not in analysis["completed_stages"]:
+            support_generalization = collect_support_generalization_diagnostics(
+                runner, support_loader, test_loader,
+                class_ids, task_states0, base_ids, novel_ids,
+                logit_scale=float(cfg.TRAINER.BiMC.INCREMENTAL.LOGIT_SCALE),
+            )
+            analysis["support_test_generalization"] = support_generalization
+            analysis["completed_stages"].append(current_stage)
+            write_diagnostic_reports(output, rows, details)
 
         current_stage = "ce_pd_gradient_diagnostics"
-        gradient_diagnostics = collect_gradient_diagnostics(
-            runner, support_loader, class_ids, task_states0, expanded, current_session=1,
-        )
-        analysis["ce_pd_gradient_diagnostics"] = gradient_diagnostics
-        analysis["completed_stages"].append(current_stage)
+        if current_stage not in analysis["completed_stages"]:
+            gradient_diagnostics = collect_gradient_diagnostics(
+                runner, support_loader, class_ids, task_states0, expanded, current_session=1,
+            )
+            analysis["ce_pd_gradient_diagnostics"] = gradient_diagnostics
+            analysis["completed_stages"].append(current_stage)
         analysis["status"] = "completed"
     except Exception as exc:
         analysis["status"] = "failed"
