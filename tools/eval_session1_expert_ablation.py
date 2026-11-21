@@ -142,6 +142,68 @@ def evaluate_variant(runner, session0_states, support_loader, test_loader,
     return metrics, features, labels, merged, novel_state
 
 
+
+def write_diagnostic_reports(output, rows, details):
+    """Persist completed ablation results and the latest diagnostic stage."""
+    output = Path(output)
+    output.mkdir(parents=True, exist_ok=True)
+
+    with (output / "summary.csv").open("w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    response_rows = []
+    for expert_name, groups in details["A_full"]["expert_response"].items():
+        for group_name, values in groups.items():
+            row = {
+                "expert": expert_name,
+                "group": group_name,
+                "sample_count": values["sample_count"],
+            }
+            for metric_name in (
+                "gate_logit", "gate", "residual_norm", "patch_residual_norm",
+                "token_residual_norm", "relative_residual",
+                "relative_patch_residual", "relative_token_residual",
+            ):
+                for statistic in ("mean", "std", "median", "q05", "q25", "q75", "q90", "q95"):
+                    row[f"{metric_name}_{statistic}"] = values[metric_name][statistic]
+            response_rows.append(row)
+
+    response_fields = [
+        "expert", "group", "sample_count",
+        *[
+            f"{metric}_{statistic}"
+            for metric in (
+                "gate_logit", "gate", "residual_norm", "patch_residual_norm",
+                "token_residual_norm", "relative_residual",
+                "relative_patch_residual", "relative_token_residual",
+            )
+            for statistic in ("mean", "std", "median", "q05", "q25", "q75", "q90", "q95")
+        ],
+    ]
+    with (output / "expert_response_by_group.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as file:
+        writer = csv.DictWriter(file, fieldnames=response_fields)
+        writer.writeheader()
+        writer.writerows(response_rows)
+
+    def json_default(value):
+        if isinstance(value, (np.ndarray,)):
+            return value.tolist()
+        if isinstance(value, (np.integer, np.floating)):
+            return value.item()
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu().tolist()
+        raise TypeError(f"Cannot JSON-serialize {type(value).__name__}.")
+
+    with (output / "details.json").open("w", encoding="utf-8") as file:
+        json.dump(details, file, ensure_ascii=False, indent=2, default=json_default)
+
+    return response_rows
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_cfg", required=True)
@@ -304,27 +366,12 @@ def main():
             base_ids.to(runner.device), novel_ids.to(runner.device),
         )
 
-    install_payload(runner, payload1)
-    anchor_response = collect_historical_anchor_responses(runner, task_states0, expanded)
-    anchor_vs_base_test = compare_anchor_responses_to_base_test(
-        anchor_response, details["A_full"]["expert_response_by_class"], base_ids
-    )
-    full_merged = variant_states["A_full"][0]
-    support_generalization = collect_support_generalization_diagnostics(
-        runner, support_loader, test_loader,
-        full_merged["class_ids"], task_states0, base_ids, novel_ids,
-        logit_scale=float(cfg.TRAINER.BiMC.INCREMENTAL.LOGIT_SCALE),
-    )
-    gradient_diagnostics = collect_gradient_diagnostics(
-        runner, support_loader, class_ids, task_states0, expanded, current_session=1,
-    )
-    details["diagnostic_analysis"] = {
+    output = Path(args.output)
+    analysis = {
+        "status": "in_progress",
+        "completed_stages": ["expert_ablation"],
         "fixed_full_prototype_query_encoder_counterfactual": fixed_proto_comparison,
         "fixed_full_query_prototype_only_counterfactual": prototype_only_comparison,
-        "historical_pd_anchor_response": anchor_response,
-        "historical_anchor_vs_base_test": anchor_vs_base_test,
-        "support_test_generalization": support_generalization,
-        "ce_pd_gradient_diagnostics": gradient_diagnostics,
         "interpretation_notes": {
             "auc_positive_class": "Novel; values near 0.5 indicate weak Base/Novel ranking separation.",
             "patch_residual": "RMS of actual expert residual over patch tokens before subsequent Transformer blocks.",
@@ -333,71 +380,56 @@ def main():
             "dropout_repeatability": "Repeated PD evaluations with newest expert in train mode.",
         },
     }
+    details["diagnostic_analysis"] = analysis
+    # Persist the expensive ablation results before running secondary diagnostics.
+    # If a later diagnostic fails, the already-computed metrics remain available.
+    write_diagnostic_reports(output, rows, details)
 
-    output = Path(args.output)
-    output.mkdir(parents=True, exist_ok=True)
-    with (output / "summary.csv").open("w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=list(rows[0]))
-        writer.writeheader()
-        writer.writerows(rows)
+    current_stage = "historical_anchor_response"
+    try:
+        install_payload(runner, payload1)
+        anchor_response = collect_historical_anchor_responses(runner, task_states0, expanded)
+        anchor_vs_base_test = compare_anchor_responses_to_base_test(
+            anchor_response, details["A_full"]["expert_response_by_class"], base_ids
+        )
+        analysis["historical_pd_anchor_response"] = anchor_response
+        analysis["historical_anchor_vs_base_test"] = anchor_vs_base_test
+        analysis["completed_stages"].append(current_stage)
+        write_diagnostic_reports(output, rows, details)
 
-    # A compact table makes the post-hoc Base/Novel response comparison easy
-    # to inspect without parsing the nested details.json structure.
-    response_rows = []
+        current_stage = "support_test_generalization"
+        support_generalization = collect_support_generalization_diagnostics(
+            runner, support_loader, test_loader,
+            class_ids, task_states0, base_ids, novel_ids,
+            logit_scale=float(cfg.TRAINER.BiMC.INCREMENTAL.LOGIT_SCALE),
+        )
+        analysis["support_test_generalization"] = support_generalization
+        analysis["completed_stages"].append(current_stage)
+        write_diagnostic_reports(output, rows, details)
+
+        current_stage = "ce_pd_gradient_diagnostics"
+        gradient_diagnostics = collect_gradient_diagnostics(
+            runner, support_loader, class_ids, task_states0, expanded, current_session=1,
+        )
+        analysis["ce_pd_gradient_diagnostics"] = gradient_diagnostics
+        analysis["completed_stages"].append(current_stage)
+        analysis["status"] = "completed"
+    except Exception as exc:
+        analysis["status"] = "failed"
+        analysis["failed_stage"] = current_stage
+        analysis["error"] = f"{type(exc).__name__}: {exc}"
+        write_diagnostic_reports(output, rows, details)
+        raise
+
+    write_diagnostic_reports(output, rows, details)
     for expert_name, groups in details["A_full"]["expert_response"].items():
         for group_name, values in groups.items():
-            row = {
-                "expert": expert_name,
-                "group": group_name,
-                "sample_count": values["sample_count"],
-            }
-            for metric_name in (
-                "gate_logit", "gate", "residual_norm", "patch_residual_norm",
-                "token_residual_norm", "relative_residual",
-                "relative_patch_residual", "relative_token_residual",
-            ):
-                for statistic in ("mean", "std", "median", "q05", "q25", "q75", "q90", "q95"):
-                    row[f"{metric_name}_{statistic}"] = values[metric_name][statistic]
-            response_rows.append(row)
-
-    response_fields = [
-        "expert", "group", "sample_count",
-        *[
-            f"{metric}_{statistic}"
-            for metric in (
-                "gate_logit", "gate", "residual_norm", "patch_residual_norm",
-                "token_residual_norm", "relative_residual",
-                "relative_patch_residual", "relative_token_residual",
+            print(
+                f"  {expert_name} [{group_name}] n={values['sample_count']} "
+                f"gate_mean={values['gate']['mean']:.6f} "
+                f"cls_residual={values['residual_norm']['mean']:.6f} "
+                f"patch_residual={values['patch_residual_norm']['mean']:.6f}"
             )
-            for statistic in ("mean", "std", "median", "q05", "q25", "q75", "q90", "q95")
-        ],
-    ]
-    with (output / "expert_response_by_group.csv").open(
-        "w", newline="", encoding="utf-8"
-    ) as file:
-        writer = csv.DictWriter(file, fieldnames=response_fields)
-        writer.writeheader()
-        writer.writerows(response_rows)
-
-    print("Expert response by label group (labels used only post hoc):")
-    for row in response_rows:
-        print(
-            f"  {row['expert']} [{row['group']}] n={row['sample_count']} "
-            f"gate_mean={row['gate_mean']:.6f} "
-            f"cls_residual={row['residual_norm_mean']:.6f} "
-            f"patch_residual={row['patch_residual_norm_mean']:.6f}"
-        )
-    def json_default(value):
-        if isinstance(value, (np.ndarray,)):
-            return value.tolist()
-        if isinstance(value, (np.integer, np.floating)):
-            return value.item()
-        if isinstance(value, torch.Tensor):
-            return value.detach().cpu().tolist()
-        raise TypeError(f"Cannot JSON-serialize {type(value).__name__}.")
-
-    with (output / "details.json").open("w", encoding="utf-8") as file:
-        json.dump(details, file, ensure_ascii=False, indent=2, default=json_default)
     print(f"Saved ablation report to {output.resolve()}")
 
 
