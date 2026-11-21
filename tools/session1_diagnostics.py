@@ -562,14 +562,36 @@ def prototype_generalization_diagnostics(
 
 @torch.no_grad()
 def collect_support_generalization_diagnostics(
-    runner, support_loader, test_loader, class_index, old_states,
+    runner, support_loader, test_loader, support_class_ids, old_states,
     base_ids, novel_ids, logit_scale,
 ):
-    """Measure source-exclusive support LOO and held-out test accuracy."""
+    """Measure support LOO using only the novel classes present in that loader.
+
+    `support_class_ids` describes the Session-1 support loader. The LOO bank
+    must be built only for `novel_ids`; Base prototypes are supplied separately
+    by `old_states` inside `_build_incremental_bank`.
+    """
+    support_class_ids = torch.unique(
+        torch.as_tensor(support_class_ids, dtype=torch.long).reshape(-1), sorted=True
+    )
+    novel_ids = torch.unique(
+        torch.as_tensor(novel_ids, dtype=torch.long).reshape(-1), sorted=True
+    )
+    base_ids = torch.as_tensor(base_ids, dtype=torch.long).reshape(-1)
+    if novel_ids.numel() == 0:
+        raise ValueError("Support generalization requires at least one novel class.")
+    if torch.isin(novel_ids, base_ids).any():
+        raise ValueError("Base and novel class IDs must be disjoint for support LOO.")
+    if not torch.equal(support_class_ids, novel_ids):
+        raise ValueError(
+            "Session-1 support loader classes must match novel_ids exactly; "
+            f"support_class_ids={support_class_ids.tolist()}, "
+            f"novel_ids={novel_ids.tolist()}. Do not pass merged Base+Novel class IDs."
+        )
     with preserve_diagnostic_state(runner):
         runner.model.eval()
         _set_masks(runner, {})
-        bank = runner._build_incremental_bank(support_loader, class_index, old_states)
+        bank = runner._build_incremental_bank(support_loader, novel_ids, old_states)
         if not bool(bank["loo_valid"].all().item()):
             raise RuntimeError("Support generalization diagnostics require valid source-exclusive LOO.")
         test_features, test_labels, _, _ = runner.model_without_dp.inference_all_img_feature(
