@@ -140,6 +140,39 @@ class Session1DiagnosticsTests(unittest.TestCase):
         self.assertAlmostEqual(result["novel_support_loo_minus_test_accuracy"], 0.0)
         self.assertIn("participated in incremental optimization", result["interpretation_limit"])
 
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for mixed-device regression")
+    def test_prototype_generalization_handles_cpu_predictions_and_cuda_masks(self):
+        device = torch.device("cuda")
+        class_ids = torch.tensor([0, 1, 2])
+        base_ids = torch.tensor([0])
+        novel_ids = torch.tensor([1, 2])
+        global_prototypes = torch.tensor([
+            [1.0, 0.0], [0.0, 1.0], [-1.0, 0.0],
+        ], device=device)
+        support_features = torch.tensor([
+            [0.0, 1.0], [0.0, 1.0], [-1.0, 0.0], [-1.0, 0.0],
+        ])
+        support_labels = torch.tensor([1, 1, 2, 2])
+        loo = torch.tensor([
+            [[0.0, 1.0], [-1.0, 0.0]],
+            [[0.0, 1.0], [-1.0, 0.0]],
+            [[0.0, 1.0], [-1.0, 0.0]],
+            [[0.0, 1.0], [-1.0, 0.0]],
+        ])
+        test_features = torch.tensor([
+            [1.0, 0.0], [0.0, 1.0], [-1.0, 0.0],
+        ])
+        test_labels = torch.tensor([0, 1, 2])
+        result = prototype_generalization_diagnostics(
+            support_features, support_labels, loo,
+            test_features, test_labels, global_prototypes, class_ids,
+            old_class_count=1, base_ids=base_ids, novel_ids=novel_ids,
+            logit_scale=10.0,
+        )
+        self.assertAlmostEqual(result["support_loo"]["novel_accuracy"], 1.0)
+        self.assertAlmostEqual(result["test"]["base_accuracy"], 1.0)
+        self.assertAlmostEqual(result["test"]["novel_accuracy"], 1.0)
+
     def test_prototype_generalization_rejects_misaligned_loo_cache(self):
         with self.assertRaises(ValueError):
             prototype_generalization_diagnostics(
