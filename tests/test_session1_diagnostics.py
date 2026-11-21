@@ -163,7 +163,6 @@ class Session1DiagnosticsTests(unittest.TestCase):
         test_features = torch.tensor([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]])
         test_labels = torch.tensor([0, 1, 2])
         bank = {
-            "loo_valid": torch.ones(4, dtype=torch.bool),
             "features": support_features,
             "labels": support_labels,
             "novel_loo": loo,
