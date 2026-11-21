@@ -10,6 +10,7 @@ from tools.session1_diagnostics import (
     response_posthoc,
     gradient_objective_diagnostics,
     prototype_generalization_diagnostics,
+    collect_support_generalization_diagnostics,
     preserve_diagnostic_state,
 )
 
@@ -147,6 +148,77 @@ class Session1DiagnosticsTests(unittest.TestCase):
                 old_class_count=1, base_ids=torch.tensor([0]),
                 novel_ids=torch.tensor([1]), logit_scale=10.0,
             )
+
+    def test_support_generalization_builds_loo_with_novel_ids_not_merged_ids(self):
+        support_features = torch.tensor([
+            [0.0, 1.0], [0.0, 1.0], [-1.0, 0.0], [-1.0, 0.0],
+        ])
+        support_labels = torch.tensor([1, 1, 2, 2])
+        loo = torch.tensor([
+            [[0.0, 1.0], [-1.0, 0.0]],
+            [[0.0, 1.0], [-1.0, 0.0]],
+            [[0.0, 1.0], [-1.0, 0.0]],
+            [[0.0, 1.0], [-1.0, 0.0]],
+        ])
+        test_features = torch.tensor([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]])
+        test_labels = torch.tensor([0, 1, 2])
+        bank = {
+            "loo_valid": torch.ones(4, dtype=torch.bool),
+            "features": support_features,
+            "labels": support_labels,
+            "novel_loo": loo,
+            "global_full": torch.tensor([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]]),
+            "global_ids": torch.tensor([0, 1, 2]),
+            "old_class_count": 1,
+        }
+
+        class DummyModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.anchor = torch.nn.Parameter(torch.zeros(1))
+
+            def inference_all_img_feature(self, loader):
+                return test_features, test_labels, None, None
+
+        class DummyRunner:
+            def __init__(self):
+                self.model = DummyModel()
+                self.model_without_dp = self.model
+                self.received_class_ids = None
+
+            def _moe_adapters(self):
+                return []
+
+            def _build_incremental_bank(self, loader, class_ids, old_states):
+                self.received_class_ids = torch.as_tensor(class_ids).clone()
+                return bank
+
+        runner = DummyRunner()
+        result = collect_support_generalization_diagnostics(
+            runner, [], [], torch.tensor([2, 1]), [{"class_ids": [0]}],
+            torch.tensor([0]), torch.tensor([1, 2]), logit_scale=10.0,
+        )
+        self.assertEqual(runner.received_class_ids.tolist(), [1, 2])
+        self.assertAlmostEqual(result["support_loo"]["novel_accuracy"], 1.0)
+        self.assertAlmostEqual(result["test"]["base_accuracy"], 1.0)
+        self.assertAlmostEqual(result["test"]["novel_accuracy"], 1.0)
+
+    def test_support_generalization_rejects_merged_base_novel_support_class_ids(self):
+        class DummyRunner:
+            def __init__(self):
+                self.builder_called = False
+
+            def _build_incremental_bank(self, *args):
+                self.builder_called = True
+                raise AssertionError("The LOO bank must not be built with merged class IDs.")
+
+        runner = DummyRunner()
+        with self.assertRaisesRegex(ValueError, "must match novel_ids exactly"):
+            collect_support_generalization_diagnostics(
+                runner, [], [], torch.tensor([0, 1, 2]), [{"class_ids": [0]}],
+                torch.tensor([0]), torch.tensor([1, 2]), logit_scale=10.0,
+            )
+        self.assertFalse(runner.builder_called)
 
     def test_diagnostic_context_restores_model_parameters_modes_gradients_and_rng(self):
         class DummyRunner:
