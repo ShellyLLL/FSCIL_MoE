@@ -2,6 +2,7 @@ import unittest
 
 import torch
 
+from engine.engine import Runner
 from tools.session1_diagnostics import (
     RESPONSE_METRICS,
     binary_auc,
@@ -148,6 +149,45 @@ class Session1DiagnosticsTests(unittest.TestCase):
                 old_class_count=1, base_ids=torch.tensor([0]),
                 novel_ids=torch.tensor([1]), logit_scale=10.0,
             )
+
+    def test_incremental_bank_exposes_support_features_with_public_diagnostic_schema(self):
+        features = torch.tensor([
+            [1.0, 0.0], [0.8, 0.6], [0.0, 1.0], [0.6, 0.8],
+        ])
+        labels = torch.tensor([1, 1, 2, 2])
+        source_ids = torch.tensor([10, 11, 20, 21])
+        cache = {
+            "features": features,
+            "labels": labels,
+            "source_ids": source_ids,
+            "classes": torch.tensor([1, 2]),
+            "loo_visual_prototypes": torch.tensor([
+                [[0.8, 0.6], [0.6, 0.8]],
+                [[1.0, 0.0], [0.6, 0.8]],
+                [[1.0, 0.0], [0.6, 0.8]],
+                [[1.0, 0.0], [0.0, 1.0]],
+            ]),
+            "loo_valid": torch.ones(4, dtype=torch.bool),
+        }
+
+        class DummyModel:
+            def build_leave_one_out_prototypes(self, loader, class_index):
+                return cache
+
+        runner = Runner.__new__(Runner)
+        runner.model_without_dp = DummyModel()
+        runner.device = torch.device("cpu")
+        bank = runner._build_incremental_bank(
+            [], torch.tensor([1, 2]),
+            [{"image_proto": torch.tensor([[1.0, 0.0]]), "class_ids": [0]}],
+        )
+
+        self.assertTrue(torch.equal(bank["features"], features))
+        self.assertTrue(torch.equal(bank["labels"], labels))
+        self.assertTrue(torch.equal(bank["source_ids"], source_ids))
+        self.assertEqual(bank["global_ids"].tolist(), [0, 1, 2])
+        self.assertEqual(bank["global_full"].shape, (3, 2))
+        self.assertNotIn("loo_valid", bank)
 
     def test_support_generalization_builds_loo_with_novel_ids_not_merged_ids(self):
         support_features = torch.tensor([
