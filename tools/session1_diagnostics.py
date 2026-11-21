@@ -502,7 +502,19 @@ def prototype_generalization_diagnostics(
     test_novel_mask = torch.isin(test_labels, novel_ids)
 
     def accuracy(predictions, labels, mask):
-        if not bool(mask.any()):
+        # classification_diagnostics intentionally returns CPU predictions for
+        # downstream post-hoc analysis. The prototype tensors and labels here
+        # may live on CUDA, so align all operands before boolean indexing.
+        labels = torch.as_tensor(labels, dtype=torch.long).reshape(-1)
+        predictions = torch.as_tensor(
+            predictions, device=labels.device, dtype=labels.dtype
+        ).reshape(-1)
+        mask = torch.as_tensor(
+            mask, device=labels.device, dtype=torch.bool
+        ).reshape(-1)
+        if predictions.shape != labels.shape or mask.shape != labels.shape:
+            raise ValueError("Predictions, labels and accuracy mask must align.")
+        if not bool(mask.any().item()):
             return None
         return float(predictions[mask].eq(labels[mask]).float().mean().item())
 
