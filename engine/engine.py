@@ -748,6 +748,8 @@ class Runner:
             adapter.freeze_all()
         self._assert_moe_frozen("checkpoint restore")
         checkpoint_class_ids = []
+        checkpoint_support_sources = set()
+        checkpoint_anchor_sources = set()
         for session_index, state in enumerate(payload["task_states"]):
             required_state = ("class_ids", "image_proto", "reference_image_proto",
                               "text_features", "description_proto", "support_count",
@@ -797,6 +799,7 @@ class Runner:
             if not isinstance(reference_cls_by_block, dict) or not reference_cls_by_block:
                 raise ValueError(f"Checkpoint task state {session_index} has no reference CLS cache.")
             expected_reference_blocks = {int(value) for value in expected_topology_blocks}
+            session_reference_sources = None
             if {int(value) for value in reference_cls_by_block} != expected_reference_blocks:
                 raise ValueError(f"Checkpoint task state {session_index} reference CLS blocks do not match MoE topology.")
             for block_idx, cache in reference_cls_by_block.items():
@@ -813,6 +816,19 @@ class Runner:
                     raise ValueError(
                         f"Checkpoint task state {session_index} block {block_idx} reference CLS cache is malformed."
                     )
+                if session_reference_sources is None:
+                    session_reference_sources = set(int(value) for value in source_ids.tolist())
+                elif session_reference_sources != set(int(value) for value in source_ids.tolist()):
+                    raise ValueError(
+                        f"Checkpoint task state {session_index} reference CLS blocks disagree on source identity."
+                    )
+            if not session_reference_sources:
+                raise ValueError(f"Checkpoint task state {session_index} has an empty support source set.")
+            if checkpoint_support_sources.intersection(session_reference_sources):
+                raise ValueError(
+                    f"Checkpoint task state {session_index} reuses support sources from an earlier Session."
+                )
+            checkpoint_support_sources.update(session_reference_sources)
             feature_anchors = state["final_feature_anchors"]
             if not isinstance(feature_anchors, dict):
                 raise ValueError(f"Checkpoint task state {session_index} has no final feature-space anchors.")
@@ -821,17 +837,30 @@ class Runner:
             anchor_sources = torch.as_tensor(feature_anchors.get("source_ids"), dtype=torch.long).reshape(-1)
             anchor_labels = torch.as_tensor(feature_anchors.get("labels"), dtype=torch.long).reshape(-1)
             anchor_class_ids = torch.as_tensor(feature_anchors.get("class_ids"), dtype=torch.long).reshape(-1)
+            expected_anchor_session = int(feature_anchors.get("session_id", -1))
             if (prefix_tokens.ndim != 3 or final_features.ndim != 2
                     or prefix_tokens.size(0) != final_features.size(0)
                     or final_features.size(0) != anchor_sources.numel()
                     or anchor_labels.numel() != anchor_sources.numel()
                     or not torch.equal(torch.unique(anchor_labels, sorted=True), anchor_class_ids.sort().values)
+                    or not torch.equal(anchor_class_ids.sort().values, class_ids.sort().values)
+                    or expected_anchor_session != int(session_index)
                     or final_features.size(1) != int(torch.as_tensor(state["image_proto"]).size(1))
                     or final_features.size(0) == 0
                     or not torch.isfinite(prefix_tokens.float()).all()
                     or not torch.isfinite(final_features.float()).all()
                     or torch.unique(anchor_sources).numel() != anchor_sources.numel()):
                 raise ValueError(f"Checkpoint task state {session_index} has malformed final feature anchors.")
+            anchor_source_set = set(int(value) for value in anchor_sources.tolist())
+            if checkpoint_anchor_sources.intersection(anchor_source_set):
+                raise ValueError(
+                    f"Checkpoint task state {session_index} reuses historical feature-anchor sources."
+                )
+            if not anchor_source_set.issubset(session_reference_sources):
+                raise ValueError(
+                    f"Checkpoint task state {session_index} feature anchors are not a subset of its support sources."
+                )
+            checkpoint_anchor_sources.update(anchor_source_set)
             anchor_by_block = state["anchor_by_block"]
             if not isinstance(anchor_by_block, dict) or not anchor_by_block:
                 raise ValueError(f"Checkpoint task state {session_index} has no per-layer old-class anchors.")
