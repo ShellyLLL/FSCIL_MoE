@@ -229,7 +229,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         base_support = lifecycle_batch(
             0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 6000, count=40
         )
-        runner._train_base_descriptors([base_support])
+        runner._train_base_descriptors([base_support], [base_support])
         base_state = make_lifecycle_state(runner, model, 0, base_support, 0)
 
         covered_support = lifecycle_batch(
@@ -280,7 +280,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         base_support = lifecycle_batch(
             0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 8100, count=40
         )
-        runner._train_base_descriptors([base_support])
+        runner._train_base_descriptors([base_support], [base_support])
         base_anchors = runner._collect_class_anchors([base_support])
         with torch.no_grad():
             adapted, _, reference = model.extract_img_feature_train(
@@ -373,7 +373,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         base_support = lifecycle_batch(
             0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 7000, count=40
         )
-        runner._train_base_descriptors([base_support])
+        runner._train_base_descriptors([base_support], [base_support])
         base_state = make_lifecycle_state(runner, model, 0, base_support, 0)
         support = [
             lifecycle_batch(
@@ -561,7 +561,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             lifecycle_batch(1, torch.tensor([0., 1., 0., 0., 0., 0., 0., 0.]), 5010, count=40),
             lifecycle_batch(2, torch.tensor([0., 0., 1., 0., 0., 0., 0., 0.]), 5020, count=40),
         ]
-        runner._train_base_descriptors(supports)
+        runner._train_base_descriptors(supports, supports)
         for _, adapter in runner._moe_adapters():
             adapter.assert_descriptors_ready()
             for descriptor in adapter.descriptors:
@@ -1114,9 +1114,14 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             runner.session_diagnostics = [{"session": 0}]
             model.base_enhanced_visual_prototype = torch.tensor([[1.0, 0.0, 0.0, 0.0,
                                                          0.0, 0.0, 0.0, 0.0]])
-            runner._train_base_descriptors([lifecycle_batch(
-                0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 7000, count=40
-            )])
+            runner._train_base_descriptors(
+                [lifecycle_batch(
+                    0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 7000, count=40
+                )],
+                [lifecycle_batch(
+                    0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 7000, count=40
+                )],
+            )
             prototype = torch.tensor([[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]])
             anchor_var = torch.full_like(prototype, 0.1)
             anchor_bank = {
@@ -1402,7 +1407,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         torch.manual_seed(887)
         runner, model = build_lifecycle_runner(); model.eval()
         base_support = lifecycle_batch(0, torch.tensor([1.,0.,0.,0.,0.,0.,0.,0.]), 8100, count=40)
-        runner._train_base_descriptors([base_support])
+        runner._train_base_descriptors([base_support], [base_support])
         base_state = make_lifecycle_state(runner, model, 0, base_support, 0)
         support = lifecycle_batch(1, torch.tensor([0.,1.,0.,0.,0.,0.,0.,0.]), 8200, count=16)
         semantic = F.normalize(torch.eye(8)[[0]], dim=-1)
@@ -1510,7 +1515,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         model.eval()
 
         base_support = lifecycle_batch(0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 100, count=40)
-        runner._train_base_descriptors([base_support])
+        runner._train_base_descriptors([base_support], [base_support])
         base_anchors = runner._collect_class_anchors([base_support])
         with torch.no_grad():
             base_adapted, _, base_reference = model.extract_img_feature_train(
@@ -1742,7 +1747,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         base_support = lifecycle_batch(
             0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 1000, count=40
         )
-        runner._train_base_descriptors([base_support])
+        runner._train_base_descriptors([base_support], [base_support])
         states = [make_lifecycle_state(runner, model, 0, base_support, 0)]
 
         expected_counts = [2, 3, 4, 5, 6]
@@ -1800,7 +1805,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         base_support = lifecycle_batch(
             0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 2000, count=40
         )
-        runner._train_base_descriptors([base_support])
+        runner._train_base_descriptors([base_support], [base_support])
         base_state = make_lifecycle_state(runner, model, 0, base_support, 0)
 
         session1_support = lifecycle_batch(
@@ -1944,7 +1949,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         base_support = lifecycle_batch(
             0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 3000, count=40
         )
-        runner._train_base_descriptors([base_support])
+        runner._train_base_descriptors([base_support], [base_support])
         # A single source cannot produce a query-exclusive same-class prototype.
         one_source = {
             "image": torch.tensor([[0., 1., 0., 0., 0., 0., 0., 0.]]),
@@ -1969,7 +1974,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         base_support = lifecycle_batch(
             0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 4000, count=40
         )
-        runner._train_base_descriptors([base_support])
+        runner._train_base_descriptors([base_support], [base_support])
         base_state = make_lifecycle_state(runner, model, 0, base_support, 0)
         support = lifecycle_batch(
             1, torch.tensor([0., 1., 0., 0., 0., 0., 0., 0.]), 4010
