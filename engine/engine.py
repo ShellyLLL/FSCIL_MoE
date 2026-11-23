@@ -1257,10 +1257,14 @@ class Runner:
         if (not torch.equal(source_ids, expected_sources)
                 or torch.unique(source_ids).numel() != source_ids.numel()
                 or not torch.equal(torch.unique(labels, sorted=True),
-                                   torch.unique(labels, sorted=True))):
+                                   torch.as_tensor(
+                                       self.base_reference_cls_features[next(iter(self.base_reference_cls_features))]["labels"]
+                                   ).unique(sorted=True))):
             raise RuntimeError("Base reference prefix tokens lost source identity or ordering.")
-        features = self.model_without_dp.extract_img_feature_from_reference_prefix(
-            prefix_tokens.to(self.device)
+        features = F.normalize(
+            self.model_without_dp.extract_img_feature_from_reference_prefix(
+                prefix_tokens.to(self.device)
+            ).float(), dim=-1
         )
         class_ids = torch.unique(labels, sorted=True).to(self.device)
         prototypes = torch.stack([
@@ -1302,7 +1306,10 @@ class Runner:
                 or not torch.equal(source_ids, torch.as_tensor(self.base_reference_source_ids, dtype=torch.long))):
             raise RuntimeError("Cached Base reference prefix tokens are malformed or misaligned.")
         self.model.eval()
-        features = self.model_without_dp.extract_img_feature_from_reference_prefix(prefix_tokens)
+        features = F.normalize(
+            self.model_without_dp.extract_img_feature_from_reference_prefix(prefix_tokens).float(),
+            dim=-1,
+        )
         current_ids = torch.unique(labels, sorted=True)
         baseline_ids = torch.as_tensor(baseline_ids, device=self.device, dtype=torch.long).reshape(-1)
         if not torch.equal(current_ids.to(self.device), baseline_ids.sort().values):
