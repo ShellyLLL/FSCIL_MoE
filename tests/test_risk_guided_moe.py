@@ -2024,6 +2024,11 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             [expected_counts[0], expected_counts[0]],
         )
         for session_id in range(1, 5):
+            # This test validates the full expansion/checkpoint lifecycle, not
+            # the statistical EXPAND/REUSE operating point. Force each layer
+            # to expand while retaining finite thresholds for the planner.
+            for block in model.expandable_blocks():
+                runner.expansion_thresholds[block][16] = -1.0e6
             feature = torch.zeros(8)
             feature[session_id] = 1.0
             support = lifecycle_batch(session_id, feature, 1000 + session_id * 10)
