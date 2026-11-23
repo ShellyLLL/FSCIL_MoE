@@ -1147,7 +1147,8 @@ class Runner:
     @torch.no_grad()
     def _capture_base_holdout_feature_anchors(self):
         """Capture class-level adapted feature anchors from the fixed Base AE holdout."""
-        loader_factory = getattr(self.data_manager, "get_base_source_dataloader", None)
+        data_manager = getattr(self, "data_manager", None)
+        loader_factory = getattr(data_manager, "get_base_source_dataloader", None)
         if not callable(loader_factory):
             return None
         if not self.base_calibration_source_ids:
@@ -1167,7 +1168,8 @@ class Runner:
     @torch.no_grad()
     def _base_holdout_feature_diagnostics(self, base_state):
         """Measure Base feature drift and fixed-prototype accuracy on Base holdout."""
-        loader_factory = getattr(self.data_manager, "get_base_source_dataloader", None)
+        data_manager = getattr(self, "data_manager", None)
+        loader_factory = getattr(data_manager, "get_base_source_dataloader", None)
         baseline = getattr(self, "base_holdout_feature_prototypes", None)
         baseline_ids = getattr(self, "base_holdout_class_ids", None)
         if not callable(loader_factory) or baseline is None or baseline_ids is None:
