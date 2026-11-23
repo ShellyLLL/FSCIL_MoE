@@ -309,6 +309,25 @@ class UnifiedDynamicMoETests(unittest.TestCase):
                     torch.testing.assert_close(expert.state_dict()[key], before, rtol=0, atol=0)
             self.assertTrue(all(not parameter.requires_grad for parameter in adapter.parameters()))
 
+    def test_final_feature_anchor_replay_is_differentiable_and_preserves_history(self):
+        torch.manual_seed(267)
+        runner, model = build_lifecycle_runner()
+        base = lifecycle_batch(0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 6900, count=20)
+        anchors = runner._collect_final_feature_anchors([base], 0)
+        self.assertEqual(anchors["anchor_count"], 2)
+        prefix = anchors["prefix_tokens"].float().to(runner.device)
+        target = anchors["final_features"].float().to(runner.device)
+        loss = runner._final_feature_anchor_loss(prefix, target)
+        self.assertLess(float(loss), 1e-6)
+        adapter = model.clip_model.visual.transformer.resblocks[0].moe_adapter
+        adapter.add_expert(session_id=1, reduction=2)
+        adapter.set_newest_trainable()
+        loss = runner._final_feature_anchor_loss(prefix, target)
+        loss.backward()
+        self.assertTrue(any(p.grad is not None for p in adapter.experts[-1].parameters()))
+        self.assertTrue(all(p.grad is None for p in adapter.experts[0].parameters()))
+        self.assertTrue(all(not p.requires_grad for p in model.clip_model.visual.transformer.resblocks[1].moe_adapter.parameters()))
+
     def test_route_preservation_loss_distills_base_and_incremental_responsibilities(self):
         torch.manual_seed(269)
         adapter = VisualMoEAdapter(8, num_experts=2, reduction=2)

@@ -156,6 +156,7 @@ class Runner:
                 "local_residual_preservation_weight": float(_cfg_value(incremental_cfg, "LOCAL_RESIDUAL_PRESERVATION_WEIGHT", 1.0)),
                 "feature_anchor_batch_size": int(_cfg_value(moe_cfg, "FEATURE_SPACE_ANCHOR_BATCH_SIZE", 16)),
                 "feature_anchors_per_class": int(_cfg_value(moe_cfg, "FEATURE_SPACE_ANCHORS_PER_CLASS", 2)),
+                "feature_anchor_batch_size": int(_cfg_value(moe_cfg, "FEATURE_SPACE_ANCHOR_BATCH_SIZE", 16)),
                 "rd_weight": float(_cfg_value(incremental_cfg, "RD_WEIGHT", 1.0)),
             },
             "optimizer": {
@@ -573,7 +574,8 @@ class Runner:
         checkpoint_class_ids = []
         for session_index, state in enumerate(payload["task_states"]):
             required_state = ("class_ids", "image_proto", "reference_image_proto",
-                              "text_features", "description_proto", "support_count", "anchor_by_block")
+                              "text_features", "description_proto", "support_count",
+                              "anchor_by_block", "final_feature_anchors")
             forbidden_state = ("anchor_features", "anchor_labels", "anchor_source_ids")
             retained_raw = [key for key in forbidden_state if key in state]
             if retained_raw:
@@ -614,6 +616,21 @@ class Runner:
                     raise ValueError(
                         f"Checkpoint task state {session_index} has non-finite {key}."
                     )
+            feature_anchors = state["final_feature_anchors"]
+            if not isinstance(feature_anchors, dict):
+                raise ValueError(f"Checkpoint task state {session_index} has no final feature-space anchors.")
+            prefix_tokens = torch.as_tensor(feature_anchors.get("prefix_tokens"))
+            final_features = torch.as_tensor(feature_anchors.get("final_features"))
+            anchor_sources = torch.as_tensor(feature_anchors.get("source_ids"), dtype=torch.long).reshape(-1)
+            if (prefix_tokens.ndim != 3 or final_features.ndim != 2
+                    or prefix_tokens.size(0) != final_features.size(0)
+                    or final_features.size(0) != anchor_sources.numel()
+                    or final_features.size(1) != int(self.model_without_dp.clip_model.visual.output_dim)
+                    or final_features.size(0) == 0
+                    or not torch.isfinite(prefix_tokens.float()).all()
+                    or not torch.isfinite(final_features.float()).all()
+                    or torch.unique(anchor_sources).numel() != anchor_sources.numel()):
+                raise ValueError(f"Checkpoint task state {session_index} has malformed final feature anchors.")
             anchor_by_block = state["anchor_by_block"]
             if not isinstance(anchor_by_block, dict) or not anchor_by_block:
                 raise ValueError(f"Checkpoint task state {session_index} has no per-layer old-class anchors.")
@@ -1256,6 +1273,78 @@ class Runner:
             f"{adapter.num_experts} deployed experts using fixed Base holdout "
             f"(n={len(self.base_calibration_source_ids)})."
         )
+
+    @torch.no_grad()
+    def _collect_final_feature_anchors(self, loader, session_id):
+        """Cache a deterministic, class-balanced set of frozen-prefix tokens and final embeddings."""
+        visual_cfg = self._visual_moe_cfg()
+        per_class = int(_cfg_value(visual_cfg, "FEATURE_SPACE_ANCHORS_PER_CLASS", 2))
+        if per_class < 1:
+            raise ValueError("FEATURE_SPACE_ANCHORS_PER_CLASS must be positive.")
+        prefix_rows, feature_rows, label_rows, source_rows = [], [], [], []
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            for batch in loader:
+                images, labels = self.parse_batch(batch)
+                source_ids = self._batch_source_ids(batch, labels.numel(), labels.device)
+                prefix = self.model_without_dp.extract_reference_prefix_tokens(images)
+                features = self.model_without_dp.extract_img_feature_train(images)
+                prefix_rows.append(prefix.detach().cpu())
+                feature_rows.append(F.normalize(features.detach().float(), dim=-1).cpu())
+                label_rows.append(labels.detach().cpu())
+                source_rows.append(source_ids.detach().cpu())
+        finally:
+            self.model.train(was_training)
+        if not prefix_rows:
+            raise RuntimeError("Cannot create final feature-space anchors from an empty support loader.")
+        prefixes = torch.cat(prefix_rows)
+        features = torch.cat(feature_rows)
+        labels = torch.cat(label_rows).long()
+        sources = torch.cat(source_rows).long()
+        if sources.numel() != torch.unique(sources).numel():
+            raise ValueError("Feature-space anchor sources must be unique within a Session.")
+        selected = []
+        for class_id in torch.unique(labels, sorted=True).tolist():
+            rows = torch.nonzero(labels.eq(int(class_id)), as_tuple=False).flatten()
+            order = torch.argsort(sources[rows], stable=True)
+            selected.extend(rows[order[:per_class]].tolist())
+        selected = torch.as_tensor(selected, dtype=torch.long)
+        return {
+            "session_id": int(session_id),
+            "class_ids": torch.unique(labels, sorted=True).cpu(),
+            "source_ids": sources[selected].clone(),
+            "prefix_tokens": prefixes[selected].contiguous().half(),
+            "final_features": features[selected].contiguous().half(),
+            "anchor_count": int(selected.numel()),
+        }
+
+    def _historical_feature_anchor_batches(self, old_states):
+        anchors = [state["final_feature_anchors"] for state in old_states
+                   if state.get("final_feature_anchors") is not None]
+        if not anchors:
+            raise RuntimeError("Incremental feature-space preservation requires historical final-feature anchors.")
+        prefixes = torch.cat([torch.as_tensor(item["prefix_tokens"]) for item in anchors], dim=0)
+        targets = torch.cat([torch.as_tensor(item["final_features"]) for item in anchors], dim=0)
+        class_ids = torch.cat([torch.as_tensor(item["class_ids"]).repeat_interleave(
+            torch.bincount(torch.as_tensor(item["labels"]).long()) if "labels" in item else
+            torch.full((len(item["class_ids"]),), int(item["anchor_count"] // len(item["class_ids"])))
+        ) for item in anchors], dim=0) if False else None
+        if prefixes.size(0) != targets.size(0) or prefixes.size(0) == 0:
+            raise ValueError("Historical feature-anchor prefixes and targets are empty or misaligned.")
+        batch_size = int(_cfg_value(self._visual_moe_cfg(), "FEATURE_SPACE_ANCHOR_BATCH_SIZE", 16))
+        if batch_size < 1:
+            raise ValueError("FEATURE_SPACE_ANCHOR_BATCH_SIZE must be positive.")
+        return prefixes.to(self.device), targets.to(self.device), batch_size
+
+    def _final_feature_anchor_loss(self, old_prefix_tokens, old_final_features):
+        """Distill the deployed final visual embedding; gradients reach only current new adapters."""
+        current = self.model_without_dp.extract_img_feature_from_reference_prefix(old_prefix_tokens)
+        current = F.normalize(current.float(), dim=-1)
+        target = F.normalize(old_final_features.detach().to(self.device).float(), dim=-1)
+        if current.shape != target.shape or not torch.isfinite(current).all():
+            raise RuntimeError("Final feature-space replay produced invalid or misaligned embeddings.")
+        return (1.0 - F.cosine_similarity(current, target, dim=-1)).mean()
 
     def _collect_class_anchors(self, loader):
         """Store compact per-class anchors in the shared frozen-reference input space."""
@@ -1982,6 +2071,9 @@ class Runner:
         state["class_index"] = state["class_ids"]
         state["encoder_version"] = 0
         state["anchor_by_block"] = self._collect_class_anchors(extract_loader)
+        state["final_feature_anchors"] = self._collect_final_feature_anchors(
+            extract_loader, int(state.get("creation_session", 0))
+        )
         return state
 
     def run(self):
@@ -2027,6 +2119,8 @@ class Runner:
                 state["encoder_version"] = 0
                 state["creation_session"] = 0
                 state["anchor_by_block"] = self._collect_class_anchors(extract_loader)
+                if use_moe:
+                    state["final_feature_anchors"] = self._collect_final_feature_anchors(extract_loader, 0)
             else:
                 if use_moe:
                     self._routing_diagnostics(extract_loader, f"session{task_id}-before",
