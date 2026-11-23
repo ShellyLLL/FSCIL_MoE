@@ -83,18 +83,20 @@ class Runner:
             "adapters": adapter_states,
             "expansion_thresholds": copy.deepcopy(self.expansion_thresholds),
             "base_reference_source_ids": list(self.base_reference_source_ids),
-            "base_reference_cls_features": self._cpu_copy(self.base_reference_cls_features),
-            "base_reference_prefix_cache": self._cpu_copy(self.base_reference_prefix_cache),
-            "base_reference_feature_prototypes": self._cpu_copy(self.base_reference_feature_prototypes),
-            "base_reference_class_ids": self._cpu_copy(self.base_reference_class_ids),
+            # These reference caches are immutable after Base completion; retain
+            # their objects instead of duplicating potentially large CPU tensors.
+            "base_reference_cls_features": self.base_reference_cls_features,
+            "base_reference_prefix_cache": self.base_reference_prefix_cache,
+            "base_reference_feature_prototypes": self.base_reference_feature_prototypes,
+            "base_reference_class_ids": self.base_reference_class_ids,
             "base_reference_accuracy_baseline": self.base_reference_accuracy_baseline,
             "base_enhanced_visual_prototype": (
                 None if base_prototype is None else base_prototype.detach().clone()
             ),
-            "state_dict_list": copy.deepcopy(state_dict_list),
+            "state_dict_list": list(state_dict_list),
             "acc_list": list(self.acc_list),
-            "task_acc_list": copy.deepcopy(self.task_acc_list),
-            "session_diagnostics": copy.deepcopy(self.session_diagnostics),
+            "task_acc_list": list(self.task_acc_list),
+            "session_diagnostics": list(self.session_diagnostics),
             "rng_state": self._rng_state(),
             "training_modes": {id(module): bool(module.training) for module in self.model.modules()},
         }
@@ -108,18 +110,18 @@ class Runner:
             adapter.freeze_all()
         self.expansion_thresholds = copy.deepcopy(snapshot["expansion_thresholds"])
         self.base_reference_source_ids = list(snapshot["base_reference_source_ids"])
-        self.base_reference_cls_features = self._cpu_copy(snapshot["base_reference_cls_features"])
-        self.base_reference_prefix_cache = self._cpu_copy(snapshot["base_reference_prefix_cache"])
-        self.base_reference_feature_prototypes = self._cpu_copy(snapshot["base_reference_feature_prototypes"])
-        self.base_reference_class_ids = self._cpu_copy(snapshot["base_reference_class_ids"])
+        self.base_reference_cls_features = snapshot["base_reference_cls_features"]
+        self.base_reference_prefix_cache = snapshot["base_reference_prefix_cache"]
+        self.base_reference_feature_prototypes = snapshot["base_reference_feature_prototypes"]
+        self.base_reference_class_ids = snapshot["base_reference_class_ids"]
         self.base_reference_accuracy_baseline = snapshot["base_reference_accuracy_baseline"]
         prototype = snapshot["base_enhanced_visual_prototype"]
         if prototype is not None and hasattr(self.model_without_dp, "base_enhanced_visual_prototype"):
             self.model_without_dp.base_enhanced_visual_prototype.copy_(prototype)
-        state_dict_list[:] = copy.deepcopy(snapshot["state_dict_list"])
+        state_dict_list[:] = snapshot["state_dict_list"]
         self.acc_list = list(snapshot["acc_list"])
-        self.task_acc_list = copy.deepcopy(snapshot["task_acc_list"])
-        self.session_diagnostics = copy.deepcopy(snapshot["session_diagnostics"])
+        self.task_acc_list = list(snapshot["task_acc_list"])
+        self.session_diagnostics = list(snapshot["session_diagnostics"])
         self._restore_rng_state(snapshot["rng_state"])
         for module in self.model.modules():
             module.training = snapshot["training_modes"].get(id(module), False)
@@ -952,6 +954,7 @@ class Runner:
             for temp_path in temp_paths:
                 torch.save(payload, temp_path)
             backed_up = []
+            published = []
             try:
                 for path, backup_path in zip(publish_targets, backup_paths):
                     if path.exists():
@@ -959,12 +962,15 @@ class Runner:
                         backed_up.append((path, backup_path))
                 for temp_path, path in zip(temp_paths, publish_targets):
                     os.replace(temp_path, path)
+                    published.append(path)
             except Exception:
-                for path in publish_targets:
+                for path in published:
                     if path.exists():
                         path.unlink()
                 for path, backup_path in reversed(backed_up):
                     if backup_path.exists():
+                        if path.exists():
+                            path.unlink()
                         os.replace(backup_path, path)
                 raise
             else:
