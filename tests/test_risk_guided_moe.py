@@ -238,7 +238,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             gates = torch.sigmoid(adapter.router.columns[-1](features["cls_in"]))
             self.assertTrue(torch.isfinite(gates).all())
 
-    def test_reuse_session_adapts_router_without_expanding_or_mutating_experts(self):
+    def test_reuse_session_keeps_all_historical_parameters_frozen(self):
         torch.manual_seed(263)
         runner, model = build_lifecycle_runner()
         model.eval()
@@ -262,8 +262,8 @@ class UnifiedDynamicMoETests(unittest.TestCase):
                 2, torch.tensor([0., 0., 1., 0., 0., 0., 0., 0.]), 7020, count=16
             ),
         ]
-        # Force the well-defined REUSE branch: AE/RD is not asked to create
-        # capacity, but the existing router must still learn the new Session.
+        # Force REUSE: the deployed expert pool has enough representational
+        # capacity, so neither historical experts nor historical routers move.
         runner.expansion_thresholds = {0: {32: 1e6}, 1: {32: 1e6}}
         expert_before = {
             block: [
@@ -281,21 +281,19 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             1, support, support, [1, 2], ["new_class_a", "new_class_b"], [base_state]
         )
         self.assertEqual(result["expanded"], [])
-        self.assertEqual([row["block_idx"] for row in result["router_adapted"]], [0, 1])
-        self.assertTrue(result["trained"])
+        self.assertEqual([row["block_idx"] for row in result["reused"]], [0, 1])
+        self.assertFalse(result["trained"])
 
         for block, adapter in runner._moe_adapters():
             history = result["training"][block]
-            self.assertEqual(history["mode"], "reuse_router")
-            self.assertEqual(history["classification_samples_per_epoch"], [32] * 8)
-            self.assertEqual(history["classification_samples_total"], 256)
+            self.assertEqual(history["mode"], "reuse_frozen")
+            self.assertEqual(history["parameter_updates"], 0)
+            self.assertEqual(history["classification_samples_total"], 0)
             self.assertEqual(history["rd_training_samples"], 0)
-            self.assertEqual(len(history["gradient_projection"]), 8)
-            self.assertTrue(torch.isfinite(torch.tensor(history["route_preservation_final"])))
-            self.assertTrue(any(
-                not torch.equal(before, after.detach())
-                for before, after in zip(router_before[block], adapter.router.parameters())
-            ))
+            self.assertEqual(history["expert_count"], 2)
+            self.assertTrue(torch.isfinite(history["route_weight_mean"]).all())
+            for before, after in zip(router_before[block], adapter.router.parameters()):
+                torch.testing.assert_close(after, before, rtol=0, atol=0)
             for expert, before_state in zip(adapter.experts, expert_before[block]):
                 for key, before in before_state.items():
                     torch.testing.assert_close(expert.state_dict()[key], before, rtol=0, atol=0)
