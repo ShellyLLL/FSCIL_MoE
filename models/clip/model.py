@@ -667,7 +667,7 @@ class VisualMoEAdapter(nn.Module):
         self.freeze_all()
         reduction = self.default_reduction if reduction is None else int(reduction)
         anchor_expert_id = 0 if anchor_expert_id is None else int(anchor_expert_id)
-        if anchor_expert_id < 0 or anchor_expert_id >= self.num_experts:
+        if anchor_expert_id < -1 or anchor_expert_id >= self.num_experts:
             raise ValueError(
                 f"RD anchor expert id {anchor_expert_id} is outside the historical pool."
             )
@@ -682,9 +682,12 @@ class VisualMoEAdapter(nn.Module):
         descriptor = RepresentationDescriptor(
             self.d_model, self.descriptor_dim, self.descriptor_eps, self.descriptor_buffer_size
         ).to(device=self.residual_scale.device)
-        descriptor.initialize_from_anchor(
-            self.descriptors[anchor_expert_id], anchor_expert_id, residual_rank
-        )
+        if anchor_expert_id >= 0:
+            descriptor.initialize_from_anchor(
+                self.descriptors[anchor_expert_id], anchor_expert_id, residual_rank
+            )
+        elif residual_rank != 0:
+            raise ValueError("Independent RD initialization requires residual_rank=0.")
         self.descriptors.append(descriptor)
         self.router.add_column(
             self.incremental_gate_bias_init if gate_bias_init is None else float(gate_bias_init)
@@ -775,12 +778,18 @@ class VisualMoEAdapter(nn.Module):
             else:
                 if int(birth_session) <= 0:
                     raise ValueError("Incremental experts must have a positive birth session.")
-                if int(anchor_id) < 0 or int(anchor_id) >= index:
-                    raise ValueError(
-                        f"Incremental descriptor {index} must reference an earlier expert as its anchor."
-                    )
-                if isinstance(residual_rank, bool) or int(residual_rank) < 1:
-                    raise ValueError(f"Incremental descriptor {index} has invalid residual rank.")
+                if int(anchor_id) == -1:
+                    if isinstance(residual_rank, bool) or int(residual_rank) != 0:
+                        raise ValueError(
+                            f"Independent incremental descriptor {index} must have residual_rank=0."
+                        )
+                else:
+                    if int(anchor_id) < 0 or int(anchor_id) >= index:
+                        raise ValueError(
+                            f"Incremental descriptor {index} must reference an earlier expert as its anchor."
+                        )
+                    if isinstance(residual_rank, bool) or int(residual_rank) < 1:
+                        raise ValueError(f"Incremental descriptor {index} has invalid residual rank.")
             validated.append((int(reduction), int(birth_session), int(anchor_id), int(residual_rank), float(dropout)))
 
         # Build the complete topology only after every expert/anchor specification is valid.

@@ -185,6 +185,7 @@ class Runner:
             "expert_input_space": "frozen_reference_vit_tokens_for_all_expert_generations",
             "gradient_clipping": "joint_all_expanded_functional_parameters_and_all_new_descriptors_norm_1.0",
             "base_descriptor_training_scope": "all_base_reference_cls_weighted_by_base_router_responsibility",
+            "descriptor_init_mode": str(_cfg_value(self._visual_moe_cfg(), "DESCRIPTOR_INIT_MODE", "anchored_residual")).lower(),
             "descriptor_training_scope": "all_current_session_augmented_cls_views",
             "descriptor_calibration_scope": "all_current_session_deterministic_reference_cls_weighted_by_deployed_expert_responsibility",
             "base_threshold_reference_scope": "deterministic_class_balanced_cached_base_reference_cls",
@@ -2127,9 +2128,24 @@ class Runner:
             # Every Session source is used in both its augmented RD fitting view
             # and deterministic reference view; no support source is held out.
             reference_source_ids = set(int(value) for value in sources.detach().cpu().tolist())
-            anchor_expert_id, anchor_q90 = adapter.select_descriptor_anchor(values)
+            descriptor_init_mode = str(_cfg_value(
+                self._visual_moe_cfg(), "DESCRIPTOR_INIT_MODE", "anchored_residual"
+            )).lower()
+            if descriptor_init_mode == "anchored_residual":
+                anchor_expert_id, anchor_q90 = adapter.select_descriptor_anchor(values)
+                descriptor_residual_rank = int(_cfg_value(
+                    self._visual_moe_cfg(), "DESCRIPTOR_RESIDUAL_RANK", 16
+                ))
+            elif descriptor_init_mode == "independent":
+                anchor_expert_id, anchor_q90 = -1, torch.empty(0)
+                descriptor_residual_rank = 0
+            else:
+                raise ValueError(
+                    "DESCRIPTOR_INIT_MODE must be 'anchored_residual' or 'independent'."
+                )
             expert_id = self.model_without_dp.add_expert(
-                block_idx, task_id, anchor_expert_id=anchor_expert_id
+                block_idx, task_id, anchor_expert_id=anchor_expert_id,
+                descriptor_residual_rank=descriptor_residual_rank,
             )
             descriptor = adapter.descriptors[expert_id]
             descriptor.set_trainable(True)
@@ -2146,7 +2162,8 @@ class Runner:
                 "anchor_q90": anchor_q90.detach().cpu(),
                 "anchor_sets": anchor_sets,
                 "history": {
-                    "expert_id": int(expert_id), "descriptor_anchor_id": int(anchor_expert_id),
+                    "expert_id": int(expert_id), "descriptor_init_mode": descriptor_init_mode,
+                    "descriptor_anchor_id": int(anchor_expert_id),
                     "descriptor_anchor_q90": [float(value) for value in anchor_q90.detach().cpu().tolist()],
                     "loss": [], "ce_loss": [], "rd_loss": [], "feature_space_loss": [],
                     "local_preservation_loss": [], "gradient_projection": [],
@@ -2360,6 +2377,7 @@ class Runner:
             if context["mode"] == "expand":
                 expanded.append({
                     "block_idx": int(block_idx), "expert_id": int(context["expert_id"]),
+                    "descriptor_init_mode": str(context["history"]["descriptor_init_mode"]),
                     "descriptor_anchor_id": int(context["adapter"].descriptors[-1].anchor_expert_id),
                     "session_q90": float(context["decision"].session_q90),
                     "session_q95_threshold": float(context["decision"].threshold),

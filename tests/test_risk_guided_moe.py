@@ -960,6 +960,25 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         self.assertTrue(all(not p.requires_grad for d in adapter.descriptors for p in d.parameters()))
         self.assertEqual(adapter.expert_birth_sessions, [0, 0, 3])
 
+    def test_independent_incremental_rd_topology_roundtrips_without_anchor(self):
+        adapter = VisualMoEAdapter(8, num_experts=2, reduction=2, descriptor_dim=4)
+        expert_id = adapter.add_expert(
+            session_id=1, reduction=2, anchor_expert_id=-1, descriptor_residual_rank=0
+        )
+        self.assertEqual(expert_id, 2)
+        self.assertFalse(adapter.descriptors[-1].is_anchored)
+        self.assertEqual(adapter.descriptors[-1].anchor_expert_id, -1)
+        self.assertEqual(adapter.descriptors[-1].residual_rank, 0)
+        topology = adapter.export_topology()
+        self.assertEqual(topology["experts"][-1]["descriptor_anchor_id"], -1)
+        self.assertEqual(topology["experts"][-1]["descriptor_residual_rank"], 0)
+        state = {key: value.detach().clone() for key, value in adapter.state_dict().items()}
+        restored = VisualMoEAdapter(8, num_experts=2, reduction=2, descriptor_dim=4)
+        restored.rebuild_topology(topology)
+        restored.load_state_dict(state, strict=True)
+        self.assertFalse(restored.descriptors[-1].is_anchored)
+        self.assertEqual(restored.export_topology(), topology)
+
     def test_incremental_rd_reuses_nearest_historical_anchor_with_zero_up_residual(self):
         torch.manual_seed(271)
         adapter = VisualMoEAdapter(
