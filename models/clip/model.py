@@ -664,8 +664,14 @@ class VisualMoEAdapter(nn.Module):
 
     def add_expert(self, session_id, reduction=None, gate_bias_init=None,
                    anchor_expert_id=None, descriptor_residual_rank=None, dropout=None):
-        self.freeze_all()
+        # Validate the complete expert/RD/router contract before changing the
+        # live topology or freezing any currently trainable module.
+        if isinstance(session_id, bool) or int(session_id) <= 0:
+            raise ValueError("Incremental expert birth session must be a positive integer.")
+        session_id = int(session_id)
         reduction = self.default_reduction if reduction is None else int(reduction)
+        if reduction < 1:
+            raise ValueError("Incremental expert reduction must be positive.")
         anchor_expert_id = 0 if anchor_expert_id is None else int(anchor_expert_id)
         if anchor_expert_id < -1 or anchor_expert_id >= self.num_experts:
             raise ValueError(
@@ -675,25 +681,40 @@ class VisualMoEAdapter(nn.Module):
             self.descriptor_residual_rank if descriptor_residual_rank is None
             else int(descriptor_residual_rank)
         )
+        if anchor_expert_id == -1:
+            if residual_rank != 0:
+                raise ValueError("Independent RD initialization requires residual_rank=0.")
+        else:
+            if residual_rank < 1:
+                raise ValueError("Anchored RD initialization requires a positive residual rank.")
+            residual_rank = min(residual_rank, self.d_model)
         expert_dropout = self.incremental_dropout if dropout is None else float(dropout)
-        self.experts.append(BottleneckExpert(
+        gate_bias = self.incremental_gate_bias_init if gate_bias_init is None else float(gate_bias_init)
+        if not np.isfinite(expert_dropout) or not 0.0 <= expert_dropout < 1.0:
+            raise ValueError("Incremental expert dropout must be finite and in [0, 1).")
+        if not np.isfinite(gate_bias):
+            raise ValueError("Incremental router gate bias must be finite.")
+
+        device, dtype = self.residual_scale.device, self.residual_scale.dtype
+        new_expert = BottleneckExpert(
             self.d_model, reduction, zero_init_up=True, dropout=expert_dropout
-        ).to(device=self.residual_scale.device, dtype=self.residual_scale.dtype))
-        descriptor = RepresentationDescriptor(
+        ).to(device=device, dtype=dtype)
+        new_descriptor = RepresentationDescriptor(
             self.d_model, self.descriptor_dim, self.descriptor_eps, self.descriptor_buffer_size
-        ).to(device=self.residual_scale.device)
+        ).to(device=device)
+        new_router_column = nn.Linear(self.d_model, 1).to(device=device, dtype=dtype)
+        nn.init.normal_(new_router_column.weight, std=0.02)
+        nn.init.constant_(new_router_column.bias, gate_bias)
         if anchor_expert_id >= 0:
-            descriptor.initialize_from_anchor(
+            new_descriptor.initialize_from_anchor(
                 self.descriptors[anchor_expert_id], anchor_expert_id, residual_rank
             )
-        elif residual_rank != 0:
-            raise ValueError("Independent RD initialization requires residual_rank=0.")
-        self.descriptors.append(descriptor)
-        self.router.add_column(
-            self.incremental_gate_bias_init if gate_bias_init is None else float(gate_bias_init)
-        )
-        self.router.columns[-1].to(device=self.residual_scale.device, dtype=self.residual_scale.dtype)
-        self.expert_birth_sessions.append(int(session_id))
+
+        self.freeze_all()
+        self.experts.append(new_expert)
+        self.descriptors.append(new_descriptor)
+        self.router.columns.append(new_router_column)
+        self.expert_birth_sessions.append(session_id)
         self.set_newest_trainable()
         return self.num_experts - 1
 

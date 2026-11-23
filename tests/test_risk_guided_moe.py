@@ -519,6 +519,54 @@ class UnifiedDynamicMoETests(unittest.TestCase):
                     torch.testing.assert_close(expert.state_dict()[key], before, rtol=0, atol=0)
             self.assertTrue(all(not parameter.requires_grad for parameter in adapter.parameters()))
 
+    def test_historical_feature_anchor_acceptance_covers_every_prior_session(self):
+        runner, model = build_lifecycle_runner()
+        runner.cfg.TRAINER.BiMC.VISUAL_MOE.FEATURE_SPACE_MIN_COSINE = 0.98
+        basis = torch.eye(8)
+        def anchor_state(session_id, class_ids, source_start):
+            features = torch.stack([basis[c] for c in class_ids for _ in range(2)])
+            labels = torch.tensor([c for c in class_ids for _ in range(2)])
+            return {
+                "creation_session": session_id,
+                "final_feature_anchors": {
+                    "session_id": session_id,
+                    "class_ids": torch.tensor(class_ids),
+                    "labels": labels,
+                    "source_ids": torch.arange(source_start, source_start + labels.numel()),
+                    "prefix_tokens": features.unsqueeze(1).half(),
+                    "final_features": features.half(),
+                    "anchor_count": int(labels.numel()),
+                },
+            }
+        states = [
+            anchor_state(0, [0, 1], 100),
+            anchor_state(1, [2], 200),
+        ]
+        def replay(prefix):
+            features = prefix[:, 0, :].clone()
+            # Drift only Session-0/class-1; Session-1/class-2 must still be checked.
+            features[features[:, 1] > 0.5] = basis[3]
+            return features
+        model.clip_model.extract_img_feature_from_reference_prefix = replay
+        result = runner._historical_feature_anchor_diagnostics(states)
+        self.assertTrue(result["available"])
+        self.assertFalse(result["within_target"])
+        self.assertEqual(result["num_sessions"], 2)
+        self.assertEqual(result["num_classes"], 3)
+        self.assertEqual(result["num_anchors"], 6)
+        self.assertAlmostEqual(
+            result["per_session"][0]["class_prototype_cosine_per_class"][1], 0.0, places=6
+        )
+        self.assertAlmostEqual(
+            result["per_session"][1]["class_prototype_cosine_per_class"][2], 1.0, places=6
+        )
+        model.clip_model.extract_img_feature_from_reference_prefix = (
+            lambda prefix: prefix[:, 0, :]
+        )
+        retained = runner._historical_feature_anchor_diagnostics(states)
+        self.assertTrue(retained["within_target"])
+        self.assertAlmostEqual(retained["class_prototype_cosine_min"], 1.0, places=6)
+
     def test_base_reference_accuracy_drop_is_a_hard_feature_space_acceptance_gate(self):
         runner, model = build_lifecycle_runner()
         runner.cfg.TRAINER.BiMC.VISUAL_MOE.FEATURE_SPACE_MIN_COSINE = 0.0
@@ -1005,6 +1053,30 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         self.assertTrue(all(p.requires_grad for p in adapter.router.columns[-1].parameters()))
         self.assertTrue(all(not p.requires_grad for d in adapter.descriptors for p in d.parameters()))
         self.assertEqual(adapter.expert_birth_sessions, [0, 0, 3])
+
+    def test_add_expert_rejects_invalid_independent_rd_without_mutating_live_adapter(self):
+        adapter = VisualMoEAdapter(8, num_experts=2, reduction=2, descriptor_dim=4)
+        adapter.train()
+        before_topology = adapter.export_topology()
+        before_training = adapter.training
+        before_modes = [module.training for module in adapter.modules()]
+        before_requires_grad = [parameter.requires_grad for parameter in adapter.parameters()]
+        before_keys = tuple(adapter.state_dict().keys())
+        with self.assertRaisesRegex(ValueError, "residual_rank=0"):
+            adapter.add_expert(
+                session_id=1, anchor_expert_id=-1, descriptor_residual_rank=4
+            )
+        self.assertEqual(adapter.export_topology(), before_topology)
+        self.assertEqual(adapter.num_experts, 2)
+        self.assertEqual(len(adapter.descriptors), 2)
+        self.assertEqual(len(adapter.router.columns), 2)
+        self.assertEqual(adapter.training, before_training)
+        self.assertEqual([module.training for module in adapter.modules()], before_modes)
+        self.assertEqual(
+            [parameter.requires_grad for parameter in adapter.parameters()],
+            before_requires_grad,
+        )
+        self.assertEqual(tuple(adapter.state_dict().keys()), before_keys)
 
     def test_independent_incremental_rd_topology_roundtrips_without_anchor(self):
         adapter = VisualMoEAdapter(8, num_experts=2, reduction=2, descriptor_dim=4)

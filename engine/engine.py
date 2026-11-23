@@ -209,7 +209,7 @@ class Runner:
         loss_cfg = _cfg_value(trainer_cfg, "LOSS", None)
         dataset_cfg = _cfg_value(self.cfg, "DATASET", None)
         return {
-            "version": 17,
+            "version": 18,
             "decision_unit": "incremental_session_per_layer",
             "sample_score": "minimum_standardized_reconstruction_error_over_current_deployed_RDs",
             "threshold_refresh": "recalibrate_from_all_accepted_session_reference_cls_after_every_successful_session",
@@ -230,7 +230,9 @@ class Runner:
             "base_threshold_reference_scope": "deterministic_class_balanced_cached_base_reference_cls",
             "base_feature_diagnostic_scope": "cached_frozen_reference_prefix_replay_no_incremental_base_image_reload",
             "threshold_calibration_scope": "base_reference_plus_all_historical_and_current_incremental_support_cls",
-            "feature_space_acceptance": "minimum_class_prototype_cosine_and_fixed_base_reference_accuracy_drop",
+            "feature_space_acceptance": "base_reference_accuracy_plus_all_historical_class_anchor_prototype_cosine",
+            "feature_space_min_cosine": float(_cfg_value(moe_cfg, "FEATURE_SPACE_MIN_COSINE", 0.98)),
+            "feature_space_max_accuracy_drop": float(_cfg_value(moe_cfg, "FEATURE_SPACE_MAX_ACCURACY_DROP", 0.0)),
             "router_learning_signal": "joint_global_CE_projected_against_final_feature_and_local_residual_preservation",
             "visual_moe_enabled": bool(_cfg_value(moe_cfg, "ENABLE", False)),
             "insert_blocks": [int(value) for value in _cfg_value(moe_cfg, "INSERT_BLOCKS", [])],
@@ -1501,6 +1503,118 @@ class Runner:
         return accuracy
 
     @torch.no_grad()
+    @torch.no_grad()
+    def _historical_feature_anchor_diagnostics(self, historical_states):
+        """Measure every accepted Session's stored class anchors in the current encoder."""
+        if not historical_states:
+            return {"available": False, "reason": "no_historical_states"}
+        self.model.eval()
+        class_cosines, sample_cosines = [], []
+        per_session = {}
+        seen_classes, seen_sources = set(), set()
+        for state_index, state in enumerate(historical_states):
+            anchors = state.get("final_feature_anchors")
+            if not isinstance(anchors, dict):
+                return {
+                    "available": False,
+                    "reason": "missing_final_feature_anchors",
+                    "missing_state_index": int(state_index),
+                }
+            session_id = int(anchors.get("session_id", state.get("creation_session", state_index)))
+            class_ids = torch.as_tensor(
+                anchors.get("class_ids"), dtype=torch.long
+            ).reshape(-1)
+            labels = torch.as_tensor(anchors.get("labels"), dtype=torch.long).reshape(-1)
+            source_ids = torch.as_tensor(anchors.get("source_ids"), dtype=torch.long).reshape(-1)
+            prefixes = torch.as_tensor(anchors.get("prefix_tokens")).float()
+            targets = torch.as_tensor(anchors.get("final_features")).float()
+            count = int(prefixes.size(0)) if prefixes.ndim == 3 else -1
+            if (prefixes.ndim != 3 or count == 0 or targets.ndim != 2
+                    or targets.size(0) != count or labels.numel() != count
+                    or source_ids.numel() != count or class_ids.numel() == 0
+                    or not torch.isfinite(prefixes).all() or not torch.isfinite(targets).all()
+                    or torch.unique(source_ids).numel() != source_ids.numel()
+                    or not set(torch.unique(labels).tolist()).issubset(set(class_ids.tolist()))):
+                raise ValueError(
+                    f"Historical feature anchors for Session {session_id} are malformed or misaligned."
+                )
+            duplicate_classes = seen_classes.intersection(int(value) for value in class_ids.tolist())
+            duplicate_sources = seen_sources.intersection(int(value) for value in source_ids.tolist())
+            if duplicate_classes:
+                raise ValueError(
+                    f"Historical feature anchors repeat classes across Sessions: {sorted(duplicate_classes)}."
+                )
+            if duplicate_sources:
+                raise ValueError(
+                    f"Historical feature anchors repeat source ids across Sessions: {sorted(duplicate_sources)}."
+                )
+            seen_classes.update(int(value) for value in class_ids.tolist())
+            seen_sources.update(int(value) for value in source_ids.tolist())
+
+            current = self.model_without_dp.extract_img_feature_from_reference_prefix(
+                prefixes.to(self.device)
+            )
+            current = F.normalize(current.float(), dim=-1)
+            target = F.normalize(targets.to(self.device), dim=-1)
+            if current.shape != target.shape or not torch.isfinite(current).all():
+                raise RuntimeError(
+                    f"Historical feature replay for Session {session_id} produced invalid embeddings."
+                )
+            sample_alignment = F.cosine_similarity(current, target, dim=-1)
+            session_class_cosines = {}
+            for class_id in sorted(int(value) for value in class_ids.tolist()):
+                mask = labels.to(self.device).eq(class_id)
+                if not bool(mask.any().item()):
+                    raise ValueError(
+                        f"Historical feature anchors for Session {session_id} omit class {class_id}."
+                    )
+                current_prototype = F.normalize(current[mask].mean(0), dim=-1)
+                target_prototype = F.normalize(target[mask].mean(0), dim=-1)
+                cosine = float(F.cosine_similarity(
+                    current_prototype.unsqueeze(0), target_prototype.unsqueeze(0), dim=-1
+                ).item())
+                session_class_cosines[int(class_id)] = cosine
+                class_cosines.append(cosine)
+            sample_cosines.extend(float(value) for value in sample_alignment.detach().cpu().tolist())
+            per_session[int(session_id)] = {
+                "num_classes": int(len(session_class_cosines)),
+                "num_anchors": int(count),
+                "class_prototype_cosine_mean": float(np.mean(list(session_class_cosines.values()))),
+                "class_prototype_cosine_min": float(min(session_class_cosines.values())),
+                "class_prototype_cosine_per_class": session_class_cosines,
+                "sample_cosine_mean": float(sample_alignment.mean().item()),
+                "sample_cosine_min": float(sample_alignment.min().item()),
+            }
+        if not class_cosines:
+            return {"available": False, "reason": "empty_historical_anchor_bank"}
+        target_cosine = float(_cfg_value(
+            self._visual_moe_cfg(), "FEATURE_SPACE_MIN_COSINE", 0.98
+        ))
+        if not np.isfinite(target_cosine) or not -1.0 <= target_cosine <= 1.0:
+            raise ValueError("FEATURE_SPACE_MIN_COSINE must be finite and in [-1, 1].")
+        result = {
+            "available": True,
+            "num_sessions": int(len(per_session)),
+            "num_classes": int(len(class_cosines)),
+            "num_anchors": int(len(sample_cosines)),
+            "class_prototype_cosine_mean": float(np.mean(class_cosines)),
+            "class_prototype_cosine_min": float(min(class_cosines)),
+            "sample_cosine_mean": float(np.mean(sample_cosines)),
+            "sample_cosine_min": float(min(sample_cosines)),
+            "minimum_cosine_target": target_cosine,
+            "within_target": bool(min(class_cosines) >= target_cosine),
+            "per_session": per_session,
+        }
+        print(
+            f"=> [Historical-Feature-Space] sessions={result['num_sessions']} "
+            f"classes={result['num_classes']} anchors={result['num_anchors']} "
+            f"class_cosine_mean={result['class_prototype_cosine_mean']:.6f} "
+            f"class_cosine_min={result['class_prototype_cosine_min']:.6f} "
+            f"sample_cosine_mean={result['sample_cosine_mean']:.6f} "
+            f"within_target={result['within_target']}"
+        )
+        return result
+
     def _base_reference_feature_diagnostics(self, base_state):
         """Measure Base drift by replaying cached reference prefixes; never reload Base images."""
         cache = getattr(self, "base_reference_prefix_cache", None)
@@ -2014,17 +2128,30 @@ class Runner:
             # A successful optimizer run is not sufficient: the deployed
             # encoder must remain inside the Base feature-space trust region.
             feature_check = self._base_reference_feature_diagnostics(old_states[0])
+            historical_feature_check = self._historical_feature_anchor_diagnostics(old_states)
             if feature_check.get("available", False) and not feature_check.get("within_target", False):
                 raise RuntimeError(
                     "Session rejected: Base reference feature-space alignment fell below "
                     f"{feature_check.get('minimum_cosine_target')}; observed "
                     f"{feature_check.get('prototype_cosine_min')}."
                 )
-            if hasattr(self, "data_manager") and callable(
+            production_data_protocol = hasattr(self, "data_manager") and callable(
                 getattr(self.data_manager, "get_base_source_dataloader", None)
-            ) and not feature_check.get("available", False):
+            )
+            if production_data_protocol and not feature_check.get("available", False):
                 raise RuntimeError(
-                    "Session rejected: production feature-space preservation check is unavailable."
+                    "Session rejected: production Base feature-space preservation check is unavailable."
+                )
+            if production_data_protocol and not historical_feature_check.get("available", False):
+                raise RuntimeError(
+                    "Session rejected: complete historical class feature-anchor check is unavailable: "
+                    f"{historical_feature_check.get('reason', 'unknown')}."
+                )
+            if production_data_protocol and not historical_feature_check.get("within_target", False):
+                raise RuntimeError(
+                    "Session rejected: at least one historical class prototype drifted below "
+                    f"{historical_feature_check.get('minimum_cosine_target')}; observed "
+                    f"{historical_feature_check.get('class_prototype_cosine_min')}."
                 )
             # Prototype construction and compact feature-anchor capture are
             # part of the same Session transaction, not post-commit side effects.
@@ -2033,6 +2160,7 @@ class Runner:
                 semantic_proto=semantic_proto, session_id=int(task_id),
             )
             result["feature_space_acceptance"] = self._cpu_copy(feature_check)
+            result["historical_feature_space_acceptance"] = self._cpu_copy(historical_feature_check)
             return result
         except Exception:
             # Restore every layer, not just the layer where the exception arose.
@@ -2544,6 +2672,9 @@ class Runner:
     
                 state_dict_list.append(state)
                 feature_space_diagnostics = self._base_reference_feature_diagnostics(state_dict_list[0])
+                feature_space_diagnostics["historical_anchors"] = self._historical_feature_anchor_diagnostics(
+                    state_dict_list
+                )
                 # Task offsets are deliberately absent from prediction. Keep a
                 # zero-valued compatibility field for old checkpoint readers.
                 merged = self.merge_dicts(state_dict_list)
