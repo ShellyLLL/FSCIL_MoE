@@ -1511,10 +1511,27 @@ class Runner:
             ))
         try:
             semantic_proto = self._build_session_semantic_prototype(current_class_name, class_index)
-            return self._train_incremental_task_impl(
+            result = self._train_incremental_task_impl(
                 task_id, train_loader, extract_loader, class_index,
                 current_class_name, old_states, semantic_proto,
             )
+            # A successful optimizer run is not sufficient: the deployed
+            # encoder must remain inside the Base feature-space trust region.
+            feature_check = self._base_holdout_feature_diagnostics(old_states[0])
+            if feature_check.get("available", False) and not feature_check.get("within_target", False):
+                raise RuntimeError(
+                    "Session rejected: Base holdout feature-space alignment fell below "
+                    f"{feature_check.get('minimum_cosine_target')}; observed "
+                    f"{feature_check.get('prototype_cosine_min')}."
+                )
+            if hasattr(self, "data_manager") and callable(
+                getattr(self.data_manager, "get_base_source_dataloader", None)
+            ) and not feature_check.get("available", False):
+                raise RuntimeError(
+                    "Session rejected: production feature-space preservation check is unavailable."
+                )
+            result["feature_space_acceptance"] = self._cpu_copy(feature_check)
+            return result
         except Exception:
             # Restore every layer, not just the layer where the exception arose.
             for block_idx, topology, state in snapshots:
