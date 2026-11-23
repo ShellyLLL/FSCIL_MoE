@@ -935,19 +935,60 @@ class VisionTransformer(nn.Module):
         self.ln_post = LayerNorm(width)
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
 
-    def forward(self, x: torch.Tensor, all_layer_outputs=False,
-                return_moe_aux=False, return_reference=False):
-        x = self.conv1(x)
-        x = x.reshape(x.shape[0], x.shape[1], -1)
-        x = x.permute(0, 2, 1)
+    def _embed_image_tokens(self, images):
+        x = self.conv1(images)
+        x = x.reshape(x.shape[0], x.shape[1], -1).permute(0, 2, 1)
         x = torch.cat([
             self.class_embedding.to(x.dtype) + torch.zeros(
                 x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device
             ),
             x,
         ], dim=1)
-        x = x + self.positional_embedding.to(x.dtype)
-        x = self.ln_pre(x)
+        return self.ln_pre(x + self.positional_embedding.to(x.dtype))
+
+    def first_moe_block(self):
+        blocks = [
+            index for index, block in enumerate(self.transformer.resblocks)
+            if getattr(block, "moe_adapter", None) is not None
+        ]
+        if not blocks:
+            raise RuntimeError("Reference-prefix replay requires at least one installed visual MoE adapter.")
+        return min(blocks)
+
+    @torch.no_grad()
+    def reference_prefix_tokens(self, images):
+        """Cache frozen-ViT tokens immediately before the first MoE insertion block."""
+        start = self.first_moe_block()
+        tokens = self._embed_image_tokens(images.type(self.conv1.weight.dtype)).permute(1, 0, 2)
+        for block in self.transformer.resblocks[:start]:
+            tokens, _ = block(tokens)
+        return tokens.permute(1, 0, 2).detach()
+
+    def forward_from_reference_prefix(self, prefix_tokens, return_moe_aux=False):
+        """Differentiably replay cached frozen-prefix tokens through the current adapter pool."""
+        start = self.first_moe_block()
+        if prefix_tokens.ndim != 3 or prefix_tokens.size(-1) != self.conv1.out_channels:
+            raise ValueError("Feature-anchor prefix tokens must have shape [batch, tokens, ViT width].")
+        adapted = prefix_tokens.to(
+            device=self.conv1.weight.device, dtype=self.conv1.weight.dtype
+        ).permute(1, 0, 2)
+        reference = adapted.detach()
+        aux_list = []
+        for block in self.transformer.resblocks[start:]:
+            adapted, reference, aux = block.forward_dual(adapted, reference)
+            if aux is not None:
+                aux_list.append(aux)
+        tokens = adapted.permute(1, 0, 2)
+        features = self.ln_post(tokens[:, 0, :])
+        if self.proj is not None:
+            features = features @ self.proj
+        if return_moe_aux:
+            return features, aux_list
+        return features
+
+    def forward(self, x: torch.Tensor, all_layer_outputs=False,
+                return_moe_aux=False, return_reference=False):
+        x = self._embed_image_tokens(x)
 
         has_moe = any(block.moe_adapter is not None for block in self.transformer.resblocks)
         if has_moe:
@@ -1085,6 +1126,18 @@ class CLIP(nn.Module):
     @property
     def dtype(self):
         return self.visual.conv1.weight.dtype
+
+    def extract_reference_prefix_tokens(self, images):
+        if not isinstance(self.visual, VisionTransformer):
+            raise TypeError("Feature-anchor replay is supported only by the ViT visual backbone.")
+        return self.visual.reference_prefix_tokens(images.type(self.dtype))
+
+    def extract_img_feature_from_reference_prefix(self, prefix_tokens, return_moe_aux=False):
+        if not isinstance(self.visual, VisionTransformer):
+            raise TypeError("Feature-anchor replay is supported only by the ViT visual backbone.")
+        return self.visual.forward_from_reference_prefix(
+            prefix_tokens, return_moe_aux=return_moe_aux
+        )
 
     def encode_image(self, image, return_moe_aux=False, return_reference=False):
         if not isinstance(self.visual, VisionTransformer):

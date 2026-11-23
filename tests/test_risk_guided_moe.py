@@ -68,6 +68,16 @@ class TinyLifecycleCLIP(nn.Module):
             [TinyLifecycleBlock(), TinyLifecycleBlock()]
         )
 
+    def extract_reference_prefix_tokens(self, images):
+        if images.ndim != 2 or images.size(-1) != 8:
+            raise ValueError("TinyLifecycleCLIP expects [batch, 8] feature-like images.")
+        return images.detach().unsqueeze(1)
+
+    def extract_img_feature_from_reference_prefix(self, prefix_tokens):
+        if prefix_tokens.ndim != 3 or prefix_tokens.size(1) != 1 or prefix_tokens.size(2) != 8:
+            raise ValueError("TinyLifecycleCLIP feature anchors must have shape [batch, 1, 8].")
+        return self.encode_image(prefix_tokens[:, 0, :])
+
     def encode_image(self, images, return_moe_aux=False, return_reference=False):
         if images.ndim != 2 or images.size(-1) != 8:
             raise ValueError("TinyLifecycleCLIP expects [batch, 8] feature-like images.")

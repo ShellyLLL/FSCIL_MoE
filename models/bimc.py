@@ -145,6 +145,19 @@ class BiMC(nn.Module):
         return self
 
     @torch.no_grad()
+    def extract_reference_prefix_tokens(self, images):
+        method = getattr(self.clip_model, "extract_reference_prefix_tokens", None)
+        if not callable(method):
+            raise TypeError("The visual encoder does not expose frozen-reference prefix tokens.")
+        return method(images)
+
+    def extract_img_feature_from_reference_prefix(self, prefix_tokens):
+        method = getattr(self.clip_model, "extract_img_feature_from_reference_prefix", None)
+        if not callable(method):
+            raise TypeError("The visual encoder does not expose differentiable feature-anchor replay.")
+        return method(prefix_tokens)
+
+    @torch.no_grad()
     def collect_blockwise_cls_features(self, loader):
         """Collect frozen-reference router CLS inputs, labels and stable support source ids."""
         block_features, fallback_source_id = {}, 0

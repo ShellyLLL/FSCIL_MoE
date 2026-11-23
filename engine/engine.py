@@ -110,7 +110,7 @@ class Runner:
         loss_cfg = _cfg_value(trainer_cfg, "LOSS", None)
         dataset_cfg = _cfg_value(self.cfg, "DATASET", None)
         return {
-            "version": 12,
+            "version": 13,
             "decision_unit": "incremental_session_per_layer",
             "sample_score": "minimum_standardized_reconstruction_error_over_current_deployed_RDs",
             "threshold_refresh": "recalibrate_base_pseudo_sessions_after_every_expert_pool_change",
@@ -118,15 +118,15 @@ class Runner:
             "decision": "pooled_session_q90_greater_than_base_pseudo_session_q95_for_same_support_size",
             "prototype_training_calibration": "same_base_semantic_retrieval_for_full_and_source_exclusive_loo_visual_prototypes",
             "reuse_policy": "freeze_existing_experts_descriptors_and_router_without_parameter_updates",
-            "feature_space_diagnostic": "fixed_base_holdout_class_prototype_alignment_and_base_classifier_accuracy_with_session_rollback",
+            "feature_space_diagnostic": "fixed_historical_final_embedding_anchor_distillation_plus_base_holdout_hard_acceptance",
             "threshold_quantile": float(_cfg_value(moe_cfg, "EXPANSION_THRESHOLD_QUANTILE", 0.95)),
             "calibration_groups": int(_cfg_value(moe_cfg, "EXPANSION_CALIBRATION_GROUPS", 256)),
-            "expert_training_scope": "all_current_session_samples",
+            "expert_training_scope": "all_current_session_samples_jointly_across_all_expanded_layers",
             "expert_input_space": "frozen_reference_vit_tokens_for_all_expert_generations",
-            "gradient_clipping": "separate_functional_and_descriptor_groups_norm_1.0",
+            "gradient_clipping": "joint_all_expanded_functional_parameters_and_all_new_descriptors_norm_1.0",
             "descriptor_training_scope": "source_disjoint_fit_partition_of_current_session_reference_cls",
             "descriptor_calibration_scope": "source_disjoint_heldout_partition_of_current_session_reference_cls",
-            "router_learning_signal": "global_CE_plus_old_route_and_expert_residual_PD",
+            "router_learning_signal": "joint_global_CE_projected_against_final_feature_and_local_residual_preservation",
             "visual_moe_enabled": bool(_cfg_value(moe_cfg, "ENABLE", False)),
             "insert_blocks": [int(value) for value in _cfg_value(moe_cfg, "INSERT_BLOCKS", [])],
             "num_base_experts": int(_cfg_value(moe_cfg, "NUM_BASE_EXPERTS", 4)),
@@ -153,6 +153,9 @@ class Runner:
                 "epochs": int(_cfg_value(incremental_cfg, "EPOCHS", 6)),
                 "logit_scale": float(_cfg_value(incremental_cfg, "LOGIT_SCALE", 100.0)),
                 "feature_space_preservation_weight": float(_cfg_value(incremental_cfg, "FEATURE_SPACE_PRESERVATION_WEIGHT", 1.0)),
+                "local_residual_preservation_weight": float(_cfg_value(incremental_cfg, "LOCAL_RESIDUAL_PRESERVATION_WEIGHT", 1.0)),
+                "feature_anchor_batch_size": int(_cfg_value(moe_cfg, "FEATURE_SPACE_ANCHOR_BATCH_SIZE", 16)),
+                "feature_anchors_per_class": int(_cfg_value(moe_cfg, "FEATURE_SPACE_ANCHORS_PER_CLASS", 2)),
                 "rd_weight": float(_cfg_value(incremental_cfg, "RD_WEIGHT", 1.0)),
             },
             "optimizer": {
@@ -476,9 +479,9 @@ class Runner:
         if missing:
             raise ValueError(f"Resume checkpoint is missing required fields: {missing}")
         schema = int(payload["schema_version"])
-        if schema != 32:
+        if schema != 33:
             raise ValueError(
-                "This branch uses pooled Session-Q90 expansion and calibrated-LOO prototype checkpoint schema (32); "
+                "This branch uses pooled Session-Q90 expansion and calibrated-LOO prototype checkpoint schema (33); "
                 "older expansion-policy checkpoints are incompatible."
             )
         checkpoint_policy = payload.get("expansion_policy")
@@ -738,7 +741,7 @@ class Runner:
         directory.mkdir(parents=True, exist_ok=True)
         topology = self.model_without_dp.export_moe_topology()
         payload = {
-            "schema_version": 32,
+            "schema_version": 33,
             "completed_session": int(completed_session),
             "base_calibration_source_ids": list(self.base_calibration_source_ids),
             "base_holdout_feature_prototypes": self._cpu_copy(getattr(self, "base_holdout_feature_prototypes", None)),
