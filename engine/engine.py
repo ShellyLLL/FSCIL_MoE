@@ -110,8 +110,8 @@ class Runner:
         loss_cfg = _cfg_value(trainer_cfg, "LOSS", None)
         dataset_cfg = _cfg_value(self.cfg, "DATASET", None)
         return {
-            "version": 11,
-            "decision_unit": "incremental_session",
+            "version": 12,
+            "decision_unit": "incremental_session_per_layer",
             "sample_score": "minimum_standardized_reconstruction_error_over_current_deployed_RDs",
             "threshold_refresh": "recalibrate_base_pseudo_sessions_after_every_expert_pool_change",
             "session_score": "pooled_q90_of_all_session_sample_scores",
@@ -476,9 +476,9 @@ class Runner:
         if missing:
             raise ValueError(f"Resume checkpoint is missing required fields: {missing}")
         schema = int(payload["schema_version"])
-        if schema != 31:
+        if schema != 32:
             raise ValueError(
-                "This branch uses pooled Session-Q90 expansion and calibrated-LOO prototype checkpoint schema (31); "
+                "This branch uses pooled Session-Q90 expansion and calibrated-LOO prototype checkpoint schema (32); "
                 "older expansion-policy checkpoints are incompatible."
             )
         checkpoint_policy = payload.get("expansion_policy")
@@ -738,7 +738,7 @@ class Runner:
         directory.mkdir(parents=True, exist_ok=True)
         topology = self.model_without_dp.export_moe_topology()
         payload = {
-            "schema_version": 31,
+            "schema_version": 32,
             "completed_session": int(completed_session),
             "base_calibration_source_ids": list(self.base_calibration_source_ids),
             "base_holdout_feature_prototypes": self._cpu_copy(getattr(self, "base_holdout_feature_prototypes", None)),
@@ -1040,23 +1040,21 @@ class Runner:
                     f"across {configured_classes} classes without within-Session replacement."
                 )
             group_scores, class_ids = [], list(class_rows)
-        for _ in range(groups):
-            selected = torch.randperm(len(class_ids), generator=generator)[:configured_classes].tolist()
-            selected_classes = [class_ids[index] for index in selected]
-            session_rows = []
-            for position, class_id in enumerate(selected_classes):
-                count = per_class_counts[position]
-                if count:
-                    rows = class_rows[class_id]
-                    order = torch.randperm(rows.numel(), generator=generator)[:count]
-                    session_rows.append(cpu_scores[rows[order]])
-            if len(session_rows) != configured_classes:
-                raise RuntimeError("Base pseudo-Session failed to sample every class.")
-            # Match the deployment statistic exactly: pool all sampled
-            # Session rows, then take one Q90. No per-class quantile/max.
-            pooled_scores = torch.cat(session_rows, dim=0)
-            group_scores.append(torch.quantile(pooled_scores, 0.90))
-        thresholds[int(size)] = float(torch.quantile(torch.stack(group_scores), quantile).item())
+            for _ in range(groups):
+                selected = torch.randperm(len(class_ids), generator=generator)[:configured_classes].tolist()
+                selected_classes = [class_ids[index] for index in selected]
+                session_rows = []
+                for position, class_id in enumerate(selected_classes):
+                    count = per_class_counts[position]
+                    if count:
+                        rows = class_rows[class_id]
+                        order = torch.randperm(rows.numel(), generator=generator)[:count]
+                        session_rows.append(cpu_scores[rows[order]])
+                if len(session_rows) != configured_classes:
+                    raise RuntimeError("Base pseudo-Session failed to sample every class.")
+                pooled_scores = torch.cat(session_rows, dim=0)
+                group_scores.append(torch.quantile(pooled_scores, 0.90))
+            thresholds[int(size)] = float(torch.quantile(torch.stack(group_scores), quantile).item())
         print(
             f"=> [Session-Threshold][B{block_idx}] "
             + " ".join(f"N={size}:Q95={value:.6f}" for size, value in sorted(thresholds.items()))
@@ -1611,7 +1609,7 @@ class Runner:
                 "session_q90": float(decision.session_q90),
                 "session_q95_threshold": float(decision.threshold),
                 "support_count": int(decision.support_count),
-                "class_q90": [{"class_id": int(cid), "score": float(value)} for cid, value in decision.class_q90],
+                "session_q90": float(decision.session_q90),
             })
             if not decision.expand:
                 history = self._train_reused_router(block_idx, expansion_features[int(block_idx)])
