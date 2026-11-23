@@ -153,6 +153,27 @@ def build_lifecycle_runner():
         F.normalize(torch.eye(8)[torch.as_tensor(class_index, dtype=torch.long)], dim=-1),
         F.normalize(torch.eye(8)[torch.as_tensor(class_index, dtype=torch.long)], dim=-1),
     )
+
+    # This fixture deliberately has no text tower/GPT-description files.
+    # Keep the Session transaction integration test focused on lifecycle,
+    # prototype alignment, and feature-anchor persistence while using the
+    # real TinyLifecycleCLIP visual path.
+    @torch.no_grad()
+    def _build_test_task_statistics(class_names, loader, class_index):
+        features, labels, image_proto, reference_proto = model.inference_all_img_feature(loader)
+        text_features, _ = runner._text_prototypes(class_names, class_index)
+        class_ids = torch.as_tensor(class_index, dtype=torch.long)
+        support_count = torch.stack([labels.eq(int(cid)).sum() for cid in class_ids])
+        return {
+            "class_ids": class_ids,
+            "image_proto": image_proto,
+            "reference_image_proto": reference_proto,
+            "text_features": text_features,
+            "description_proto": text_features.clone(),
+            "support_count": support_count,
+        }
+
+    model.build_task_statistics = _build_test_task_statistics
     return runner, model
 
 

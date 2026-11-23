@@ -629,7 +629,7 @@ class Runner:
                     or final_features.size(0) != anchor_sources.numel()
                     or anchor_labels.numel() != anchor_sources.numel()
                     or not torch.equal(torch.unique(anchor_labels, sorted=True), anchor_class_ids.sort().values)
-                    or final_features.size(1) != int(self.model_without_dp.clip_model.visual.output_dim)
+                    or final_features.size(1) != int(torch.as_tensor(state["image_proto"]).size(1))
                     or final_features.size(0) == 0
                     or not torch.isfinite(prefix_tokens.float()).all()
                     or not torch.isfinite(final_features.float()).all()
@@ -1628,9 +1628,8 @@ class Runner:
             # part of the same Session transaction, not post-commit side effects.
             result["task_state"] = self._build_and_refine_task_state(
                 current_class_name, extract_loader, class_index, old_states,
-                semantic_proto=semantic_proto,
+                semantic_proto=semantic_proto, session_id=int(task_id),
             )
-            result["task_state"]["creation_session"] = int(task_id)
             result["feature_space_acceptance"] = self._cpu_copy(feature_check)
             return result
         except Exception:
@@ -2001,7 +2000,7 @@ class Runner:
         }
 
     def _build_and_refine_task_state(self, current_class_name, extract_loader, class_index,
-                                     old_states, semantic_proto=None):
+                                     old_states, semantic_proto=None, session_id=0):
         """Build a novel visual prototype, then apply the single semantic-guided calibration."""
         state = self.model_without_dp.build_task_statistics(
             current_class_name, extract_loader, class_index,
@@ -2019,9 +2018,10 @@ class Runner:
         state["class_ids"] = torch.as_tensor(class_index, device=self.device, dtype=torch.long)
         state["class_index"] = state["class_ids"]
         state["encoder_version"] = 0
+        state["creation_session"] = int(session_id)
         state["anchor_by_block"] = self._collect_class_anchors(extract_loader)
         state["final_feature_anchors"] = self._collect_final_feature_anchors(
-            extract_loader, int(state.get("creation_session", 0))
+            extract_loader, int(session_id)
         )
         return state
 
