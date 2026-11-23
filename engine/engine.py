@@ -1942,7 +1942,7 @@ class Runner:
             with torch.no_grad():
                 errors = descriptor.reconstruction_error(context["calibration_values"])
                 descriptor.update_reference(errors)
-                descriptor.assert_ready()
+                context['adapter'].assert_descriptors_ready()
                 context["history"]["rd_effective_reference_count"] = float(
                     descriptor.effective_error_count.item()
                 )

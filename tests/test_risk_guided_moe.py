@@ -320,6 +320,8 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         target = anchors["final_features"].float().to(runner.device)
         loss = runner._final_feature_anchor_loss(prefix, target)
         self.assertLess(float(loss), 1e-6)
+        for block in model.clip_model.visual.transformer.resblocks:
+            block.moe_adapter.freeze_all()
         adapter = model.clip_model.visual.transformer.resblocks[0].moe_adapter
         adapter.add_expert(session_id=1, reduction=2)
         adapter.set_newest_trainable()
@@ -1026,7 +1028,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             }
             checkpoint_path = runner.save_checkpoint(0, [state])
             payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-            self.assertEqual(payload["schema_version"], 32)
+            self.assertEqual(payload["schema_version"], 33)
             self.assertTrue(payload["base_calibration_source_ids"])
             self.assertIn("expansion_thresholds", payload)
             self.assertEqual(payload["expansion_thresholds"], runner.expansion_thresholds)
@@ -1370,6 +1372,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             "text_features": F.normalize(torch.eye(8)[[0]], dim=-1),
             "description_proto": F.normalize(torch.eye(8)[[0]], dim=-1),
             "anchor_by_block": base_anchors,
+            "final_feature_anchors": runner._collect_final_feature_anchors([base_support], 0),
             "creation_session": 0,
         }
         for _, adapter in runner._moe_adapters():
