@@ -404,6 +404,10 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         self.assertEqual(result["expanded"], [])
         self.assertEqual([row["block_idx"] for row in result["reused"]], [0, 1])
         self.assertFalse(result["trained"])
+        # Both novel support classes become known-domain reference distributions
+        # for future expansion decisions even though no expert was added.
+        for block, threshold in runner.expansion_thresholds.items():
+            self.assertTrue(torch.isfinite(torch.as_tensor(list(threshold.values()))).all())
 
         for block, adapter in runner._moe_adapters():
             history = result["training"][block]

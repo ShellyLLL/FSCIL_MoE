@@ -115,7 +115,7 @@ class Runner:
             "version": 16,
             "decision_unit": "incremental_session_per_layer",
             "sample_score": "minimum_standardized_reconstruction_error_over_current_deployed_RDs",
-            "threshold_refresh": "recalibrate_from_cached_base_reference_cls_after_every_expert_pool_change",
+            "threshold_refresh": "recalibrate_from_all_accepted_session_reference_cls_after_every_successful_session",
             "session_score": "pooled_q90_of_all_session_sample_scores",
             "decision": "pooled_session_q90_greater_than_base_pseudo_session_q95_for_same_support_size",
             "prototype_training_calibration": "same_base_semantic_retrieval_for_full_and_source_exclusive_loo_visual_prototypes",
@@ -2008,6 +2008,12 @@ class Runner:
         if not expanded_contexts:
             for _, adapter in self._moe_adapters():
                 adapter.freeze_all()
+            # Even when every layer reuses its pool, the accepted Session adds
+            # a known feature domain for the next Session's novelty threshold.
+            for block_idx in self.model_without_dp.expandable_blocks():
+                self._refresh_block_expansion_threshold(
+                    block_idx, current_reference_features=expansion_features, old_states=old_states
+                )
             return {
                 "trained": False, "decisions": decisions, "expanded": [],
                 "reused": reused, "training": {block: value["history"] for block, value in contexts.items()},
@@ -2198,9 +2204,6 @@ class Runner:
         # Recalibrate thresholds after every new RD has joined its layer's deployed pool.
         for block_idx, context in contexts.items():
             if context["mode"] == "expand":
-                self._refresh_block_expansion_threshold(
-                    block_idx, current_reference_features=expansion_features, old_states=old_states
-                )
                 expanded.append({
                     "block_idx": int(block_idx), "expert_id": int(context["expert_id"]),
                     "descriptor_anchor_id": int(context["adapter"].descriptors[-1].anchor_expert_id),
@@ -2209,6 +2212,12 @@ class Runner:
                 })
         for _, adapter in self._moe_adapters():
             adapter.freeze_all()
+        # Recalibrate every layer after all new RDs have valid error statistics.
+        # Reused-only layers also learn from this accepted Session's known domain.
+        for block_idx in self.model_without_dp.expandable_blocks():
+            self._refresh_block_expansion_threshold(
+                block_idx, current_reference_features=expansion_features, old_states=old_states
+            )
         self._assert_moe_frozen("joint incremental Session completion")
         histories = {block: context["history"] for block, context in contexts.items()}
         for block, history in histories.items():
