@@ -1140,20 +1140,20 @@ class Runner:
             quotient, remainder = divmod(size, configured_classes)
             per_class_counts = [quotient + (1 if index < remainder else 0)
                                 for index in range(configured_classes)]
-            if configured_classes > len(class_rows):
-                raise ValueError("Base reference has fewer classes than an incremental Session.")
-            if any(
-                count > min(class_rows[class_id].numel() for class_id in class_rows)
-                for count in per_class_counts if count > 0
-            ):
+            required_per_class = max(per_class_counts)
+            eligible_classes = [
+                class_id for class_id in class_rows
+                if class_rows[class_id].numel() >= required_per_class
+            ]
+            if configured_classes > len(eligible_classes):
                 raise ValueError(
-                    f"Base reference cannot form a class-balanced Session of {size} samples "
-                    f"across {configured_classes} classes without within-Session replacement."
+                    f"Known reference cache has only {len(eligible_classes)} classes with "
+                    f"at least {required_per_class} sources; cannot calibrate {configured_classes}-class Sessions."
                 )
-            group_scores, class_ids = [], list(class_rows)
+            group_scores = []
             for _ in range(groups):
-                selected = torch.randperm(len(class_ids), generator=generator)[:configured_classes].tolist()
-                selected_classes = [class_ids[index] for index in selected]
+                selected = torch.randperm(len(eligible_classes), generator=generator)[:configured_classes].tolist()
+                selected_classes = [eligible_classes[index] for index in selected]
                 session_rows = []
                 for position, class_id in enumerate(selected_classes):
                     count = per_class_counts[position]
@@ -1404,6 +1404,9 @@ class Runner:
     ):
         """Recalibrate a changed pool over Base and every previously accepted Session domain."""
         feature_items = []
+        base_cache = getattr(self, "base_reference_cls_features", {}).get(int(block_idx))
+        if base_cache is not None:
+            feature_items.append(base_cache)
         for state in (old_states or []):
             cache_by_block = state.get("reference_cls_by_block", {})
             cache = cache_by_block.get(int(block_idx), cache_by_block.get(str(block_idx)))
@@ -1414,25 +1417,39 @@ class Runner:
             if current is not None:
                 feature_items.append(current)
         if not feature_items:
-            fallback = getattr(self, "base_reference_cls_features", {}).get(int(block_idx))
-            if fallback is not None:
-                feature_items.append(fallback)
-        if not feature_items:
             raise RuntimeError(
                 f"Block {int(block_idx)} has no cached known-domain CLS features for threshold refresh."
             )
-        values_rows, labels_rows, source_rows = [], [], []
+
+        # Base cache and Base task-state cache may overlap. Deduplicate by stable
+        # source identity while rejecting inconsistent labels or feature rows.
+        rows_by_source = {}
         for item in feature_items:
-            values_rows.append(torch.as_tensor(item["cls_in"]).float())
-            labels_rows.append(torch.as_tensor(item["labels"]).long().reshape(-1))
-            source_rows.append(torch.as_tensor(item["source_ids"]).long().reshape(-1))
-        values = torch.cat(values_rows, dim=0)
-        labels = torch.cat(labels_rows, dim=0)
-        sources = torch.cat(source_rows, dim=0)
-        if (values.size(0) != labels.numel() or labels.numel() != sources.numel()
-                or torch.unique(sources).numel() != sources.numel()
-                or not torch.isfinite(values).all()):
-            raise ValueError("Known-domain threshold CLS cache contains duplicate sources or invalid rows.")
+            values = torch.as_tensor(item["cls_in"]).float()
+            labels = torch.as_tensor(item["labels"]).long().reshape(-1)
+            sources = torch.as_tensor(item["source_ids"]).long().reshape(-1)
+            if (values.ndim != 2 or values.size(0) == 0
+                    or values.size(0) != labels.numel() or labels.numel() != sources.numel()
+                    or not torch.isfinite(values).all()):
+                raise ValueError("Known-domain threshold CLS cache contains malformed rows.")
+            for row, source in enumerate(sources.tolist()):
+                source = int(source)
+                label = int(labels[row])
+                if source in rows_by_source:
+                    old_label, old_value = rows_by_source[source]
+                    if old_label != label or not torch.allclose(
+                        old_value.float(), values[row].float(), rtol=1e-3, atol=1e-3
+                    ):
+                        raise ValueError(
+                            f"Known-domain threshold caches disagree for source {source}."
+                        )
+                    continue
+                rows_by_source[source] = (label, values[row].detach().cpu())
+        ordered_sources = sorted(rows_by_source)
+        values = torch.stack([rows_by_source[source][1] for source in ordered_sources])
+        labels = torch.as_tensor(
+            [rows_by_source[source][0] for source in ordered_sources], dtype=torch.long
+        )
         adapter = self._adapter_by_block(block_idx)
         sizes = sorted(self.expansion_thresholds.get(int(block_idx), {}).keys())
         if not sizes:
@@ -1443,7 +1460,7 @@ class Runner:
         self.expansion_thresholds[int(block_idx)] = refreshed
         print(
             f"=> [Session-Threshold][B{int(block_idx)}] refreshed for {adapter.num_experts} experts "
-            f"from {len(feature_items)} accepted Session caches / {values.size(0)} reference rows."
+            f"from {len(feature_items)} accepted Session caches / {values.size(0)} unique reference rows."
         )
 
     @torch.no_grad()
