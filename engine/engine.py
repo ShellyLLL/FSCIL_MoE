@@ -55,9 +55,10 @@ class Runner:
         self.acc_list, self.task_acc_list = [], []
         self.session_diagnostics = []
         self.expansion_thresholds = {}
-        self.base_calibration_source_ids = []
-        self.base_holdout_feature_prototypes = None
-        self.base_holdout_class_ids = None
+        self.base_reference_source_ids = []
+        self.base_reference_cls_features = {}
+        self.base_reference_feature_prototypes = None
+        self.base_reference_class_ids = None
         self.evaluator = AccuracyEvaluator(self.data_manager.class_index_in_task)
         self._resume_completed_session = -1
         self._resume_state_dict_list = []
@@ -100,7 +101,7 @@ class Runner:
         return getattr(self.cfg.TRAINER.BiMC, "CHECKPOINT", None)
 
     def _expansion_policy(self):
-        """Checkpointed contract for Base-calibrated Session-Q90/Q95 expansion."""
+        """Checkpointed contract for all-support RD fitting and cached Base-reference expansion."""
         moe_cfg = self._visual_moe_cfg()
         model_cfg = _cfg_value(self.cfg, "MODEL", None)
         backbone_cfg = _cfg_value(model_cfg, "BACKBONE", None)
@@ -110,22 +111,24 @@ class Runner:
         loss_cfg = _cfg_value(trainer_cfg, "LOSS", None)
         dataset_cfg = _cfg_value(self.cfg, "DATASET", None)
         return {
-            "version": 13,
+            "version": 14,
             "decision_unit": "incremental_session_per_layer",
             "sample_score": "minimum_standardized_reconstruction_error_over_current_deployed_RDs",
-            "threshold_refresh": "recalibrate_base_pseudo_sessions_after_every_expert_pool_change",
+            "threshold_refresh": "recalibrate_from_cached_base_reference_cls_after_every_expert_pool_change",
             "session_score": "pooled_q90_of_all_session_sample_scores",
             "decision": "pooled_session_q90_greater_than_base_pseudo_session_q95_for_same_support_size",
             "prototype_training_calibration": "same_base_semantic_retrieval_for_full_and_source_exclusive_loo_visual_prototypes",
             "reuse_policy": "freeze_existing_experts_descriptors_and_router_without_parameter_updates",
-            "feature_space_diagnostic": "fixed_historical_final_embedding_anchor_distillation_plus_base_holdout_hard_acceptance",
+            "feature_space_diagnostic": "fixed_historical_final_embedding_anchor_distillation_plus_base_reference_feature_drift_acceptance",
             "threshold_quantile": float(_cfg_value(moe_cfg, "EXPANSION_THRESHOLD_QUANTILE", 0.95)),
             "calibration_groups": int(_cfg_value(moe_cfg, "EXPANSION_CALIBRATION_GROUPS", 256)),
             "expert_training_scope": "all_current_session_samples_jointly_across_all_expanded_layers",
             "expert_input_space": "frozen_reference_vit_tokens_for_all_expert_generations",
             "gradient_clipping": "joint_all_expanded_functional_parameters_and_all_new_descriptors_norm_1.0",
-            "descriptor_training_scope": "source_disjoint_fit_partition_of_current_session_reference_cls",
-            "descriptor_calibration_scope": "source_disjoint_heldout_partition_of_current_session_reference_cls",
+            "base_descriptor_training_scope": "all_base_reference_cls_weighted_by_base_router_responsibility",
+            "descriptor_training_scope": "all_current_session_reference_cls",
+            "descriptor_calibration_scope": "all_current_session_reference_cls_weighted_by_deployed_expert_responsibility",
+            "base_threshold_reference_scope": "deterministic_class_balanced_cached_base_reference_cls",
             "router_learning_signal": "joint_global_CE_projected_against_final_feature_and_local_residual_preservation",
             "visual_moe_enabled": bool(_cfg_value(moe_cfg, "ENABLE", False)),
             "insert_blocks": [int(value) for value in _cfg_value(moe_cfg, "INSERT_BLOCKS", [])],
@@ -473,17 +476,17 @@ class Runner:
         required = (
             "schema_version", "completed_session", "model_state", "task_states",
             "support_manifest", "moe_topology", "expansion_policy", "expansion_thresholds",
-            "base_calibration_source_ids", "base_holdout_feature_prototypes",
-            "base_holdout_class_ids",
+            "base_reference_source_ids", "base_reference_cls_features",
+            "base_reference_feature_prototypes", "base_reference_class_ids",
         )
         missing = [key for key in required if key not in payload]
         if missing:
             raise ValueError(f"Resume checkpoint is missing required fields: {missing}")
         schema = int(payload["schema_version"])
-        if schema != 33:
+        if schema != 34:
             raise ValueError(
-                "This branch uses pooled Session-Q90 expansion and calibrated-LOO prototype checkpoint schema (33); "
-                "older expansion-policy checkpoints are incompatible."
+                "This branch uses all-support responsibility-weighted RD fitting and cached Base-reference "
+                "Session-Q90 expansion checkpoint schema (34); older expansion-policy checkpoints are incompatible."
             )
         checkpoint_policy = payload.get("expansion_policy")
         if checkpoint_policy != self._expansion_policy():
@@ -529,12 +532,48 @@ class Runner:
             int(block): {int(size): float(value) for size, value in by_size.items()}
             for block, by_size in thresholds.items()
         }
-        self.base_calibration_source_ids = [
-            int(value) for value in payload["base_calibration_source_ids"]
+        self.base_reference_source_ids = [
+            int(value) for value in payload["base_reference_source_ids"]
         ]
-        if (not self.base_calibration_source_ids
-                or len(set(self.base_calibration_source_ids)) != len(self.base_calibration_source_ids)):
-            raise ValueError("Checkpoint Base calibration source ids must be non-empty and unique.")
+        if (not self.base_reference_source_ids
+                or len(set(self.base_reference_source_ids)) != len(self.base_reference_source_ids)):
+            raise ValueError("Checkpoint Base reference source ids must be non-empty and unique.")
+        raw_reference_cache = payload.get("base_reference_cls_features")
+        if not isinstance(raw_reference_cache, dict):
+            raise ValueError("Checkpoint is missing cached Base reference CLS features.")
+        expected_reference_blocks = {int(value) for value in expected_topology_blocks}
+        normalized_reference_cache = {}
+        expected_base_ids = torch.as_tensor(
+            payload["task_states"][0].get("class_ids", payload["task_states"][0].get("class_index")),
+            dtype=torch.long,
+        ).reshape(-1)
+        for block_idx in expected_reference_blocks:
+            cache = raw_reference_cache.get(block_idx, raw_reference_cache.get(str(block_idx)))
+            if not isinstance(cache, dict):
+                raise ValueError(f"Checkpoint is missing Base reference CLS cache for block {block_idx}.")
+            cls_in = torch.as_tensor(cache.get("cls_in")).float()
+            labels = torch.as_tensor(cache.get("labels"), dtype=torch.long).reshape(-1)
+            source_ids = torch.as_tensor(cache.get("source_ids"), dtype=torch.long).reshape(-1)
+            expected_sources = torch.as_tensor(self.base_reference_source_ids, dtype=torch.long)
+            adapter = self._adapter_by_block(block_idx)
+            if (cls_in.ndim != 2 or cls_in.size(1) != adapter.d_model
+                    or cls_in.size(0) == 0 or labels.numel() != cls_in.size(0)
+                    or source_ids.numel() != cls_in.size(0)
+                    or not torch.isfinite(cls_in).all()
+                    or torch.unique(source_ids).numel() != source_ids.numel()
+                    or not torch.equal(source_ids, expected_sources)
+                    or not torch.equal(torch.unique(labels, sorted=True), expected_base_ids.sort().values)):
+                raise ValueError(
+                    f"Checkpoint Base reference CLS cache for block {block_idx} is malformed or misaligned."
+                )
+            normalized_reference_cache[block_idx] = {
+                "cls_in": cls_in.cpu().half(),
+                "labels": labels.cpu(),
+                "source_ids": source_ids.cpu(),
+            }
+        if set(normalized_reference_cache) != expected_reference_blocks:
+            raise ValueError("Checkpoint Base reference CLS cache blocks do not match the MoE topology.")
+        self.base_reference_cls_features = normalized_reference_cache
         if any(
             size <= 0 or not np.isfinite(value)
             for by_size in self.expansion_thresholds.values()
@@ -542,10 +581,10 @@ class Runner:
         ):
             raise ValueError("Checkpoint contains invalid Session expansion thresholds.")
 
-        holdout_prototypes = payload["base_holdout_feature_prototypes"]
-        holdout_class_ids = payload["base_holdout_class_ids"]
+        holdout_prototypes = payload["base_reference_feature_prototypes"]
+        holdout_class_ids = payload["base_reference_class_ids"]
         if (holdout_prototypes is None) != (holdout_class_ids is None):
-            raise ValueError("Checkpoint Base holdout feature prototypes and class ids must be jointly present.")
+            raise ValueError("Checkpoint Base reference feature prototypes and class ids must be jointly present.")
         if holdout_prototypes is not None:
             holdout_prototypes = torch.as_tensor(holdout_prototypes).float()
             holdout_class_ids = torch.as_tensor(holdout_class_ids, dtype=torch.long).reshape(-1)
@@ -558,14 +597,14 @@ class Runner:
                     or holdout_prototypes.size(1) != int(self.model_without_dp.clip_model.visual.output_dim)
                     or not torch.isfinite(holdout_prototypes).all()
                     or not torch.equal(holdout_class_ids.sort().values, expected_base_ids.sort().values)):
-                raise ValueError("Checkpoint Base holdout feature anchors are malformed or misaligned.")
-            self.base_holdout_feature_prototypes = F.normalize(holdout_prototypes, dim=-1).cpu().half()
-            self.base_holdout_class_ids = holdout_class_ids.cpu()
+                raise ValueError("Checkpoint Base reference feature anchors are malformed or misaligned.")
+            self.base_reference_feature_prototypes = F.normalize(holdout_prototypes, dim=-1).cpu().half()
+            self.base_reference_class_ids = holdout_class_ids.cpu()
         else:
             if callable(getattr(getattr(self, "data_manager", None), "get_base_source_dataloader", None)):
-                raise ValueError("Production checkpoint is missing Base holdout feature-space anchors.")
-            self.base_holdout_feature_prototypes = None
-            self.base_holdout_class_ids = None
+                raise ValueError("Production checkpoint is missing Base reference feature-space anchors.")
+            self.base_reference_feature_prototypes = None
+            self.base_reference_class_ids = None
         self.model_without_dp.rebuild_moe_topology(topology)
         self.model_without_dp.load_state_dict(payload["model_state"], strict=True)
         for _, adapter in self._moe_adapters():
@@ -762,11 +801,12 @@ class Runner:
         directory.mkdir(parents=True, exist_ok=True)
         topology = self.model_without_dp.export_moe_topology()
         payload = {
-            "schema_version": 33,
+            "schema_version": 34,
             "completed_session": int(completed_session),
-            "base_calibration_source_ids": list(self.base_calibration_source_ids),
-            "base_holdout_feature_prototypes": self._cpu_copy(getattr(self, "base_holdout_feature_prototypes", None)),
-            "base_holdout_class_ids": self._cpu_copy(getattr(self, "base_holdout_class_ids", None)),
+            "base_reference_source_ids": list(self.base_reference_source_ids),
+            "base_reference_cls_features": self._cpu_copy(self.base_reference_cls_features),
+            "base_reference_feature_prototypes": self._cpu_copy(getattr(self, "base_reference_feature_prototypes", None)),
+            "base_reference_class_ids": self._cpu_copy(getattr(self, "base_reference_class_ids", None)),
             "expansion_thresholds": self._cpu_copy(self.expansion_thresholds),
             "model_state": self._cpu_copy(self.model_without_dp.state_dict()),
             "moe_topology": topology,
@@ -816,7 +856,7 @@ class Runner:
         self, adapter, expert_id, values, epochs, sample_weights=None,
         calibration_values=None, calibration_weights=None,
     ):
-        """Fit a Base RD or a denoising low-rank residual on a frozen historical RD anchor."""
+        """Fit a Base RD or anchored residual; reference errors may reuse support sources."""
         descriptor = adapter.descriptors[int(expert_id)]
         descriptor.float()
         values = values.detach().float()
@@ -889,99 +929,96 @@ class Runner:
                 descriptor.retract_basis_()
         descriptor.eval()
         with torch.no_grad():
-            if calibration_values is None:
-                raise ValueError("AE reference statistics require independent held-out representations.")
-            reference_values = torch.as_tensor(
-                calibration_values, device=values.device
-            ).float()
-            minimum_calibration = 2
-            if (reference_values.ndim != 2 or reference_values.size(0) < minimum_calibration
+            reference_values = (
+                values if calibration_values is None
+                else torch.as_tensor(calibration_values, device=values.device).float()
+            )
+            minimum_reference = 2
+            if (reference_values.ndim != 2 or reference_values.size(0) < minimum_reference
                     or not torch.isfinite(reference_values).all()):
                 raise ValueError(
-                    f"AE error calibration requires at least {minimum_calibration} "
-                    "finite independent held-out representations."
+                    f"AE error calibration requires at least {minimum_reference} "
+                    "finite reference representations."
                 )
             errors = descriptor.reconstruction_error(reference_values)
-            calibration_weights = torch.ones_like(errors) if calibration_weights is None else torch.as_tensor(
-                calibration_weights, device=errors.device, dtype=torch.float32
-            ).reshape(-1)
-            if calibration_weights.numel() != errors.numel():
-                raise ValueError("AE calibration responsibilities must align with held-out sources.")
-            descriptor.update_reference(errors, calibration_weights)
+            if calibration_weights is None:
+                reference_weights = (
+                    weights if calibration_values is None else torch.ones_like(errors)
+                )
+            else:
+                reference_weights = torch.as_tensor(
+                    calibration_weights, device=errors.device, dtype=torch.float32
+                ).reshape(-1)
+            if reference_weights.numel() != errors.numel():
+                raise ValueError("AE calibration responsibilities must align with reference sources.")
+            descriptor.update_reference(errors, reference_weights)
             if int(descriptor.error_count.item()) < 2:
-                raise RuntimeError("AE descriptors require at least two independent calibration errors.")
+                raise RuntimeError("AE descriptors require at least two reference errors.")
         descriptor.set_trainable(False)
         if not descriptor.is_ready():
             raise RuntimeError("AE descriptor did not reach a valid independent reference-statistics state.")
         return float(loss.item())
 
     @staticmethod
-    def _make_calibration_mask(
-        labels, source_ids, min_calibration_count=3,
-        min_fit_per_class=3, min_calibration_per_class=1,
+    def _select_class_balanced_reference_mask(
+        labels, source_ids, per_class_count=None, total_count=None,
     ):
-        """Hold out independent source identities with a per-class minimum."""
+        """Select deterministic class-balanced reference rows without excluding them from RD fitting."""
         labels = torch.as_tensor(labels).long().reshape(-1)
-        source_ids = torch.as_tensor(source_ids, device=labels.device).reshape(-1)
+        source_ids = torch.as_tensor(source_ids, device=labels.device).long().reshape(-1)
         if labels.numel() == 0 or source_ids.numel() != labels.numel():
-            raise ValueError("AE calibration labels and source ids must be non-empty and aligned.")
+            raise ValueError("Base reference labels and source ids must be non-empty and aligned.")
         for source_id in torch.unique(source_ids, sorted=True):
             source_labels = torch.unique(labels[source_ids.eq(source_id)])
             if source_labels.numel() != 1:
                 raise ValueError(
-                    f"AE calibration source id {int(source_id)} is associated with multiple classes."
+                    f"Base reference source id {int(source_id)} is associated with multiple classes."
                 )
-        min_calibration_count = int(min_calibration_count)
-        min_fit_per_class = int(min_fit_per_class)
-        min_calibration_per_class = int(min_calibration_per_class)
-        if min_calibration_count < 1 or min_fit_per_class < 3 or min_calibration_per_class < 1:
-            raise ValueError("AE calibration requires positive holdout counts and at least three fit sources per class.")
+        if torch.unique(source_ids).numel() != source_ids.numel():
+            raise ValueError("Base reference source ids must identify unique feature rows.")
+        if (per_class_count is None) == (total_count is None):
+            raise ValueError("Specify exactly one of per_class_count or total_count.")
         classes = torch.unique(labels, sorted=True)
-        per_class_sources, holdout_counts = {}, {}
-        for class_id in classes.tolist():
-            class_sources = torch.unique(source_ids[labels.eq(class_id)], sorted=True)
-            capacity = int(class_sources.numel()) - min_fit_per_class
-            if capacity < min_calibration_per_class:
-                raise ValueError(
-                    f"Class {class_id} has {class_sources.numel()} independent sources; "
-                    f"requires at least {min_fit_per_class + min_calibration_per_class} "
-                    "for disjoint fitting and per-class calibration."
-                )
-            ordered = sorted(
-                (int(source_id) for source_id in class_sources.tolist()),
-                key=lambda source_id: hashlib.sha256(
-                    f"fscil-ae-holdout:{int(class_id)}:{source_id}".encode("utf-8")
-                ).digest(),
-            )
-            per_class_sources[int(class_id)] = torch.as_tensor(
-                ordered, device=class_sources.device, dtype=class_sources.dtype
-            )
-            holdout_counts[int(class_id)] = min_calibration_per_class
-        heldout_total = sum(holdout_counts.values())
-        while heldout_total < min_calibration_count:
-            progressed = False
-            for class_id in classes.tolist():
-                capacity = int(per_class_sources[int(class_id)].numel()) - min_fit_per_class
-                if holdout_counts[int(class_id)] < capacity:
-                    holdout_counts[int(class_id)] += 1
-                    heldout_total += 1
-                    progressed = True
-                    if heldout_total >= min_calibration_count:
-                        break
-            if not progressed:
-                raise ValueError("Insufficient independent support sources for requested AE calibration holdout.")
+        if per_class_count is not None:
+            count_by_class = {int(class_id): int(per_class_count) for class_id in classes.tolist()}
+            if int(per_class_count) < 1:
+                raise ValueError("Per-class Base reference count must be positive.")
+        else:
+            requested = min(int(total_count), int(labels.numel()))
+            if requested < int(classes.numel()):
+                raise ValueError("Base reference total count must cover every represented class.")
+            quotient, remainder = divmod(requested, int(classes.numel()))
+            count_by_class = {
+                int(class_id): quotient + (1 if index < remainder else 0)
+                for index, class_id in enumerate(classes.tolist())
+            }
         mask = torch.zeros(labels.numel(), dtype=torch.bool, device=labels.device)
         for class_id in classes.tolist():
-            selected = per_class_sources[int(class_id)][:holdout_counts[int(class_id)]]
+            class_sources = torch.unique(source_ids[labels.eq(int(class_id))], sorted=True)
+            count = count_by_class[int(class_id)]
+            if class_sources.numel() < count:
+                raise ValueError(
+                    f"Base class {int(class_id)} has {class_sources.numel()} sources, "
+                    f"but the reference protocol requires {count}."
+                )
+            ordered = sorted(
+                (int(value) for value in class_sources.detach().cpu().tolist()),
+                key=lambda source_id: hashlib.sha256(
+                    f"fscil-ae-reference:{int(class_id)}:{source_id}".encode("utf-8")
+                ).digest(),
+            )
+            selected = torch.as_tensor(
+                ordered[:count], device=source_ids.device, dtype=source_ids.dtype
+            )
             mask |= labels.eq(int(class_id)) & torch.isin(source_ids, selected)
-            fit_sources = torch.unique(source_ids[labels.eq(int(class_id)) & ~mask], sorted=True)
-            if fit_sources.numel() < min_fit_per_class:
-                raise RuntimeError(f"AE calibration split left too few fitting sources for class {class_id}.")
+        if int(mask.sum().item()) != sum(count_by_class.values()):
+            raise RuntimeError("Class-balanced Base reference selection produced an invalid row count.")
         return mask
 
     @staticmethod
-    def _base_session_holdout_per_class(support_sizes, session_class_count):
-        """Convert total Session support counts into per-class Base holdout capacity.
+    def _base_reference_per_class    @staticmethod
+    def _base_reference_per_class(support_sizes, session_class_count):
+        """Convert total Session support counts into per-class Base reference capacity.
 
         Threshold pseudo-Sessions contain support_size examples distributed
         across session_class_count classes. The Base descriptor split must
@@ -1019,7 +1056,7 @@ class Runner:
     def _calibrate_session_expansion_thresholds(
         self, adapter, heldout_values, heldout_labels, support_sizes, block_idx
     ):
-        """Calibrate one Session-Q95 threshold per support-set size from Base holdout CLS."""
+        """Calibrate one Session-Q95 threshold per support-set size from Base reference CLS."""
         moe_cfg = self._visual_moe_cfg()
         quantile = float(_cfg_value(moe_cfg, "EXPANSION_THRESHOLD_QUANTILE", 0.95))
         groups = int(_cfg_value(moe_cfg, "EXPANSION_CALIBRATION_GROUPS", 256))
@@ -1028,16 +1065,16 @@ class Runner:
         heldout_values = torch.as_tensor(heldout_values, device=self.device).float()
         if (heldout_values.ndim != 2 or heldout_values.size(0) < 2
                 or not torch.isfinite(heldout_values).all()):
-            raise ValueError(f"Block {block_idx} Base holdout is insufficient for Session calibration.")
+            raise ValueError(f"Block {block_idx} Base reference is insufficient for Session calibration.")
         if not support_sizes:
             raise ValueError("No incremental support-set sizes were supplied for Base threshold calibration.")
         heldout_labels = torch.as_tensor(heldout_labels, device=heldout_values.device).long().reshape(-1)
         if heldout_labels.numel() != heldout_values.size(0):
-            raise ValueError("Base holdout labels must align with reference features.")
+            raise ValueError("Base reference labels must align with reference features.")
         classes = torch.unique(heldout_labels, sorted=True)
         configured_classes = int(self.cfg.DATASET.NUM_INC_CLS)
         if configured_classes < 1 or classes.numel() < configured_classes:
-            raise ValueError("Base holdout has fewer classes than an incremental Session.")
+            raise ValueError("Base reference has fewer classes than an incremental Session.")
         class_rows = {
             int(class_id): torch.nonzero(heldout_labels.eq(class_id), as_tuple=False).flatten().cpu()
             for class_id in classes.tolist()
@@ -1054,13 +1091,13 @@ class Runner:
             per_class_counts = [quotient + (1 if index < remainder else 0)
                                 for index in range(configured_classes)]
             if configured_classes > len(class_rows):
-                raise ValueError("Base holdout has fewer classes than an incremental Session.")
+                raise ValueError("Base reference has fewer classes than an incremental Session.")
             if any(
                 count > min(class_rows[class_id].numel() for class_id in class_rows)
                 for count in per_class_counts if count > 0
             ):
                 raise ValueError(
-                    f"Base holdout cannot form a class-balanced Session of {size} samples "
+                    f"Base reference cannot form a class-balanced Session of {size} samples "
                     f"across {configured_classes} classes without within-Session replacement."
                 )
             group_scores, class_ids = [], list(class_rows)
@@ -1086,127 +1123,122 @@ class Runner:
         return thresholds
 
     def _train_base_descriptors(self, extract_loader):
-        """Fit Base RDs and calibrate support-size-specific Session thresholds.
-
-        Each descriptor is fitted on Base reference CLS inputs weighted by its
-        deployed Base-Softmax responsibility. A disjoint source-level holdout
-        estimates standardized reconstruction-error statistics and supplies
-        Base pseudo-Sessions for the Q95 threshold calibration.
-        """
+        """Fit Base RDs on all Base CLS rows; balanced references serve error and threshold statistics."""
         epochs = int(_cfg_value(self.cfg.TRAINER.BiMC.OPTIM, "BASE_DESCRIPTOR_EPOCHS", 8))
         print(f"\n========== Fit Base AE Distribution Descriptors ({epochs} epochs) ==========")
         feature_map = self.model_without_dp.collect_blockwise_cls_features(extract_loader)
         support_sizes = self._incremental_support_sizes()
         self.expansion_thresholds = {}
+        self.base_reference_cls_features = {}
         for block_idx, adapter in self._moe_adapters():
             item = feature_map[block_idx]
-            values = item["cls_in"].to(self.device)
-            labels = item["labels"].to(self.device)
-            source_ids = item["source_ids"].to(self.device)
+            values = item["cls_in"].to(self.device).float()
+            labels = item["labels"].to(self.device).long()
+            source_ids = item["source_ids"].to(self.device).long()
             adapter.set_base_feature_stats(values)
-            # Independent error-reference sources are held out from AE fitting.
-            # Every Base class contributes to both partitions.
-            base_class_count = int(torch.unique(labels, sorted=True).numel())
+
             session_class_count = int(self.cfg.DATASET.NUM_INC_CLS)
-            per_class_session_capacity = self._base_session_holdout_per_class(
+            threshold_reference_per_class = self._base_reference_per_class(
                 support_sizes, session_class_count
             )
-            reference_mask = self._make_calibration_mask(
-                labels, source_ids,
-                min_calibration_count=per_class_session_capacity * base_class_count,
-                min_fit_per_class=5,
-                min_calibration_per_class=per_class_session_capacity,
+            threshold_mask = self._select_class_balanced_reference_mask(
+                labels, source_ids, per_class_count=threshold_reference_per_class
             )
-            fit_mask = ~reference_mask
-            current_holdout_ids = [int(value) for value in source_ids[reference_mask].tolist()]
-            existing_holdout_ids = getattr(self, "base_calibration_source_ids", [])
-            if not existing_holdout_ids:
-                self.base_calibration_source_ids = current_holdout_ids
-            elif existing_holdout_ids != current_holdout_ids:
-                raise RuntimeError("Base calibration source identities changed across MoE blocks.")
-            fit_values = values[fit_mask]
-            reference_values = values[reference_mask]
-            fit_labels = labels[fit_mask]
-            reference_labels = labels[reference_mask]
-            expected_classes = sorted(int(value) for value in torch.unique(
-                labels, sorted=True
-            ).tolist())
-            if (sorted(int(value) for value in torch.unique(
-                    fit_labels, sorted=True).tolist()) != expected_classes
-                    or sorted(int(value) for value in torch.unique(
-                        reference_labels, sorted=True
-                    ).tolist()) != expected_classes):
-                raise RuntimeError(
-                    f"Block {block_idx} Base AE fit/reference partitions must cover every Base class."
-                )
+            error_reference_count = min(
+                int(adapter.descriptors[0].buffer_size), int(values.size(0))
+            )
+            error_reference_mask = self._select_class_balanced_reference_mask(
+                labels, source_ids, total_count=error_reference_count
+            )
+            threshold_source_ids = [int(value) for value in source_ids[threshold_mask].tolist()]
+            existing_source_ids = getattr(self, "base_reference_source_ids", [])
+            if not existing_source_ids:
+                self.base_reference_source_ids = threshold_source_ids
+            elif existing_source_ids != threshold_source_ids:
+                raise RuntimeError("Base reference source identities changed across MoE blocks.")
+
+            threshold_values = values[threshold_mask]
+            threshold_labels = labels[threshold_mask]
+            self.base_reference_cls_features[int(block_idx)] = {
+                "cls_in": threshold_values.detach().cpu().half(),
+                "labels": threshold_labels.detach().cpu(),
+                "source_ids": source_ids[threshold_mask].detach().cpu(),
+            }
+            error_reference_values = values[error_reference_mask]
             with torch.no_grad():
                 fit_responsibilities = torch.stack([
-                    adapter.expert_responsibility(fit_values, expert_id)
+                    adapter.expert_responsibility(values, expert_id)
                     for expert_id in range(adapter.num_experts)
                 ], dim=-1)
+                reference_responsibilities = torch.stack([
+                    adapter.expert_responsibility(error_reference_values, expert_id)
+                    for expert_id in range(adapter.num_experts)
+                ], dim=-1)
+
             for expert_id in range(adapter.num_experts):
                 loss = self._train_descriptor(
-                    adapter, expert_id, fit_values, epochs,
+                    adapter, expert_id, values, epochs,
                     fit_responsibilities[:, expert_id],
-                    calibration_values=reference_values,
+                    calibration_values=error_reference_values,
+                    calibration_weights=reference_responsibilities[:, expert_id],
                 )
                 descriptor = adapter.descriptors[expert_id]
                 if int(descriptor.error_count.item()) < 2:
-                    raise RuntimeError(
-                        "Base descriptor requires at least two independent reconstruction-error references."
-                    )
+                    raise RuntimeError("Base descriptor requires at least two weighted reference errors.")
                 print(
                     f"=> [AE-Descriptor][B{block_idx}][E{expert_id}] "
-                    f"loss={loss:.6f} reference_n={int(descriptor.error_count.item())} "
+                    f"loss={loss:.6f} fit_n={int(values.size(0))} "
+                    f"error_reference_n={int(descriptor.error_count.item())} "
+                    f"effective_n={descriptor.effective_error_count.item():.2f} "
                     f"mean={descriptor.error_mean.item():.6f} "
                     f"std={descriptor.error_std.item():.6f}"
                 )
             adapter.assert_descriptors_ready()
             adapter.freeze_all()
             self.expansion_thresholds[int(block_idx)] = self._calibrate_session_expansion_thresholds(
-                adapter, reference_values, reference_labels, support_sizes, block_idx
+                adapter, threshold_values, threshold_labels, support_sizes, block_idx
             )
 
-        self._capture_base_holdout_feature_anchors()
+        self._capture_base_reference_feature_anchors()
 
     @torch.no_grad()
-    def _capture_base_holdout_feature_anchors(self):
+    def _capture_base_reference_feature_anchors(self):
         """Capture class-level adapted feature anchors from the fixed Base AE holdout."""
         data_manager = getattr(self, "data_manager", None)
         loader_factory = getattr(data_manager, "get_base_source_dataloader", None)
         if not callable(loader_factory):
             return None
-        if not self.base_calibration_source_ids:
+        if not self.base_reference_source_ids:
             raise RuntimeError("Cannot capture Base feature anchors before AE holdout identities are fixed.")
-        loader = loader_factory(self.base_calibration_source_ids)
+        loader = loader_factory(self.base_reference_source_ids)
         self.model.eval()
         _, labels, prototypes, _ = self.model_without_dp.inference_all_img_feature(loader)
         class_ids = torch.unique(labels.to(self.device, dtype=torch.long), sorted=True)
         prototypes = F.normalize(torch.as_tensor(prototypes, device=self.device).float(), dim=-1)
         if prototypes.ndim != 2 or prototypes.size(0) != class_ids.numel() or not torch.isfinite(prototypes).all():
-            raise RuntimeError("Base holdout feature-anchor capture produced invalid class prototypes.")
-        self.base_holdout_feature_prototypes = prototypes.detach().cpu().half()
-        self.base_holdout_class_ids = class_ids.detach().cpu()
-        print(f"=> [Feature-Space][Base-anchor] classes={class_ids.numel()} holdout_sources={len(self.base_calibration_source_ids)}")
+            raise RuntimeError("Base reference feature-anchor capture produced invalid class prototypes.")
+        self.base_reference_feature_prototypes = prototypes.detach().cpu().half()
+        self.base_reference_class_ids = class_ids.detach().cpu()
+        print(f"=> [Feature-Space][Base-anchor] classes={class_ids.numel()} reference_sources={len(self.base_reference_source_ids)}")
         return True
 
     @torch.no_grad()
-    def _base_holdout_feature_diagnostics(self, base_state):
-        """Measure Base feature drift and fixed-prototype accuracy on Base holdout."""
+    def _base_reference_feature_diagnostics(self, base_state):
+        """Measure Base feature drift and fixed-prototype accuracy on Base reference."""
         data_manager = getattr(self, "data_manager", None)
         loader_factory = getattr(data_manager, "get_base_source_dataloader", None)
-        baseline = getattr(self, "base_holdout_feature_prototypes", None)
-        baseline_ids = getattr(self, "base_holdout_class_ids", None)
+        baseline = getattr(self, "base_reference_feature_prototypes", None)
+        baseline_ids = getattr(self, "base_reference_class_ids", None)
         if not callable(loader_factory) or baseline is None or baseline_ids is None:
             return {"available": False}
-        loader = loader_factory(self.base_calibration_source_ids)
+        loader = loader_factory(self.base_reference_source_ids)
         self.model.eval()
         features, labels, current_prototypes, _ = self.model_without_dp.inference_all_img_feature(loader)
         labels = labels.to(self.device, dtype=torch.long)
         current_ids = torch.unique(labels, sorted=True)
         baseline_ids = torch.as_tensor(baseline_ids, device=self.device, dtype=torch.long).reshape(-1)
         if not torch.equal(current_ids.sort().values, baseline_ids.sort().values):
-            raise RuntimeError("Current Base holdout classes differ from captured feature-space anchors.")
+            raise RuntimeError("Current Base reference classes differ from captured feature-space anchors.")
         row_map = {int(value): i for i, value in enumerate(current_ids.tolist())}
         rows = torch.as_tensor([row_map[int(value)] for value in baseline_ids.tolist()], device=self.device)
         current = F.normalize(torch.as_tensor(current_prototypes, device=self.device).float()[rows], dim=-1)
@@ -1216,7 +1248,7 @@ class Runner:
         prototypes = F.normalize(torch.as_tensor(base_state["image_proto"], device=self.device).float(), dim=-1)
         matches = labels[:, None].eq(base_ids[None, :])
         if not matches.any(dim=1).all():
-            raise RuntimeError("Base holdout contains labels absent from the Base classifier bank.")
+            raise RuntimeError("Base reference contains labels absent from the Base classifier bank.")
         targets = matches.long().argmax(-1)
         predictions = (F.normalize(torch.as_tensor(features, device=self.device).float(), dim=-1) @ prototypes.t()).argmax(-1)
         predicted_ids = base_ids[predictions]
@@ -1230,52 +1262,40 @@ class Runner:
             "prototype_cosine_mean": float(alignment.mean().item()),
             "prototype_cosine_min": float(alignment.min().item()),
             "prototype_cosine_per_class": {int(k): float(v) for k, v in zip(baseline_ids.tolist(), alignment.tolist())},
-            "base_holdout_accuracy": float(predictions.eq(targets).float().mean().item() * 100.0),
-            "base_holdout_class_accuracy": class_acc,
+            "base_reference_accuracy": float(predictions.eq(targets).float().mean().item() * 100.0),
+            "base_reference_class_accuracy": class_acc,
             "minimum_cosine_target": target_cosine,
             "within_target": bool(float(alignment.min().item()) >= target_cosine),
         }
         print(f"=> [Feature-Space][Session] cosine_mean={result['prototype_cosine_mean']:.6f} "
-              f"cosine_min={result['prototype_cosine_min']:.6f} base_holdout_acc={result['base_holdout_accuracy']:.2f}% "
+              f"cosine_min={result['prototype_cosine_min']:.6f} base_reference_acc={result['base_reference_accuracy']:.2f}% "
               f"within_target={result['within_target']}")
         return result
 
     @torch.no_grad()
     def _refresh_block_expansion_threshold(self, block_idx):
-        """Recalibrate the changed deployed RD pool on the frozen Base holdout.
-
-        The Base source identities are fixed at Base fitting and checkpointed.
-        Whenever an expert is added, the minimum-over-pool statistic changes;
-        therefore the old threshold is invalid and must be recomputed using
-        the same Base holdout and the complete current descriptor pool.
-        """
-        if not self.base_calibration_source_ids:
-            raise RuntimeError("Cannot refresh dynamic-pool thresholds without the fixed Base calibration sources.")
-        if not hasattr(self, "data_manager") or not hasattr(
-            self.data_manager, "get_base_source_dataloader"
-        ):
-            # Lightweight isolated unit fixtures have no dataset manager.
-            # Production Runner always owns one and must take the calibrated path.
-            if hasattr(self, "data_manager"):
-                raise RuntimeError("DatasetManager lacks the Base calibration source loader.")
-            return
-        loader = self.data_manager.get_base_source_dataloader(
-            self.base_calibration_source_ids
-        )
-        features = self.model_without_dp.collect_blockwise_cls_features(loader)
-        item = features[int(block_idx)]
+        """Refresh a changed expert pool from cached frozen-reference Base CLS inputs."""
+        cache = getattr(self, "base_reference_cls_features", {}).get(int(block_idx))
+        if not isinstance(cache, dict):
+            raise RuntimeError(
+                f"Block {int(block_idx)} has no cached Base reference CLS features for threshold refresh."
+            )
         adapter = self._adapter_by_block(block_idx)
         sizes = sorted(self.expansion_thresholds.get(int(block_idx), {}).keys())
         if not sizes:
             sizes = self._incremental_support_sizes()
         refreshed = self._calibrate_session_expansion_thresholds(
-            adapter, item["cls_in"], item["labels"], sizes, int(block_idx)
+            adapter,
+            torch.as_tensor(cache["cls_in"], device=self.device).float(),
+            torch.as_tensor(cache["labels"], device=self.device).long(),
+            sizes,
+            int(block_idx),
         )
         self.expansion_thresholds[int(block_idx)] = refreshed
         print(
             f"=> [Session-Threshold][B{int(block_idx)}] refreshed for "
-            f"{adapter.num_experts} deployed experts using fixed Base holdout "
-            f"(n={len(self.base_calibration_source_ids)})."
+            f"{adapter.num_experts} deployed experts from cached Base reference CLS "
+            f"(n={len(cache['source_ids'])}); no Base image reload."
         )
 
     @torch.no_grad()
@@ -1611,10 +1631,10 @@ class Runner:
             )
             # A successful optimizer run is not sufficient: the deployed
             # encoder must remain inside the Base feature-space trust region.
-            feature_check = self._base_holdout_feature_diagnostics(old_states[0])
+            feature_check = self._base_reference_feature_diagnostics(old_states[0])
             if feature_check.get("available", False) and not feature_check.get("within_target", False):
                 raise RuntimeError(
-                    "Session rejected: Base holdout feature-space alignment fell below "
+                    "Session rejected: Base reference feature-space alignment fell below "
                     f"{feature_check.get('minimum_cosine_target')}; observed "
                     f"{feature_check.get('prototype_cosine_min')}."
                 )
@@ -1741,23 +1761,13 @@ class Runner:
             values = item["cls_in"].to(self.device).float()
             labels = item["labels"].to(self.device).long()
             sources = item["source_ids"].to(self.device)
-            class_source_counts = [
-                int(torch.unique(sources[labels.eq(class_id)]).numel())
-                for class_id in torch.unique(labels, sorted=True).tolist()
-            ]
-            calibration_per_class = max(2, int(math.ceil(0.40 * min(class_source_counts))))
-            calibration_mask = self._make_calibration_mask(
-                labels, sources,
-                min_calibration_count=calibration_per_class * int(torch.unique(labels).numel()),
-                min_fit_per_class=3,
-                min_calibration_per_class=calibration_per_class,
-            )
-            fit_mask, calibration_mask = ~calibration_mask, calibration_mask
-            fit_values, calibration_values = values[fit_mask], values[calibration_mask]
-            if (not fit_values.numel() or not calibration_values.numel()
-                    or set(labels[fit_mask].tolist()) != set(expected_classes)
-                    or set(labels[calibration_mask].tolist()) != set(expected_classes)):
-                raise ValueError("New RD requires source-disjoint fit and calibration sources from every Session class.")
+            if (sources.numel() != values.size(0)
+                    or torch.unique(sources).numel() != sources.numel()
+                    or sorted(int(value) for value in torch.unique(labels, sorted=True).tolist()) != expected_classes):
+                raise ValueError("New RD requires one stable reference row for every Session support source.")
+            # Every current Session source participates in RD optimization and
+            # in the deployed expert's weighted reference-error distribution.
+            reference_source_ids = set(int(value) for value in sources.detach().cpu().tolist())
             anchor_expert_id, anchor_q90 = adapter.select_descriptor_anchor(values)
             expert_id = self.model_without_dp.add_expert(
                 block_idx, task_id, anchor_expert_id=anchor_expert_id
@@ -1771,9 +1781,7 @@ class Runner:
             context.update({
                 "expert_id": int(expert_id), "descriptor": descriptor,
                 "values": values, "labels": labels, "sources": sources,
-                "fit_mask": fit_mask, "calibration_mask": calibration_mask,
-                "fit_values": fit_values, "calibration_values": calibration_values,
-                "fit_source_ids": set(sources[fit_mask].detach().cpu().tolist()),
+                "reference_source_ids": reference_source_ids,
                 "source_to_row": {int(source): row for row, source in enumerate(sources.tolist())},
                 "anchor_q90": anchor_q90.detach().cpu(),
                 "anchor_sets": anchor_sets,
@@ -1783,11 +1791,11 @@ class Runner:
                     "loss": [], "ce_loss": [], "rd_loss": [], "feature_space_loss": [],
                     "local_preservation_loss": [], "pd_loss": [], "gradient_projection": [],
                     "classification_samples_per_epoch": [], "classification_samples_total": 0,
-                    "rd_training_samples": int(fit_values.size(0)),
-                    "rd_reference_samples": int(calibration_values.size(0)),
-                    "rd_fit_source_ids": sorted(int(value) for value in sources[fit_mask].tolist()),
-                    "rd_calibration_source_ids": sorted(int(value) for value in sources[calibration_mask].tolist()),
-                    "rd_session_classes": sorted(int(value) for value in torch.unique(labels[calibration_mask]).tolist()),
+                    "rd_training_samples": int(values.size(0)),
+                    "rd_reference_samples": int(values.size(0)),
+                    "rd_training_source_ids": sorted(reference_source_ids),
+                    "rd_reference_source_ids": sorted(reference_source_ids),
+                    "rd_session_classes": sorted(int(value) for value in torch.unique(labels).tolist()),
                 },
             })
 
@@ -1870,11 +1878,7 @@ class Runner:
                         )
                     except KeyError as error:
                         raise KeyError(f"Training source {error.args[0]} is absent from the Session reference cache.") from error
-                    fit_rows = torch.as_tensor(
-                        [int(source) in context["fit_source_ids"] for source in source_ids.tolist()],
-                        device=self.device, dtype=torch.bool,
-                    )
-                    clean = context["values"][rows[fit_rows]]
+                    clean = context["values"][rows]
                     noise_scale = float(_cfg_value(self._visual_moe_cfg(), "DESCRIPTOR_DENOISE_SCALE", 0.05))
                     residual_weight = float(_cfg_value(self._visual_moe_cfg(), "DESCRIPTOR_RESIDUAL_WEIGHT", 1e-3))
                     noise = context["adapter"].base_feature_std.to(self.device).reshape(1, -1) * noise_scale
@@ -1952,18 +1956,23 @@ class Runner:
             descriptor = context["descriptor"]
             descriptor.eval()
             with torch.no_grad():
-                errors = descriptor.reconstruction_error(context["calibration_values"])
-                descriptor.update_reference(errors)
+                reference_values = context["values"]
+                errors = descriptor.reconstruction_error(reference_values)
+                responsibility = context["adapter"].expert_responsibility(
+                    reference_values, context["expert_id"]
+                ).detach()
+                descriptor.update_reference(errors, responsibility)
                 context['adapter'].assert_descriptors_ready()
+                reference_scores = descriptor.standardized_score(reference_values)
                 context["history"]["rd_effective_reference_count"] = float(
                     descriptor.effective_error_count.item()
                 )
-                context["history"]["rd_fit_q90"] = float(torch.quantile(
-                    descriptor.standardized_score(context["fit_values"]), 0.90
-                ).item())
-                context["history"]["rd_calibration_q90"] = float(torch.quantile(
-                    descriptor.standardized_score(context["calibration_values"]), 0.90
-                ).item())
+                context["history"]["rd_reference_q90"] = float(
+                    torch.quantile(reference_scores, 0.90).item()
+                )
+                context["history"]["rd_reference_responsibility_mean"] = float(
+                    responsibility.mean().item()
+                )
                 context["history"]["session_q90"] = float(context["decision"].session_q90)
                 context["history"]["session_q95_threshold"] = float(context["decision"].threshold)
                 context["history"]["old_anchor_gate_mean"] = context["adapter"].old_anchor_response(
@@ -2082,7 +2091,7 @@ class Runner:
                 state = adaptation.pop("task_state")
 
             state_dict_list.append(state)
-            feature_space_diagnostics = self._base_holdout_feature_diagnostics(state_dict_list[0])
+            feature_space_diagnostics = self._base_reference_feature_diagnostics(state_dict_list[0])
             # Task offsets are deliberately absent from prediction. Keep a
             # zero-valued compatibility field for old checkpoint readers.
             merged = self.merge_dicts(state_dict_list)

@@ -262,8 +262,10 @@ class UnifiedDynamicMoETests(unittest.TestCase):
                     projection_epoch["ce_pd_dot_after"],
                     projection_epoch["ce_pd_dot_before"] - 1e-8,
                 )
-            self.assertEqual(history["rd_training_samples"], 18)
-            self.assertEqual(history["rd_reference_samples"], 14)
+            self.assertEqual(history["rd_training_samples"], 32)
+            self.assertEqual(history["rd_reference_samples"], 32)
+            self.assertEqual(history["rd_training_source_ids"], history["rd_reference_source_ids"])
+            self.assertEqual(len(history["rd_reference_source_ids"]), 32)
             self.assertEqual(history["rd_session_classes"], [1, 2])
             self.assertGreater(history["rd_effective_reference_count"], 1.0)
             self.assertTrue(all(torch.isfinite(torch.tensor(history[key])).all()
@@ -541,17 +543,17 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         self.assertEqual(tuple(adapted.shape), tuple(reference.shape))
         self.assertEqual(tuple(aux[0]["cls_in"].shape), (images.size(0), 8))
 
-    def test_base_session_holdout_capacity_uses_per_class_not_total_support(self):
+    def test_base_threshold_reference_capacity_uses_per_class_not_total_support(self):
         # CUB200: 10 novel classes x 5 shots = 50 total support images,
         # therefore Base holdout needs 5 sources per Base class, not 50.
-        self.assertEqual(Runner._base_session_holdout_per_class([50], 10), 5)
-        self.assertEqual(Runner._base_session_holdout_per_class([25], 5), 5)
-        self.assertEqual(Runner._base_session_holdout_per_class([16], 1), 16)
-        self.assertEqual(Runner._base_session_holdout_per_class([50, 60], 10), 6)
+        self.assertEqual(Runner._base_reference_per_class([50], 10), 5)
+        self.assertEqual(Runner._base_reference_per_class([25], 5), 5)
+        self.assertEqual(Runner._base_reference_per_class([16], 1), 16)
+        self.assertEqual(Runner._base_reference_per_class([50, 60], 10), 6)
         with self.assertRaisesRegex(ValueError, "positive Session class count"):
-            Runner._base_session_holdout_per_class([50], 0)
+            Runner._base_reference_per_class([50], 0)
 
-    def test_base_rd_uses_disjoint_reference_sources_and_calibrates_session_thresholds(self):
+    def test_base_rd_uses_all_fit_sources_and_weighted_reference_statistics(self):
         torch.manual_seed(233)
         runner, model = build_lifecycle_runner()
         supports = [
@@ -564,9 +566,13 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             adapter.assert_descriptors_ready()
             for descriptor in adapter.descriptors:
                 self.assertEqual(int(descriptor.error_count.item()), 16)
-                self.assertGreater(float(descriptor.effective_error_count.item()), 0.0)
+                self.assertGreater(float(descriptor.effective_error_count.item()), 1.0)
                 self.assertTrue(torch.isfinite(descriptor.error_mean))
                 self.assertTrue(torch.isfinite(descriptor.error_std))
+            cache = runner.base_reference_cls_features[0]
+            self.assertEqual(cache["cls_in"].size(0), 96)
+            self.assertEqual(len(runner.base_reference_source_ids), 96)
+            self.assertEqual(set(cache["labels"].tolist()), {0, 1, 2})
 
     def test_gem_projection_removes_conflicting_ce_component_per_parameter_group(self):
         primary = (torch.tensor([1.0, 2.0]), torch.tensor([3.0]))
@@ -669,9 +675,9 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         for key, value in before.items():
             torch.testing.assert_close(descriptor.state_dict()[key], value, rtol=0, atol=0)
 
-    def test_weighted_ae_requires_two_independent_reference_errors(self):
+    def test_weighted_ae_requires_two_reference_errors(self):
         descriptor = RepresentationDescriptor(4, descriptor_dim=2, buffer_size=8)
-        with self.assertRaisesRegex(ValueError, "at least two finite independent errors"):
+        with self.assertRaisesRegex(ValueError, "at least two finite reference errors"):
             descriptor.update_reference(torch.tensor([0.1]), torch.tensor([1.0]))
         self.assertFalse(descriptor.is_ready())
 
@@ -687,53 +693,48 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         self.assertTrue(torch.isfinite(descriptor.error_std))
         self.assertGreater(float(descriptor.error_std), 0.0)
 
-    def test_incremental_calibration_mask_keeps_one_source_out_of_fit(self):
+    def test_reference_subset_does_not_remove_support_from_rd_training(self):
         labels = torch.tensor([3, 3, 3, 3, 3])
         source_ids = torch.tensor([101, 102, 103, 104, 105])
-        mask = Runner._make_calibration_mask(
-            labels, source_ids, min_calibration_count=1, min_fit_per_class=3
+        mask = Runner._select_class_balanced_reference_mask(
+            labels, source_ids, per_class_count=2
         )
-        self.assertEqual(int(mask.sum()), 1)
-        self.assertEqual(int((~mask).sum()), 4)
-        self.assertFalse(torch.isin(source_ids[mask], source_ids[~mask]).any())
+        self.assertEqual(int(mask.sum()), 2)
+        self.assertTrue(set(source_ids[mask].tolist()).issubset(set(source_ids.tolist())))
+        # Reference rows are also present in the full RD fitting tensor.
 
-    def test_calibration_split_is_source_order_invariant_and_reproducible(self):
+    def test_reference_selection_is_source_order_invariant_and_reproducible(self):
         labels = torch.tensor([0] * 6 + [1] * 6)
         source_ids = torch.tensor([11, 12, 13, 14, 15, 16, 21, 22, 23, 24, 25, 26])
-        first = Runner._make_calibration_mask(
-            labels, source_ids, min_calibration_count=2, min_fit_per_class=3
+        first = Runner._select_class_balanced_reference_mask(
+            labels, source_ids, per_class_count=1
         )
         permutation = torch.tensor([7, 2, 10, 0, 8, 4, 11, 1, 5, 9, 3, 6])
-        second = Runner._make_calibration_mask(
-            labels[permutation], source_ids[permutation],
-            min_calibration_count=2, min_fit_per_class=3
+        second = Runner._select_class_balanced_reference_mask(
+            labels[permutation], source_ids[permutation], per_class_count=1
         )
         selected_first = set(source_ids[first].tolist())
         selected_second = set(source_ids[permutation][second].tolist())
         self.assertEqual(selected_first, selected_second)
         self.assertEqual(len(selected_first), 2)
         for class_id in (0, 1):
-            class_selected = [
-                sid for sid in selected_first
-                if sid // 10 == class_id + 1
-            ]
+            class_selected = [sid for sid in selected_first if sid // 10 == class_id + 1]
             self.assertEqual(len(class_selected), 1)
 
-    def test_base_calibration_mask_never_reuses_fit_sources_as_holdout(self):
+    def test_base_reference_selection_does_not_require_an_independent_fit_partition(self):
         labels = torch.tensor([3, 3, 3, 3])
         source_ids = torch.tensor([201, 202, 203, 204])
-        with self.assertRaisesRegex(ValueError, "Insufficient independent support sources"):
-            Runner._make_calibration_mask(
-                labels, source_ids, min_calibration_count=3, min_fit_per_class=3
-            )
+        mask = Runner._select_class_balanced_reference_mask(
+            labels, source_ids, total_count=4
+        )
+        self.assertEqual(int(mask.sum()), 4)
 
-    def test_ae_calibration_rejects_source_identity_cross_class_collisions(self):
+    def test_reference_selection_rejects_source_identity_cross_class_collisions(self):
         labels = torch.tensor([0, 0, 1, 1, 1, 1])
         source_ids = torch.tensor([10, 11, 10, 12, 13, 14])
         with self.assertRaisesRegex(ValueError, "source id 10.*multiple classes"):
-            Runner._make_calibration_mask(
-                labels, source_ids, min_calibration_count=1,
-                min_fit_per_class=3, min_calibration_per_class=1,
+            Runner._select_class_balanced_reference_mask(
+                labels, source_ids, per_class_count=1
             )
 
     def test_low_rank_ae_is_centered_tied_weight_and_orthogonal(self):
@@ -1143,8 +1144,9 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             }
             checkpoint_path = runner.save_checkpoint(0, [state])
             payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-            self.assertEqual(payload["schema_version"], 33)
-            self.assertTrue(payload["base_calibration_source_ids"])
+            self.assertEqual(payload["schema_version"], 34)
+            self.assertTrue(payload["base_reference_source_ids"])
+            self.assertIn("base_reference_cls_features", payload)
             self.assertIn("expansion_thresholds", payload)
             self.assertEqual(payload["expansion_thresholds"], runner.expansion_thresholds)
             self.assertIn("reference_image_proto", payload["task_states"][0])
@@ -1231,16 +1233,21 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertNotEqual(first[8], first[4])
 
-    def test_dynamic_pool_change_refreshes_threshold_on_fixed_base_sources(self):
+    def test_dynamic_pool_change_refreshes_threshold_from_cached_base_cls(self):
         torch.manual_seed(227)
         runner, model = build_lifecycle_runner()
-        base_holdout = lifecycle_batch(
+        base_reference = lifecycle_batch(
             0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 8800, count=40
         )
-        runner.base_calibration_source_ids = base_holdout["source_ids"].tolist()
-        runner.data_manager = SimpleNamespace(
-            get_base_source_dataloader=lambda source_ids: [base_holdout]
-        )
+        features = model.collect_blockwise_cls_features([base_reference])[0]
+        runner.base_reference_source_ids = features["source_ids"].tolist()
+        runner.base_reference_cls_features = {
+            0: {
+                "cls_in": features["cls_in"].half(),
+                "labels": features["labels"],
+                "source_ids": features["source_ids"],
+            }
+        }
         adapter = model.clip_model.visual.transformer.resblocks[0].moe_adapter
         for descriptor in adapter.descriptors:
             descriptor.update_reference(torch.tensor([0.1, 0.2, 0.3, 0.4]))
@@ -1252,9 +1259,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         self.assertEqual(adapter.num_experts, 3)
         self.assertIn(16, runner.expansion_thresholds[0])
         self.assertTrue(torch.isfinite(torch.tensor(runner.expansion_thresholds[0][16])))
-        self.assertEqual(
-            runner.base_calibration_source_ids, base_holdout["source_ids"].tolist()
-        )
+        self.assertEqual(runner.base_reference_source_ids, features["source_ids"].tolist())
 
     def test_session_expansion_uses_pooled_q90_of_best_historical_rd_scores(self):
         model = BiMC.__new__(BiMC)

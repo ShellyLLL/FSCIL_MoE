@@ -271,7 +271,7 @@ class RepresentationDescriptor(nn.Module):
             errors, device=self.error_history.device, dtype=torch.float32
         ).reshape(-1)
         if errors.numel() < 2 or not torch.isfinite(errors).all():
-            raise ValueError("AE reference update requires at least two finite independent errors.")
+            raise ValueError("AE reference update requires at least two finite reference errors.")
         weights = torch.ones_like(errors) if weights is None else torch.as_tensor(
             weights, device=errors.device, dtype=torch.float32
         ).reshape(-1)
