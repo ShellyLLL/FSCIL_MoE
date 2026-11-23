@@ -11,13 +11,12 @@ import models.clip.clip as clip
 
 @dataclass
 class LayerExpansionDecision:
-    """Base-calibrated class-balanced Session expansion decision for one transformer layer."""
+    """One sample-pooled Session decision for a single transformer layer."""
     block_idx: int
     expand: bool
     session_q90: float
     threshold: float
     support_count: int
-    class_q90: tuple = ()
 
 
 def build_loo_cache_from_embeddings(features, labels, source_ids, class_index=None):
@@ -254,7 +253,7 @@ class BiMC(nn.Module):
 
     @torch.no_grad()
     def plan_layer_expansion(self, block_idx, features, class_index, threshold=None):
-        """One Session decision from max-class-Q90 of min historical-RD standardized errors."""
+        """Decide EXPAND/REUSE from the pooled Session-Q90 novelty score."""
         block_idx = int(block_idx)
         if threshold is None or not math.isfinite(float(threshold)):
             raise ValueError("A finite Base-calibrated Session Q95 threshold is required.")
@@ -280,28 +279,25 @@ class BiMC(nn.Module):
         if torch.unique(sources).numel() != sources.numel():
             raise ValueError("Session-level expansion requires one deterministic reference row per support source.")
 
-        # Score each class independently before making one Session decision.
-        # A pooled sample Q90 can hide an entire under-covered class in its upper tail.
-        per_expert_z = adapter.descriptor_scores(values, require_ready=True)
-        sample_novelty = per_expert_z.min(dim=1).values
-        class_q90 = []
-        for class_id in expected:
-            class_scores = sample_novelty[labels.eq(class_id)]
-            if class_scores.numel() == 0:
-                raise RuntimeError(f"Block {block_idx} has no support scores for class {class_id}.")
-            class_q90.append((int(class_id), float(torch.quantile(class_scores, 0.90).item())))
-        score = max(value for _, value in class_q90)
+        # First select the best-matching deployed RD for each sample. Then
+        # aggregate all Session samples together: labels validate the Session
+        # manifest but never create per-class expansion decisions.
+        per_descriptor_z = adapter.descriptor_scores(values, require_ready=True)
+        sample_novelty = per_descriptor_z.min(dim=1).values
+        score = float(torch.quantile(sample_novelty, 0.90).item())
         if not math.isfinite(score):
-            raise FloatingPointError(f"Block {block_idx} produced a non-finite class-balanced Session score.")
+            raise FloatingPointError(f"Block {block_idx} produced a non-finite pooled Session Q90.")
         decision = LayerExpansionDecision(
-            block_idx=block_idx, expand=score > tau, session_q90=score,
-            threshold=tau, support_count=int(values.size(0)), class_q90=tuple(class_q90),
+            block_idx=block_idx,
+            expand=score > tau,
+            session_q90=score,
+            threshold=tau,
+            support_count=int(values.size(0)),
         )
-        class_summary = ",".join(f"{class_id}:{value:.4f}" for class_id, value in decision.class_q90)
         print(
             f"=> [Session-Expansion][B{block_idx}] support_n={decision.support_count} "
-            f"max_class_q90={score:.6f} base_q95={tau:.6f} "
-            f"class_q90=[{class_summary}] decision={'EXPAND' if decision.expand else 'REUSE'}"
+            f"session_q90={score:.6f} base_q95={tau:.6f} "
+            f"decision={'EXPAND' if decision.expand else 'REUSE'}"
         )
         return decision
 

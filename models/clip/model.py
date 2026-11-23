@@ -523,19 +523,20 @@ class VisualMoEAdapter(nn.Module):
         self, route_anchor_mean, route_anchor_var,
         expert_anchor_mean, expert_anchor_var,
     ):
-        """Penalize the newest gate and its actual residual on historical class anchors.
+        """Historical feature-space trust-region loss for the newest expert.
 
-        Route anchors live in the frozen-reference router space; expert
-        anchors live in the adapted, layer-normalized expert-input space.
-        Their paired class means and mean +/- per-dimension standard deviations
-        approximate historical class support without retaining old images.
+        Historical class means and diagonal variances are converted into
+        balanced anchor points. The newest independent gate is discouraged
+        from activating on old classes, while its actual gated residual is
+        penalized relative to the anchor feature energy. Only the newest
+        expert and router column receive gradients from this objective.
         """
         fields = (
             route_anchor_mean, route_anchor_var,
             expert_anchor_mean, expert_anchor_var,
         )
         if any(value is None for value in fields):
-            raise ValueError("Incremental PD requires route-space and expert-input old-class anchors.")
+            raise ValueError("Feature-space preservation requires route and expert-input historical anchors.")
         route_anchors = self._anchor_points(route_anchor_mean, route_anchor_var).to(
             device=self.residual_scale.device
         )
@@ -543,67 +544,15 @@ class VisualMoEAdapter(nn.Module):
             device=self.residual_scale.device
         )
         if route_anchors.shape != expert_anchors.shape:
-            raise ValueError("Old route and expert-input anchors must have aligned class rows and dimensions.")
+            raise ValueError("Historical route and expert-input anchors must have aligned class rows and dimensions.")
         gate = torch.sigmoid(self.router.columns[-1](route_anchors))
         expert_output = self.experts[-1](expert_anchors.unsqueeze(0)).squeeze(0)
         gated_residual = self.residual_scale.to(expert_output.dtype) * gate * expert_output
-        # The first term keeps the new route closed on old classes. The second
-        # directly penalizes the feature residual that could move old prototypes.
-        return gate.square().mean() + gated_residual.float().square().mean()
-
-    @torch.no_grad()
-    def snapshot_route_anchor_targets(self, route_anchor_mean, route_anchor_var):
-        """Snapshot deployed expert responsibilities on historical route anchors."""
-        if route_anchor_mean is None or route_anchor_var is None:
-            raise ValueError("Router preservation requires historical route-anchor means and variances.")
-        anchors = self._anchor_points(route_anchor_mean, route_anchor_var).to(
-            device=self.residual_scale.device, dtype=torch.float32
-        )
-        if anchors.ndim != 2 or anchors.size(0) == 0 or anchors.size(1) != self.d_model:
-            raise ValueError("Historical router anchors must be a non-empty [N, d_model] matrix.")
-        _, responsibilities = self.routing_outputs(anchors)
-        if not torch.isfinite(responsibilities).all():
-            raise FloatingPointError("Historical router responsibilities are non-finite.")
-        return anchors.detach(), responsibilities.detach()
-
-    def route_preservation_loss(self, route_anchors, reference_responsibilities):
-        """Preserve old Base-softmax and incremental-sigmoid routing on old anchors.
-
-        Base experts form a normalized categorical distribution, so their
-        responsibilities use KL divergence. Incremental experts have
-        independent sigmoid gates, so their responsibilities use MSE.
-        """
-        route_anchors = torch.as_tensor(
-            route_anchors, device=self.residual_scale.device, dtype=torch.float32
-        )
-        reference = torch.as_tensor(
-            reference_responsibilities, device=route_anchors.device, dtype=torch.float32
-        ).detach()
-        if (route_anchors.ndim != 2 or route_anchors.size(0) == 0
-                or route_anchors.size(1) != self.d_model):
-            raise ValueError("Router preservation anchors must be a non-empty [N, d_model] matrix.")
-        if reference.shape != (route_anchors.size(0), self.num_experts):
-            raise ValueError("Historical router responsibilities do not align with the deployed expert pool.")
-        if not torch.isfinite(route_anchors).all() or not torch.isfinite(reference).all():
-            raise ValueError("Router preservation inputs must be finite.")
-        if (reference < 0).any() or (reference > 1).any():
-            raise ValueError("Historical router responsibilities must lie in [0, 1].")
-
-        _, current = self.routing_outputs(route_anchors)
-        base_target = reference[:, :self.base_expert_count].clamp_min(1e-8)
-        base_target = base_target / base_target.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-        base_current = current[:, :self.base_expert_count].clamp_min(1e-8)
-        base_kl = F.kl_div(base_current.log(), base_target, reduction="batchmean")
-        if self.num_experts > self.base_expert_count:
-            incremental_mse = F.mse_loss(
-                current[:, self.base_expert_count:],
-                reference[:, self.base_expert_count:],
-            )
-        else:
-            incremental_mse = current.new_zeros(())
-        loss = base_kl + incremental_mse
+        anchor_energy = expert_anchors.float().square().sum(dim=-1).clamp_min(1e-6)
+        relative_residual_energy = gated_residual.float().square().sum(dim=-1) / anchor_energy
+        loss = gate.float().square().mean() + relative_residual_energy.mean()
         if not torch.isfinite(loss):
-            raise FloatingPointError("Router preservation loss is non-finite.")
+            raise FloatingPointError("Historical feature-space preservation loss is non-finite.")
         return loss
 
     @torch.no_grad()
