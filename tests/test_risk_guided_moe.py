@@ -998,7 +998,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             }
             checkpoint_path = runner.save_checkpoint(0, [state])
             payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-            self.assertEqual(payload["schema_version"], 29)
+            self.assertEqual(payload["schema_version"], 30)
             self.assertTrue(payload["base_calibration_source_ids"])
             self.assertIn("expansion_thresholds", payload)
             self.assertEqual(payload["expansion_thresholds"], runner.expansion_thresholds)
@@ -1138,18 +1138,57 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             [2.0, 3.0], [2.1, 3.1], [2.2, 3.2], [4.0, 5.0],
         ])
         decision = model.plan_layer_expansion(0, features, [2, 3], 1.0)
-        expected_q90 = torch.quantile(torch.tensor([0.1, 0.2, 0.3, 0.4, 2.0, 2.1, 2.2, 4.0]), 0.90)
+        expected_class_q90 = (
+            torch.quantile(torch.tensor([0.1, 0.2, 0.3, 0.4]), 0.90),
+            torch.quantile(torch.tensor([2.0, 2.1, 2.2, 4.0]), 0.90),
+        )
+        expected_session_score = max(float(value) for value in expected_class_q90)
         self.assertTrue(decision.expand)
-        self.assertAlmostEqual(decision.session_q90, float(expected_q90), places=6)
+        self.assertAlmostEqual(decision.session_q90, expected_session_score, places=6)
+        self.assertEqual(decision.class_q90[0][0], 2)
+        self.assertAlmostEqual(decision.class_q90[0][1], float(expected_class_q90[0]), places=6)
         self.assertEqual(decision.support_count, 8)
         self.assertEqual(decision.threshold, 1.0)
 
-        # Session decisions aggregate all samples: class labels do not create
-        # separate tests or separate expert expansion decisions.
+        # There is still one Session decision; class-wise scores only prevent
+        # a poorly covered class from disappearing inside a pooled sample tail.
         adapter.descriptor_scores = lambda x, require_ready=True: torch.full((8, 2), 0.25)
         decision = model.plan_layer_expansion(0, features, [2, 3], 0.5)
         self.assertFalse(decision.expand)
         self.assertEqual(decision.support_count, 8)
+
+    def test_classwise_max_q90_detects_one_undercovered_class_hidden_by_pooled_q90(self):
+        model = BiMC.__new__(BiMC)
+        nn.Module.__init__(model)
+        adapter = VisualMoEAdapter(8, num_experts=2, reduction=2, descriptor_dim=4)
+        block = nn.Module()
+        block.moe_adapter = adapter
+        transformer = nn.Module()
+        transformer.resblocks = nn.ModuleList([block])
+        visual = nn.Module()
+        visual.transformer = transformer
+        model.clip_model = nn.Module()
+        model.clip_model.visual = visual
+        model.device = "cpu"
+        model.cfg = SimpleNamespace(TRAINER=SimpleNamespace(BiMC=SimpleNamespace(
+            VISUAL_MOE=SimpleNamespace(EXPANSION_THRESHOLD_QUANTILE=0.95))))
+        for descriptor in adapter.descriptors:
+            descriptor.update_reference(torch.tensor([0.1, 0.11, 0.09, 0.1]))
+        labels = torch.arange(10).repeat_interleave(5)
+        features = {0: {
+            "cls_in": torch.randn(50, 8),
+            "labels": labels,
+            "source_ids": torch.arange(100, 150),
+        }}
+        scores = torch.tensor([[0.1, 0.2]] * 45 + [[5.0, 6.0]] * 5)
+        adapter.descriptor_scores = lambda x, require_ready=True: scores
+        pooled_q90 = torch.quantile(scores.min(dim=1).values, 0.90)
+        self.assertLess(float(pooled_q90.item()), 1.0)
+        decision = model.plan_layer_expansion(0, features, list(range(10)), 1.0)
+        self.assertTrue(decision.expand)
+        self.assertAlmostEqual(decision.session_q90, 5.0, places=6)
+        self.assertEqual(decision.class_q90[-1][0], 9)
+        self.assertAlmostEqual(decision.class_q90[-1][1], 5.0, places=6)
 
     def test_semantic_guided_calibration_uses_only_base_description_to_retrieve_enhanced_visual(self):
         runner = Runner.__new__(Runner)
@@ -1205,6 +1244,66 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         )
         self.assertLess(reliable_diag["alpha"].item(), diagnostics["alpha"].item())
         self.assertGreater(reliable[0, 1].item(), calibrated[0, 1].item())
+
+    def test_semantic_calibration_supports_query_exclusive_loo_bank(self):
+        runner = Runner.__new__(Runner)
+        runner.device = torch.device("cpu")
+        runner.cfg = SimpleNamespace(TRAINER=SimpleNamespace(BiMC=SimpleNamespace(
+            VISUAL_MOE=SimpleNamespace(
+                SEMANTIC_TEMPERATURE=0.07,
+                SEMANTIC_CALIBRATION_MAX_ALPHA=0.5,
+                PROTOTYPE_RELIABILITY_K=5.0,
+            )
+        )))
+        old_states = [{
+            "image_proto": F.normalize(torch.eye(4)[[0]], dim=-1),
+            "description_proto": F.normalize(torch.eye(4)[[0]], dim=-1),
+        }]
+        visual = F.normalize(torch.tensor([
+            [[0., 1., 0., 0.], [0., 0., 1., 0.]],
+            [[0., 0., 1., 0.], [0., 1., 0., 0.]],
+        ]), dim=-1)
+        semantic = F.normalize(torch.tensor([[1., 0., 0., 0.], [0., 1., 0., 0.]]), dim=-1)
+        counts = torch.tensor([[4., 5.], [3., 4.]])
+        calibrated, diagnostics = runner._semantic_guided_visual_prototype_calibration(
+            visual, semantic, counts, old_states
+        )
+        self.assertEqual(tuple(calibrated.shape), (2, 2, 4))
+        self.assertEqual(tuple(diagnostics["alpha"].shape), (2, 2))
+        for query in range(visual.size(0)):
+            expected, _ = runner._semantic_guided_visual_prototype_calibration(
+                visual[query], semantic, counts[query], old_states
+            )
+            torch.testing.assert_close(calibrated[query], expected, rtol=0, atol=1e-7)
+
+    def test_incremental_bank_uses_identical_semantic_rule_for_full_and_loo_prototypes(self):
+        torch.manual_seed(887)
+        runner, model = build_lifecycle_runner()
+        model.eval()
+        base_support = lifecycle_batch(
+            0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 8100, count=40
+        )
+        runner._train_base_descriptors([base_support])
+        base_state = make_lifecycle_state(runner, model, 0, base_support, 0)
+        support = lifecycle_batch(
+            1, torch.tensor([0., 1., 0., 0., 0., 0., 0., 0.]), 8200, count=16
+        )
+        semantic = F.normalize(torch.eye(8)[[0]], dim=-1)
+        bank = runner._build_incremental_bank(
+            [support], [1], [base_state], semantic_proto=semantic
+        )
+        cache = model.build_leave_one_out_prototypes([support], [1])
+        raw_full = F.normalize(cache["features"].mean(0, keepdim=True), dim=-1)
+        raw_loo = F.normalize(cache["loo_visual_prototypes"], dim=-1)
+        expected_full, _ = runner._semantic_guided_visual_prototype_calibration(
+            raw_full, semantic, torch.tensor([16.]), [base_state]
+        )
+        expected_loo, _ = runner._semantic_guided_visual_prototype_calibration(
+            raw_loo, semantic, torch.full((16, 1), 15.), [base_state]
+        )
+        torch.testing.assert_close(bank["novel_full"], expected_full, rtol=0, atol=1e-7)
+        torch.testing.assert_close(bank["novel_loo"], expected_loo, rtol=0, atol=1e-7)
+        self.assertTrue(torch.isfinite(bank["global_full"]).all())
 
     def test_classifier_bank_never_fuses_text_semantics_into_visual_prototypes(self):
         runner = Runner.__new__(Runner)
