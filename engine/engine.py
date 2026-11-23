@@ -1379,7 +1379,9 @@ class Runner:
         reliability = support_count / (support_count + reliability_k)
         alpha = alpha_max * confidence * (1.0 - reliability)
         if visual.ndim == 3:
-            alpha, guided = alpha.unsqueeze(0), guided.unsqueeze(0)
+            # Reliability already has [query, class] shape; only the shared
+            # semantic retrieval bank needs a leading query dimension.
+            guided = guided.unsqueeze(0)
         calibrated = F.normalize((1.0 - alpha.unsqueeze(-1)) * visual + alpha.unsqueeze(-1) * guided, dim=-1)
         if not torch.isfinite(calibrated).all() or (calibrated.norm(dim=-1) <= 1e-8).any():
             raise ValueError("Semantic-guided calibration produced invalid prototypes.")
