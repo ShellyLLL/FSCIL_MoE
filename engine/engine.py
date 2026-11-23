@@ -2188,6 +2188,8 @@ class Runner:
             )
             descriptor = adapter.descriptors[expert_id]
             descriptor.set_trainable(True)
+            if not descriptor.is_anchored:
+                descriptor.set_center(context["values"])
             descriptor.train()
             anchor_sets = self._all_old_anchor_sets(old_states, block_idx)
             if any(anchor_sets[key] is None for key in ("route_mean", "route_var", "expert_mean", "expert_var")):
@@ -2301,14 +2303,23 @@ class Runner:
                     except KeyError as error:
                         raise KeyError(f"Training source {error.args[0]} is absent from the Session reference cache.") from error
                     clean = context["values"][rows]
-                    noise_scale = float(_cfg_value(self._visual_moe_cfg(), "DESCRIPTOR_DENOISE_SCALE", 0.05))
-                    residual_weight = float(_cfg_value(self._visual_moe_cfg(), "DESCRIPTOR_RESIDUAL_WEIGHT", 1e-3))
+                    descriptor = context["descriptor"]
+                    if descriptor.is_anchored:
+                        noise_scale = float(_cfg_value(
+                            self._visual_moe_cfg(), "DESCRIPTOR_DENOISE_SCALE", 0.05
+                        ))
+                        residual_weight = float(_cfg_value(
+                            self._visual_moe_cfg(), "DESCRIPTOR_RESIDUAL_WEIGHT", 1e-3
+                        ))
+                    else:
+                        noise_scale, residual_weight = 0.0, 0.0
                     noise = context["adapter"].base_feature_std.to(self.device).reshape(1, -1) * noise_scale
                     if clean.numel():
                         noisy = clean + torch.randn_like(clean) * noise
-                        reconstruction = F.mse_loss(context["descriptor"](noisy), clean)
-                        residual = context["descriptor"].residual_output(clean).square().mean()
-                        rd_losses.append(reconstruction + residual_weight * residual)
+                        reconstruction = F.mse_loss(descriptor(noisy), clean)
+                        residual = descriptor.residual_output(clean).square().mean()
+                        orthogonality = descriptor.orthogonality_loss()
+                        rd_losses.append(reconstruction + 1e-3 * orthogonality + residual_weight * residual)
                     else:
                         rd_losses.append(classification.new_zeros(()))
                 local_preservation = torch.stack(local_losses).mean()
