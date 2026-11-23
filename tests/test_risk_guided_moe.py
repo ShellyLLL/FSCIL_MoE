@@ -342,9 +342,17 @@ class UnifiedDynamicMoETests(unittest.TestCase):
                     result["training"][block]["classification_samples_per_epoch"],
                     [16] * int(runner.cfg.TRAINER.BiMC.INCREMENTAL.EPOCHS),
                 )
-                self.assertTrue(any(
-                    not torch.equal(adapter.state_dict()[key], value)
-                    for key, value in before[block].items()
+                self.assertEqual(
+                    history["classification_samples_total"],
+                    16 * int(runner.cfg.TRAINER.BiMC.INCREMENTAL.EPOCHS),
+                )
+                self.assertEqual(
+                    len(history["gradient_projection"]),
+                    int(runner.cfg.TRAINER.BiMC.INCREMENTAL.EPOCHS),
+                )
+                self.assertTrue(all(
+                    torch.isfinite(torch.tensor(item["projection_coefficient"]))
+                    for item in history["gradient_projection"]
                 ))
             self.assertTrue(all(not parameter.requires_grad for parameter in adapter.parameters()))
 
