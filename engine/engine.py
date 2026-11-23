@@ -127,8 +127,8 @@ class Runner:
             "expert_input_space": "frozen_reference_vit_tokens_for_all_expert_generations",
             "gradient_clipping": "joint_all_expanded_functional_parameters_and_all_new_descriptors_norm_1.0",
             "base_descriptor_training_scope": "all_base_reference_cls_weighted_by_base_router_responsibility",
-            "descriptor_training_scope": "all_current_session_reference_cls",
-            "descriptor_calibration_scope": "all_current_session_reference_cls_weighted_by_deployed_expert_responsibility",
+            "descriptor_training_scope": "all_current_session_augmented_cls_views",
+            "descriptor_calibration_scope": "all_current_session_deterministic_reference_cls_weighted_by_deployed_expert_responsibility",
             "base_threshold_reference_scope": "deterministic_class_balanced_cached_base_reference_cls",
             "base_feature_diagnostic_scope": "cached_frozen_reference_prefix_replay_no_incremental_base_image_reload",
             "router_learning_signal": "joint_global_CE_projected_against_final_feature_and_local_residual_preservation",
@@ -833,7 +833,7 @@ class Runner:
             "completed_session": int(completed_session),
             "base_reference_source_ids": list(self.base_reference_source_ids),
             "base_reference_cls_features": self._cpu_copy(self.base_reference_cls_features),
-            "base_reference_prefix_cache": self._cpu_copy(self.base_reference_prefix_cache),
+            "base_reference_prefix_cache": self._cpu_copy(getattr(self, "base_reference_prefix_cache", None)),
             "base_reference_feature_prototypes": self._cpu_copy(getattr(self, "base_reference_feature_prototypes", None)),
             "base_reference_class_ids": self._cpu_copy(getattr(self, "base_reference_class_ids", None)),
             "expansion_thresholds": self._cpu_copy(self.expansion_thresholds),
@@ -1150,20 +1150,38 @@ class Runner:
         )
         return thresholds
 
-    def _train_base_descriptors(self, extract_loader):
-        """Fit Base RDs on all Base CLS rows; balanced references serve error and threshold statistics."""
+    def _train_base_descriptors(self, train_loader, extract_loader):
+        """Fit Base RDs on all augmented Base views and calibrate on all deterministic reference views."""
         epochs = int(_cfg_value(self.cfg.TRAINER.BiMC.OPTIM, "BASE_DESCRIPTOR_EPOCHS", 8))
         print(f"\n========== Fit Base AE Distribution Descriptors ({epochs} epochs) ==========")
-        feature_map = self.model_without_dp.collect_blockwise_cls_features(extract_loader)
+        fit_feature_map = self.model_without_dp.collect_blockwise_cls_features(train_loader)
+        reference_feature_map = self.model_without_dp.collect_blockwise_cls_features(extract_loader)
+        if set(fit_feature_map) != set(reference_feature_map):
+            raise RuntimeError("Base RD fit/reference feature views have different MoE blocks.")
         support_sizes = self._incremental_support_sizes()
         self.expansion_thresholds = {}
         self.base_reference_cls_features = {}
         for block_idx, adapter in self._moe_adapters():
-            item = feature_map[block_idx]
-            values = item["cls_in"].to(self.device).float()
-            labels = item["labels"].to(self.device).long()
-            source_ids = item["source_ids"].to(self.device).long()
-            adapter.set_base_feature_stats(values)
+            fit_item = fit_feature_map[block_idx]
+            reference_item = reference_feature_map[block_idx]
+            fit_values = fit_item["cls_in"].to(self.device).float()
+            fit_labels = fit_item["labels"].to(self.device).long()
+            fit_source_ids = fit_item["source_ids"].to(self.device).long()
+            values = reference_item["cls_in"].to(self.device).float()
+            labels = reference_item["labels"].to(self.device).long()
+            source_ids = reference_item["source_ids"].to(self.device).long()
+            if (set(fit_source_ids.tolist()) != set(source_ids.tolist())
+                    or len(set(fit_source_ids.tolist())) != fit_source_ids.numel()
+                    or len(set(source_ids.tolist())) != source_ids.numel()):
+                raise RuntimeError(f"Block {block_idx} Base RD fit/reference views lost source identity alignment.")
+            fit_label_by_source = {
+                int(source): int(label)
+                for source, label in zip(fit_source_ids.tolist(), fit_labels.tolist())
+            }
+            if any(fit_label_by_source.get(int(source)) != int(label)
+                   for source, label in zip(source_ids.tolist(), labels.tolist())):
+                raise RuntimeError(f"Block {block_idx} Base RD fit/reference views disagree on source labels.")
+            adapter.set_base_feature_stats(fit_values)
 
             session_class_count = int(self.cfg.DATASET.NUM_INC_CLS)
             threshold_reference_per_class = self._base_reference_per_class(
@@ -1195,7 +1213,7 @@ class Runner:
             error_reference_values = values[error_reference_mask]
             with torch.no_grad():
                 fit_responsibilities = torch.stack([
-                    adapter.expert_responsibility(values, expert_id)
+                    adapter.expert_responsibility(fit_values, expert_id)
                     for expert_id in range(adapter.num_experts)
                 ], dim=-1)
                 reference_responsibilities = torch.stack([
@@ -1205,7 +1223,7 @@ class Runner:
 
             for expert_id in range(adapter.num_experts):
                 loss = self._train_descriptor(
-                    adapter, expert_id, values, epochs,
+                    adapter, expert_id, fit_values, epochs,
                     fit_responsibilities[:, expert_id],
                     calibration_values=error_reference_values,
                     calibration_weights=reference_responsibilities[:, expert_id],
@@ -1695,7 +1713,7 @@ class Runner:
                   f"ce={totals['ce']/n:.4f} lb={totals['lb']/n:.4f}")
         for _, adapter in self._moe_adapters():
             adapter.freeze_all()
-        self._train_base_descriptors(extract_loader)
+        self._train_base_descriptors(train_loader, extract_loader)
 
     def train_incremental_task(self, task_id, train_loader, extract_loader, class_index,
                                current_class_name, old_states):
@@ -1791,6 +1809,9 @@ class Runner:
 
         # One immutable Session snapshot drives every layer's decision.
         expansion_features = self.model_without_dp.collect_blockwise_cls_features(extract_loader)
+        rd_fit_features = self.model_without_dp.collect_blockwise_cls_features(train_loader)
+        if set(expansion_features) != set(rd_fit_features):
+            raise RuntimeError("Incremental RD fit/reference feature views have different MoE blocks.")
         expected_classes = sorted(int(value) for value in class_index)
         if not expansion_features:
             raise RuntimeError("Session-level expansion received no blockwise reference features.")
@@ -1846,13 +1867,27 @@ class Runner:
             item = context["item"]
             values = item["cls_in"].to(self.device).float()
             labels = item["labels"].to(self.device).long()
-            sources = item["source_ids"].to(self.device)
-            if (sources.numel() != values.size(0)
+            sources = item["source_ids"].to(self.device).long()
+            fit_item = rd_fit_features[int(block_idx)]
+            fit_values = fit_item["cls_in"].to(self.device).float()
+            fit_labels = fit_item["labels"].to(self.device).long()
+            fit_sources = fit_item["source_ids"].to(self.device).long()
+            if (sources.numel() != values.size(0) or fit_sources.numel() != fit_values.size(0)
                     or torch.unique(sources).numel() != sources.numel()
-                    or sorted(int(value) for value in torch.unique(labels, sorted=True).tolist()) != expected_classes):
-                raise ValueError("New RD requires one stable reference row for every Session support source.")
-            # Every current Session source participates in RD optimization and
-            # in the deployed expert's weighted reference-error distribution.
+                    or torch.unique(fit_sources).numel() != fit_sources.numel()
+                    or set(sources.tolist()) != set(fit_sources.tolist())
+                    or sorted(int(value) for value in torch.unique(labels, sorted=True).tolist()) != expected_classes
+                    or sorted(int(value) for value in torch.unique(fit_labels, sorted=True).tolist()) != expected_classes):
+                raise ValueError("New RD fit/reference views must cover the same stable Session support sources.")
+            fit_label_by_source = {
+                int(source): int(label)
+                for source, label in zip(fit_sources.tolist(), fit_labels.tolist())
+            }
+            if any(fit_label_by_source.get(int(source)) != int(label)
+                   for source, label in zip(sources.tolist(), labels.tolist())):
+                raise ValueError("New RD fit/reference views disagree on source labels.")
+            # Every Session source is used in both its augmented RD fitting view
+            # and deterministic reference view; no support source is held out.
             reference_source_ids = set(int(value) for value in sources.detach().cpu().tolist())
             anchor_expert_id, anchor_q90 = adapter.select_descriptor_anchor(values)
             expert_id = self.model_without_dp.add_expert(
@@ -1866,9 +1901,10 @@ class Runner:
                 raise RuntimeError(f"Block {block_idx} expansion lacks historical route/expert feature anchors.")
             context.update({
                 "expert_id": int(expert_id), "descriptor": descriptor,
-                "values": values, "labels": labels, "sources": sources,
+                "values": fit_values, "labels": fit_labels, "sources": fit_sources,
+                "calibration_values": values, "calibration_labels": labels,
                 "reference_source_ids": reference_source_ids,
-                "source_to_row": {int(source): row for row, source in enumerate(sources.tolist())},
+                "source_to_row": {int(source): row for row, source in enumerate(fit_sources.tolist())},
                 "anchor_q90": anchor_q90.detach().cpu(),
                 "anchor_sets": anchor_sets,
                 "history": {
@@ -2042,7 +2078,7 @@ class Runner:
             descriptor = context["descriptor"]
             descriptor.eval()
             with torch.no_grad():
-                reference_values = context["values"]
+                reference_values = context["calibration_values"]
                 errors = descriptor.reconstruction_error(reference_values)
                 responsibility = context["adapter"].expert_responsibility(
                     reference_values, context["expert_id"]
@@ -2058,6 +2094,13 @@ class Runner:
                 )
                 context["history"]["rd_reference_responsibility_mean"] = float(
                     responsibility.mean().item()
+                )
+                context["history"]["rd_fit_reference_view_cosine"] = float(
+                    F.cosine_similarity(
+                        F.normalize(context["values"], dim=-1),
+                        F.normalize(reference_values, dim=-1),
+                        dim=-1,
+                    ).mean().item()
                 )
                 context["history"]["session_q90"] = float(context["decision"].session_q90)
                 context["history"]["session_q95_threshold"] = float(context["decision"].threshold)
