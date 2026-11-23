@@ -2357,6 +2357,8 @@ class Runner:
                 torch.nn.utils.clip_grad_norm_(functional_parameters, 1.0)
                 torch.nn.utils.clip_grad_norm_(descriptor_parameters, 1.0)
                 optimizer.step()
+                for context in expanded_contexts:
+                    context["descriptor"].retract_basis_()
 
                 batch_size = int(labels.numel())
                 epoch_totals["ce"] += float(classification.item()) * batch_size
