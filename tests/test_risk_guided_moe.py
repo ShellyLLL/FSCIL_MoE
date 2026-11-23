@@ -398,9 +398,18 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             for block, adapter in runner._moe_adapters()
         }
 
+        observed_threshold_classes = []
+        original_calibration = runner._calibrate_session_expansion_thresholds
+        def record_threshold_classes(adapter, values, labels, support_sizes, block_idx):
+            observed_threshold_classes.append(set(torch.unique(labels).tolist()))
+            return original_calibration(adapter, values, labels, support_sizes, block_idx)
+        runner._calibrate_session_expansion_thresholds = record_threshold_classes
         result = runner.train_incremental_task(
             1, support, support, [1, 2], ["new_class_a", "new_class_b"], [base_state]
         )
+        runner._calibrate_session_expansion_thresholds = original_calibration
+        self.assertEqual(len(observed_threshold_classes), 2)
+        self.assertTrue(all({0, 1, 2}.issubset(classes) for classes in observed_threshold_classes))
         self.assertEqual(result["expanded"], [])
         self.assertEqual([row["block_idx"] for row in result["reused"]], [0, 1])
         self.assertFalse(result["trained"])
@@ -560,12 +569,20 @@ class UnifiedDynamicMoETests(unittest.TestCase):
     def test_base_rd_uses_all_fit_sources_and_weighted_reference_statistics(self):
         torch.manual_seed(233)
         runner, model = build_lifecycle_runner()
-        supports = [
+        reference_supports = [
             lifecycle_batch(0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 5000, count=40),
             lifecycle_batch(1, torch.tensor([0., 1., 0., 0., 0., 0., 0., 0.]), 5010, count=40),
             lifecycle_batch(2, torch.tensor([0., 0., 1., 0., 0., 0., 0., 0.]), 5020, count=40),
         ]
-        runner._train_base_descriptors(supports, supports)
+        fit_supports = [
+            lifecycle_batch(0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 5000, count=40,
+                            augmented=True, seed=233),
+            lifecycle_batch(1, torch.tensor([0., 1., 0., 0., 0., 0., 0., 0.]), 5010, count=40,
+                            augmented=True, seed=234),
+            lifecycle_batch(2, torch.tensor([0., 0., 1., 0., 0., 0., 0., 0.]), 5020, count=40,
+                            augmented=True, seed=235),
+        ]
+        runner._train_base_descriptors(fit_supports, reference_supports)
         for _, adapter in runner._moe_adapters():
             adapter.assert_descriptors_ready()
             for descriptor in adapter.descriptors:
