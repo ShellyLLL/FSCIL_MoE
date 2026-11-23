@@ -976,11 +976,17 @@ class Runner:
             else:
                 for _, backup_path in backed_up:
                     if backup_path.exists():
-                        backup_path.unlink()
+                        try:
+                            backup_path.unlink()
+                        except OSError:
+                            pass
         finally:
             for temp_path in temp_paths:
                 if temp_path.exists():
-                    temp_path.unlink()
+                    try:
+                        temp_path.unlink()
+                    except OSError:
+                        pass
         print(f"=> Saved checkpoint: {target}")
         return target
 
