@@ -186,6 +186,7 @@ def make_lifecycle_state(runner, model, class_id, support, creation_session):
         "description_proto": semantic,
         "support_count": torch.tensor([support["label"].numel()], dtype=torch.long),
         "anchor_by_block": anchors,
+        "final_feature_anchors": runner._collect_final_feature_anchors([support], creation_session),
         "creation_session": int(creation_session),
     }
 

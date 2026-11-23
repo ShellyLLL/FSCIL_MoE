@@ -1659,23 +1659,20 @@ class Runner:
 
     def _train_incremental_task_impl(self, task_id, train_loader, extract_loader, class_index,
                                       current_class_name, old_states, semantic_proto=None):
-        """Session-level Q90 expansion; each new expert and RD models the full Session."""
+        """Plan every layer first, then jointly optimize all expanded modules in one Session."""
         optim_cfg = self.cfg.TRAINER.BiMC.OPTIM
         incremental_cfg = self.cfg.TRAINER.BiMC.INCREMENTAL
         epochs = int(incremental_cfg.EPOCHS)
         scale = float(incremental_cfg.LOGIT_SCALE)
-        # Validate the Session's class coverage and source-exclusive LOO
-        # support before threshold lookup or any expert topology mutation.
-        self._build_incremental_bank(extract_loader, class_index, old_states, semantic_proto)
+        if epochs < 1:
+            raise ValueError("Incremental Session epochs must be positive.")
         if not self.expansion_thresholds:
             raise RuntimeError("Base Session-Q95 expansion thresholds have not been calibrated.")
-
-        decisions, expanded, reused, histories = [], [], [], {}
+        self._build_incremental_bank(extract_loader, class_index, old_states, semantic_proto)
         for _, adapter in self._moe_adapters():
             adapter.freeze_all()
 
-        # The frozen reference stream is invariant to adapter residuals. This
-        # full-Session scan supplies both expansion evidence and paired AE data.
+        # One immutable Session snapshot drives every layer's decision.
         expansion_features = self.model_without_dp.collect_blockwise_cls_features(extract_loader)
         expected_classes = sorted(int(value) for value in class_index)
         if not expansion_features:
@@ -1685,369 +1682,307 @@ class Runner:
         ).tolist())
         if reference_labels != expected_classes:
             raise RuntimeError(
-                f"Reference support classes {reference_labels} do not match Session classes "
-                f"{expected_classes}."
+                f"Reference support classes {reference_labels} do not match Session classes {expected_classes}."
             )
 
-        # Each adapter consumes its block's frozen-reference stream, so expansion
-        # evidence is invariant to all earlier adapter residual updates.
+        decisions, expanded, reused, contexts = [], [], [], {}
+        # Phase 1: decide for all layers without mutating any layer topology.
         for block_idx in self.model_without_dp.expandable_blocks():
+            item = expansion_features[int(block_idx)]
+            support_size = int(item["cls_in"].size(0))
+            threshold = self.expansion_thresholds.get(int(block_idx), {}).get(support_size)
             decision = self.model_without_dp.plan_layer_expansion(
-                block_idx,
-                expansion_features,
-                class_index,
-                self.expansion_thresholds.get(int(block_idx), {}).get(
-                    int(expansion_features[int(block_idx)]["cls_in"].size(0))
-                ),
+                block_idx, expansion_features, class_index, threshold
             )
             decisions.append({
-                "block_idx": int(block_idx),
-                "expand": bool(decision.expand),
+                "block_idx": int(block_idx), "expand": bool(decision.expand),
                 "session_q90": float(decision.session_q90),
                 "session_q95_threshold": float(decision.threshold),
                 "support_count": int(decision.support_count),
-                "session_q90": float(decision.session_q90),
             })
             if not decision.expand:
-                history = self._train_reused_router(block_idx, expansion_features[int(block_idx)])
-                histories[block_idx] = history
+                adapter = self._adapter_by_block(block_idx)
+                with torch.no_grad():
+                    _, weights = adapter.routing_outputs(item["cls_in"].to(self.device).float())
                 reused.append({"block_idx": int(block_idx), "mode": "reuse_frozen",
-                               "expert_count": int(history["expert_count"])})
-                continue
+                               "expert_count": int(adapter.num_experts)})
+                contexts[int(block_idx)] = {
+                    "mode": "reuse_frozen", "adapter": adapter,
+                    "history": {
+                        "mode": "reuse_frozen", "parameter_updates": 0,
+                        "classification_samples_per_epoch": [], "classification_samples_total": 0,
+                        "rd_training_samples": 0, "rd_reference_samples": 0,
+                        "route_anchor_count": int(item["cls_in"].size(0)),
+                        "route_weight_mean": weights.mean(0).detach().cpu(),
+                        "expert_count": int(adapter.num_experts),
+                    },
+                }
+            else:
+                contexts[int(block_idx)] = {"mode": "expand", "adapter": self._adapter_by_block(block_idx),
+                                            "item": item, "decision": decision}
 
-            adapter = self._adapter_by_block(block_idx)
-            local_item = expansion_features[int(block_idx)]
-            local_values = local_item["cls_in"].to(self.device).float()
-            local_labels = local_item["labels"].to(self.device).long()
-            local_sources = local_item["source_ids"].to(self.device)
-            # Source-level split: descriptor optimization and its error-scale
-            # calibration are disjoint, while CE and routing still use every
-            # Session support source.
+        # Phase 2: instantiate all new experts/RDs before the first optimizer step.
+        for block_idx, context in contexts.items():
+            if context["mode"] != "expand":
+                continue
+            adapter = context["adapter"]
+            item = context["item"]
+            values = item["cls_in"].to(self.device).float()
+            labels = item["labels"].to(self.device).long()
+            sources = item["source_ids"].to(self.device)
             class_source_counts = [
-                int(torch.unique(local_sources[local_labels.eq(class_id)]).numel())
-                for class_id in torch.unique(local_labels, sorted=True).tolist()
+                int(torch.unique(sources[labels.eq(class_id)]).numel())
+                for class_id in torch.unique(labels, sorted=True).tolist()
             ]
-            calibration_per_class = max(
-                2, int(math.ceil(0.40 * min(class_source_counts)))
-            )
+            calibration_per_class = max(2, int(math.ceil(0.40 * min(class_source_counts))))
             calibration_mask = self._make_calibration_mask(
-                local_labels, local_sources,
-                min_calibration_count=calibration_per_class * int(torch.unique(local_labels).numel()),
+                labels, sources,
+                min_calibration_count=calibration_per_class * int(torch.unique(labels).numel()),
                 min_fit_per_class=3,
                 min_calibration_per_class=calibration_per_class,
             )
-            descriptor_fit_mask = ~calibration_mask
-            descriptor_calibration_mask = calibration_mask
-            descriptor_fit_values = local_values[descriptor_fit_mask]
-            descriptor_calibration_values = local_values[descriptor_calibration_mask]
-            if (not descriptor_fit_values.numel() or not descriptor_calibration_values.numel()
-                    or set(local_labels[descriptor_fit_mask].tolist()) != set(expected_classes)
-                    or set(local_labels[descriptor_calibration_mask].tolist()) != set(expected_classes)):
+            fit_mask, calibration_mask = ~calibration_mask, calibration_mask
+            fit_values, calibration_values = values[fit_mask], values[calibration_mask]
+            if (not fit_values.numel() or not calibration_values.numel()
+                    or set(labels[fit_mask].tolist()) != set(expected_classes)
+                    or set(labels[calibration_mask].tolist()) != set(expected_classes)):
                 raise ValueError("New RD requires source-disjoint fit and calibration sources from every Session class.")
-            anchor_expert_id, anchor_q90 = adapter.select_descriptor_anchor(local_values)
+            anchor_expert_id, anchor_q90 = adapter.select_descriptor_anchor(values)
             expert_id = self.model_without_dp.add_expert(
                 block_idx, task_id, anchor_expert_id=anchor_expert_id
-            )
-            anchor_sets = self._all_old_anchor_sets(old_states, block_idx)
-            anchor_mean, anchor_var = anchor_sets["route_mean"], anchor_sets["route_var"]
-            expert_anchor_mean, expert_anchor_var = (
-                anchor_sets["expert_mean"], anchor_sets["expert_var"]
             )
             descriptor = adapter.descriptors[expert_id]
             descriptor.set_trainable(True)
             descriptor.train()
-            descriptor_noise_scale = float(_cfg_value(
-                self._visual_moe_cfg(), "DESCRIPTOR_DENOISE_SCALE", 0.05
-            ))
-            descriptor_residual_weight = float(_cfg_value(
-                self._visual_moe_cfg(), "DESCRIPTOR_RESIDUAL_WEIGHT", 1e-3
-            ))
-            rd_weight = float(_cfg_value(incremental_cfg, "RD_WEIGHT", 1.0))
-            if (not np.isfinite(descriptor_noise_scale) or descriptor_noise_scale < 0
-                    or not np.isfinite(descriptor_residual_weight) or descriptor_residual_weight < 0
-                    or not np.isfinite(rd_weight) or rd_weight < 0):
-                raise ValueError("RD noise, residual and objective weights must be finite and non-negative.")
-            noise_std = adapter.base_feature_std.to(self.device).reshape(1, -1) * descriptor_noise_scale
-            source_to_row = {
-                int(source_id): row for row, source_id in enumerate(local_sources.tolist())
+            anchor_sets = self._all_old_anchor_sets(old_states, block_idx)
+            if any(anchor_sets[key] is None for key in ("route_mean", "route_var", "expert_mean", "expert_var")):
+                raise RuntimeError(f"Block {block_idx} expansion lacks historical route/expert feature anchors.")
+            context.update({
+                "expert_id": int(expert_id), "descriptor": descriptor,
+                "values": values, "labels": labels, "sources": sources,
+                "fit_mask": fit_mask, "calibration_mask": calibration_mask,
+                "fit_values": fit_values, "calibration_values": calibration_values,
+                "fit_source_ids": set(sources[fit_mask].detach().cpu().tolist()),
+                "source_to_row": {int(source): row for row, source in enumerate(sources.tolist())},
+                "anchor_q90": anchor_q90.detach().cpu(),
+                "anchor_sets": anchor_sets,
+                "history": {
+                    "expert_id": int(expert_id), "descriptor_anchor_id": int(anchor_expert_id),
+                    "descriptor_anchor_q90": [float(value) for value in anchor_q90.detach().cpu().tolist()],
+                    "loss": [], "ce_loss": [], "rd_loss": [], "feature_space_loss": [],
+                    "local_preservation_loss": [], "gradient_projection": [],
+                    "classification_samples_per_epoch": [], "classification_samples_total": 0,
+                    "rd_training_samples": int(fit_values.size(0)),
+                    "rd_reference_samples": int(calibration_values.size(0)),
+                    "rd_fit_source_ids": sorted(int(value) for value in sources[fit_mask].tolist()),
+                    "rd_calibration_source_ids": sorted(int(value) for value in sources[calibration_mask].tolist()),
+                    "rd_session_classes": sorted(int(value) for value in torch.unique(labels[calibration_mask]).tolist()),
+                },
+            })
+
+        expanded_contexts = [context for context in contexts.values() if context["mode"] == "expand"]
+        if not expanded_contexts:
+            for _, adapter in self._moe_adapters():
+                adapter.freeze_all()
+            return {
+                "trained": False, "decisions": decisions, "expanded": [],
+                "reused": reused, "training": {block: value["history"] for block, value in contexts.items()},
+                "semantic_prototype": None if semantic_proto is None else semantic_proto.detach(),
+                "encoder_version": 0,
             }
-            fit_source_ids = set(local_sources[descriptor_fit_mask].detach().cpu().tolist())
-            optimizer = optim.AdamW([
-                {"params": adapter.experts[-1].parameters(),
-                 "lr": float(optim_cfg.LR_INCREMENTAL_EXPERT)},
-                {"params": adapter.router.columns[-1].parameters(),
-                 "lr": float(optim_cfg.LR_INCREMENTAL_ROUTER)},
-                {"params": descriptor.trainable_parameters(),
-                 "lr": float(_cfg_value(optim_cfg, "LR_DESCRIPTOR", 1e-3))},
-            ], weight_decay=float(optim_cfg.WEIGHT_DECAY))
 
-            loss_history, ce_history, rd_history, pd_history = [], [], [], []
-            gradient_projection_history = []
-            classification_samples_total = 0
-            samples_per_epoch = []
-            observed_train_classes = set()
-            for epoch in range(epochs):
-                bank = self._build_incremental_bank(
-                    extract_loader, class_index, old_states, semantic_proto)
-                self.model.train()
-                # Frozen historical experts stay in eval mode; only the
-                # newest residual adapter uses its configured dropout.
-                for _, layer_adapter in self._moe_adapters():
-                    layer_adapter.eval()
-                adapter.experts[-1].train()
-                descriptor.train()
-                total, ce_total, rd_total, pd_total, count = 0.0, 0.0, 0.0, 0.0, 0
-                projection_rows = {"expert": [], "router": []}
-                epoch_samples = 0
-                for batch in train_loader:
-                    all_images, all_labels = self.parse_batch(batch)
-                    all_source_ids = self._batch_source_ids(
-                        batch, all_labels.numel(), all_labels.device
-                    )
-                    if not torch.isin(
-                        all_labels, torch.as_tensor(class_index, device=all_labels.device)
-                    ).all():
-                        raise ValueError(
-                            f"Block {block_idx} training loader contains labels outside "
-                            "the current Session."
-                        )
-                    observed_train_classes.update(int(value) for value in all_labels.unique().tolist())
+        # One optimizer owns every newly created functional module and descriptor.
+        parameter_groups, functional_parameters, descriptor_parameters = [], [], []
+        for context in expanded_contexts:
+            adapter = context["adapter"]
+            expert_parameters = list(adapter.experts[-1].parameters())
+            router_parameters = list(adapter.router.columns[-1].parameters())
+            rd_parameters = list(context["descriptor"].trainable_parameters())
+            functional_parameters.extend(expert_parameters + router_parameters)
+            descriptor_parameters.extend(rd_parameters)
+            parameter_groups.extend([
+                {"params": expert_parameters, "lr": float(optim_cfg.LR_INCREMENTAL_EXPERT)},
+                {"params": router_parameters, "lr": float(optim_cfg.LR_INCREMENTAL_ROUTER)},
+                {"params": rd_parameters, "lr": float(_cfg_value(optim_cfg, "LR_DESCRIPTOR", 1e-3))},
+            ])
+        optimizer = optim.AdamW(parameter_groups, weight_decay=float(optim_cfg.WEIGHT_DECAY))
+        rd_weight = float(_cfg_value(incremental_cfg, "RD_WEIGHT", 1.0))
+        feature_weight = float(_cfg_value(incremental_cfg, "FEATURE_SPACE_PRESERVATION_WEIGHT", 1.0))
+        local_weight = float(_cfg_value(incremental_cfg, "LOCAL_RESIDUAL_PRESERVATION_WEIGHT", 1.0))
+        if any(not np.isfinite(value) or value < 0 for value in (rd_weight, feature_weight, local_weight)):
+            raise ValueError("Session objective weights must be finite and non-negative.")
 
-                    optimizer.zero_grad(set_to_none=True)
-                    # Every current-Session example contributes to global
-                    # classification; historical anchors provide the explicit
-                    # old-feature preservation objective.
-                    logits, targets = self._global_incremental_logits(
-                        all_images, all_labels, all_source_ids, bank, scale
-                    )
-                    classification = F.cross_entropy(logits, targets)
-                    old_suppression = adapter.old_feature_preservation_loss(
-                        anchor_mean, anchor_var,
-                        expert_anchor_mean, expert_anchor_var,
-                    )
+        old_prefix, old_final, anchor_batch_size = self._historical_feature_anchor_batches(old_states)
+        loss_projection_history = []
+        for epoch in range(epochs):
+            bank = self._build_incremental_bank(extract_loader, class_index, old_states, semantic_proto)
+            self.model.train()
+            for _, layer_adapter in self._moe_adapters():
+                layer_adapter.eval()
+            for context in expanded_contexts:
+                context["adapter"].experts[-1].train()
+                context["descriptor"].train()
+            epoch_totals = {"ce": 0.0, "feature": 0.0, "local": 0.0, "rd": 0.0, "n": 0}
+            observed_classes, projection_rows = set(), []
+            for batch in train_loader:
+                images, labels = self.parse_batch(batch)
+                source_ids = self._batch_source_ids(batch, labels.numel(), labels.device)
+                if not torch.isin(labels, torch.as_tensor(class_index, device=labels.device)).all():
+                    raise ValueError("Training loader contains labels outside the current Session.")
+                observed_classes.update(int(value) for value in labels.unique().tolist())
+                optimizer.zero_grad(set_to_none=True)
+                logits, targets = self._global_incremental_logits(images, labels, source_ids, bank, scale)
+                classification = F.cross_entropy(logits, targets)
+
+                # Replay historical frozen-prefix tokens through the complete current adapter stack.
+                feature_losses = []
+                for offset in range(0, old_prefix.size(0), anchor_batch_size):
+                    stop = min(offset + anchor_batch_size, old_prefix.size(0))
+                    feature_losses.append(self._final_feature_anchor_loss(
+                        old_prefix[offset:stop], old_final[offset:stop]
+                    ))
+                feature_preservation = torch.stack(feature_losses).mean()
+
+                local_losses, rd_losses = [], []
+                for context in expanded_contexts:
+                    adapter = context["adapter"]
+                    anchors = context["anchor_sets"]
+                    local_losses.append(adapter.old_feature_preservation_loss(
+                        anchors["route_mean"], anchors["route_var"],
+                        anchors["expert_mean"], anchors["expert_var"],
+                    ))
+                    source_to_row = context["source_to_row"]
                     try:
-                        rd_rows = torch.as_tensor(
-                            [source_to_row[int(source_id)] for source_id in all_source_ids.tolist()],
+                        rows = torch.as_tensor(
+                            [source_to_row[int(source)] for source in source_ids.tolist()],
                             device=self.device, dtype=torch.long,
                         )
                     except KeyError as error:
-                        raise KeyError(
-                            f"Training source {error.args[0]} is absent from the Session RD feature cache."
-                        ) from error
-                    rd_fit_mask = torch.as_tensor(
-                        [int(source_id) in fit_source_ids for source_id in all_source_ids.tolist()],
+                        raise KeyError(f"Training source {error.args[0]} is absent from the Session reference cache.") from error
+                    fit_rows = torch.as_tensor(
+                        [int(source) in context["fit_source_ids"] for source in source_ids.tolist()],
                         device=self.device, dtype=torch.bool,
                     )
-                    rd_clean = local_values[rd_rows[rd_fit_mask]]
-                    if rd_clean.numel():
-                        rd_noisy = rd_clean + torch.randn_like(rd_clean) * noise_std
-                        rd_reconstruction = F.mse_loss(
-                            descriptor(rd_noisy), rd_clean
-                        )
-                        rd_residual_loss = descriptor.residual_output(rd_clean).square().mean()
-                        rd_loss = rd_reconstruction + descriptor_residual_weight * rd_residual_loss
+                    clean = context["values"][rows[fit_rows]]
+                    noise_scale = float(_cfg_value(self._visual_moe_cfg(), "DESCRIPTOR_DENOISE_SCALE", 0.05))
+                    residual_weight = float(_cfg_value(self._visual_moe_cfg(), "DESCRIPTOR_RESIDUAL_WEIGHT", 1e-3))
+                    noise = context["adapter"].base_feature_std.to(self.device).reshape(1, -1) * noise_scale
+                    if clean.numel():
+                        noisy = clean + torch.randn_like(clean) * noise
+                        reconstruction = F.mse_loss(context["descriptor"](noisy), clean)
+                        residual = context["descriptor"].residual_output(clean).square().mean()
+                        rd_losses.append(reconstruction + residual_weight * residual)
                     else:
-                        rd_loss = classification.new_zeros(())
-                    pd_weight = float(getattr(incremental_cfg, "FEATURE_SPACE_PRESERVATION_WEIGHT", 1.0))
-                    if not np.isfinite(pd_weight) or pd_weight < 0:
-                        raise ValueError("FEATURE_SPACE_PRESERVATION_WEIGHT must be finite and non-negative.")
-                    loss = classification + pd_weight * old_suppression + rd_weight * rd_loss
-                    if not bool(torch.isfinite(loss).item()):
-                        raise FloatingPointError(
-                            "Non-finite Session-level global visual-prototype incremental loss."
-                        )
+                        rd_losses.append(classification.new_zeros(()))
+                local_preservation = torch.stack(local_losses).mean()
+                rd_loss = torch.stack(rd_losses).mean()
+                preservation = feature_weight * feature_preservation + local_weight * local_preservation
+                total_loss = classification + preservation + rd_weight * rd_loss
+                if not torch.isfinite(total_loss):
+                    raise FloatingPointError("Unified Session objective became non-finite.")
 
-                    # Resolve CE/PD conflict independently for the newest
-                    # expert and router. The projected CE component cannot
-                    # increase the old-feature preservation objective to
-                    # first order; the PD component is then added explicitly.
-                    expert_parameters = list(adapter.experts[-1].parameters())
-                    router_parameters = list(adapter.router.columns[-1].parameters())
-                    functional_parameters = expert_parameters + router_parameters
-                    ce_gradients = torch.autograd.grad(
-                        classification, functional_parameters,
-                        retain_graph=True, allow_unused=True,
-                    )
-                    pd_gradients = torch.autograd.grad(
-                        old_suppression, functional_parameters,
-                        retain_graph=False, allow_unused=True,
-                    )
-                    expert_count = len(expert_parameters)
-                    projected_expert_ce, expert_projection = self._project_conflicting_gradients(
-                        ce_gradients[:expert_count], pd_gradients[:expert_count]
-                    )
-                    projected_router_ce, router_projection = self._project_conflicting_gradients(
-                        ce_gradients[expert_count:], pd_gradients[expert_count:]
-                    )
-                    for parameter, ce_gradient, pd_gradient in zip(
-                        expert_parameters, projected_expert_ce, pd_gradients[:expert_count]
-                    ):
-                        if ce_gradient is None and pd_gradient is None:
-                            parameter.grad = None
-                        else:
-                            combined_gradient = (
-                                torch.zeros_like(parameter) if ce_gradient is None else ce_gradient
-                            )
-                            if pd_gradient is not None:
-                                combined_gradient = combined_gradient + pd_weight * pd_gradient
-                            parameter.grad = combined_gradient.detach()
-                    for parameter, ce_gradient, pd_gradient in zip(
-                        router_parameters, projected_router_ce, pd_gradients[expert_count:]
-                    ):
-                        if ce_gradient is None and pd_gradient is None:
-                            parameter.grad = None
-                        else:
-                            combined_gradient = (
-                                torch.zeros_like(parameter) if ce_gradient is None else ce_gradient
-                            )
-                            if pd_gradient is not None:
-                                combined_gradient = combined_gradient + pd_weight * pd_gradient
-                            parameter.grad = combined_gradient.detach()
-
-                    descriptor_parameters = descriptor.trainable_parameters()
-                    if rd_loss.requires_grad:
-                        rd_gradients = torch.autograd.grad(
-                            rd_weight * rd_loss, descriptor_parameters,
-                            allow_unused=True,
-                        )
-                        for parameter, gradient in zip(descriptor_parameters, rd_gradients):
-                            parameter.grad = None if gradient is None else gradient.detach()
+                # Project the single global CE gradient against the complete historical-preservation gradient.
+                ce_grad = torch.autograd.grad(
+                    classification, functional_parameters, retain_graph=True, allow_unused=True
+                )
+                preservation_grad = torch.autograd.grad(
+                    preservation, functional_parameters, retain_graph=True, allow_unused=True
+                )
+                projected_ce, projection_diag = self._project_conflicting_gradients(
+                    ce_grad, preservation_grad
+                )
+                for parameter, ce_value, preserve_value in zip(
+                    functional_parameters, projected_ce, preservation_grad
+                ):
+                    if ce_value is None and preserve_value is None:
+                        parameter.grad = None
                     else:
-                        for parameter in descriptor_parameters:
-                            parameter.grad = None
+                        combined = torch.zeros_like(parameter) if ce_value is None else ce_value
+                        if preserve_value is not None:
+                            combined = combined + preserve_value
+                        parameter.grad = combined.detach()
+                rd_grad = torch.autograd.grad(
+                    rd_weight * rd_loss, descriptor_parameters, allow_unused=True
+                )
+                for parameter, gradient in zip(descriptor_parameters, rd_grad):
+                    parameter.grad = None if gradient is None else gradient.detach()
+                torch.nn.utils.clip_grad_norm_(functional_parameters, 1.0)
+                torch.nn.utils.clip_grad_norm_(descriptor_parameters, 1.0)
+                optimizer.step()
 
-                    projection_rows["expert"].append(expert_projection)
-                    projection_rows["router"].append(router_projection)
-                    # RD remains isolated to the descriptor parameter group.
-                    torch.nn.utils.clip_grad_norm_(functional_parameters, 1.0)
-                    torch.nn.utils.clip_grad_norm_(descriptor_parameters, 1.0)
-                    optimizer.step()
-                    batch_size = int(all_labels.numel())
-                    total += float(loss.item()) * batch_size
-                    ce_total += float(classification.item()) * batch_size
-                    rd_total += float(rd_loss.item()) * batch_size
-                    pd_total += float(old_suppression.item()) * batch_size
-                    count += batch_size
-                    epoch_samples += batch_size
-                    classification_samples_total += batch_size
+                batch_size = int(labels.numel())
+                epoch_totals["ce"] += float(classification.item()) * batch_size
+                epoch_totals["feature"] += float(feature_preservation.item()) * batch_size
+                epoch_totals["local"] += float(local_preservation.item()) * batch_size
+                epoch_totals["rd"] += float(rd_loss.item()) * batch_size
+                epoch_totals["n"] += batch_size
+                projection_rows.append(projection_diag)
+                for context in expanded_contexts:
+                    context["history"]["classification_samples_total"] += batch_size
+            if epoch_totals["n"] == 0 or sorted(observed_classes) != expected_classes:
+                raise RuntimeError("Joint Session loader was empty or failed to cover all Session classes.")
+            n = epoch_totals["n"]
+            for context in expanded_contexts:
+                history = context["history"]
+                history["ce_loss"].append(epoch_totals["ce"] / n)
+                history["feature_space_loss"].append(epoch_totals["feature"] / n)
+                history["local_preservation_loss"].append(epoch_totals["local"] / n)
+                history["rd_loss"].append(epoch_totals["rd"] / n)
+                history["loss"].append(
+                    epoch_totals["ce"] / n + epoch_totals["feature"] / n +
+                    epoch_totals["local"] / n + rd_weight * epoch_totals["rd"] / n
+                )
+                history["classification_samples_per_epoch"].append(n)
+            loss_projection_history.append(projection_diag)
 
-                if count == 0:
-                    raise RuntimeError(f"Block {block_idx} expanded but the current task loader was empty.")
-                if sorted(observed_train_classes) != expected_classes:
-                    raise RuntimeError(
-                        f"Block {block_idx} training loader classes {sorted(observed_train_classes)} "
-                        f"do not cover the current Session classes {expected_classes}."
-                    )
-                samples_per_epoch.append(int(epoch_samples))
-                loss_history.append(total / count)
-                ce_history.append(ce_total / count)
-                rd_history.append(rd_total / count)
-                pd_history.append(pd_total / count)
-                def summarize_projection(rows):
-                    conflicts = [row for row in rows if row["applied"]]
-                    before = [row["ce_pd_cosine_before"] for row in rows
-                              if row["ce_pd_cosine_before"] is not None]
-                    after = [row["ce_pd_cosine_after"] for row in rows
-                             if row["ce_pd_cosine_after"] is not None]
-                    return {
-                        "batch_count": len(rows),
-                        "conflict_count": len(conflicts),
-                        "conflict_rate": float(len(conflicts) / max(1, len(rows))),
-                        "projection_coefficient_mean": (
-                            float(np.mean([row["projection_coefficient"] for row in conflicts]))
-                            if conflicts else 0.0
-                        ),
-                        "ce_pd_cosine_before_mean": float(np.mean(before)) if before else None,
-                        "ce_pd_cosine_after_mean": float(np.mean(after)) if after else None,
-                    }
-                gradient_projection_history.append({
-                    group: summarize_projection(rows)
-                    for group, rows in projection_rows.items()
-                })
-
-            # The paired RD is optimized only on the fit partition. Its
-            # standardized error scale is calibrated on disjoint source IDs.
+        # Calibrate all newly trained RDs only after the shared functional training has finished.
+        for context in expanded_contexts:
+            descriptor = context["descriptor"]
             descriptor.eval()
             with torch.no_grad():
-                session_errors = descriptor.reconstruction_error(
-                    descriptor_calibration_values
+                errors = descriptor.reconstruction_error(context["calibration_values"])
+                descriptor.update_reference(errors)
+                descriptor.assert_ready()
+                context["history"]["rd_effective_reference_count"] = float(
+                    descriptor.effective_error_count.item()
                 )
-                descriptor.update_reference(session_errors)
-                rd_fit_z = descriptor.standardized_score(descriptor_fit_values)
-                rd_calibration_z = descriptor.standardized_score(descriptor_calibration_values)
-                rd_session_z = descriptor.standardized_score(local_values)
-                rd_calibration_diagnostics = {
-                    "fit_q90": float(torch.quantile(rd_fit_z, 0.90).item()),
-                    "calibration_q90": float(torch.quantile(rd_calibration_z, 0.90).item()),
-                    "session_q90": float(torch.quantile(rd_session_z, 0.90).item()),
-                    "error_mean": float(descriptor.error_mean.item()),
-                    "error_std": float(descriptor.error_std.item()),
-                }
-            print(
-                f"=> [RD-Calibration][B{block_idx}][E{expert_id}] "
-                f"fit_q90={rd_calibration_diagnostics['fit_q90']:.4f} "
-                f"heldout_q90={rd_calibration_diagnostics['calibration_q90']:.4f} "
-                f"session_q90={rd_calibration_diagnostics['session_q90']:.4f} "
-                f"error_mean={rd_calibration_diagnostics['error_mean']:.8g} "
-                f"error_std={rd_calibration_diagnostics['error_std']:.8g}"
-            )
-            adapter.freeze_all()
-            # Adding an RD changes min_k z_{i,k}; the previous Base threshold
-            # is no longer calibrated for this expert pool.
-            self._refresh_block_expansion_threshold(block_idx)
-            ae_loss = float(rd_history[-1])
-            fit_class_ids = sorted(int(value) for value in torch.unique(
-                local_labels[descriptor_fit_mask], sorted=True
-            ).tolist())
-            calibration_class_ids = sorted(int(value) for value in torch.unique(
-                local_labels[descriptor_calibration_mask], sorted=True
-            ).tolist())
-
-            histories[block_idx] = {
-                "expert_id": int(expert_id),
-                "descriptor_anchor_id": int(anchor_expert_id),
-                "descriptor_anchor_q90": [float(value) for value in anchor_q90.detach().cpu().tolist()],
-                "loss": loss_history,
-                "ce_loss": ce_history,
-                "rd_loss": rd_history,
-                "pd_loss": pd_history,
-                "gradient_projection": gradient_projection_history,
-                "rd_loss_final": ae_loss,
-                "session_q90": float(decision.session_q90),
-                "session_q95_threshold": float(decision.threshold),
-                "classification_samples_per_epoch": samples_per_epoch,
-                "classification_samples_total": int(classification_samples_total),
-                "rd_training_samples": int(descriptor_fit_values.size(0)),
-                "rd_reference_samples": int(descriptor_calibration_values.size(0)),
-                "rd_fit_source_ids": sorted(int(value) for value in local_sources[descriptor_fit_mask].tolist()),
-                "rd_calibration_source_ids": sorted(int(value) for value in local_sources[descriptor_calibration_mask].tolist()),
-                "rd_effective_reference_count": float(
-                    adapter.descriptors[expert_id].effective_error_count.item()
-                ),
-                "rd_session_classes": calibration_class_ids,
-                "old_anchor_gate_mean": adapter.old_anchor_response(anchor_mean, anchor_var),
-                "old_anchor_residual_norm": adapter.old_anchor_residual_response(
-                    anchor_mean, anchor_var, expert_anchor_mean, expert_anchor_var
-                ),
-            }
-            expanded.append({
-                "block_idx": int(block_idx),
-                "expert_id": int(expert_id),
-                "descriptor_anchor_id": int(anchor_expert_id),
-                "descriptor_anchor_q90": [float(value) for value in anchor_q90.detach().cpu().tolist()],
-                "session_q90": float(decision.session_q90),
-                "session_q95_threshold": float(decision.threshold),
-            })
-
+                context["history"]["rd_fit_q90"] = float(torch.quantile(
+                    descriptor.standardized_score(context["fit_values"]), 0.90
+                ).item())
+                context["history"]["rd_calibration_q90"] = float(torch.quantile(
+                    descriptor.standardized_score(context["calibration_values"]), 0.90
+                ).item())
+                context["history"]["session_q90"] = float(context["decision"].session_q90)
+                context["history"]["session_q95_threshold"] = float(context["decision"].threshold)
+                context["history"]["old_anchor_gate_mean"] = context["adapter"].old_anchor_response(
+                    context["anchor_sets"]["route_mean"], context["anchor_sets"]["route_var"]
+                )
+                context["history"]["old_anchor_residual_norm"] = context["adapter"].old_anchor_residual_response(
+                    context["anchor_sets"]["route_mean"], context["anchor_sets"]["route_var"],
+                    context["anchor_sets"]["expert_mean"], context["anchor_sets"]["expert_var"]
+                )
+            context["adapter"].freeze_all()
+        # Recalibrate thresholds after every new RD has joined its layer's deployed pool.
+        for block_idx, context in contexts.items():
+            if context["mode"] == "expand":
+                self._refresh_block_expansion_threshold(block_idx)
+                expanded.append({
+                    "block_idx": int(block_idx), "expert_id": int(context["expert_id"]),
+                    "descriptor_anchor_id": int(context["adapter"].descriptors[-1].anchor_expert_id),
+                    "session_q90": float(context["decision"].session_q90),
+                    "session_q95_threshold": float(context["decision"].threshold),
+                })
         for _, adapter in self._moe_adapters():
             adapter.freeze_all()
-        self._assert_moe_frozen("incremental Session completion")
+        self._assert_moe_frozen("joint incremental Session completion")
+        histories = {block: context["history"] for block, context in contexts.items()}
+        for block, history in histories.items():
+            if history.get("mode") == "reuse_frozen":
+                continue
+            history["gradient_projection"] = loss_projection_history
         return {
-            "trained": bool(expanded),
-            "decisions": decisions,
-            "expanded": expanded,
-            "reused": reused,
-            "training": histories,
+            "trained": bool(expanded), "decisions": decisions, "expanded": expanded,
+            "reused": reused, "training": histories,
             "semantic_prototype": None if semantic_proto is None else semantic_proto.detach(),
             "encoder_version": 0,
         }
