@@ -359,6 +359,42 @@ class UnifiedDynamicMoETests(unittest.TestCase):
                 ))
             self.assertTrue(all(not parameter.requires_grad for parameter in adapter.parameters()))
 
+    def test_session_wide_transaction_restores_topology_thresholds_metrics_and_rng(self):
+        runner, model = build_lifecycle_runner()
+        runner.acc_list = [80.0]
+        runner.task_acc_list = [[80.0]]
+        runner.session_diagnostics = [{"session": 0}]
+        runner.expansion_thresholds = {0: {16: 0.5}, 1: {16: 0.7}}
+        runner.base_reference_source_ids = [11, 12]
+        runner.base_reference_cls_features = {"sentinel": torch.tensor([1])}
+        runner.base_reference_prefix_cache = None
+        runner.base_reference_feature_prototypes = None
+        runner.base_reference_class_ids = None
+        runner.base_reference_accuracy_baseline = None
+        states = [{"class_ids": torch.tensor([0])}]
+        before = {
+            block: adapter.export_topology()
+            for block, adapter in runner._moe_adapters()
+        }
+        snapshot = runner._snapshot_session_transaction(states)
+        runner._adapter_by_block(0).add_expert(session_id=1, anchor_expert_id=0)
+        runner.expansion_thresholds[0][16] = 99.0
+        runner.acc_list.append(10.0)
+        runner.task_acc_list.append([10.0])
+        runner.session_diagnostics.append({"session": 1})
+        states.append({"class_ids": torch.tensor([1])})
+        random_before_restore = torch.rand(3)
+        runner._restore_session_transaction(snapshot, states)
+        self.assertEqual(states, snapshot["state_dict_list"])
+        self.assertEqual(runner.acc_list, [80.0])
+        self.assertEqual(runner.task_acc_list, [[80.0]])
+        self.assertEqual(runner.session_diagnostics, [{"session": 0}])
+        self.assertEqual(runner.expansion_thresholds, {0: {16: 0.5}, 1: {16: 0.7}})
+        self.assertEqual(runner.base_reference_source_ids, [11, 12])
+        for block, adapter in runner._moe_adapters():
+            self.assertEqual(adapter.export_topology(), before[block])
+            self.assertTrue(all(not parameter.requires_grad for parameter in adapter.parameters()))
+
     def test_reuse_session_keeps_all_historical_parameters_frozen(self):
         torch.manual_seed(263)
         runner, model = build_lifecycle_runner()
