@@ -251,7 +251,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             self.assertEqual(history["classification_samples_total"], 256)
             self.assertEqual(len(history["ce_loss"]), 8)
             self.assertEqual(len(history["rd_loss"]), 8)
-            self.assertEqual(len(history["pd_loss"]), 8)
+            self.assertEqual(len(history["local_preservation_loss"]), 8)
             self.assertEqual(len(history["gradient_projection"]), 8)
             for projection_epoch in history["gradient_projection"]:
                 self.assertIn("applied", projection_epoch)
@@ -269,7 +269,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             self.assertEqual(history["rd_session_classes"], [1, 2])
             self.assertGreater(history["rd_effective_reference_count"], 1.0)
             self.assertTrue(all(torch.isfinite(torch.tensor(history[key])).all()
-                                for key in ("ce_loss", "rd_loss", "pd_loss")))
+                                for key in ("ce_loss", "rd_loss", "local_preservation_loss")))
             features = model.collect_blockwise_cls_features(support)[block_idx]
             gates = torch.sigmoid(adapter.router.columns[-1](features["cls_in"]))
             self.assertTrue(torch.isfinite(gates).all())
@@ -432,6 +432,22 @@ class UnifiedDynamicMoETests(unittest.TestCase):
                 for key, before in before_state.items():
                     torch.testing.assert_close(expert.state_dict()[key], before, rtol=0, atol=0)
             self.assertTrue(all(not parameter.requires_grad for parameter in adapter.parameters()))
+
+    def test_final_feature_anchor_selection_is_source_order_invariant(self):
+        runner, model = build_lifecycle_runner()
+        support = lifecycle_batch(
+            0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 9200, count=12
+        )
+        first = runner._collect_final_feature_anchors([support], session_id=3)
+        order = torch.tensor([9, 1, 7, 3, 11, 0, 6, 4, 10, 2, 8, 5])
+        permuted = {
+            key: (value[order] if torch.is_tensor(value) and value.ndim > 0
+                  and value.size(0) == support["image"].size(0) else value)
+            for key, value in support.items()
+        }
+        second = runner._collect_final_feature_anchors([permuted], session_id=3)
+        self.assertEqual(set(first["source_ids"].tolist()), set(second["source_ids"].tolist()))
+        self.assertEqual(first["anchor_count"], 2)
 
     def test_final_feature_anchor_replay_is_differentiable_and_preserves_history(self):
         torch.manual_seed(267)
@@ -1182,10 +1198,11 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             }
             checkpoint_path = runner.save_checkpoint(0, [state])
             payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-            self.assertEqual(payload["schema_version"], 36)
+            self.assertEqual(payload["schema_version"], 37)
             self.assertTrue(payload["base_reference_source_ids"])
             self.assertIn("base_reference_cls_features", payload)
             self.assertIn("base_reference_prefix_cache", payload)
+            self.assertIn("base_reference_accuracy_baseline", payload)
             self.assertIn("expansion_thresholds", payload)
             self.assertEqual(payload["expansion_thresholds"], runner.expansion_thresholds)
             self.assertIn("reference_image_proto", payload["task_states"][0])
@@ -1295,6 +1312,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             baseline_proto = F.normalize(baseline_features.mean(0, keepdim=True), dim=-1)
         runner.base_reference_feature_prototypes = baseline_proto.cpu().half()
         runner.base_reference_class_ids = torch.tensor([0])
+        runner.base_reference_accuracy_baseline = 100.0
         state = {
             "class_ids": torch.tensor([0]),
             "image_proto": baseline_proto,
@@ -1302,6 +1320,8 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         result = runner._base_reference_feature_diagnostics(state)
         self.assertTrue(result["available"])
         self.assertTrue(result["within_target"])
+        self.assertTrue(result["within_accuracy_target"])
+        self.assertEqual(result["base_reference_accuracy_drop"], 0.0)
         self.assertEqual(result["num_sources"], 8)
 
     def test_dynamic_pool_change_refreshes_threshold_from_cached_base_cls(self):

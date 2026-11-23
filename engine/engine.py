@@ -60,6 +60,7 @@ class Runner:
         self.base_reference_prefix_cache = None
         self.base_reference_feature_prototypes = None
         self.base_reference_class_ids = None
+        self.base_reference_accuracy_baseline = None
         self.evaluator = AccuracyEvaluator(self.data_manager.class_index_in_task)
         self._resume_completed_session = -1
         self._resume_state_dict_list = []
@@ -112,7 +113,7 @@ class Runner:
         loss_cfg = _cfg_value(trainer_cfg, "LOSS", None)
         dataset_cfg = _cfg_value(self.cfg, "DATASET", None)
         return {
-            "version": 16,
+            "version": 17,
             "decision_unit": "incremental_session_per_layer",
             "sample_score": "minimum_standardized_reconstruction_error_over_current_deployed_RDs",
             "threshold_refresh": "recalibrate_from_all_accepted_session_reference_cls_after_every_successful_session",
@@ -132,6 +133,7 @@ class Runner:
             "base_threshold_reference_scope": "deterministic_class_balanced_cached_base_reference_cls",
             "base_feature_diagnostic_scope": "cached_frozen_reference_prefix_replay_no_incremental_base_image_reload",
             "threshold_calibration_scope": "base_reference_plus_all_historical_and_current_incremental_support_cls",
+            "feature_space_acceptance": "minimum_class_prototype_cosine_and_fixed_base_reference_accuracy_drop",
             "router_learning_signal": "joint_global_CE_projected_against_final_feature_and_local_residual_preservation",
             "visual_moe_enabled": bool(_cfg_value(moe_cfg, "ENABLE", False)),
             "insert_blocks": [int(value) for value in _cfg_value(moe_cfg, "INSERT_BLOCKS", [])],
@@ -481,15 +483,16 @@ class Runner:
             "support_manifest", "moe_topology", "expansion_policy", "expansion_thresholds",
             "base_reference_source_ids", "base_reference_cls_features",
             "base_reference_prefix_cache", "base_reference_feature_prototypes", "base_reference_class_ids",
+            "base_reference_accuracy_baseline",
         )
         missing = [key for key in required if key not in payload]
         if missing:
             raise ValueError(f"Resume checkpoint is missing required fields: {missing}")
         schema = int(payload["schema_version"])
-        if schema != 36:
+        if schema != 37:
             raise ValueError(
                 "This branch uses all-support dual-view RD fitting, known-domain Session-Q90 threshold "
-                "calibration and prefix-replay feature diagnostics checkpoint schema (36); "
+                "calibration and cosine/accuracy feature-space acceptance checkpoint schema (37); "
                 "older expansion-policy checkpoints are incompatible."
             )
         checkpoint_policy = payload.get("expansion_policy")
@@ -629,11 +632,17 @@ class Runner:
                 raise ValueError("Checkpoint Base reference feature anchors are malformed or misaligned.")
             self.base_reference_feature_prototypes = F.normalize(holdout_prototypes, dim=-1).cpu().half()
             self.base_reference_class_ids = holdout_class_ids.cpu()
+            baseline_accuracy = payload.get("base_reference_accuracy_baseline")
+            if (baseline_accuracy is None or not np.isfinite(float(baseline_accuracy))
+                    or not 0.0 <= float(baseline_accuracy) <= 100.0):
+                raise ValueError("Checkpoint Base reference accuracy baseline is missing or invalid.")
+            self.base_reference_accuracy_baseline = float(baseline_accuracy)
         else:
             if callable(getattr(getattr(self, "data_manager", None), "get_base_source_dataloader", None)):
                 raise ValueError("Production checkpoint is missing Base reference feature-space anchors.")
             self.base_reference_feature_prototypes = None
             self.base_reference_class_ids = None
+            self.base_reference_accuracy_baseline = None
         self.model_without_dp.rebuild_moe_topology(topology)
         self.model_without_dp.load_state_dict(payload["model_state"], strict=True)
         for _, adapter in self._moe_adapters():
@@ -851,13 +860,14 @@ class Runner:
         directory.mkdir(parents=True, exist_ok=True)
         topology = self.model_without_dp.export_moe_topology()
         payload = {
-            "schema_version": 36,
+            "schema_version": 37,
             "completed_session": int(completed_session),
             "base_reference_source_ids": list(self.base_reference_source_ids),
             "base_reference_cls_features": self._cpu_copy(self.base_reference_cls_features),
             "base_reference_prefix_cache": self._cpu_copy(getattr(self, "base_reference_prefix_cache", None)),
             "base_reference_feature_prototypes": self._cpu_copy(getattr(self, "base_reference_feature_prototypes", None)),
             "base_reference_class_ids": self._cpu_copy(getattr(self, "base_reference_class_ids", None)),
+            "base_reference_accuracy_baseline": self._cpu_copy(getattr(self, "base_reference_accuracy_baseline", None)),
             "expansion_thresholds": self._cpu_copy(self.expansion_thresholds),
             "model_state": self._cpu_copy(self.model_without_dp.state_dict()),
             "moe_topology": topology,
@@ -1328,12 +1338,39 @@ class Runner:
         return True
 
     @torch.no_grad()
+    def _capture_base_reference_accuracy_anchor(self, base_state):
+        """Measure fixed Base-reference accuracy before any incremental Session."""
+        cache = getattr(self, "base_reference_prefix_cache", None)
+        if cache is None:
+            return None
+        prefix_tokens = torch.as_tensor(cache["prefix_tokens"], device=self.device).float()
+        labels = torch.as_tensor(cache["labels"], device=self.device, dtype=torch.long)
+        base_ids = torch.as_tensor(base_state["class_ids"], device=self.device, dtype=torch.long).reshape(-1)
+        prototypes = F.normalize(torch.as_tensor(base_state["image_proto"], device=self.device).float(), dim=-1)
+        features = F.normalize(
+            self.model_without_dp.extract_img_feature_from_reference_prefix(prefix_tokens).float(),
+            dim=-1,
+        )
+        matches = labels[:, None].eq(base_ids[None, :])
+        if not matches.any(dim=1).all():
+            raise RuntimeError("Base reference accuracy anchor contains labels absent from Base prototypes.")
+        targets = matches.long().argmax(-1)
+        predictions = (features @ prototypes.t()).argmax(-1)
+        accuracy = float(predictions.eq(targets).float().mean().item() * 100.0)
+        if not np.isfinite(accuracy):
+            raise FloatingPointError("Base reference accuracy anchor is non-finite.")
+        self.base_reference_accuracy_baseline = accuracy
+        print(f"=> [Feature-Space][Base-anchor] reference_accuracy={accuracy:.2f}%")
+        return accuracy
+
+    @torch.no_grad()
     def _base_reference_feature_diagnostics(self, base_state):
         """Measure Base drift by replaying cached reference prefixes; never reload Base images."""
         cache = getattr(self, "base_reference_prefix_cache", None)
         baseline = getattr(self, "base_reference_feature_prototypes", None)
         baseline_ids = getattr(self, "base_reference_class_ids", None)
-        if cache is None or baseline is None or baseline_ids is None:
+        baseline_accuracy = getattr(self, "base_reference_accuracy_baseline", None)
+        if cache is None or baseline is None or baseline_ids is None or baseline_accuracy is None:
             return {"available": False}
         prefix_tokens = torch.as_tensor(
             cache["prefix_tokens"], device=self.device
@@ -1376,6 +1413,16 @@ class Runner:
             for class_id in base_ids.tolist()
         }
         target_cosine = float(_cfg_value(self._visual_moe_cfg(), "FEATURE_SPACE_MIN_COSINE", 0.98))
+        max_accuracy_drop = float(_cfg_value(
+            self._visual_moe_cfg(), "FEATURE_SPACE_MAX_ACCURACY_DROP", 0.0
+        ))
+        if not np.isfinite(max_accuracy_drop) or max_accuracy_drop < 0:
+            raise ValueError("FEATURE_SPACE_MAX_ACCURACY_DROP must be finite and non-negative.")
+        current_accuracy = float(
+            predictions.eq(targets.to(self.device)).float().mean().item() * 100.0
+        )
+        accuracy_drop = max(0.0, float(baseline_accuracy) - current_accuracy)
+        within_accuracy_target = bool(accuracy_drop <= max_accuracy_drop)
         result = {
             "available": True,
             "num_classes": int(baseline_ids.numel()),
@@ -1385,15 +1432,21 @@ class Runner:
             "prototype_cosine_per_class": {
                 int(k): float(v) for k, v in zip(baseline_ids.tolist(), alignment.tolist())
             },
-            "base_reference_accuracy": float(predictions.eq(targets.to(self.device)).float().mean().item() * 100.0),
+            "base_reference_accuracy_baseline": float(baseline_accuracy),
+            "base_reference_accuracy": current_accuracy,
+            "base_reference_accuracy_drop": accuracy_drop,
+            "max_accuracy_drop": max_accuracy_drop,
             "base_reference_class_accuracy": class_acc,
             "minimum_cosine_target": target_cosine,
-            "within_target": bool(float(alignment.min().item()) >= target_cosine),
+            "within_cosine_target": bool(float(alignment.min().item()) >= target_cosine),
+            "within_accuracy_target": within_accuracy_target,
+            "within_target": bool(float(alignment.min().item()) >= target_cosine) and within_accuracy_target,
         }
         print(
             f"=> [Feature-Space][Session] cosine_mean={result['prototype_cosine_mean']:.6f} "
             f"cosine_min={result['prototype_cosine_min']:.6f} "
             f"base_reference_acc={result['base_reference_accuracy']:.2f}% "
+            f"accuracy_drop={result['base_reference_accuracy_drop']:.2f}pp "
             f"within_target={result['within_target']}"
         )
         return result
@@ -1495,9 +1548,14 @@ class Runner:
             raise ValueError("Feature-space anchor sources must be unique within a Session.")
         selected = []
         for class_id in torch.unique(labels, sorted=True).tolist():
-            rows = torch.nonzero(labels.eq(int(class_id)), as_tuple=False).flatten()
-            order = torch.argsort(sources[rows], stable=True)
-            selected.extend(rows[order[:per_class]].tolist())
+            rows = torch.nonzero(labels.eq(int(class_id)), as_tuple=False).flatten().tolist()
+            ordered_rows = sorted(
+                rows,
+                key=lambda row: hashlib.sha256(
+                    f"fscil-feature-anchor:{int(session_id)}:{int(class_id)}:{int(sources[row])}".encode("utf-8")
+                ).digest(),
+            )
+            selected.extend(ordered_rows[:per_class])
         selected = torch.as_tensor(selected, dtype=torch.long)
         return {
             "session_id": int(session_id),
@@ -1994,7 +2052,7 @@ class Runner:
                     "expert_id": int(expert_id), "descriptor_anchor_id": int(anchor_expert_id),
                     "descriptor_anchor_q90": [float(value) for value in anchor_q90.detach().cpu().tolist()],
                     "loss": [], "ce_loss": [], "rd_loss": [], "feature_space_loss": [],
-                    "local_preservation_loss": [], "pd_loss": [], "gradient_projection": [],
+                    "local_preservation_loss": [], "gradient_projection": [],
                     "classification_samples_per_epoch": [], "classification_samples_total": 0,
                     "rd_training_samples": int(values.size(0)),
                     "rd_reference_samples": int(values.size(0)),
@@ -2153,7 +2211,6 @@ class Runner:
                 history["ce_loss"].append(epoch_totals["ce"] / n)
                 history["feature_space_loss"].append(epoch_totals["feature"] / n)
                 history["local_preservation_loss"].append(epoch_totals["local"] / n)
-                history["pd_loss"].append(epoch_totals["local"] / n)
                 history["rd_loss"].append(epoch_totals["rd"] / n)
                 history["loss"].append(
                     epoch_totals["ce"] / n + epoch_totals["feature"] / n +
@@ -2303,6 +2360,7 @@ class Runner:
                 state["anchor_by_block"] = self._collect_class_anchors(extract_loader)
                 if use_moe:
                     state["reference_cls_by_block"] = self._cpu_copy(self.base_reference_cls_features)
+                    self._capture_base_reference_accuracy_anchor(state)
                     state["final_feature_anchors"] = self._collect_final_feature_anchors(extract_loader, 0)
             else:
                 if use_moe:
