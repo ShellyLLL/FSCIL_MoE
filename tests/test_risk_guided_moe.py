@@ -1144,9 +1144,10 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             }
             checkpoint_path = runner.save_checkpoint(0, [state])
             payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-            self.assertEqual(payload["schema_version"], 34)
+            self.assertEqual(payload["schema_version"], 35)
             self.assertTrue(payload["base_reference_source_ids"])
             self.assertIn("base_reference_cls_features", payload)
+            self.assertIn("base_reference_prefix_cache", payload)
             self.assertIn("expansion_thresholds", payload)
             self.assertEqual(payload["expansion_thresholds"], runner.expansion_thresholds)
             self.assertIn("reference_image_proto", payload["task_states"][0])
@@ -1232,6 +1233,38 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         self.assertEqual(set(first), {4, 8})
         self.assertEqual(first, second)
         self.assertNotEqual(first[8], first[4])
+
+    def test_base_reference_feature_diagnostics_replay_cached_prefix_without_image_reload(self):
+        runner, model = build_lifecycle_runner()
+        support = lifecycle_batch(
+            0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 9100, count=8
+        )
+        runner.base_reference_source_ids = support["source_ids"].tolist()
+        runner.data_manager = SimpleNamespace(
+            get_base_source_dataloader=lambda _ids: (_ for _ in ()).throw(
+                AssertionError("Incremental Base-image reload is forbidden.")
+            )
+        )
+        runner.base_reference_prefix_cache = {
+            "prefix_tokens": model.extract_reference_prefix_tokens(support["image"]).half(),
+            "labels": support["label"].clone(),
+            "source_ids": support["source_ids"].clone(),
+        }
+        with torch.no_grad():
+            baseline_features = model.extract_img_feature_from_reference_prefix(
+                runner.base_reference_prefix_cache["prefix_tokens"].float()
+            )
+            baseline_proto = F.normalize(baseline_features.mean(0, keepdim=True), dim=-1)
+        runner.base_reference_feature_prototypes = baseline_proto.cpu().half()
+        runner.base_reference_class_ids = torch.tensor([0])
+        state = {
+            "class_ids": torch.tensor([0]),
+            "image_proto": baseline_proto,
+        }
+        result = runner._base_reference_feature_diagnostics(state)
+        self.assertTrue(result["available"])
+        self.assertTrue(result["within_target"])
+        self.assertEqual(result["num_sources"], 8)
 
     def test_dynamic_pool_change_refreshes_threshold_from_cached_base_cls(self):
         torch.manual_seed(227)

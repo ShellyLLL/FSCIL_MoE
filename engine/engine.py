@@ -57,6 +57,7 @@ class Runner:
         self.expansion_thresholds = {}
         self.base_reference_source_ids = []
         self.base_reference_cls_features = {}
+        self.base_reference_prefix_cache = None
         self.base_reference_feature_prototypes = None
         self.base_reference_class_ids = None
         self.evaluator = AccuracyEvaluator(self.data_manager.class_index_in_task)
@@ -111,7 +112,7 @@ class Runner:
         loss_cfg = _cfg_value(trainer_cfg, "LOSS", None)
         dataset_cfg = _cfg_value(self.cfg, "DATASET", None)
         return {
-            "version": 14,
+            "version": 15,
             "decision_unit": "incremental_session_per_layer",
             "sample_score": "minimum_standardized_reconstruction_error_over_current_deployed_RDs",
             "threshold_refresh": "recalibrate_from_cached_base_reference_cls_after_every_expert_pool_change",
@@ -129,6 +130,7 @@ class Runner:
             "descriptor_training_scope": "all_current_session_reference_cls",
             "descriptor_calibration_scope": "all_current_session_reference_cls_weighted_by_deployed_expert_responsibility",
             "base_threshold_reference_scope": "deterministic_class_balanced_cached_base_reference_cls",
+            "base_feature_diagnostic_scope": "cached_frozen_reference_prefix_replay_no_incremental_base_image_reload",
             "router_learning_signal": "joint_global_CE_projected_against_final_feature_and_local_residual_preservation",
             "visual_moe_enabled": bool(_cfg_value(moe_cfg, "ENABLE", False)),
             "insert_blocks": [int(value) for value in _cfg_value(moe_cfg, "INSERT_BLOCKS", [])],
@@ -477,16 +479,17 @@ class Runner:
             "schema_version", "completed_session", "model_state", "task_states",
             "support_manifest", "moe_topology", "expansion_policy", "expansion_thresholds",
             "base_reference_source_ids", "base_reference_cls_features",
-            "base_reference_feature_prototypes", "base_reference_class_ids",
+            "base_reference_prefix_cache", "base_reference_feature_prototypes", "base_reference_class_ids",
         )
         missing = [key for key in required if key not in payload]
         if missing:
             raise ValueError(f"Resume checkpoint is missing required fields: {missing}")
         schema = int(payload["schema_version"])
-        if schema != 34:
+        if schema != 35:
             raise ValueError(
-                "This branch uses all-support responsibility-weighted RD fitting and cached Base-reference "
-                "Session-Q90 expansion checkpoint schema (34); older expansion-policy checkpoints are incompatible."
+                "This branch uses all-support responsibility-weighted RD fitting, cached Base-reference "
+                "Session-Q90 expansion and prefix-replay feature diagnostics checkpoint schema (35); "
+                "older expansion-policy checkpoints are incompatible."
             )
         checkpoint_policy = payload.get("expansion_policy")
         if checkpoint_policy != self._expansion_policy():
@@ -574,6 +577,31 @@ class Runner:
         if set(normalized_reference_cache) != expected_reference_blocks:
             raise ValueError("Checkpoint Base reference CLS cache blocks do not match the MoE topology.")
         self.base_reference_cls_features = normalized_reference_cache
+        raw_prefix_cache = payload.get("base_reference_prefix_cache")
+        if raw_prefix_cache is None:
+            if callable(getattr(getattr(self, "data_manager", None), "get_base_source_dataloader", None)):
+                raise ValueError("Production checkpoint is missing cached Base reference prefix tokens.")
+            self.base_reference_prefix_cache = None
+        else:
+            if not isinstance(raw_prefix_cache, dict):
+                raise ValueError("Checkpoint Base reference prefix cache must be a mapping.")
+            prefix_tokens = torch.as_tensor(raw_prefix_cache.get("prefix_tokens")).float()
+            prefix_labels = torch.as_tensor(raw_prefix_cache.get("labels"), dtype=torch.long).reshape(-1)
+            prefix_sources = torch.as_tensor(raw_prefix_cache.get("source_ids"), dtype=torch.long).reshape(-1)
+            expected_sources = torch.as_tensor(self.base_reference_source_ids, dtype=torch.long)
+            if (prefix_tokens.ndim != 3 or prefix_tokens.size(0) == 0
+                    or prefix_labels.numel() != prefix_tokens.size(0)
+                    or prefix_sources.numel() != prefix_tokens.size(0)
+                    or not torch.isfinite(prefix_tokens).all()
+                    or torch.unique(prefix_sources).numel() != prefix_sources.numel()
+                    or not torch.equal(prefix_sources, expected_sources)
+                    or not torch.equal(torch.unique(prefix_labels, sorted=True), expected_base_ids.sort().values)):
+                raise ValueError("Checkpoint Base reference prefix cache is malformed or misaligned.")
+            self.base_reference_prefix_cache = {
+                "prefix_tokens": prefix_tokens.cpu().half(),
+                "labels": prefix_labels.cpu(),
+                "source_ids": prefix_sources.cpu(),
+            }
         if any(
             size <= 0 or not np.isfinite(value)
             for by_size in self.expansion_thresholds.values()
@@ -801,10 +829,11 @@ class Runner:
         directory.mkdir(parents=True, exist_ok=True)
         topology = self.model_without_dp.export_moe_topology()
         payload = {
-            "schema_version": 34,
+            "schema_version": 35,
             "completed_session": int(completed_session),
             "base_reference_source_ids": list(self.base_reference_source_ids),
             "base_reference_cls_features": self._cpu_copy(self.base_reference_cls_features),
+            "base_reference_prefix_cache": self._cpu_copy(self.base_reference_prefix_cache),
             "base_reference_feature_prototypes": self._cpu_copy(getattr(self, "base_reference_feature_prototypes", None)),
             "base_reference_class_ids": self._cpu_copy(getattr(self, "base_reference_class_ids", None)),
             "expansion_thresholds": self._cpu_copy(self.expansion_thresholds),
@@ -1016,7 +1045,6 @@ class Runner:
         return mask
 
     @staticmethod
-    def _base_reference_per_class    @staticmethod
     def _base_reference_per_class(support_sizes, session_class_count):
         """Convert total Session support counts into per-class Base reference capacity.
 
@@ -1203,45 +1231,86 @@ class Runner:
 
     @torch.no_grad()
     def _capture_base_reference_feature_anchors(self):
-        """Capture class-level adapted feature anchors from the fixed Base AE holdout."""
+        """Cache frozen-reference ViT prefix tokens and Base feature anchors once at Base completion."""
         data_manager = getattr(self, "data_manager", None)
         loader_factory = getattr(data_manager, "get_base_source_dataloader", None)
         if not callable(loader_factory):
             return None
         if not self.base_reference_source_ids:
-            raise RuntimeError("Cannot capture Base feature anchors before AE holdout identities are fixed.")
+            raise RuntimeError("Cannot capture Base feature anchors before reference source identities are fixed.")
         loader = loader_factory(self.base_reference_source_ids)
         self.model.eval()
-        _, labels, prototypes, _ = self.model_without_dp.inference_all_img_feature(loader)
-        class_ids = torch.unique(labels.to(self.device, dtype=torch.long), sorted=True)
-        prototypes = F.normalize(torch.as_tensor(prototypes, device=self.device).float(), dim=-1)
+        prefix_rows, label_rows, source_rows = [], [], []
+        for batch in loader:
+            images, labels = self.parse_batch(batch)
+            source_ids = self._batch_source_ids(batch, labels.numel(), labels.device)
+            prefix = self.model_without_dp.extract_reference_prefix_tokens(images)
+            prefix_rows.append(prefix.detach().cpu())
+            label_rows.append(labels.detach().cpu().long())
+            source_rows.append(source_ids.detach().cpu().long())
+        if not prefix_rows:
+            raise RuntimeError("Base reference prefix capture received an empty loader.")
+        prefix_tokens = torch.cat(prefix_rows)
+        labels = torch.cat(label_rows).long()
+        source_ids = torch.cat(source_rows).long()
+        expected_sources = torch.as_tensor(self.base_reference_source_ids, dtype=torch.long)
+        if (not torch.equal(source_ids, expected_sources)
+                or torch.unique(source_ids).numel() != source_ids.numel()
+                or not torch.equal(torch.unique(labels, sorted=True),
+                                   torch.unique(labels, sorted=True))):
+            raise RuntimeError("Base reference prefix tokens lost source identity or ordering.")
+        features = self.model_without_dp.extract_img_feature_from_reference_prefix(
+            prefix_tokens.to(self.device)
+        )
+        class_ids = torch.unique(labels, sorted=True).to(self.device)
+        prototypes = torch.stack([
+            F.normalize(features[labels.to(self.device).eq(class_id)].mean(0), dim=-1)
+            for class_id in class_ids
+        ])
         if prototypes.ndim != 2 or prototypes.size(0) != class_ids.numel() or not torch.isfinite(prototypes).all():
             raise RuntimeError("Base reference feature-anchor capture produced invalid class prototypes.")
+        self.base_reference_prefix_cache = {
+            "prefix_tokens": prefix_tokens.contiguous().half(),
+            "labels": labels.cpu(),
+            "source_ids": source_ids.cpu(),
+        }
         self.base_reference_feature_prototypes = prototypes.detach().cpu().half()
         self.base_reference_class_ids = class_ids.detach().cpu()
-        print(f"=> [Feature-Space][Base-anchor] classes={class_ids.numel()} reference_sources={len(self.base_reference_source_ids)}")
+        print(
+            f"=> [Feature-Space][Base-anchor] classes={class_ids.numel()} "
+            f"reference_sources={len(self.base_reference_source_ids)} "
+            f"cached_prefix_shape={tuple(prefix_tokens.shape)}"
+        )
         return True
 
     @torch.no_grad()
     def _base_reference_feature_diagnostics(self, base_state):
-        """Measure Base feature drift and fixed-prototype accuracy on Base reference."""
-        data_manager = getattr(self, "data_manager", None)
-        loader_factory = getattr(data_manager, "get_base_source_dataloader", None)
+        """Measure Base drift by replaying cached reference prefixes; never reload Base images."""
+        cache = getattr(self, "base_reference_prefix_cache", None)
         baseline = getattr(self, "base_reference_feature_prototypes", None)
         baseline_ids = getattr(self, "base_reference_class_ids", None)
-        if not callable(loader_factory) or baseline is None or baseline_ids is None:
+        if cache is None or baseline is None or baseline_ids is None:
             return {"available": False}
-        loader = loader_factory(self.base_reference_source_ids)
+        prefix_tokens = torch.as_tensor(
+            cache["prefix_tokens"], device=self.device
+        ).float()
+        labels = torch.as_tensor(cache["labels"], device=self.device, dtype=torch.long)
+        source_ids = torch.as_tensor(cache["source_ids"], dtype=torch.long)
+        if (prefix_tokens.ndim != 3 or prefix_tokens.size(0) == 0
+                or labels.numel() != prefix_tokens.size(0)
+                or source_ids.numel() != prefix_tokens.size(0)
+                or not torch.equal(source_ids, torch.as_tensor(self.base_reference_source_ids, dtype=torch.long))):
+            raise RuntimeError("Cached Base reference prefix tokens are malformed or misaligned.")
         self.model.eval()
-        features, labels, current_prototypes, _ = self.model_without_dp.inference_all_img_feature(loader)
-        labels = labels.to(self.device, dtype=torch.long)
+        features = self.model_without_dp.extract_img_feature_from_reference_prefix(prefix_tokens)
         current_ids = torch.unique(labels, sorted=True)
         baseline_ids = torch.as_tensor(baseline_ids, device=self.device, dtype=torch.long).reshape(-1)
-        if not torch.equal(current_ids.sort().values, baseline_ids.sort().values):
+        if not torch.equal(current_ids.to(self.device), baseline_ids.sort().values):
             raise RuntimeError("Current Base reference classes differ from captured feature-space anchors.")
-        row_map = {int(value): i for i, value in enumerate(current_ids.tolist())}
-        rows = torch.as_tensor([row_map[int(value)] for value in baseline_ids.tolist()], device=self.device)
-        current = F.normalize(torch.as_tensor(current_prototypes, device=self.device).float()[rows], dim=-1)
+        current = torch.stack([
+            F.normalize(features[labels.to(self.device).eq(class_id)].mean(0), dim=-1)
+            for class_id in baseline_ids
+        ])
         reference = F.normalize(torch.as_tensor(baseline, device=self.device).float(), dim=-1)
         alignment = F.cosine_similarity(reference, current, dim=-1)
         base_ids = torch.as_tensor(base_state["class_ids"], device=self.device, dtype=torch.long).reshape(-1)
@@ -1250,26 +1319,36 @@ class Runner:
         if not matches.any(dim=1).all():
             raise RuntimeError("Base reference contains labels absent from the Base classifier bank.")
         targets = matches.long().argmax(-1)
-        predictions = (F.normalize(torch.as_tensor(features, device=self.device).float(), dim=-1) @ prototypes.t()).argmax(-1)
+        predictions = (F.normalize(features.float(), dim=-1) @ prototypes.t()).argmax(-1)
         predicted_ids = base_ids[predictions]
         class_acc = {
-            int(class_id): float(predicted_ids[labels.eq(int(class_id))].eq(int(class_id)).float().mean().item() * 100.0)
+            int(class_id): float(
+                predicted_ids[labels.to(self.device).eq(int(class_id))]
+                .eq(int(class_id)).float().mean().item() * 100.0
+            )
             for class_id in base_ids.tolist()
         }
         target_cosine = float(_cfg_value(self._visual_moe_cfg(), "FEATURE_SPACE_MIN_COSINE", 0.98))
         result = {
-            "available": True, "num_classes": int(baseline_ids.numel()), "num_sources": int(labels.numel()),
+            "available": True,
+            "num_classes": int(baseline_ids.numel()),
+            "num_sources": int(labels.numel()),
             "prototype_cosine_mean": float(alignment.mean().item()),
             "prototype_cosine_min": float(alignment.min().item()),
-            "prototype_cosine_per_class": {int(k): float(v) for k, v in zip(baseline_ids.tolist(), alignment.tolist())},
-            "base_reference_accuracy": float(predictions.eq(targets).float().mean().item() * 100.0),
+            "prototype_cosine_per_class": {
+                int(k): float(v) for k, v in zip(baseline_ids.tolist(), alignment.tolist())
+            },
+            "base_reference_accuracy": float(predictions.eq(targets.to(self.device)).float().mean().item() * 100.0),
             "base_reference_class_accuracy": class_acc,
             "minimum_cosine_target": target_cosine,
             "within_target": bool(float(alignment.min().item()) >= target_cosine),
         }
-        print(f"=> [Feature-Space][Session] cosine_mean={result['prototype_cosine_mean']:.6f} "
-              f"cosine_min={result['prototype_cosine_min']:.6f} base_reference_acc={result['base_reference_accuracy']:.2f}% "
-              f"within_target={result['within_target']}")
+        print(
+            f"=> [Feature-Space][Session] cosine_mean={result['prototype_cosine_mean']:.6f} "
+            f"cosine_min={result['prototype_cosine_min']:.6f} "
+            f"base_reference_acc={result['base_reference_accuracy']:.2f}% "
+            f"within_target={result['within_target']}"
+        )
         return result
 
     @torch.no_grad()
