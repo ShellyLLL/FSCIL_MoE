@@ -274,6 +274,45 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             gates = torch.sigmoid(adapter.router.columns[-1](features["cls_in"]))
             self.assertTrue(torch.isfinite(gates).all())
 
+    def test_independent_rd_mode_trains_all_support_and_deploys_unanchored_descriptor(self):
+        torch.manual_seed(241)
+        runner, model = build_lifecycle_runner()
+        runner.cfg.TRAINER.BiMC.VISUAL_MOE.DESCRIPTOR_INIT_MODE = "independent"
+        base_support = lifecycle_batch(
+            0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 9400, count=40
+        )
+        runner._train_base_descriptors([base_support], [base_support])
+        base_state = make_lifecycle_state(runner, model, 0, base_support, 0)
+        support = lifecycle_batch(
+            1, torch.tensor([0., 1., 0., 0., 0., 0., 0., 0.]), 9410
+        )
+        train = lifecycle_batch(
+            1, torch.tensor([0., 1., 0., 0., 0., 0., 0., 0.]), 9410,
+            augmented=True, seed=241,
+        )
+        original_plan = model.plan_layer_expansion
+        def force_expand(block_idx, features, class_index, threshold=None):
+            decision = original_plan(block_idx, features, class_index, threshold)
+            return LayerExpansionDecision(
+                block_idx=int(block_idx), expand=True,
+                session_q90=decision.session_q90, threshold=decision.threshold,
+                support_count=decision.support_count,
+            )
+        model.plan_layer_expansion = force_expand
+        try:
+            result = runner.train_incremental_task(
+                1, [train], [support], [1], ["independent_rd_class"], [base_state]
+            )
+        finally:
+            model.plan_layer_expansion = original_plan
+        for block, adapter in runner._moe_adapters():
+            self.assertFalse(adapter.descriptors[-1].is_anchored)
+            self.assertTrue(adapter.descriptors[-1].is_ready())
+            self.assertEqual(result["training"][block]["descriptor_init_mode"], "independent")
+            self.assertEqual(result["training"][block]["descriptor_anchor_id"], -1)
+            self.assertEqual(result["training"][block]["rd_training_samples"], 16)
+            self.assertEqual(result["training"][block]["rd_reference_samples"], 16)
+
     def test_mixed_session_expands_one_layer_and_reuses_another_under_one_optimizer(self):
         torch.manual_seed(83)
         runner, model = build_lifecycle_runner()
