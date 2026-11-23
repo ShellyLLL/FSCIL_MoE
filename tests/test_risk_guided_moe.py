@@ -473,6 +473,44 @@ class UnifiedDynamicMoETests(unittest.TestCase):
                     torch.testing.assert_close(expert.state_dict()[key], before, rtol=0, atol=0)
             self.assertTrue(all(not parameter.requires_grad for parameter in adapter.parameters()))
 
+    def test_base_reference_accuracy_drop_is_a_hard_feature_space_acceptance_gate(self):
+        runner, model = build_lifecycle_runner()
+        runner.cfg.TRAINER.BiMC.VISUAL_MOE.FEATURE_SPACE_MIN_COSINE = 0.0
+        runner.cfg.TRAINER.BiMC.VISUAL_MOE.FEATURE_SPACE_MAX_ACCURACY_DROP = 0.0
+        images = torch.cat([
+            torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]).repeat(4, 1),
+            torch.tensor([0., 1., 0., 0., 0., 0., 0., 0.]).repeat(4, 1),
+        ])
+        labels = torch.tensor([0] * 4 + [1] * 4)
+        source_ids = torch.arange(9300, 9308)
+        runner.base_reference_source_ids = source_ids.tolist()
+        runner.data_manager = SimpleNamespace(
+            get_base_source_dataloader=lambda _ids: (_ for _ in ()).throw(
+                AssertionError("Feature acceptance must replay cached prefixes.")
+            )
+        )
+        runner.base_reference_prefix_cache = {
+            "prefix_tokens": images.unsqueeze(1).half(),
+            "labels": labels,
+            "source_ids": source_ids,
+        }
+        runner.base_reference_feature_prototypes = torch.eye(8)[[0, 1]].half()
+        runner.base_reference_class_ids = torch.tensor([0, 1])
+        runner.base_reference_accuracy_baseline = 100.0
+        current_features = images.clone()
+        current_features[0] = torch.tensor([0., 1., 0., 0., 0., 0., 0., 0.])
+        model.extract_img_feature_from_reference_prefix = lambda _prefix: current_features
+        state = {
+            "class_ids": torch.tensor([0, 1]),
+            "image_proto": torch.eye(8)[[0, 1]],
+        }
+        result = runner._base_reference_feature_diagnostics(state)
+        self.assertEqual(result["base_reference_accuracy"], 87.5)
+        self.assertEqual(result["base_reference_accuracy_drop"], 12.5)
+        self.assertTrue(result["within_cosine_target"])
+        self.assertFalse(result["within_accuracy_target"])
+        self.assertFalse(result["within_target"])
+
     def test_final_feature_anchor_selection_is_source_order_invariant(self):
         runner, model = build_lifecycle_runner()
         support = lifecycle_batch(
