@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from models.clip.model import RepresentationDescriptor, VisualMoEAdapter, VisionTransformer
-from models.bimc import BiMC, build_loo_cache_from_embeddings
+from models.bimc import BiMC, LayerExpansionDecision, build_loo_cache_from_embeddings
 from engine.engine import Runner
 
 
@@ -271,6 +271,82 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             features = model.collect_blockwise_cls_features(support)[block_idx]
             gates = torch.sigmoid(adapter.router.columns[-1](features["cls_in"]))
             self.assertTrue(torch.isfinite(gates).all())
+
+    def test_mixed_session_expands_one_layer_and_reuses_another_under_one_optimizer(self):
+        torch.manual_seed(83)
+        runner, model = build_lifecycle_runner()
+        base_support = lifecycle_batch(
+            0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 8100, count=40
+        )
+        runner._train_base_descriptors([base_support])
+        base_anchors = runner._collect_class_anchors([base_support])
+        with torch.no_grad():
+            adapted, _, reference = model.extract_img_feature_train(
+                base_support["image"], return_reference=True
+            )
+            base_proto = F.normalize(adapted.mean(0, keepdim=True), dim=-1)
+            reference_proto = F.normalize(reference.mean(0, keepdim=True), dim=-1)
+        base_state = {
+            "class_ids": torch.tensor([0]),
+            "image_proto": base_proto,
+            "reference_image_proto": reference_proto,
+            "text_features": F.normalize(torch.eye(8)[[0]], dim=-1),
+            "description_proto": F.normalize(torch.eye(8)[[0]], dim=-1),
+            "support_count": torch.tensor([40]),
+            "anchor_by_block": base_anchors,
+            "final_feature_anchors": runner._collect_final_feature_anchors([base_support], 0),
+            "creation_session": 0,
+        }
+        support = lifecycle_batch(
+            1, torch.tensor([0., 1., 0., 0., 0., 0., 0., 0.]), 8200
+        )
+        train = lifecycle_batch(
+            1, torch.tensor([0., 1., 0., 0., 0., 0., 0., 0.]), 8200,
+            augmented=True, seed=83,
+        )
+        before = {
+            block: {key: value.detach().clone() for key, value in adapter.state_dict().items()}
+            for block, adapter in runner._moe_adapters()
+        }
+        original_plan = model.plan_layer_expansion
+
+        def mixed_plan(block_idx, features, class_index, threshold=None):
+            decision = original_plan(block_idx, features, class_index, threshold)
+            if int(block_idx) == 1:
+                return LayerExpansionDecision(
+                    block_idx=int(block_idx), expand=False,
+                    session_q90=decision.session_q90, threshold=decision.threshold,
+                    support_count=decision.support_count,
+                )
+            return decision
+
+        model.plan_layer_expansion = mixed_plan
+        try:
+            result = runner.train_incremental_task(
+                1, [train], [support], [1], ["class_1"], [base_state]
+            )
+        finally:
+            model.plan_layer_expansion = original_plan
+
+        self.assertEqual([item["block_idx"] for item in result["expanded"]], [0])
+        self.assertEqual([item["block_idx"] for item in result["reused"]], [1])
+        self.assertEqual([adapter.num_experts for _, adapter in runner._moe_adapters()], [3, 2])
+        for block, adapter in runner._moe_adapters():
+            adapter.assert_descriptors_ready()
+            if block == 1:
+                for key, value in before[block].items():
+                    torch.testing.assert_close(adapter.state_dict()[key], value, rtol=0, atol=0)
+                self.assertEqual(result["training"][block]["classification_samples_total"], 0)
+            else:
+                self.assertEqual(
+                    result["training"][block]["classification_samples_per_epoch"],
+                    [16] * int(runner.cfg.TRAINER.BiMC.INCREMENTAL.EPOCHS),
+                )
+                self.assertTrue(any(
+                    not torch.equal(adapter.state_dict()[key], value)
+                    for key, value in before[block].items()
+                ))
+            self.assertTrue(all(not parameter.requires_grad for parameter in adapter.parameters()))
 
     def test_reuse_session_keeps_all_historical_parameters_frozen(self):
         torch.manual_seed(263)
