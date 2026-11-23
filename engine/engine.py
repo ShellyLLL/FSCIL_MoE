@@ -2189,7 +2189,7 @@ class Runner:
             descriptor = adapter.descriptors[expert_id]
             descriptor.set_trainable(True)
             if not descriptor.is_anchored:
-                descriptor.set_center(context["values"])
+                descriptor.set_center(fit_values)
             descriptor.train()
             anchor_sets = self._all_old_anchor_sets(old_states, block_idx)
             if any(anchor_sets[key] is None for key in ("route_mean", "route_var", "expert_mean", "expert_var")):
