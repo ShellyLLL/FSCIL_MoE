@@ -552,6 +552,61 @@ class VisualMoEAdapter(nn.Module):
         return gate.square().mean() + gated_residual.float().square().mean()
 
     @torch.no_grad()
+    def snapshot_route_anchor_targets(self, route_anchor_mean, route_anchor_var):
+        """Snapshot deployed expert responsibilities on historical route anchors."""
+        if route_anchor_mean is None or route_anchor_var is None:
+            raise ValueError("Router preservation requires historical route-anchor means and variances.")
+        anchors = self._anchor_points(route_anchor_mean, route_anchor_var).to(
+            device=self.residual_scale.device, dtype=torch.float32
+        )
+        if anchors.ndim != 2 or anchors.size(0) == 0 or anchors.size(1) != self.d_model:
+            raise ValueError("Historical router anchors must be a non-empty [N, d_model] matrix.")
+        _, responsibilities = self.routing_outputs(anchors)
+        if not torch.isfinite(responsibilities).all():
+            raise FloatingPointError("Historical router responsibilities are non-finite.")
+        return anchors.detach(), responsibilities.detach()
+
+    def route_preservation_loss(self, route_anchors, reference_responsibilities):
+        """Preserve old Base-softmax and incremental-sigmoid routing on old anchors.
+
+        Base experts form a normalized categorical distribution, so their
+        responsibilities use KL divergence. Incremental experts have
+        independent sigmoid gates, so their responsibilities use MSE.
+        """
+        route_anchors = torch.as_tensor(
+            route_anchors, device=self.residual_scale.device, dtype=torch.float32
+        )
+        reference = torch.as_tensor(
+            reference_responsibilities, device=route_anchors.device, dtype=torch.float32
+        ).detach()
+        if (route_anchors.ndim != 2 or route_anchors.size(0) == 0
+                or route_anchors.size(1) != self.d_model):
+            raise ValueError("Router preservation anchors must be a non-empty [N, d_model] matrix.")
+        if reference.shape != (route_anchors.size(0), self.num_experts):
+            raise ValueError("Historical router responsibilities do not align with the deployed expert pool.")
+        if not torch.isfinite(route_anchors).all() or not torch.isfinite(reference).all():
+            raise ValueError("Router preservation inputs must be finite.")
+        if (reference < 0).any() or (reference > 1).any():
+            raise ValueError("Historical router responsibilities must lie in [0, 1].")
+
+        _, current = self.routing_outputs(route_anchors)
+        base_target = reference[:, :self.base_expert_count].clamp_min(1e-8)
+        base_target = base_target / base_target.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        base_current = current[:, :self.base_expert_count].clamp_min(1e-8)
+        base_kl = F.kl_div(base_current.log(), base_target, reduction="batchmean")
+        if self.num_experts > self.base_expert_count:
+            incremental_mse = F.mse_loss(
+                current[:, self.base_expert_count:],
+                reference[:, self.base_expert_count:],
+            )
+        else:
+            incremental_mse = current.new_zeros(())
+        loss = base_kl + incremental_mse
+        if not torch.isfinite(loss):
+            raise FloatingPointError("Router preservation loss is non-finite.")
+        return loss
+
+    @torch.no_grad()
     def old_anchor_response(self, anchor_mean, anchor_var):
         if anchor_mean is None or anchor_mean.numel() == 0:
             return 0.0

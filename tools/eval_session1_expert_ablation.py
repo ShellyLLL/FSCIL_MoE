@@ -240,6 +240,40 @@ def main():
     if len(task_states0) != 1 or len(task_states1) != 2:
         raise ValueError("Expected one Base state in Session 00 and two task states in Session 01.")
 
+    def same_tree(left, right):
+        if torch.is_tensor(left) or torch.is_tensor(right):
+            return (
+                torch.is_tensor(left) and torch.is_tensor(right)
+                and torch.equal(left.detach().cpu(), right.detach().cpu())
+            )
+        if isinstance(left, dict) or isinstance(right, dict):
+            return (
+                isinstance(left, dict) and isinstance(right, dict)
+                and left.keys() == right.keys()
+                and all(same_tree(left[key], right[key]) for key in left)
+            )
+        if isinstance(left, (list, tuple)) or isinstance(right, (list, tuple)):
+            return (
+                isinstance(left, (list, tuple)) and isinstance(right, (list, tuple))
+                and len(left) == len(right)
+                and all(same_tree(a, b) for a, b in zip(left, right))
+            )
+        if isinstance(left, np.ndarray) or isinstance(right, np.ndarray):
+            return (
+                isinstance(left, np.ndarray) and isinstance(right, np.ndarray)
+                and np.array_equal(left, right)
+            )
+        return left == right
+
+    if not same_tree(task_states0[0], task_states1[0]):
+        raise ValueError(
+            "Session-00 and Session-01 checkpoints do not contain the same Base task state. "
+            "Use checkpoints from the same training run; matching support manifests alone is insufficient."
+        )
+    # The Session-01 checkpoint's embedded Base state is authoritative for all
+    # ablations; Session-00 is retained only for the pre-incremental encoder.
+    task_states0 = task_states1[:1]
+
     base_ids = torch.as_tensor(task_states0[0]["class_ids"], dtype=torch.long)
     novel_ids = torch.as_tensor(task_states1[1]["class_ids"], dtype=torch.long)
     if set(base_ids.tolist()) & set(novel_ids.tolist()):
@@ -444,7 +478,7 @@ def main():
         if current_stage not in analysis["completed_stages"]:
             support_generalization = collect_support_generalization_diagnostics(
                 runner, support_loader, test_loader,
-                class_ids, task_states0, base_ids, novel_ids,
+                novel_ids, task_states0, base_ids, novel_ids,
                 logit_scale=float(cfg.TRAINER.BiMC.INCREMENTAL.LOGIT_SCALE),
             )
             analysis["support_test_generalization"] = support_generalization

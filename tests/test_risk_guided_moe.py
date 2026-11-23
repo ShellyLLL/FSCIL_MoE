@@ -238,6 +238,95 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             gates = torch.sigmoid(adapter.router.columns[-1](features["cls_in"]))
             self.assertTrue(torch.isfinite(gates).all())
 
+    def test_reuse_session_adapts_router_without_expanding_or_mutating_experts(self):
+        torch.manual_seed(263)
+        runner, model = build_lifecycle_runner()
+        model.eval()
+        runner.cfg.TRAINER.BiMC.INCREMENTAL.OLD_SUPPRESSION_WEIGHT = 1.0
+        for _, adapter in runner._moe_adapters():
+            with torch.no_grad():
+                for expert in adapter.experts:
+                    expert.c_proj.weight.normal_(std=0.1)
+                    expert.c_proj.bias.normal_(std=0.01)
+
+        base_support = lifecycle_batch(
+            0, torch.tensor([1., 0., 0., 0., 0., 0., 0., 0.]), 7000, count=40
+        )
+        runner._train_base_descriptors([base_support])
+        base_state = make_lifecycle_state(runner, model, 0, base_support, 0)
+        support = [
+            lifecycle_batch(
+                1, torch.tensor([0., 1., 0., 0., 0., 0., 0., 0.]), 7010, count=16
+            ),
+            lifecycle_batch(
+                2, torch.tensor([0., 0., 1., 0., 0., 0., 0., 0.]), 7020, count=16
+            ),
+        ]
+        # Force the well-defined REUSE branch: AE/RD is not asked to create
+        # capacity, but the existing router must still learn the new Session.
+        runner.expansion_thresholds = {0: {32: 1e6}, 1: {32: 1e6}}
+        expert_before = {
+            block: [
+                {key: value.detach().clone() for key, value in expert.state_dict().items()}
+                for expert in adapter.experts
+            ]
+            for block, adapter in runner._moe_adapters()
+        }
+        router_before = {
+            block: [parameter.detach().clone() for parameter in adapter.router.parameters()]
+            for block, adapter in runner._moe_adapters()
+        }
+
+        result = runner.train_incremental_task(
+            1, support, support, [1, 2], ["new_class_a", "new_class_b"], [base_state]
+        )
+        self.assertEqual(result["expanded"], [])
+        self.assertEqual([row["block_idx"] for row in result["router_adapted"]], [0, 1])
+        self.assertTrue(result["trained"])
+
+        for block, adapter in runner._moe_adapters():
+            history = result["training"][block]
+            self.assertEqual(history["mode"], "reuse_router")
+            self.assertEqual(history["classification_samples_per_epoch"], [32] * 8)
+            self.assertEqual(history["classification_samples_total"], 256)
+            self.assertEqual(history["rd_training_samples"], 0)
+            self.assertEqual(len(history["gradient_projection"]), 8)
+            self.assertTrue(torch.isfinite(torch.tensor(history["route_preservation_final"])))
+            self.assertTrue(any(
+                not torch.equal(before, after.detach())
+                for before, after in zip(router_before[block], adapter.router.parameters())
+            ))
+            for expert, before_state in zip(adapter.experts, expert_before[block]):
+                for key, before in before_state.items():
+                    torch.testing.assert_close(expert.state_dict()[key], before, rtol=0, atol=0)
+            self.assertTrue(all(not parameter.requires_grad for parameter in adapter.parameters()))
+
+    def test_route_preservation_loss_distills_base_and_incremental_responsibilities(self):
+        torch.manual_seed(269)
+        adapter = VisualMoEAdapter(8, num_experts=2, reduction=2)
+        adapter.add_expert(session_id=1, reduction=2)
+        route_mean = torch.randn(3, 8)
+        route_var = torch.full_like(route_mean, 0.1)
+        anchors, reference = adapter.snapshot_route_anchor_targets(route_mean, route_var)
+        adapter.freeze_all()
+        for parameter in adapter.router.parameters():
+            parameter.requires_grad = True
+        initial = adapter.route_preservation_loss(anchors, reference)
+        self.assertAlmostEqual(float(initial), 0.0, places=7)
+        with torch.no_grad():
+            adapter.router.columns[0].bias.add_(0.5)
+            adapter.router.columns[-1].bias.sub_(0.5)
+        loss = adapter.route_preservation_loss(anchors, reference)
+        self.assertGreater(float(loss), 0.0)
+        loss.backward()
+        self.assertTrue(any(
+            parameter.grad is not None and parameter.grad.abs().sum() > 0
+            for parameter in adapter.router.parameters()
+        ))
+        self.assertTrue(all(
+            parameter.grad is None for expert in adapter.experts for parameter in expert.parameters()
+        ))
+
     def test_incremental_route_responsibility_has_positive_and_negative_targets(self):
         logits = torch.tensor([-1.0, 1.0], requires_grad=True)
         targets = torch.tensor([0.0, 1.0])

@@ -1430,6 +1430,194 @@ class Runner:
                 adapter.freeze_all()
             raise
 
+    def _train_reused_router(
+        self, block_idx, train_loader, extract_loader, class_index, old_states,
+    ):
+        """Adapt a reused expert pool through its router without changing experts/RDs.
+
+        AE/RD still decides whether capacity expansion is required. When the
+        existing pool is sufficient, CE may re-route current-session examples
+        across that pool, while a snapshot of historical responsibilities
+        constrains routing drift on old-class anchors.
+        """
+        adapter = self._adapter_by_block(block_idx)
+        anchor_sets = self._all_old_anchor_sets(old_states, block_idx)
+        route_mean, route_var = anchor_sets["route_mean"], anchor_sets["route_var"]
+        if route_mean is None or route_var is None:
+            raise ValueError(
+                f"Block {block_idx} cannot adapt a reused router without historical route anchors."
+            )
+        route_anchors, reference_responsibilities = adapter.snapshot_route_anchor_targets(
+            route_mean, route_var
+        )
+
+        adapter.freeze_all()
+        router_parameters = list(adapter.router.parameters())
+        if not router_parameters:
+            raise RuntimeError(f"Block {block_idx} has no router parameters to adapt.")
+        for parameter in router_parameters:
+            parameter.requires_grad = True
+
+        optim_cfg = self.cfg.TRAINER.BiMC.OPTIM
+        incremental_cfg = self.cfg.TRAINER.BiMC.INCREMENTAL
+        epochs = int(incremental_cfg.EPOCHS)
+        scale = float(incremental_cfg.LOGIT_SCALE)
+        pd_weight = float(getattr(incremental_cfg, "OLD_SUPPRESSION_WEIGHT", 1.0))
+        if epochs < 1:
+            raise ValueError("Incremental EPOCHS must be positive for router reuse adaptation.")
+        if not np.isfinite(pd_weight) or pd_weight < 0:
+            raise ValueError("OLD_SUPPRESSION_WEIGHT must be finite and non-negative.")
+
+        optimizer = optim.AdamW(
+            router_parameters,
+            lr=float(optim_cfg.LR_INCREMENTAL_ROUTER),
+            weight_decay=float(optim_cfg.WEIGHT_DECAY),
+        )
+        expected_classes = sorted(int(value) for value in class_index)
+        loss_history, ce_history, pd_history = [], [], []
+        projection_history, samples_per_epoch = [], []
+        classification_samples_total = 0
+
+        for epoch in range(epochs):
+            bank = self._build_incremental_bank(extract_loader, class_index, old_states)
+            self.model.train()
+            # Keep every expert and descriptor in eval mode. Only router
+            # parameters receive gradients in the REUSE path.
+            for _, layer_adapter in self._moe_adapters():
+                layer_adapter.eval()
+
+            total, ce_total, pd_total, count = 0.0, 0.0, 0.0, 0
+            epoch_samples = 0
+            observed_train_classes = set()
+            projection_rows = []
+
+            for batch in train_loader:
+                all_images, all_labels = self.parse_batch(batch)
+                all_source_ids = self._batch_source_ids(
+                    batch, all_labels.numel(), all_labels.device
+                )
+                if not torch.isin(
+                    all_labels, torch.as_tensor(class_index, device=all_labels.device)
+                ).all():
+                    raise ValueError(
+                        f"Block {block_idx} REUSE loader contains labels outside the current Session."
+                    )
+                observed_train_classes.update(
+                    int(value) for value in all_labels.unique().tolist()
+                )
+
+                optimizer.zero_grad(set_to_none=True)
+                logits, targets = self._global_incremental_logits(
+                    all_images, all_labels, all_source_ids, bank, scale
+                )
+                classification = F.cross_entropy(logits, targets)
+                route_preservation = adapter.route_preservation_loss(
+                    route_anchors, reference_responsibilities
+                )
+                loss = classification + pd_weight * route_preservation
+                if not bool(torch.isfinite(loss).item()):
+                    raise FloatingPointError(
+                        f"Non-finite REUSE router objective in block {block_idx}."
+                    )
+
+                ce_gradients = torch.autograd.grad(
+                    classification, router_parameters,
+                    retain_graph=True, allow_unused=True,
+                )
+                pd_gradients = torch.autograd.grad(
+                    route_preservation, router_parameters, allow_unused=True,
+                )
+                projected_ce, projection = self._project_conflicting_gradients(
+                    ce_gradients, pd_gradients
+                )
+                for parameter, ce_gradient, pd_gradient in zip(
+                    router_parameters, projected_ce, pd_gradients
+                ):
+                    if ce_gradient is None and pd_gradient is None:
+                        parameter.grad = None
+                    else:
+                        combined_gradient = (
+                            torch.zeros_like(parameter) if ce_gradient is None else ce_gradient
+                        )
+                        if pd_gradient is not None:
+                            combined_gradient = combined_gradient + pd_weight * pd_gradient
+                        parameter.grad = combined_gradient.detach()
+
+                torch.nn.utils.clip_grad_norm_(router_parameters, 1.0)
+                optimizer.step()
+
+                batch_size = int(all_labels.numel())
+                total += float(loss.detach().item()) * batch_size
+                ce_total += float(classification.detach().item()) * batch_size
+                pd_total += float(route_preservation.detach().item()) * batch_size
+                count += batch_size
+                epoch_samples += batch_size
+                classification_samples_total += batch_size
+                projection_rows.append(projection)
+
+            if count == 0:
+                raise RuntimeError(
+                    f"Block {block_idx} selected REUSE but the current task loader was empty."
+                )
+            if sorted(observed_train_classes) != expected_classes:
+                raise RuntimeError(
+                    f"Block {block_idx} REUSE loader classes {sorted(observed_train_classes)} "
+                    f"do not cover the current Session classes {expected_classes}."
+                )
+
+            def summarize_projection(rows):
+                conflicts = [row for row in rows if row["applied"]]
+                before = [row["ce_pd_cosine_before"] for row in rows
+                          if row["ce_pd_cosine_before"] is not None]
+                after = [row["ce_pd_cosine_after"] for row in rows
+                         if row["ce_pd_cosine_after"] is not None]
+                return {
+                    "batch_count": len(rows),
+                    "conflict_count": len(conflicts),
+                    "conflict_rate": float(len(conflicts) / max(1, len(rows))),
+                    "projection_coefficient_mean": (
+                        float(np.mean([row["projection_coefficient"] for row in conflicts]))
+                        if conflicts else 0.0
+                    ),
+                    "ce_pd_cosine_before_mean": float(np.mean(before)) if before else None,
+                    "ce_pd_cosine_after_mean": float(np.mean(after)) if after else None,
+                }
+
+            loss_history.append(total / count)
+            ce_history.append(ce_total / count)
+            pd_history.append(pd_total / count)
+            projection_history.append(summarize_projection(projection_rows))
+            samples_per_epoch.append(int(epoch_samples))
+
+        adapter.freeze_all()
+        with torch.no_grad():
+            final_route_preservation = float(
+                adapter.route_preservation_loss(
+                    route_anchors, reference_responsibilities
+                ).item()
+            )
+        history = {
+            "mode": "reuse_router",
+            "loss": loss_history,
+            "ce_loss": ce_history,
+            "route_preservation_loss": pd_history,
+            "gradient_projection": projection_history,
+            "classification_samples_per_epoch": samples_per_epoch,
+            "classification_samples_total": int(classification_samples_total),
+            "route_anchor_count": int(route_anchors.size(0)),
+            "route_preservation_weight": float(pd_weight),
+            "route_preservation_final": final_route_preservation,
+            "rd_training_samples": 0,
+            "rd_reference_samples": 0,
+        }
+        print(
+            f"=> [Router-Reuse][B{block_idx}] epochs={epochs} "
+            f"samples={classification_samples_total} "
+            f"CE={ce_history[-1]:.4f} route_PD={pd_history[-1]:.6f} "
+            f"route_PD_final={final_route_preservation:.6f}"
+        )
+        return history
+
     def _train_incremental_task_impl(self, task_id, train_loader, extract_loader, class_index,
                                       current_class_name, old_states):
         """Session-level Q90 expansion; each new expert and RD models the full Session."""
@@ -1443,7 +1631,7 @@ class Runner:
         if not self.expansion_thresholds:
             raise RuntimeError("Base Session-Q95 expansion thresholds have not been calibrated.")
 
-        decisions, expanded, histories = [], [], {}
+        decisions, expanded, router_adapted, histories = [], [], [], {}
         for _, adapter in self._moe_adapters():
             adapter.freeze_all()
 
@@ -1481,6 +1669,16 @@ class Runner:
                 "support_count": int(decision.support_count),
             })
             if not decision.expand:
+                history = self._train_reused_router(
+                    block_idx, train_loader, extract_loader, class_index, old_states
+                )
+                histories[block_idx] = history
+                router_adapted.append({
+                    "block_idx": int(block_idx),
+                    "mode": "reuse_router",
+                    "classification_samples_total": int(history["classification_samples_total"]),
+                    "route_preservation_final": float(history["route_preservation_final"]),
+                })
                 continue
 
             adapter = self._adapter_by_block(block_idx)
@@ -1811,9 +2009,10 @@ class Runner:
             adapter.freeze_all()
         self._assert_moe_frozen("incremental Session completion")
         return {
-            "trained": bool(expanded),
+            "trained": bool(expanded or router_adapted),
             "decisions": decisions,
             "expanded": expanded,
+            "router_adapted": router_adapted,
             "training": histories,
             "encoder_version": 0,
         }
