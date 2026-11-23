@@ -556,6 +556,37 @@ class VisualMoEAdapter(nn.Module):
         return loss
 
     @torch.no_grad()
+    def snapshot_route_anchor_targets(self, route_anchor_mean, route_anchor_var):
+        """Snapshot deployed routing responsibilities on compact historical anchors."""
+        if route_anchor_mean is None or route_anchor_var is None:
+            raise ValueError("Router preservation requires historical route anchors.")
+        anchors = self._anchor_points(route_anchor_mean, route_anchor_var).to(
+            device=self.residual_scale.device, dtype=torch.float32
+        )
+        _, responsibilities = self.routing_outputs(anchors)
+        return anchors.detach(), responsibilities.detach()
+
+    def route_preservation_loss(self, route_anchors, reference_responsibilities):
+        """Preserve historical Base-softmax and incremental-sigmoid responsibilities."""
+        route_anchors = torch.as_tensor(route_anchors, device=self.residual_scale.device).float()
+        reference = torch.as_tensor(
+            reference_responsibilities, device=route_anchors.device
+        ).float().detach()
+        if reference.shape != (route_anchors.size(0), self.num_experts):
+            raise ValueError("Historical routing targets do not align with deployed experts.")
+        _, current = self.routing_outputs(route_anchors)
+        base_target = reference[:, :self.base_expert_count].clamp_min(1e-8)
+        base_target = base_target / base_target.sum(-1, keepdim=True).clamp_min(1e-8)
+        base_current = current[:, :self.base_expert_count].clamp_min(1e-8)
+        loss = F.kl_div(base_current.log(), base_target, reduction="batchmean")
+        if self.num_experts > self.base_expert_count:
+            loss = loss + F.mse_loss(
+                current[:, self.base_expert_count:],
+                reference[:, self.base_expert_count:]
+            )
+        return loss
+
+    @torch.no_grad()
     def old_anchor_response(self, anchor_mean, anchor_var):
         if anchor_mean is None or anchor_mean.numel() == 0:
             return 0.0

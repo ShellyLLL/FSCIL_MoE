@@ -110,15 +110,15 @@ class Runner:
         loss_cfg = _cfg_value(trainer_cfg, "LOSS", None)
         dataset_cfg = _cfg_value(self.cfg, "DATASET", None)
         return {
-            "version": 10,
+            "version": 11,
             "decision_unit": "incremental_session",
             "sample_score": "minimum_standardized_reconstruction_error_over_current_deployed_RDs",
             "threshold_refresh": "recalibrate_base_pseudo_sessions_after_every_expert_pool_change",
-            "session_score": "maximum_classwise_q90_of_sample_scores",
-            "decision": "maximum_classwise_q90_greater_than_base_holdout_q95_for_same_support_size",
+            "session_score": "pooled_q90_of_all_session_sample_scores",
+            "decision": "pooled_session_q90_greater_than_base_pseudo_session_q95_for_same_support_size",
             "prototype_training_calibration": "same_base_semantic_retrieval_for_full_and_source_exclusive_loo_visual_prototypes",
             "reuse_policy": "freeze_existing_experts_descriptors_and_router_without_parameter_updates",
-            "feature_space_diagnostic": "fixed_base_holdout_class_prototype_alignment_and_base_classifier_accuracy",
+            "feature_space_diagnostic": "fixed_base_holdout_class_prototype_alignment_and_base_classifier_accuracy_with_session_rollback",
             "threshold_quantile": float(_cfg_value(moe_cfg, "EXPANSION_THRESHOLD_QUANTILE", 0.95)),
             "calibration_groups": int(_cfg_value(moe_cfg, "EXPANSION_CALIBRATION_GROUPS", 256)),
             "expert_training_scope": "all_current_session_samples",
@@ -152,7 +152,7 @@ class Runner:
             "incremental_training": {
                 "epochs": int(_cfg_value(incremental_cfg, "EPOCHS", 6)),
                 "logit_scale": float(_cfg_value(incremental_cfg, "LOGIT_SCALE", 100.0)),
-                "old_suppression_weight": float(_cfg_value(incremental_cfg, "OLD_SUPPRESSION_WEIGHT", 1.0)),
+                "feature_space_preservation_weight": float(_cfg_value(incremental_cfg, "FEATURE_SPACE_PRESERVATION_WEIGHT", 1.0)),
                 "rd_weight": float(_cfg_value(incremental_cfg, "RD_WEIGHT", 1.0)),
             },
             "optimizer": {
@@ -476,10 +476,10 @@ class Runner:
         if missing:
             raise ValueError(f"Resume checkpoint is missing required fields: {missing}")
         schema = int(payload["schema_version"])
-        if schema != 30:
+        if schema != 31:
             raise ValueError(
-                "This branch uses class-balanced expansion and calibrated-LOO prototype checkpoint schema (30); "
-                "older pooled-Q90 or uncalibrated-LOO checkpoints are incompatible."
+                "This branch uses pooled Session-Q90 expansion and calibrated-LOO prototype checkpoint schema (31); "
+                "older expansion-policy checkpoints are incompatible."
             )
         checkpoint_policy = payload.get("expansion_policy")
         if checkpoint_policy != self._expansion_policy():
@@ -738,7 +738,7 @@ class Runner:
         directory.mkdir(parents=True, exist_ok=True)
         topology = self.model_without_dp.export_moe_topology()
         payload = {
-            "schema_version": 30,
+            "schema_version": 31,
             "completed_session": int(completed_session),
             "base_calibration_source_ids": list(self.base_calibration_source_ids),
             "base_holdout_feature_prototypes": self._cpu_copy(getattr(self, "base_holdout_feature_prototypes", None)),
@@ -1040,20 +1040,23 @@ class Runner:
                     f"across {configured_classes} classes without within-Session replacement."
                 )
             group_scores, class_ids = [], list(class_rows)
-            for _ in range(groups):
-                selected = torch.randperm(len(class_ids), generator=generator)[:configured_classes].tolist()
-                selected_classes = [class_ids[index] for index in selected]
-                class_q90 = []
-                for position, class_id in enumerate(selected_classes):
-                    count = per_class_counts[position]
-                    if count:
-                        rows = class_rows[class_id]
-                        order = torch.randperm(rows.numel(), generator=generator)[:count]
-                        class_q90.append(torch.quantile(cpu_scores[rows[order]], 0.90))
-                if len(class_q90) != configured_classes:
-                    raise RuntimeError("Base pseudo-Session failed to sample every class.")
-                group_scores.append(torch.stack(class_q90).max())
-            thresholds[int(size)] = float(torch.quantile(torch.stack(group_scores), quantile).item())
+        for _ in range(groups):
+            selected = torch.randperm(len(class_ids), generator=generator)[:configured_classes].tolist()
+            selected_classes = [class_ids[index] for index in selected]
+            session_rows = []
+            for position, class_id in enumerate(selected_classes):
+                count = per_class_counts[position]
+                if count:
+                    rows = class_rows[class_id]
+                    order = torch.randperm(rows.numel(), generator=generator)[:count]
+                    session_rows.append(cpu_scores[rows[order]])
+            if len(session_rows) != configured_classes:
+                raise RuntimeError("Base pseudo-Session failed to sample every class.")
+            # Match the deployment statistic exactly: pool all sampled
+            # Session rows, then take one Q90. No per-class quantile/max.
+            pooled_scores = torch.cat(session_rows, dim=0)
+            group_scores.append(torch.quantile(pooled_scores, 0.90))
+        thresholds[int(size)] = float(torch.quantile(torch.stack(group_scores), quantile).item())
         print(
             f"=> [Session-Threshold][B{block_idx}] "
             + " ".join(f"N={size}:Q95={value:.6f}" for size, value in sorted(thresholds.items()))
@@ -1733,9 +1736,9 @@ class Runner:
                         rd_loss = rd_reconstruction + descriptor_residual_weight * rd_residual_loss
                     else:
                         rd_loss = classification.new_zeros(())
-                    pd_weight = float(getattr(incremental_cfg, "OLD_SUPPRESSION_WEIGHT", 1.0))
+                    pd_weight = float(getattr(incremental_cfg, "FEATURE_SPACE_PRESERVATION_WEIGHT", 1.0))
                     if not np.isfinite(pd_weight) or pd_weight < 0:
-                        raise ValueError("OLD_SUPPRESSION_WEIGHT must be finite and non-negative.")
+                        raise ValueError("FEATURE_SPACE_PRESERVATION_WEIGHT must be finite and non-negative.")
                     loss = classification + pd_weight * old_suppression + rd_weight * rd_loss
                     if not bool(torch.isfinite(loss).item()):
                         raise FloatingPointError(

@@ -1109,51 +1109,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             runner.base_calibration_source_ids, base_holdout["source_ids"].tolist()
         )
 
-    def test_session_expansion_uses_q90_of_best_historical_rd_scores(self):
-        model = BiMC.__new__(BiMC)
-        nn.Module.__init__(model)
-        adapter = VisualMoEAdapter(8, num_experts=2, reduction=2, descriptor_dim=4)
-        block = nn.Module()
-        block.moe_adapter = adapter
-        transformer = nn.Module()
-        transformer.resblocks = nn.ModuleList([block])
-        visual = nn.Module()
-        visual.transformer = transformer
-        model.clip_model = nn.Module()
-        model.clip_model.visual = visual
-        model.device = "cpu"
-        model.cfg = SimpleNamespace(TRAINER=SimpleNamespace(BiMC=SimpleNamespace(
-            VISUAL_MOE=SimpleNamespace(EXPANSION_THRESHOLD_QUANTILE=0.95))))
-        for descriptor in adapter.descriptors:
-            descriptor.update_reference(torch.tensor([0.1, 0.11, 0.09, 0.1]))
-        features = {0: {
-            "cls_in": torch.randn(8, 8),
-            "labels": torch.tensor([2, 2, 2, 2, 3, 3, 3, 3]),
-            "source_ids": torch.arange(10, 18),
-        }}
-        adapter.descriptor_scores = lambda x, require_ready=True: torch.tensor([
-            [0.1, 0.2], [0.2, 0.3], [0.3, 0.4], [0.4, 0.5],
-            [2.0, 3.0], [2.1, 3.1], [2.2, 3.2], [4.0, 5.0],
-        ])
-        decision = model.plan_layer_expansion(0, features, [2, 3], 1.0)
-        expected_class_q90 = (torch.quantile(torch.tensor([0.1, 0.2, 0.3, 0.4]), 0.90),
-                              torch.quantile(torch.tensor([2.0, 2.1, 2.2, 4.0]), 0.90))
-        expected_session_score = max(float(value) for value in expected_class_q90)
-        self.assertTrue(decision.expand)
-        self.assertAlmostEqual(decision.session_q90, expected_session_score, places=6)
-        self.assertEqual(decision.class_q90[0][0], 2)
-        self.assertAlmostEqual(decision.class_q90[0][1], float(expected_class_q90[0]), places=6)
-        self.assertEqual(decision.support_count, 8)
-        self.assertEqual(decision.threshold, 1.0)
-
-        # Session decisions aggregate all samples: class labels do not create
-        # separate tests or separate expert expansion decisions.
-        adapter.descriptor_scores = lambda x, require_ready=True: torch.full((8, 2), 0.25)
-        decision = model.plan_layer_expansion(0, features, [2, 3], 0.5)
-        self.assertFalse(decision.expand)
-        self.assertEqual(decision.support_count, 8)
-
-    def test_classwise_max_q90_detects_one_undercovered_class_hidden_by_pooled_q90(self):
+    def test_session_expansion_uses_pooled_q90_of_best_historical_rd_scores(self):
         model = BiMC.__new__(BiMC)
         nn.Module.__init__(model)
         adapter = VisualMoEAdapter(8, num_experts=2, reduction=2, descriptor_dim=4)
@@ -1166,16 +1122,22 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             VISUAL_MOE=SimpleNamespace(EXPANSION_THRESHOLD_QUANTILE=0.95))))
         for descriptor in adapter.descriptors:
             descriptor.update_reference(torch.tensor([0.1, 0.11, 0.09, 0.1]))
-        labels = torch.arange(10).repeat_interleave(5)
-        features = {0: {"cls_in": torch.randn(50, 8), "labels": labels,
-                        "source_ids": torch.arange(100, 150)}}
-        scores = torch.tensor([[0.1, 0.2]] * 45 + [[5.0, 6.0]] * 5)
+        scores = torch.tensor([
+            [0.1, 0.2], [0.2, 0.3], [0.3, 0.4], [0.4, 0.5],
+            [2.0, 3.0], [2.1, 3.1], [2.2, 3.2], [4.0, 5.0],
+        ])
         adapter.descriptor_scores = lambda x, require_ready=True: scores
-        self.assertLess(float(torch.quantile(scores.min(1).values, 0.90)), 1.0)
-        decision = model.plan_layer_expansion(0, features, list(range(10)), 1.0)
-        self.assertTrue(decision.expand)
-        self.assertAlmostEqual(decision.session_q90, 5.0, places=6)
-        self.assertEqual(decision.class_q90[-1][0], 9)
+        features = {0: {
+            "cls_in": torch.randn(8, 8),
+            "labels": torch.tensor([2, 2, 2, 2, 3, 3, 3, 3]),
+            "source_ids": torch.arange(10, 18),
+        }}
+        expected = float(torch.quantile(scores.min(dim=1).values, 0.90))
+        decision = model.plan_layer_expansion(0, features, [2, 3], 1.0)
+        self.assertEqual(decision.support_count, 8)
+        self.assertAlmostEqual(decision.session_q90, expected, places=6)
+        self.assertEqual(decision.expand, expected > 1.0)
+        self.assertFalse(hasattr(decision, "class_q90"))
 
     def test_semantic_guided_calibration_uses_only_base_description_to_retrieve_enhanced_visual(self):
         runner = Runner.__new__(Runner)
