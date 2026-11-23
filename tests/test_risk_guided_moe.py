@@ -233,12 +233,14 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             self.assertEqual(len(history["pd_loss"]), 8)
             self.assertEqual(len(history["gradient_projection"]), 8)
             for projection_epoch in history["gradient_projection"]:
-                for group in ("expert", "router"):
-                    self.assertEqual(projection_epoch[group]["batch_count"], 2)
-                    self.assertTrue(0.0 <= projection_epoch[group]["conflict_rate"] <= 1.0)
-                    self.assertTrue(torch.isfinite(torch.tensor(
-                        projection_epoch[group]["projection_coefficient_mean"]
-                    )))
+                self.assertIn("applied", projection_epoch)
+                self.assertTrue(torch.isfinite(torch.tensor(
+                    projection_epoch["projection_coefficient"]
+                )))
+                self.assertGreaterEqual(
+                    projection_epoch["ce_pd_dot_after"],
+                    projection_epoch["ce_pd_dot_before"] - 1e-8,
+                )
             self.assertEqual(history["rd_training_samples"], 18)
             self.assertEqual(history["rd_reference_samples"], 14)
             self.assertEqual(history["rd_session_classes"], [1, 2])
