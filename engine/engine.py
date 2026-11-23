@@ -622,9 +622,13 @@ class Runner:
             prefix_tokens = torch.as_tensor(feature_anchors.get("prefix_tokens"))
             final_features = torch.as_tensor(feature_anchors.get("final_features"))
             anchor_sources = torch.as_tensor(feature_anchors.get("source_ids"), dtype=torch.long).reshape(-1)
+            anchor_labels = torch.as_tensor(feature_anchors.get("labels"), dtype=torch.long).reshape(-1)
+            anchor_class_ids = torch.as_tensor(feature_anchors.get("class_ids"), dtype=torch.long).reshape(-1)
             if (prefix_tokens.ndim != 3 or final_features.ndim != 2
                     or prefix_tokens.size(0) != final_features.size(0)
                     or final_features.size(0) != anchor_sources.numel()
+                    or anchor_labels.numel() != anchor_sources.numel()
+                    or not torch.equal(torch.unique(anchor_labels, sorted=True), anchor_class_ids.sort().values)
                     or final_features.size(1) != int(self.model_without_dp.clip_model.visual.output_dim)
                     or final_features.size(0) == 0
                     or not torch.isfinite(prefix_tokens.float()).all()
@@ -1289,7 +1293,7 @@ class Runner:
                 images, labels = self.parse_batch(batch)
                 source_ids = self._batch_source_ids(batch, labels.numel(), labels.device)
                 prefix = self.model_without_dp.extract_reference_prefix_tokens(images)
-                features = self.model_without_dp.extract_img_feature_train(images)
+                features, _ = self.model_without_dp.extract_img_feature_train(images)
                 prefix_rows.append(prefix.detach().cpu())
                 feature_rows.append(F.normalize(features.detach().float(), dim=-1).cpu())
                 label_rows.append(labels.detach().cpu())
@@ -1313,6 +1317,7 @@ class Runner:
         return {
             "session_id": int(session_id),
             "class_ids": torch.unique(labels, sorted=True).cpu(),
+            "labels": labels[selected].clone(),
             "source_ids": sources[selected].clone(),
             "prefix_tokens": prefixes[selected].contiguous().half(),
             "final_features": features[selected].contiguous().half(),
@@ -1326,10 +1331,6 @@ class Runner:
             raise RuntimeError("Incremental feature-space preservation requires historical final-feature anchors.")
         prefixes = torch.cat([torch.as_tensor(item["prefix_tokens"]) for item in anchors], dim=0)
         targets = torch.cat([torch.as_tensor(item["final_features"]) for item in anchors], dim=0)
-        class_ids = torch.cat([torch.as_tensor(item["class_ids"]).repeat_interleave(
-            torch.bincount(torch.as_tensor(item["labels"]).long()) if "labels" in item else
-            torch.full((len(item["class_ids"]),), int(item["anchor_count"] // len(item["class_ids"])))
-        ) for item in anchors], dim=0) if False else None
         if prefixes.size(0) != targets.size(0) or prefixes.size(0) == 0:
             raise ValueError("Historical feature-anchor prefixes and targets are empty or misaligned.")
         batch_size = int(_cfg_value(self._visual_moe_cfg(), "FEATURE_SPACE_ANCHOR_BATCH_SIZE", 16))
