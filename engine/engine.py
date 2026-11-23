@@ -69,6 +69,61 @@ class Runner:
     # ------------------------------------------------------------------
     # Generic state / model helpers
     # ------------------------------------------------------------------
+    def _snapshot_session_transaction(self, state_dict_list):
+        """Capture every mutable FSCIL state component before a Session starts."""
+        adapter_states = []
+        for block_idx, adapter in self._moe_adapters():
+            adapter_states.append((
+                int(block_idx),
+                adapter.export_topology(),
+                {key: value.detach().clone() for key, value in adapter.state_dict().items()},
+            ))
+        base_prototype = getattr(self.model_without_dp, "base_enhanced_visual_prototype", None)
+        return {
+            "adapters": adapter_states,
+            "expansion_thresholds": copy.deepcopy(self.expansion_thresholds),
+            "base_reference_source_ids": list(self.base_reference_source_ids),
+            "base_reference_cls_features": self._cpu_copy(self.base_reference_cls_features),
+            "base_reference_prefix_cache": self._cpu_copy(self.base_reference_prefix_cache),
+            "base_reference_feature_prototypes": self._cpu_copy(self.base_reference_feature_prototypes),
+            "base_reference_class_ids": self._cpu_copy(self.base_reference_class_ids),
+            "base_reference_accuracy_baseline": self.base_reference_accuracy_baseline,
+            "base_enhanced_visual_prototype": (
+                None if base_prototype is None else base_prototype.detach().clone()
+            ),
+            "state_dict_list": copy.deepcopy(state_dict_list),
+            "acc_list": list(self.acc_list),
+            "task_acc_list": copy.deepcopy(self.task_acc_list),
+            "session_diagnostics": copy.deepcopy(self.session_diagnostics),
+            "rng_state": self._rng_state(),
+            "training_modes": {id(module): bool(module.training) for module in self.model.modules()},
+        }
+
+    def _restore_session_transaction(self, snapshot, state_dict_list):
+        """Roll back model, references, metrics, RNG and module modes as one Session unit."""
+        for block_idx, topology, state in snapshot["adapters"]:
+            adapter = self._adapter_by_block(block_idx)
+            adapter.rebuild_topology(topology)
+            adapter.load_state_dict(state, strict=True)
+            adapter.freeze_all()
+        self.expansion_thresholds = copy.deepcopy(snapshot["expansion_thresholds"])
+        self.base_reference_source_ids = list(snapshot["base_reference_source_ids"])
+        self.base_reference_cls_features = self._cpu_copy(snapshot["base_reference_cls_features"])
+        self.base_reference_prefix_cache = self._cpu_copy(snapshot["base_reference_prefix_cache"])
+        self.base_reference_feature_prototypes = self._cpu_copy(snapshot["base_reference_feature_prototypes"])
+        self.base_reference_class_ids = self._cpu_copy(snapshot["base_reference_class_ids"])
+        self.base_reference_accuracy_baseline = snapshot["base_reference_accuracy_baseline"]
+        prototype = snapshot["base_enhanced_visual_prototype"]
+        if prototype is not None and hasattr(self.model_without_dp, "base_enhanced_visual_prototype"):
+            self.model_without_dp.base_enhanced_visual_prototype.copy_(prototype)
+        state_dict_list[:] = copy.deepcopy(snapshot["state_dict_list"])
+        self.acc_list = list(snapshot["acc_list"])
+        self.task_acc_list = copy.deepcopy(snapshot["task_acc_list"])
+        self.session_diagnostics = copy.deepcopy(snapshot["session_diagnostics"])
+        self._restore_rng_state(snapshot["rng_state"])
+        for module in self.model.modules():
+            module.training = snapshot["training_modes"].get(id(module), False)
+
     def _moe_adapters(self):
         result = []
         for block_idx, block in enumerate(self.model_without_dp.clip_model.visual.transformer.resblocks):
@@ -882,14 +937,44 @@ class Runner:
             "config": self.cfg.dump() if hasattr(self.cfg, "dump") else str(self.cfg),
         }
         target = directory / f"session_{int(completed_session):02d}.pth"
-        temp_target = target.with_suffix(target.suffix + ".tmp")
-        torch.save(payload, temp_target)
-        os.replace(temp_target, target)
+        publish_targets = [target]
         if bool(_cfg_value(self._checkpoint_cfg(), "SAVE_EVERY_SESSION", True)):
-            latest = directory / "latest.pth"
-            temp_latest = latest.with_suffix(latest.suffix + ".tmp")
-            torch.save(payload, temp_latest)
-            os.replace(temp_latest, latest)
+            publish_targets.append(directory / "latest.pth")
+        temp_paths = [path.with_suffix(path.suffix + ".tmp") for path in publish_targets]
+        backup_paths = [path.with_suffix(path.suffix + ".bak") for path in publish_targets]
+        for temp_path in temp_paths:
+            if temp_path.exists():
+                temp_path.unlink()
+        for backup_path in backup_paths:
+            if backup_path.exists():
+                backup_path.unlink()
+        try:
+            for temp_path in temp_paths:
+                torch.save(payload, temp_path)
+            backed_up = []
+            try:
+                for path, backup_path in zip(publish_targets, backup_paths):
+                    if path.exists():
+                        os.replace(path, backup_path)
+                        backed_up.append((path, backup_path))
+                for temp_path, path in zip(temp_paths, publish_targets):
+                    os.replace(temp_path, path)
+            except Exception:
+                for path in publish_targets:
+                    if path.exists():
+                        path.unlink()
+                for path, backup_path in reversed(backed_up):
+                    if backup_path.exists():
+                        os.replace(backup_path, path)
+                raise
+            else:
+                for _, backup_path in backed_up:
+                    if backup_path.exists():
+                        backup_path.unlink()
+        finally:
+            for temp_path in temp_paths:
+                if temp_path.exists():
+                    temp_path.unlink()
         print(f"=> Saved checkpoint: {target}")
         return target
 
@@ -2342,80 +2427,85 @@ class Runner:
             if use_moe:
                 self._log_expert_topology(f"session{task_id}-before")
 
-            if task_id == 0:
-                state = self.model_without_dp.build_task_statistics(
-                    class_names, extract_loader, class_index,
-                    )
-                state["class_ids"] = torch.as_tensor(class_index, device=self.device, dtype=torch.long)
-                state["class_index"] = state["class_ids"]
-                if use_moe:
-                    self.train_base_task(state, train_loader, extract_loader)
-                    self.model.eval()
+            session_snapshot = self._snapshot_session_transaction(state_dict_list)
+            try:
+                if task_id == 0:
                     state = self.model_without_dp.build_task_statistics(
-                        class_names, extract_loader, class_index)
+                        class_names, extract_loader, class_index,
+                        )
                     state["class_ids"] = torch.as_tensor(class_index, device=self.device, dtype=torch.long)
                     state["class_index"] = state["class_ids"]
-                state["encoder_version"] = 0
-                state["creation_session"] = 0
-                state["anchor_by_block"] = self._collect_class_anchors(extract_loader)
+                    if use_moe:
+                        self.train_base_task(state, train_loader, extract_loader)
+                        self.model.eval()
+                        state = self.model_without_dp.build_task_statistics(
+                            class_names, extract_loader, class_index)
+                        state["class_ids"] = torch.as_tensor(class_index, device=self.device, dtype=torch.long)
+                        state["class_index"] = state["class_ids"]
+                    state["encoder_version"] = 0
+                    state["creation_session"] = 0
+                    state["anchor_by_block"] = self._collect_class_anchors(extract_loader)
+                    if use_moe:
+                        state["reference_cls_by_block"] = self._cpu_copy(self.base_reference_cls_features)
+                        self._capture_base_reference_accuracy_anchor(state)
+                        state["final_feature_anchors"] = self._collect_final_feature_anchors(extract_loader, 0)
+                else:
+                    if use_moe:
+                        self._routing_diagnostics(extract_loader, f"session{task_id}-before",
+                                                  current_task=task_id)
+                        adaptation = self.train_incremental_task(
+                            task_id, train_loader, extract_loader, class_index,
+                            class_names, old_states)
+                        plan_summary = self._cpu_copy(adaptation["decisions"])
+                    self.model.eval()
+                    state = adaptation.pop("task_state")
+    
+                state_dict_list.append(state)
+                feature_space_diagnostics = self._base_reference_feature_diagnostics(state_dict_list[0])
+                # Task offsets are deliberately absent from prediction. Keep a
+                # zero-valued compatibility field for old checkpoint readers.
+                merged = self.merge_dicts(state_dict_list)
+                final_routing = {}
                 if use_moe:
-                    state["reference_cls_by_block"] = self._cpu_copy(self.base_reference_cls_features)
-                    self._capture_base_reference_accuracy_anchor(state)
-                    state["final_feature_anchors"] = self._collect_final_feature_anchors(extract_loader, 0)
-            else:
-                if use_moe:
-                    self._routing_diagnostics(extract_loader, f"session{task_id}-before",
-                                              current_task=task_id)
-                    adaptation = self.train_incremental_task(
-                        task_id, train_loader, extract_loader, class_index,
-                        class_names, old_states)
-                    plan_summary = self._cpu_copy(adaptation["decisions"])
-                self.model.eval()
-                state = adaptation.pop("task_state")
-
-            state_dict_list.append(state)
-            feature_space_diagnostics = self._base_reference_feature_diagnostics(state_dict_list[0])
-            # Task offsets are deliberately absent from prediction. Keep a
-            # zero-valued compatibility field for old checkpoint readers.
-            merged = self.merge_dicts(state_dict_list)
-            final_routing = {}
-            if use_moe:
-                final_routing = self._routing_diagnostics(
-                    extract_loader, f"session{task_id}-final", current_task=task_id)
-                self._log_expert_topology(f"session{task_id}-final")
-            start_time = time.perf_counter()
-            acc = self.inference_task_bilevel(task_id, merged)
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            elapsed = time.perf_counter() - start_time
-            print(f"+++++++++++ session {task_id}, time: {elapsed:.3f}s ++++++++++++++++")
-            task_history = self.task_acc_list + [acc["task_acc"]]
-            forgetting = []
-            for old_task in range(task_id + 1):
-                best = max(float(task_history[session][old_task])
-                           for session in range(old_task, task_id + 1))
-                current = float(task_history[task_id][old_task])
-                forgetting.append(best - current)
-            acc["performance_drop"] = float(np.mean(forgetting)) if forgetting else 0.0
-            self.acc_list.append(round(acc["mean_acc"], 3))
-            acc["average_accuracy"] = float(np.mean(self.acc_list))
-            print(f"=> Session [{task_id}], AA={acc['average_accuracy']:.3f}, "
-                  f"Current={acc['mean_acc']:.3f}, Base={acc['base_avg_acc']:.2f}, "
-                  f"Novel={acc['inc_avg_acc']:.2f}, H={acc['harmonic_acc']:.2f}, "
-                  f"PD={acc['performance_drop']:.3f}")
-            self.task_acc_list.append(acc["task_acc"])
-            self.session_diagnostics.append({
-                "session": int(task_id),
-                "support_manifest_hash": self._support_manifest_hash(),
-                "expansion": self._cpu_copy(plan_summary),
-                "adaptation": self._cpu_copy(adaptation),
-                "routing": self._cpu_copy(final_routing),
-                "expert_counts": {int(b): int(a.num_experts) for b, a in self._moe_adapters()},
-                "classifier": self._cpu_copy(acc),
-                "feature_space": self._cpu_copy(feature_space_diagnostics),
-                "evaluation_seconds": float(elapsed),
-            })
-            self.save_checkpoint(task_id, state_dict_list)
+                    final_routing = self._routing_diagnostics(
+                        extract_loader, f"session{task_id}-final", current_task=task_id)
+                    self._log_expert_topology(f"session{task_id}-final")
+                start_time = time.perf_counter()
+                acc = self.inference_task_bilevel(task_id, merged)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                elapsed = time.perf_counter() - start_time
+                print(f"+++++++++++ session {task_id}, time: {elapsed:.3f}s ++++++++++++++++")
+                task_history = self.task_acc_list + [acc["task_acc"]]
+                forgetting = []
+                for old_task in range(task_id + 1):
+                    best = max(float(task_history[session][old_task])
+                               for session in range(old_task, task_id + 1))
+                    current = float(task_history[task_id][old_task])
+                    forgetting.append(best - current)
+                acc["performance_drop"] = float(np.mean(forgetting)) if forgetting else 0.0
+                self.acc_list.append(round(acc["mean_acc"], 3))
+                acc["average_accuracy"] = float(np.mean(self.acc_list))
+                print(f"=> Session [{task_id}], AA={acc['average_accuracy']:.3f}, "
+                      f"Current={acc['mean_acc']:.3f}, Base={acc['base_avg_acc']:.2f}, "
+                      f"Novel={acc['inc_avg_acc']:.2f}, H={acc['harmonic_acc']:.2f}, "
+                      f"PD={acc['performance_drop']:.3f}")
+                self.task_acc_list.append(acc["task_acc"])
+                self.session_diagnostics.append({
+                    "session": int(task_id),
+                    "support_manifest_hash": self._support_manifest_hash(),
+                    "expansion": self._cpu_copy(plan_summary),
+                    "adaptation": self._cpu_copy(adaptation),
+                    "routing": self._cpu_copy(final_routing),
+                    "expert_counts": {int(b): int(a.num_experts) for b, a in self._moe_adapters()},
+                    "classifier": self._cpu_copy(acc),
+                    "feature_space": self._cpu_copy(feature_space_diagnostics),
+                    "evaluation_seconds": float(elapsed),
+                })
+                self.save_checkpoint(task_id, state_dict_list)
+            except Exception:
+                self._restore_session_transaction(session_snapshot, state_dict_list)
+                raise
 
         print(f"\nFinal session accuracy: {self.acc_list}")
         print("Session-wise class accuracy:")
