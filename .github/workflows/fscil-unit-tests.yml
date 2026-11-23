@@ -40,3 +40,6 @@ jobs:
 
       - name: Run Session-1 diagnostic unit tests
         run: python -m unittest discover -s tests -p "test_session1_diagnostics.py" -v
+
+      - name: Validate complete YACS training configuration
+        run: python -m unittest discover -s tests -p "test_config_schema.py" -v
