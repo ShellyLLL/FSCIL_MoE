@@ -1596,6 +1596,8 @@ class Runner:
         """Transactional wrapper: a failed session cannot leave partial experts."""
         snapshots = []
         threshold_snapshot = copy.deepcopy(self.expansion_thresholds)
+        rng_snapshot = self._rng_state()
+        training_modes = {id(module): bool(module.training) for module in self.model.modules()}
         for block_idx, adapter in self._moe_adapters():
             snapshots.append((
                 int(block_idx), adapter.export_topology(),
@@ -1622,6 +1624,13 @@ class Runner:
                 raise RuntimeError(
                     "Session rejected: production feature-space preservation check is unavailable."
                 )
+            # Prototype construction and compact feature-anchor capture are
+            # part of the same Session transaction, not post-commit side effects.
+            result["task_state"] = self._build_and_refine_task_state(
+                current_class_name, extract_loader, class_index, old_states,
+                semantic_proto=semantic_proto,
+            )
+            result["task_state"]["creation_session"] = int(task_id)
             result["feature_space_acceptance"] = self._cpu_copy(feature_check)
             return result
         except Exception:
@@ -1634,6 +1643,9 @@ class Runner:
             # Thresholds are part of the deployed expert-pool state. A failed
             # Session must roll back their recalibration together with topology.
             self.expansion_thresholds = threshold_snapshot
+            self._restore_rng_state(rng_snapshot)
+            for module in self.model.modules():
+                module.training = training_modes.get(id(module), False)
             raise
 
     def _train_reused_router(self, block_idx, reference_features):
@@ -2066,11 +2078,7 @@ class Runner:
                         class_names, old_states)
                     plan_summary = self._cpu_copy(adaptation["decisions"])
                 self.model.eval()
-                state = self._build_and_refine_task_state(
-                    class_names, extract_loader, class_index, old_states,
-                    semantic_proto=(adaptation.get("semantic_prototype") if adaptation is not None else None),
-                )
-                state["creation_session"] = int(task_id)
+                state = adaptation.pop("task_state")
 
             state_dict_list.append(state)
             feature_space_diagnostics = self._base_holdout_feature_diagnostics(state_dict_list[0])
