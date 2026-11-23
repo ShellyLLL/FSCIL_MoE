@@ -338,8 +338,9 @@ class UnifiedDynamicMoETests(unittest.TestCase):
                     torch.testing.assert_close(adapter.state_dict()[key], value, rtol=0, atol=0)
                 self.assertEqual(result["training"][block]["classification_samples_total"], 0)
             else:
+                history = result["training"][block]
                 self.assertEqual(
-                    result["training"][block]["classification_samples_per_epoch"],
+                    history["classification_samples_per_epoch"],
                     [16] * int(runner.cfg.TRAINER.BiMC.INCREMENTAL.EPOCHS),
                 )
                 self.assertEqual(
