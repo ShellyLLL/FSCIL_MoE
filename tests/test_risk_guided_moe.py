@@ -290,6 +290,10 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             1, torch.tensor([0., 1., 0., 0., 0., 0., 0., 0.]), 9410,
             augmented=True, seed=241,
         )
+        expected_fit_centers = {
+            block: item["cls_in"].mean(0)
+            for block, item in model.collect_blockwise_cls_features([train]).items()
+        }
         original_plan = model.plan_layer_expansion
         def force_expand(block_idx, features, class_index, threshold=None):
             decision = original_plan(block_idx, features, class_index, threshold)
@@ -312,6 +316,9 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             self.assertEqual(result["training"][block]["descriptor_anchor_id"], -1)
             self.assertEqual(result["training"][block]["rd_training_samples"], 16)
             self.assertEqual(result["training"][block]["rd_reference_samples"], 16)
+            torch.testing.assert_close(adapter.descriptors[-1].center, expected_fit_centers[block])
+            gram = adapter.descriptors[-1].basis.t() @ adapter.descriptors[-1].basis
+            torch.testing.assert_close(gram, torch.eye(gram.size(0)), atol=1e-5, rtol=1e-5)
 
     def test_mixed_session_expands_one_layer_and_reuses_another_under_one_optimizer(self):
         torch.manual_seed(83)
