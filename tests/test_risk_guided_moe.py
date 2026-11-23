@@ -1024,6 +1024,13 @@ class UnifiedDynamicMoETests(unittest.TestCase):
                 "support_count": torch.tensor([5]),
                 "description_proto": prototype.clone(),
                 "anchor_by_block": {0: anchor_bank, 1: anchor_bank},
+                "final_feature_anchors": {
+                    "session_id": 0, "class_ids": torch.tensor([0]),
+                    "labels": torch.tensor([0, 0]), "source_ids": torch.tensor([700001, 700002]),
+                    "prefix_tokens": torch.randn(2, 2, 8).half(),
+                    "final_features": F.normalize(torch.randn(2, 8), dim=-1).half(),
+                    "anchor_count": 2,
+                },
                 "creation_session": 0,
             }
             checkpoint_path = runner.save_checkpoint(0, [state])

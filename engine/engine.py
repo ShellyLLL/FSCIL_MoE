@@ -1782,7 +1782,7 @@ class Runner:
                     "expert_id": int(expert_id), "descriptor_anchor_id": int(anchor_expert_id),
                     "descriptor_anchor_q90": [float(value) for value in anchor_q90.detach().cpu().tolist()],
                     "loss": [], "ce_loss": [], "rd_loss": [], "feature_space_loss": [],
-                    "local_preservation_loss": [], "gradient_projection": [],
+                    "local_preservation_loss": [], "pd_loss": [], "gradient_projection": [],
                     "classification_samples_per_epoch": [], "classification_samples_total": 0,
                     "rd_training_samples": int(fit_values.size(0)),
                     "rd_reference_samples": int(calibration_values.size(0)),
@@ -1939,6 +1939,7 @@ class Runner:
                 history["ce_loss"].append(epoch_totals["ce"] / n)
                 history["feature_space_loss"].append(epoch_totals["feature"] / n)
                 history["local_preservation_loss"].append(epoch_totals["local"] / n)
+                history["pd_loss"].append(epoch_totals["local"] / n)
                 history["rd_loss"].append(epoch_totals["rd"] / n)
                 history["loss"].append(
                     epoch_totals["ce"] / n + epoch_totals["feature"] / n +
