@@ -1502,6 +1502,7 @@ class Runner:
                                current_class_name, old_states):
         """Transactional wrapper: a failed session cannot leave partial experts."""
         snapshots = []
+        threshold_snapshot = copy.deepcopy(self.expansion_thresholds)
         for block_idx, adapter in self._moe_adapters():
             snapshots.append((
                 int(block_idx), adapter.export_topology(),
@@ -1537,6 +1538,9 @@ class Runner:
                 adapter.rebuild_topology(topology)
                 adapter.load_state_dict(state, strict=True)
                 adapter.freeze_all()
+            # Thresholds are part of the deployed expert-pool state. A failed
+            # Session must roll back their recalibration together with topology.
+            self.expansion_thresholds = threshold_snapshot
             raise
 
     def _train_reused_router(self, block_idx, reference_features):
