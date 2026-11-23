@@ -38,7 +38,7 @@ def _cfg_value(node, name, default):
 
 
 class Runner:
-    """FSCIL runner with Session-Q90 RD detection, dynamic experts and semantic visual prototypes."""
+    """FSCIL runner with class-balanced RD detection, dynamic experts and calibrated visual prototypes."""
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -1568,8 +1568,8 @@ class Runner:
                 f"{expected_classes}."
             )
 
-        # Functional experts are trained shallow-to-deep because upstream
-        # adapters change the adapted inputs seen by downstream expert functions.
+        # Each adapter consumes its block's frozen-reference stream, so expansion
+        # evidence is invariant to all earlier adapter residual updates.
         for block_idx in self.model_without_dp.expandable_blocks():
             decision = self.model_without_dp.plan_layer_expansion(
                 block_idx,

@@ -5,6 +5,7 @@ on:
     branches:
       - feature/fscil-ae-driven-unified-moe
       - feature/fscil-session1-diagnostics-hardening
+      - codex/fscil-ae-unified-architecture-refactor
     paths:
       - "**/*.py"
       - ".github/workflows/fscil-unit-tests.yml"

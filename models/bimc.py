@@ -11,7 +11,7 @@ import models.clip.clip as clip
 
 @dataclass
 class LayerExpansionDecision:
-    """Base-calibrated Session-Q90 expansion decision for one transformer layer."""
+    """Base-calibrated class-balanced Session expansion decision for one transformer layer."""
     block_idx: int
     expand: bool
     session_q90: float
@@ -254,7 +254,7 @@ class BiMC(nn.Module):
 
     @torch.no_grad()
     def plan_layer_expansion(self, block_idx, features, class_index, threshold=None):
-        """Session-level novelty test: Q90(min historical-RD standardized error)."""
+        """One Session decision from max-class-Q90 of min historical-RD standardized errors."""
         block_idx = int(block_idx)
         if threshold is None or not math.isfinite(float(threshold)):
             raise ValueError("A finite Base-calibrated Session Q95 threshold is required.")
