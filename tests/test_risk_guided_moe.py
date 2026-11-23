@@ -1138,6 +1138,18 @@ class UnifiedDynamicMoETests(unittest.TestCase):
                 "support_count": torch.tensor([5]),
                 "description_proto": prototype.clone(),
                 "anchor_by_block": {0: anchor_bank, 1: anchor_bank},
+                "reference_cls_by_block": {
+                    0: {
+                        "cls_in": torch.randn(40, 8).half(),
+                        "labels": torch.zeros(40, dtype=torch.long),
+                        "source_ids": torch.arange(700000, 700040),
+                    },
+                    1: {
+                        "cls_in": torch.randn(40, 8).half(),
+                        "labels": torch.zeros(40, dtype=torch.long),
+                        "source_ids": torch.arange(700000, 700040),
+                    },
+                },
                 "final_feature_anchors": {
                     "session_id": 0, "class_ids": torch.tensor([0]),
                     "labels": torch.tensor([0, 0]), "source_ids": torch.tensor([700001, 700002]),
@@ -1149,7 +1161,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             }
             checkpoint_path = runner.save_checkpoint(0, [state])
             payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-            self.assertEqual(payload["schema_version"], 35)
+            self.assertEqual(payload["schema_version"], 36)
             self.assertTrue(payload["base_reference_source_ids"])
             self.assertIn("base_reference_cls_features", payload)
             self.assertIn("base_reference_prefix_cache", payload)
