@@ -112,7 +112,7 @@ class Runner:
         loss_cfg = _cfg_value(trainer_cfg, "LOSS", None)
         dataset_cfg = _cfg_value(self.cfg, "DATASET", None)
         return {
-            "version": 15,
+            "version": 16,
             "decision_unit": "incremental_session_per_layer",
             "sample_score": "minimum_standardized_reconstruction_error_over_current_deployed_RDs",
             "threshold_refresh": "recalibrate_from_cached_base_reference_cls_after_every_expert_pool_change",
@@ -131,6 +131,7 @@ class Runner:
             "descriptor_calibration_scope": "all_current_session_deterministic_reference_cls_weighted_by_deployed_expert_responsibility",
             "base_threshold_reference_scope": "deterministic_class_balanced_cached_base_reference_cls",
             "base_feature_diagnostic_scope": "cached_frozen_reference_prefix_replay_no_incremental_base_image_reload",
+            "threshold_calibration_scope": "base_reference_plus_all_historical_and_current_incremental_support_cls",
             "router_learning_signal": "joint_global_CE_projected_against_final_feature_and_local_residual_preservation",
             "visual_moe_enabled": bool(_cfg_value(moe_cfg, "ENABLE", False)),
             "insert_blocks": [int(value) for value in _cfg_value(moe_cfg, "INSERT_BLOCKS", [])],
@@ -485,10 +486,10 @@ class Runner:
         if missing:
             raise ValueError(f"Resume checkpoint is missing required fields: {missing}")
         schema = int(payload["schema_version"])
-        if schema != 35:
+        if schema != 36:
             raise ValueError(
-                "This branch uses all-support responsibility-weighted RD fitting, cached Base-reference "
-                "Session-Q90 expansion and prefix-replay feature diagnostics checkpoint schema (35); "
+                "This branch uses all-support dual-view RD fitting, known-domain Session-Q90 threshold "
+                "calibration and prefix-replay feature diagnostics checkpoint schema (36); "
                 "older expansion-policy checkpoints are incompatible."
             )
         checkpoint_policy = payload.get("expansion_policy")
@@ -642,7 +643,8 @@ class Runner:
         for session_index, state in enumerate(payload["task_states"]):
             required_state = ("class_ids", "image_proto", "reference_image_proto",
                               "text_features", "description_proto", "support_count",
-                              "anchor_by_block", "final_feature_anchors")
+                              "anchor_by_block", "final_feature_anchors",
+                              "reference_cls_by_block")
             forbidden_state = ("anchor_features", "anchor_labels", "anchor_source_ids")
             retained_raw = [key for key in forbidden_state if key in state]
             if retained_raw:
@@ -682,6 +684,26 @@ class Runner:
                 if not torch.isfinite(prototype).all():
                     raise ValueError(
                         f"Checkpoint task state {session_index} has non-finite {key}."
+                    )
+            reference_cls_by_block = state["reference_cls_by_block"]
+            if not isinstance(reference_cls_by_block, dict) or not reference_cls_by_block:
+                raise ValueError(f"Checkpoint task state {session_index} has no reference CLS cache.")
+            expected_reference_blocks = {int(value) for value in expected_topology_blocks}
+            if {int(value) for value in reference_cls_by_block} != expected_reference_blocks:
+                raise ValueError(f"Checkpoint task state {session_index} reference CLS blocks do not match MoE topology.")
+            for block_idx, cache in reference_cls_by_block.items():
+                cls_in = torch.as_tensor(cache.get("cls_in")).float()
+                labels = torch.as_tensor(cache.get("labels"), dtype=torch.long).reshape(-1)
+                source_ids = torch.as_tensor(cache.get("source_ids"), dtype=torch.long).reshape(-1)
+                adapter = self._adapter_by_block(int(block_idx))
+                if (cls_in.ndim != 2 or cls_in.size(1) != adapter.d_model
+                        or cls_in.size(0) == 0 or labels.numel() != cls_in.size(0)
+                        or source_ids.numel() != cls_in.size(0)
+                        or torch.unique(source_ids).numel() != source_ids.numel()
+                        or not torch.isfinite(cls_in).all()
+                        or not torch.equal(torch.unique(labels, sorted=True), class_ids.sort().values)):
+                    raise ValueError(
+                        f"Checkpoint task state {session_index} block {block_idx} reference CLS cache is malformed."
                     )
             feature_anchors = state["final_feature_anchors"]
             if not isinstance(feature_anchors, dict):
@@ -829,7 +851,7 @@ class Runner:
         directory.mkdir(parents=True, exist_ok=True)
         topology = self.model_without_dp.export_moe_topology()
         payload = {
-            "schema_version": 35,
+            "schema_version": 36,
             "completed_session": int(completed_session),
             "base_reference_source_ids": list(self.base_reference_source_ids),
             "base_reference_cls_features": self._cpu_copy(self.base_reference_cls_features),
@@ -1377,29 +1399,51 @@ class Runner:
         return result
 
     @torch.no_grad()
-    def _refresh_block_expansion_threshold(self, block_idx):
-        """Refresh a changed expert pool from cached frozen-reference Base CLS inputs."""
-        cache = getattr(self, "base_reference_cls_features", {}).get(int(block_idx))
-        if not isinstance(cache, dict):
+    def _refresh_block_expansion_threshold(
+        self, block_idx, current_reference_features=None, old_states=None,
+    ):
+        """Recalibrate a changed pool over Base and every previously accepted Session domain."""
+        feature_items = []
+        for state in (old_states or []):
+            cache_by_block = state.get("reference_cls_by_block", {})
+            cache = cache_by_block.get(int(block_idx), cache_by_block.get(str(block_idx)))
+            if cache is not None:
+                feature_items.append(cache)
+        if current_reference_features is not None:
+            current = current_reference_features.get(int(block_idx))
+            if current is not None:
+                feature_items.append(current)
+        if not feature_items:
+            fallback = getattr(self, "base_reference_cls_features", {}).get(int(block_idx))
+            if fallback is not None:
+                feature_items.append(fallback)
+        if not feature_items:
             raise RuntimeError(
-                f"Block {int(block_idx)} has no cached Base reference CLS features for threshold refresh."
+                f"Block {int(block_idx)} has no cached known-domain CLS features for threshold refresh."
             )
+        values_rows, labels_rows, source_rows = [], [], []
+        for item in feature_items:
+            values_rows.append(torch.as_tensor(item["cls_in"]).float())
+            labels_rows.append(torch.as_tensor(item["labels"]).long().reshape(-1))
+            source_rows.append(torch.as_tensor(item["source_ids"]).long().reshape(-1))
+        values = torch.cat(values_rows, dim=0)
+        labels = torch.cat(labels_rows, dim=0)
+        sources = torch.cat(source_rows, dim=0)
+        if (values.size(0) != labels.numel() or labels.numel() != sources.numel()
+                or torch.unique(sources).numel() != sources.numel()
+                or not torch.isfinite(values).all()):
+            raise ValueError("Known-domain threshold CLS cache contains duplicate sources or invalid rows.")
         adapter = self._adapter_by_block(block_idx)
         sizes = sorted(self.expansion_thresholds.get(int(block_idx), {}).keys())
         if not sizes:
             sizes = self._incremental_support_sizes()
         refreshed = self._calibrate_session_expansion_thresholds(
-            adapter,
-            torch.as_tensor(cache["cls_in"], device=self.device).float(),
-            torch.as_tensor(cache["labels"], device=self.device).long(),
-            sizes,
-            int(block_idx),
+            adapter, values.to(self.device), labels.to(self.device), sizes, int(block_idx)
         )
         self.expansion_thresholds[int(block_idx)] = refreshed
         print(
-            f"=> [Session-Threshold][B{int(block_idx)}] refreshed for "
-            f"{adapter.num_experts} deployed experts from cached Base reference CLS "
-            f"(n={len(cache['source_ids'])}); no Base image reload."
+            f"=> [Session-Threshold][B{int(block_idx)}] refreshed for {adapter.num_experts} experts "
+            f"from {len(feature_items)} accepted Session caches / {values.size(0)} reference rows."
         )
 
     @torch.no_grad()
@@ -1470,6 +1514,28 @@ class Runner:
         if current.shape != target.shape or not torch.isfinite(current).all():
             raise RuntimeError("Final feature-space replay produced invalid or misaligned embeddings.")
         return (1.0 - F.cosine_similarity(current, target, dim=-1)).mean()
+
+    @torch.no_grad()
+    def _collect_reference_cls_cache(self, loader):
+        """Cache exact frozen-reference CLS rows for future known-domain threshold calibration."""
+        feature_map = self.model_without_dp.collect_blockwise_cls_features(loader)
+        cache = {}
+        for block_idx, item in feature_map.items():
+            cls_in = torch.as_tensor(item["cls_in"]).detach().cpu().half()
+            labels = torch.as_tensor(item["labels"]).detach().cpu().long()
+            source_ids = torch.as_tensor(item["source_ids"]).detach().cpu().long()
+            if (cls_in.ndim != 2 or cls_in.size(0) == 0
+                    or labels.numel() != cls_in.size(0)
+                    or source_ids.numel() != cls_in.size(0)
+                    or torch.unique(source_ids).numel() != source_ids.numel()
+                    or not torch.isfinite(cls_in.float()).all()):
+                raise ValueError(f"Block {int(block_idx)} reference CLS cache is malformed.")
+            cache[int(block_idx)] = {
+                "cls_in": cls_in, "labels": labels, "source_ids": source_ids,
+            }
+        if not cache:
+            raise RuntimeError("Cannot cache reference CLS rows without configured MoE blocks.")
+        return cache
 
     def _collect_class_anchors(self, loader):
         """Store compact per-class anchors in the shared frozen-reference input space."""
@@ -2115,7 +2181,9 @@ class Runner:
         # Recalibrate thresholds after every new RD has joined its layer's deployed pool.
         for block_idx, context in contexts.items():
             if context["mode"] == "expand":
-                self._refresh_block_expansion_threshold(block_idx)
+                self._refresh_block_expansion_threshold(
+                    block_idx, current_reference_features=expansion_features, old_states=old_states
+                )
                 expanded.append({
                     "block_idx": int(block_idx), "expert_id": int(context["expert_id"]),
                     "descriptor_anchor_id": int(context["adapter"].descriptors[-1].anchor_expert_id),
@@ -2158,6 +2226,7 @@ class Runner:
         state["encoder_version"] = 0
         state["creation_session"] = int(session_id)
         state["anchor_by_block"] = self._collect_class_anchors(extract_loader)
+        state["reference_cls_by_block"] = self._collect_reference_cls_cache(extract_loader)
         state["final_feature_anchors"] = self._collect_final_feature_anchors(
             extract_loader, int(session_id)
         )
@@ -2207,6 +2276,7 @@ class Runner:
                 state["creation_session"] = 0
                 state["anchor_by_block"] = self._collect_class_anchors(extract_loader)
                 if use_moe:
+                    state["reference_cls_by_block"] = self._cpu_copy(self.base_reference_cls_features)
                     state["final_feature_anchors"] = self._collect_final_feature_anchors(extract_loader, 0)
             else:
                 if use_moe:
