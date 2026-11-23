@@ -69,6 +69,45 @@ class Runner:
     # ------------------------------------------------------------------
     # Generic state / model helpers
     # ------------------------------------------------------------------
+    @staticmethod
+    def _tensor_tree_nbytes(value):
+        if torch.is_tensor(value):
+            return int(value.numel() * value.element_size())
+        if isinstance(value, dict):
+            return sum(Runner._tensor_tree_nbytes(item) for item in value.values())
+        if isinstance(value, (list, tuple)):
+            return sum(Runner._tensor_tree_nbytes(item) for item in value)
+        return 0
+
+    def _feature_memory_summary(self, state_dict_list):
+        """Report persistent feature-anchor/cache memory in bytes and MiB."""
+        base_prefix = self._tensor_tree_nbytes(
+            None if self.base_reference_prefix_cache is None
+            else self.base_reference_prefix_cache.get("prefix_tokens")
+        )
+        final_anchor_prefix = sum(
+            self._tensor_tree_nbytes(state.get("final_feature_anchors", {}).get("prefix_tokens"))
+            for state in state_dict_list
+        )
+        final_anchor_targets = sum(
+            self._tensor_tree_nbytes(state.get("final_feature_anchors", {}).get("final_features"))
+            for state in state_dict_list
+        )
+        reference_cls = sum(
+            self._tensor_tree_nbytes(cache.get("cls_in"))
+            for state in state_dict_list
+            for cache in state.get("reference_cls_by_block", {}).values()
+        )
+        total = base_prefix + final_anchor_prefix + final_anchor_targets + reference_cls
+        return {
+            "base_reference_prefix_bytes": base_prefix,
+            "historical_prefix_anchor_bytes": final_anchor_prefix,
+            "historical_final_feature_bytes": final_anchor_targets,
+            "known_domain_cls_cache_bytes": reference_cls,
+            "total_feature_cache_bytes": total,
+            "total_feature_cache_mib": float(total / (1024.0 ** 2)),
+        }
+
     def _snapshot_session_transaction(self, state_dict_list):
         """Capture every mutable FSCIL state component before a Session starts."""
         adapter_states = []
@@ -2530,6 +2569,7 @@ class Runner:
                     "expert_counts": {int(b): int(a.num_experts) for b, a in self._moe_adapters()},
                     "classifier": self._cpu_copy(acc),
                     "feature_space": self._cpu_copy(feature_space_diagnostics),
+                    "feature_memory": self._feature_memory_summary(state_dict_list),
                     "evaluation_seconds": float(elapsed),
                 })
                 self.save_checkpoint(task_id, state_dict_list)
