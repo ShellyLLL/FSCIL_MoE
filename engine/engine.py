@@ -1401,9 +1401,11 @@ class Runner:
         loo_raw = F.normalize(cache["loo_visual_prototypes"].to(self.device).float(), dim=-1)
         full_counts = torch.as_tensor([torch.unique(sources[labels.eq(cls)]).numel() for cls in classes.tolist()],
                                       device=self.device, dtype=torch.float32)
-        loo_counts = torch.stack([torch.stack([
-            torch.unique(sources[labels.eq(cls) & sources.ne(source_id)]).numel() for cls in classes
-        ]) for source_id in sources]).to(device=self.device, dtype=torch.float32)
+        loo_counts = torch.tensor([
+            [int(torch.unique(sources[labels.eq(cls) & sources.ne(source_id)]).numel())
+             for cls in classes.tolist()]
+            for source_id in sources.tolist()
+        ], device=self.device, dtype=torch.float32)
         if semantic_proto is not None:
             semantic_ids = torch.as_tensor(class_index, device=self.device, dtype=torch.long).reshape(-1)
             semantic_proto = torch.as_tensor(semantic_proto, device=self.device).float()
