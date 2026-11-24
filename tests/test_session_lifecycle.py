@@ -181,7 +181,14 @@ class SessionLifecycleTests(unittest.TestCase):
 
         # Force the two layer decisions only in this integration test; the
         # numeric Session-mean Z boundary is independently tested in unit tests.
+        sequential_checks = []
         def force_expand(_self, block_idx, feature_map, class_ids):
+            if int(block_idx) == 1:
+                previous = model.clip_model.visual.transformer.resblocks[0].moe_adapter
+                self.assertEqual(previous.num_experts, 3)
+                self.assertTrue(previous.descriptors[-1].is_ready())
+                self.assertTrue(all(not parameter.requires_grad for parameter in previous.parameters()))
+                sequential_checks.append("block0_trained_and_frozen_before_block1_decision")
             count = int(feature_map[int(block_idx)]["cls_in"].size(0))
             return LayerExpansionDecision(int(block_idx), True, 2.0, 1.0, 0, count)
         model.plan_layer_expansion = force_expand.__get__(model, BiMC)
@@ -193,6 +200,7 @@ class SessionLifecycleTests(unittest.TestCase):
             ["novel_a", "novel_b"], [base_state],
         )
         self.assertEqual(len(result["expanded"]), 2)
+        self.assertEqual(sequential_checks, ["block0_trained_and_frozen_before_block1_decision"])
         self.assertEqual(result["task_state"]["class_ids"].tolist(), [1,2])
         self.assertEqual(len(result["refreshed_old_states"]), 1)
         self.assertEqual(
