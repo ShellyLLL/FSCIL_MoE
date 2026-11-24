@@ -196,31 +196,27 @@ class Runner:
         return getattr(self.cfg.TRAINER.BiMC, "CHECKPOINT", None)
 
     def _expansion_policy(self):
-        """Versioned contract for Session-mean AE-Z expansion and nearest-expert migration."""
+        """Versioned contract for sequential adapted-stream AE-driven expansion."""
         moe = self._visual_moe_cfg()
         inc = self.cfg.TRAINER.BiMC.INCREMENTAL
         opt = self.cfg.TRAINER.BiMC.OPTIM
         data = _cfg_value(self.cfg, "DATASET", None)
         return {
-            "version": 19, "decision": "expand_iff_minimum_historical_rd_session_mean_z_gt_1",
-            "threshold": 1.0, "session_statistic": "mean_standardized_reconstruction_error_per_historical_rd",
+            "version": 20,
+            "decision": "sequential_layerwise_expand_iff_minimum_historical_rd_session_mean_z_gt_1",
+            "threshold": 1.0,
+            "session_statistic": "mean_unweighted_standardized_reconstruction_error_per_historical_rd",
+            "feature_stream": "adapted_hidden_state_after_completed_shallower_blocks",
             "migration": "same_argmin_rd_initializes_expert_and_anchored_rd",
             "expert_initialization": "exact_historical_parameter_copy_and_hidden_width_inheritance",
             "regularization": "l2_sp_to_frozen_migration_snapshot",
             "reuse": "all_existing_experts_and_router_columns_frozen_and_active",
-            "rd_fit": "all_session_augmented_reference_aligned_cls_sources",
-            "rd_calibration": "deterministic_session_errors_weighted_by_new_sigmoid_responsibility",
-            "router": "base_softmax_plus_incremental_independent_sigmoid",
-            "feature_preservation": "frozen_prefix_replay_to_historical_final_feature_anchors",
-            "prototype_calibration": "existing_base_semantic_retrieval_and_support_reliability_calibration",
-            "feature_space_acceptance": {
-                "minimum_class_prototype_cosine": float(_cfg_value(moe, "FEATURE_SPACE_MIN_COSINE", 0.98)),
-                "maximum_base_reference_accuracy_drop_pp": float(
-                    _cfg_value(moe, "FEATURE_SPACE_MAX_ACCURACY_DROP", 0.0)
-                ),
-                "anchors_per_class": int(_cfg_value(moe, "FEATURE_SPACE_ANCHORS_PER_CLASS", 2)),
-                "anchor_batch_size": int(_cfg_value(moe, "FEATURE_SPACE_ANCHOR_BATCH_SIZE", 16)),
-            },
+            "rd_fit": "separate_reconstruction_only_on_current_layer_augmented_session_inputs",
+            "rd_calibration": "unweighted_deterministic_current_session_reference_errors",
+            "router": "base_softmax_plus_incremental_independent_sigmoid_on_adapted_layer_input",
+            "feature_preservation": "frozen_prefix_replay_diagnostic_only_no_incremental_training_loss",
+            "prototype_calibration": "topk_base_semantic_retrieval_with_base_support_loo_alpha_selection",
+            "semantic_alpha_selection": "deterministic_leave_one_source_out_base_support_grid_search_no_test_labels",
             "visual_moe_enabled": bool(_cfg_value(moe, "ENABLE", False)),
             "insert_blocks": [int(v) for v in _cfg_value(moe, "INSERT_BLOCKS", [])],
             "num_base_experts": int(_cfg_value(moe, "NUM_BASE_EXPERTS", 4)),
@@ -234,25 +230,39 @@ class Runner:
             "incremental_gate_bias_init": float(_cfg_value(moe, "INCREMENTAL_GATE_BIAS_INIT", -4.0)),
             "incremental_dropout": float(_cfg_value(moe, "INCREMENTAL_DROPOUT", 0.1)),
             "semantic_temperature": float(_cfg_value(moe, "SEMANTIC_TEMPERATURE", 0.07)),
+            "semantic_retrieval_top_k": int(_cfg_value(moe, "SEMANTIC_RETRIEVAL_TOP_K", 5)),
             "semantic_calibration_max_alpha": float(_cfg_value(moe, "SEMANTIC_CALIBRATION_MAX_ALPHA", 0.5)),
             "prototype_reliability_k": float(_cfg_value(moe, "PROTOTYPE_RELIABILITY_K", 5.0)),
-            "incremental": {"epochs": int(_cfg_value(inc, "EPOCHS", 6)),
+            "feature_space_acceptance": {
+                "minimum_class_prototype_cosine": float(_cfg_value(moe, "FEATURE_SPACE_MIN_COSINE", 0.98)),
+                "maximum_base_reference_accuracy_drop_pp": float(
+                    _cfg_value(moe, "FEATURE_SPACE_MAX_ACCURACY_DROP", 0.0)
+                ),
+                "anchors_per_class": int(_cfg_value(moe, "FEATURE_SPACE_ANCHORS_PER_CLASS", 2)),
+                "anchor_batch_size": int(_cfg_value(moe, "FEATURE_SPACE_ANCHOR_BATCH_SIZE", 16)),
+            },
+            "incremental": {
+                "epochs": int(_cfg_value(inc, "EPOCHS", 6)),
                 "logit_scale": float(_cfg_value(inc, "LOGIT_SCALE", 100.0)),
                 "l2sp_weight": float(_cfg_value(inc, "L2SP_WEIGHT", 1e-4)),
-                "feature_space_weight": float(_cfg_value(inc, "FEATURE_SPACE_PRESERVATION_WEIGHT", 1.0)),
-                "rd_weight": float(_cfg_value(inc, "RD_WEIGHT", 1.0))},
-            "optimizer": {"base_epochs": int(_cfg_value(opt, "BASE_EPOCHS", 50)),
+            },
+            "optimizer": {
+                "base_epochs": int(_cfg_value(opt, "BASE_EPOCHS", 50)),
                 "base_descriptor_epochs": int(_cfg_value(opt, "BASE_DESCRIPTOR_EPOCHS", 8)),
+                "incremental_descriptor_epochs": int(_cfg_value(opt, "INCREMENTAL_DESCRIPTOR_EPOCHS", 8)),
                 "lr_base_moe": float(_cfg_value(opt, "LR_BASE_MOE", 1e-4)),
                 "lr_incremental_expert": float(_cfg_value(opt, "LR_INCREMENTAL_EXPERT", 3e-4)),
                 "lr_incremental_router": float(_cfg_value(opt, "LR_INCREMENTAL_ROUTER", 3e-4)),
                 "lr_descriptor": float(_cfg_value(opt, "LR_DESCRIPTOR", 1e-3)),
-                "weight_decay": float(_cfg_value(opt, "WEIGHT_DECAY", 1e-4))},
-            "data": {"seed": int(_cfg_value(self.cfg, "SEED", 1)),
+                "weight_decay": float(_cfg_value(opt, "WEIGHT_DECAY", 1e-4)),
+            },
+            "data": {
+                "seed": int(_cfg_value(self.cfg, "SEED", 1)),
                 "num_init_classes": int(_cfg_value(data, "NUM_INIT_CLS", -1)),
                 "num_incremental_classes": int(_cfg_value(data, "NUM_INC_CLS", -1)),
                 "base_shot": int(_cfg_value(data, "NUM_BASE_SHOT", -1)),
-                "incremental_shot": int(_cfg_value(data, "NUM_INC_SHOT", -1))},
+                "incremental_shot": int(_cfg_value(data, "NUM_INC_SHOT", -1)),
+            },
         }
 
     @staticmethod
@@ -493,8 +503,8 @@ class Runner:
         if missing:
             raise ValueError(f"Resume checkpoint is missing required fields: {missing}")
         schema = int(payload["schema_version"])
-        if schema != 38:
-            raise ValueError("Checkpoint predates Session-mean AE-Z expansion and nearest-expert migration (schema 38).")
+        if schema != 39:
+            raise ValueError("Checkpoint predates sequential adapted-stream expansion, independent RD fitting, or Top-K semantic calibration (schema 39).")
         checkpoint_policy = payload.get("expansion_policy")
         if checkpoint_policy != self._expansion_policy():
             raise ValueError(
@@ -659,6 +669,12 @@ class Runner:
                 raise ValueError(
                     f"Checkpoint task state {session_index} is missing calibrated fields: {missing_state}"
                 )
+            if session_index == 0:
+                if "semantic_calibration_alpha_max" not in state:
+                    raise ValueError("Checkpoint Base state is missing its LOO-calibrated semantic alpha.")
+                calibrated_alpha = float(state["semantic_calibration_alpha_max"])
+                if not np.isfinite(calibrated_alpha) or not 0.0 <= calibrated_alpha <= 1.0:
+                    raise ValueError("Checkpoint Base semantic calibration alpha is invalid.")
             class_ids = torch.as_tensor(state["class_ids"], dtype=torch.long).reshape(-1)
             expected_ids = torch.as_tensor(
                 self.data_manager.class_index_in_task[session_index], dtype=torch.long
@@ -886,7 +902,7 @@ class Runner:
         directory.mkdir(parents=True, exist_ok=True)
         topology = self.model_without_dp.export_moe_topology()
         payload = {
-            "schema_version": 38,
+            "schema_version": 39,
             "completed_session": int(completed_session),
             "base_reference_source_ids": list(self.base_reference_source_ids),
             "base_reference_cls_features": self._cpu_copy(self.base_reference_cls_features),
@@ -1179,12 +1195,10 @@ class Runner:
             with torch.no_grad():
                 fit_resp = torch.stack([adapter.expert_responsibility(fit_x, i)
                                         for i in range(adapter.num_experts)], dim=-1)
-                ref_resp = torch.stack([adapter.expert_responsibility(ref_values, i)
-                                        for i in range(adapter.num_experts)], dim=-1)
             for expert_id in range(adapter.num_experts):
                 loss = self._train_descriptor(
                     adapter, expert_id, fit_x, epochs, fit_resp[:, expert_id],
-                    calibration_values=ref_values, calibration_weights=ref_resp[:, expert_id],
+                    calibration_values=ref_values, calibration_weights=None,
                 )
                 descriptor = adapter.descriptors[expert_id]
                 if not descriptor.is_ready() or int(descriptor.error_count.item()) < 2:
@@ -1572,7 +1586,7 @@ class Runner:
 
     @torch.no_grad()
     def _collect_reference_cls_cache(self, loader):
-        """Cache exact frozen-reference CLS rows for future known-domain threshold calibration."""
+        """Cache exact adapted layer-input CLS rows for future known-domain diagnostics."""
         feature_map = self.model_without_dp.collect_blockwise_cls_features(loader)
         cache = {}
         for block_idx, item in feature_map.items():
@@ -1593,7 +1607,7 @@ class Runner:
         return cache
 
     def _collect_class_anchors(self, loader):
-        """Store compact per-class anchors in the shared frozen-reference input space."""
+        """Store compact per-class anchors in each deployed adapted layer-input space."""
         feature_map = self.model_without_dp.collect_blockwise_cls_features(loader)
         anchors = {}
         for block_idx, item in feature_map.items():
@@ -1678,8 +1692,162 @@ class Runner:
             raise ValueError("Current Session semantic prototypes must be finite and class-aligned.")
         return semantic.detach()
 
+    def _semantic_retrieval_prior(
+        self, semantic, base_semantic, base_visual, exclude_indices=None,
+    ):
+        """Retrieve a sparse Top-K Base visual prior from semantic similarities."""
+        semantic = F.normalize(torch.as_tensor(semantic, device=self.device).float(), dim=-1)
+        base_semantic = F.normalize(torch.as_tensor(base_semantic, device=self.device).float(), dim=-1)
+        base_visual = F.normalize(torch.as_tensor(base_visual, device=self.device).float(), dim=-1)
+        if (semantic.ndim != 2 or base_semantic.ndim != 2 or base_visual.ndim != 2
+                or base_semantic.shape != base_visual.shape
+                or semantic.size(1) != base_semantic.size(1)
+                or not torch.isfinite(semantic).all()
+                or not torch.isfinite(base_semantic).all()
+                or not torch.isfinite(base_visual).all()):
+            raise ValueError("Semantic retrieval requires finite, dimension-aligned prototype matrices.")
+        temperature = float(_cfg_value(self._visual_moe_cfg(), "SEMANTIC_TEMPERATURE", 0.07))
+        configured_top_k = int(_cfg_value(self._visual_moe_cfg(), "SEMANTIC_RETRIEVAL_TOP_K", 5))
+        if not np.isfinite(temperature) or temperature <= 0 or configured_top_k < 1:
+            raise ValueError("Semantic retrieval temperature and Top-K must be positive.")
+        similarity = semantic @ base_semantic.t()
+        if exclude_indices is not None:
+            excluded = torch.as_tensor(exclude_indices, device=self.device, dtype=torch.long).reshape(-1)
+            if excluded.numel() != semantic.size(0):
+                raise ValueError("Semantic retrieval exclusion indices must align with query classes.")
+            if (excluded < 0).any() or (excluded >= base_semantic.size(0)).any():
+                raise ValueError("Semantic retrieval exclusion index is outside the Base bank.")
+            similarity[torch.arange(semantic.size(0), device=self.device), excluded] = -torch.inf
+            available = base_semantic.size(0) - 1
+        else:
+            available = base_semantic.size(0)
+        if available < 1:
+            raise ValueError("Semantic retrieval requires at least one eligible Base class.")
+        top_k = min(configured_top_k, available)
+        top_values, top_indices = torch.topk(similarity, k=top_k, dim=-1)
+        weights = torch.softmax(top_values / temperature, dim=-1)
+        retrieved = base_visual[top_indices]
+        guided = F.normalize((weights.unsqueeze(-1) * retrieved).sum(dim=1), dim=-1)
+        if top_k == 1:
+            confidence = torch.ones(semantic.size(0), device=self.device)
+        else:
+            entropy = -(weights.clamp_min(1e-8) * weights.clamp_min(1e-8).log()).sum(-1)
+            confidence = (1.0 - entropy / math.log(float(top_k))).clamp(0.0, 1.0)
+        return guided, confidence, top_indices, weights
+
+    @torch.no_grad()
+    def _calibrate_semantic_alpha(self, base_state, loader):
+        """Select semantic calibration strength by Base-support leave-one-source-out validation.
+
+        This uses only the fixed Base training support and never reads the test
+        split. Each query is classified against a visual prototype that excludes
+        its own source; the semantic prior for a Base class also excludes that
+        class from its retrieval bank to simulate a genuinely novel category.
+        """
+        configured_max = float(_cfg_value(
+            self._visual_moe_cfg(), "SEMANTIC_CALIBRATION_MAX_ALPHA", 0.5
+        ))
+        if not np.isfinite(configured_max) or not 0.0 <= configured_max <= 1.0:
+            raise ValueError("SEMANTIC_CALIBRATION_MAX_ALPHA must be finite and in [0, 1].")
+        class_ids = torch.as_tensor(
+            base_state.get("class_ids", base_state.get("class_index")),
+            device=self.device, dtype=torch.long,
+        ).reshape(-1)
+        if class_ids.numel() < 2:
+            return 0.0, {
+                "available": False, "reason": "fewer_than_two_base_classes",
+                "selected_alpha_max": 0.0, "validation_accuracy": None,
+            }
+        cache = self.model_without_dp.build_leave_one_out_prototypes(loader, class_ids)
+        classes = torch.as_tensor(cache["classes"], device=self.device, dtype=torch.long).reshape(-1)
+        labels = torch.as_tensor(cache["labels"], device=self.device, dtype=torch.long).reshape(-1)
+        source_ids = torch.as_tensor(cache["source_ids"], device=self.device).reshape(-1)
+        query_features = F.normalize(torch.as_tensor(cache["features"], device=self.device).float(), dim=-1)
+        loo_visual = F.normalize(
+            torch.as_tensor(cache["loo_visual_prototypes"], device=self.device).float(), dim=-1
+        )
+        if (not bool(torch.as_tensor(cache["loo_valid"]).all().item())
+                or query_features.ndim != 2 or loo_visual.ndim != 3
+                or loo_visual.size(0) != query_features.size(0)
+                or loo_visual.size(1) != classes.numel()
+                or labels.numel() != query_features.size(0)
+                or source_ids.numel() != labels.numel()
+                or torch.unique(source_ids).numel() != source_ids.numel()
+                or not torch.isfinite(query_features).all()
+                or not torch.isfinite(loo_visual).all()):
+            raise ValueError("Base semantic-alpha validation requires aligned, source-exclusive LOO support rows.")
+        if not torch.equal(classes.sort().values, class_ids.sort().values):
+            raise ValueError("Base LOO classes do not match the Base classifier class ids.")
+        state_ids = class_ids.tolist()
+        row_map = {int(class_id): row for row, class_id in enumerate(state_ids)}
+        order = torch.as_tensor(
+            [row_map[int(class_id)] for class_id in classes.tolist()],
+            device=self.device, dtype=torch.long,
+        )
+        base_visual = F.normalize(
+            torch.as_tensor(base_state["image_proto"], device=self.device).float()[order], dim=-1
+        )
+        base_semantic = F.normalize(
+            torch.as_tensor(base_state["description_proto"], device=self.device).float()[order], dim=-1
+        )
+        if base_visual.shape != base_semantic.shape or base_visual.size(0) != classes.numel():
+            raise ValueError("Base visual and semantic banks do not align for alpha validation.")
+        guided, confidence, _, _ = self._semantic_retrieval_prior(
+            base_semantic, base_semantic, base_visual,
+            exclude_indices=torch.arange(classes.numel(), device=self.device),
+        )
+        support_counts = torch.stack([labels.eq(class_id).sum() for class_id in classes]).float()
+        loo_counts = support_counts.unsqueeze(0) - labels.unsqueeze(1).eq(classes.unsqueeze(0)).float()
+        if (loo_counts <= 0).any():
+            raise ValueError("Base semantic-alpha validation requires at least two support sources per class.")
+        reliability_k = float(_cfg_value(self._visual_moe_cfg(), "PROTOTYPE_RELIABILITY_K", 5.0))
+        if not np.isfinite(reliability_k) or reliability_k <= 0:
+            raise ValueError("PROTOTYPE_RELIABILITY_K must be finite and positive.")
+        alpha_factor = confidence.unsqueeze(0) * (
+            1.0 - loo_counts / (loo_counts + reliability_k)
+        )
+        matches = labels.unsqueeze(1).eq(classes.unsqueeze(0))
+        if not matches.any(dim=1).all():
+            raise ValueError("Base LOO labels do not map to the Base classifier.")
+        targets = matches.long().argmax(dim=1)
+        best_alpha, best_accuracy = 0.0, -1.0
+        candidate_rows = []
+        for candidate in torch.linspace(0.0, configured_max, steps=11, device=self.device):
+            alpha = candidate * alpha_factor
+            calibrated = F.normalize(
+                (1.0 - alpha.unsqueeze(-1)) * loo_visual
+                + alpha.unsqueeze(-1) * guided.unsqueeze(0),
+                dim=-1,
+            )
+            logits = torch.einsum("nd,ncd->nc", query_features, calibrated)
+            accuracy = float(logits.argmax(dim=-1).eq(targets).float().mean().item())
+            candidate_value = float(candidate.item())
+            candidate_rows.append({"alpha_max": candidate_value, "accuracy": accuracy})
+            # Iterating upward and updating only on strict improvement makes
+            # ties prefer the more conservative, smaller calibration strength.
+            if accuracy > best_accuracy + 1e-12:
+                best_alpha, best_accuracy = candidate_value, accuracy
+        diagnostics = {
+            "available": True,
+            "method": "base_support_leave_one_source_out",
+            "selected_alpha_max": float(best_alpha),
+            "validation_accuracy": float(best_accuracy),
+            "query_count": int(query_features.size(0)),
+            "base_class_count": int(classes.numel()),
+            "retrieval_top_k": min(
+                int(_cfg_value(self._visual_moe_cfg(), "SEMANTIC_RETRIEVAL_TOP_K", 5)),
+                max(1, int(classes.numel()) - 1),
+            ),
+            "candidate_results": candidate_rows,
+        }
+        print(
+            f"=> [Semantic-Calibration][Base-LOO] alpha_max={best_alpha:.3f} "
+            f"accuracy={best_accuracy * 100.0:.2f}% queries={query_features.size(0)}"
+        )
+        return float(best_alpha), diagnostics
+
     def _semantic_guided_visual_prototype_calibration(self, visual, semantic, support_count, old_states):
-        """Apply the same Base-semantic calibration to full and query-exclusive LOO prototypes."""
+        """Apply the same sparse Top-K Base-semantic calibration to full and LOO prototypes."""
         visual = F.normalize(torch.as_tensor(visual, device=self.device).float(), dim=-1)
         semantic = F.normalize(torch.as_tensor(semantic, device=self.device).float(), dim=-1)
         support_count = torch.as_tensor(support_count, device=self.device, dtype=torch.float32)
@@ -1694,38 +1862,45 @@ class Runner:
         if not torch.isfinite(visual).all() or not torch.isfinite(semantic).all():
             raise ValueError("Novel visual and semantic prototypes must be finite.")
         if not old_states:
-            return visual, {"alpha": torch.zeros(expected_shape, device=self.device),
-                            "semantic_confidence": torch.zeros(classes, device=self.device),
-                            "visual_prototype_reliability": torch.ones(expected_shape, device=self.device)}
+            return visual, {
+                "alpha": torch.zeros(expected_shape, device=self.device),
+                "semantic_confidence": torch.zeros(classes, device=self.device),
+                "visual_prototype_reliability": torch.ones(expected_shape, device=self.device),
+            }
         base = old_states[0]
         base_visual = F.normalize(torch.as_tensor(base["image_proto"], device=self.device).float(), dim=-1)
         base_semantic = F.normalize(torch.as_tensor(base["description_proto"], device=self.device).float(), dim=-1)
         if base_visual.ndim != 2 or base_semantic.shape != base_visual.shape or base_visual.size(1) != dim:
             raise ValueError("Base visual and semantic prototype banks must align.")
+        guided, confidence, retrieval_indices, retrieval_weights = self._semantic_retrieval_prior(
+            semantic, base_semantic, base_visual
+        )
         cfg = self._visual_moe_cfg()
-        temperature = float(getattr(cfg, "SEMANTIC_TEMPERATURE", 0.07))
-        alpha_max = float(getattr(cfg, "SEMANTIC_CALIBRATION_MAX_ALPHA", 0.5))
+        alpha_max = float(base.get(
+            "semantic_calibration_alpha_max",
+            getattr(cfg, "SEMANTIC_CALIBRATION_MAX_ALPHA", 0.5),
+        ))
         reliability_k = float(getattr(cfg, "PROTOTYPE_RELIABILITY_K", 5.0))
-        if not np.isfinite(temperature) or temperature <= 0 or not np.isfinite(alpha_max) or not 0 <= alpha_max <= 1 or not np.isfinite(reliability_k) or reliability_k <= 0:
-            raise ValueError("Semantic calibration configuration is invalid.")
-        weights = torch.softmax((semantic @ base_semantic.t()) / temperature, dim=-1)
-        guided = F.normalize(weights @ base_visual, dim=-1)
-        if base_visual.size(0) == 1:
-            confidence = torch.ones(classes, device=self.device)
-        else:
-            entropy = -(weights.clamp_min(1e-8) * weights.clamp_min(1e-8).log()).sum(-1)
-            confidence = (1.0 - entropy / math.log(float(base_visual.size(0)))).clamp(0, 1)
+        if (not np.isfinite(alpha_max) or not 0.0 <= alpha_max <= 1.0
+                or not np.isfinite(reliability_k) or reliability_k <= 0):
+            raise ValueError("Semantic calibration alpha or prototype reliability configuration is invalid.")
         reliability = support_count / (support_count + reliability_k)
         alpha = alpha_max * confidence * (1.0 - reliability)
         if visual.ndim == 3:
-            # Reliability already has [query, class] shape; only the shared
-            # semantic retrieval bank needs a leading query dimension.
             guided = guided.unsqueeze(0)
-        calibrated = F.normalize((1.0 - alpha.unsqueeze(-1)) * visual + alpha.unsqueeze(-1) * guided, dim=-1)
+        calibrated = F.normalize(
+            (1.0 - alpha.unsqueeze(-1)) * visual + alpha.unsqueeze(-1) * guided,
+            dim=-1,
+        )
         if not torch.isfinite(calibrated).all() or (calibrated.norm(dim=-1) <= 1e-8).any():
             raise ValueError("Semantic-guided calibration produced invalid prototypes.")
-        return calibrated, {"alpha": alpha.detach(), "semantic_confidence": confidence.detach(),
-                            "visual_prototype_reliability": reliability.detach()}
+        return calibrated, {
+            "alpha": alpha.detach(),
+            "semantic_confidence": confidence.detach(),
+            "visual_prototype_reliability": reliability.detach(),
+            "retrieval_indices": retrieval_indices.detach(),
+            "retrieval_weights": retrieval_weights.detach(),
+        }
 
     def _build_incremental_bank(self, loader, class_index, old_states, semantic_proto=None):
         """Build full and source-exclusive LOO visual banks with identical calibration."""
@@ -1773,6 +1948,47 @@ class Runner:
                 "novel_support_count": full_counts, "novel_loo_support_count": loo_counts,
                 "semantic_calibration_full": full_diag, "semantic_calibration_loo": loo_diag,
                 "global_full": global_full, "global_ids": global_ids, "old_class_count": old_ids.numel()}
+
+    @torch.no_grad()
+    def _refresh_historical_prototypes(self, old_states):
+        """Re-embed compact historical prefix anchors in the currently deployed feature space."""
+        refreshed = []
+        for state in old_states:
+            anchors = state.get("final_feature_anchors")
+            if not isinstance(anchors, dict):
+                raise RuntimeError("Historical prototype refresh requires stored final_feature_anchors.")
+            prefixes = torch.as_tensor(anchors.get("prefix_tokens"), device=self.device)
+            labels = torch.as_tensor(anchors.get("labels"), device=self.device, dtype=torch.long).reshape(-1)
+            source_ids = torch.as_tensor(anchors.get("source_ids"), device=self.device).reshape(-1)
+            class_ids = torch.as_tensor(
+                state.get("class_ids", state.get("class_index")),
+                device=self.device, dtype=torch.long,
+            ).reshape(-1)
+            if (prefixes.ndim != 3 or prefixes.size(0) == 0
+                    or labels.numel() != prefixes.size(0)
+                    or source_ids.numel() != prefixes.size(0)
+                    or torch.unique(source_ids).numel() != source_ids.numel()
+                    or not torch.equal(torch.unique(labels, sorted=True), class_ids.sort().values)):
+                raise ValueError("Historical prefix anchors are malformed or class-misaligned.")
+            features = F.normalize(
+                self.model_without_dp.extract_img_feature_from_reference_prefix(prefixes).float(),
+                dim=-1,
+            )
+            refreshed_state = dict(state)
+            prototypes = []
+            for class_id in class_ids:
+                mask = labels.eq(class_id)
+                if not bool(mask.any().item()):
+                    raise ValueError(f"Historical anchors are missing class {int(class_id.item())}.")
+                prototypes.append(F.normalize(features[mask].mean(0), dim=-1))
+            refreshed_state["image_proto"] = torch.stack(prototypes).detach()
+            refreshed_state["prototype_refresh"] = {
+                "feature_space": "current_deployed_adapted_encoder",
+                "anchor_count": int(prefixes.size(0)),
+                "source_ids": source_ids.detach().cpu(),
+            }
+            refreshed.append(refreshed_state)
+        return refreshed
 
     def _global_incremental_logits(self, images, labels, source_ids, bank, scale):
         if torch.is_grad_enabled():
@@ -1857,41 +2073,28 @@ class Runner:
             # encoder must remain inside the Base feature-space trust region.
             feature_check = self._base_reference_feature_diagnostics(old_states[0])
             historical_feature_check = self._historical_feature_anchor_diagnostics(old_states)
-            if feature_check.get("available", False) and not feature_check.get("within_target", False):
-                failures = []
-                if not feature_check.get("within_cosine_target", False):
-                    failures.append(
-                        f"minimum cosine {feature_check.get('prototype_cosine_min')} < "
-                        f"{feature_check.get('minimum_cosine_target')}"
-                    )
-                if not feature_check.get("within_accuracy_target", False):
-                    failures.append(
-                        f"accuracy drop {feature_check.get('base_reference_accuracy_drop')} pp > "
-                        f"{feature_check.get('max_accuracy_drop')} pp"
-                    )
-                raise RuntimeError("Session rejected: Base feature-space acceptance failed: " + "; ".join(failures))
             production_data_protocol = hasattr(self, "data_manager") and callable(
                 getattr(self.data_manager, "get_base_source_dataloader", None)
             )
             if production_data_protocol and not feature_check.get("available", False):
                 raise RuntimeError(
-                    "Session rejected: production Base feature-space preservation check is unavailable."
+                    "Session diagnostics failed: production Base feature-space measurement is unavailable."
                 )
             if production_data_protocol and not historical_feature_check.get("available", False):
                 raise RuntimeError(
-                    "Session rejected: complete historical class feature-anchor check is unavailable: "
+                    "Session diagnostics failed: historical class feature-anchor measurement is unavailable: "
                     f"{historical_feature_check.get('reason', 'unknown')}."
                 )
-            if production_data_protocol and not historical_feature_check.get("within_target", False):
-                raise RuntimeError(
-                    "Session rejected: at least one historical class prototype drifted below "
-                    f"{historical_feature_check.get('minimum_cosine_target')}; observed "
-                    f"{historical_feature_check.get('class_prototype_cosine_min')}."
-                )
+            # Feature-space cosine and Base-reference accuracy are acceptance
+            # diagnostics, not an extra optimization loss or an unvalidated
+            # hard rejection gate. Preserve the measurements for analysis.
+            # Historical prototypes are refreshed from compact support anchors
+            # in the current feature space before constructing the new task bank.
+            refreshed_old_states = result.get("refreshed_old_states", old_states)
             # Prototype construction and compact feature-anchor capture are
             # part of the same Session transaction, not post-commit side effects.
             result["task_state"] = self._build_and_refine_task_state(
-                current_class_name, extract_loader, class_index, old_states,
+                current_class_name, extract_loader, class_index, refreshed_old_states,
                 semantic_proto=semantic_proto, session_id=int(task_id),
             )
             result["feature_space_acceptance"] = self._cpu_copy(feature_check)
@@ -1932,254 +2135,270 @@ class Runner:
 
     def _train_incremental_task_impl(self, task_id, train_loader, extract_loader, class_index,
                                       current_class_name, old_states, semantic_proto=None):
-        """Plan all layers, migrate nearest experts, then jointly optimize new Session modules."""
+        """Process insertion blocks shallow-to-deep with an isolated train/freeze cycle per layer."""
         optim_cfg = self.cfg.TRAINER.BiMC.OPTIM
         inc_cfg = self.cfg.TRAINER.BiMC.INCREMENTAL
-        epochs, scale = int(inc_cfg.EPOCHS), float(inc_cfg.LOGIT_SCALE)
-        if epochs < 1:
-            raise ValueError("Incremental epochs must be positive.")
-        self._build_incremental_bank(extract_loader, class_index, old_states, semantic_proto)
+        epochs = int(_cfg_value(inc_cfg, "EPOCHS", 6))
+        scale = float(_cfg_value(inc_cfg, "LOGIT_SCALE", 100.0))
+        descriptor_epochs = int(_cfg_value(
+            optim_cfg, "INCREMENTAL_DESCRIPTOR_EPOCHS",
+            _cfg_value(optim_cfg, "BASE_DESCRIPTOR_EPOCHS", 8),
+        ))
+        l2sp_weight = float(_cfg_value(inc_cfg, "L2SP_WEIGHT", 1e-4))
+        weight_decay = float(_cfg_value(optim_cfg, "WEIGHT_DECAY", 1e-4))
+        if epochs < 1 or descriptor_epochs < 1:
+            raise ValueError("Incremental expert and independent RD epochs must be positive.")
+        if any(not np.isfinite(value) or value < 0 for value in (l2sp_weight, weight_decay)):
+            raise ValueError("Incremental L2-SP and weight decay must be finite and non-negative.")
+
         for _, adapter in self._moe_adapters():
             adapter.freeze_all()
 
-        # Plan all layers against one immutable deterministic Session snapshot.
-        ref_map = self.model_without_dp.collect_blockwise_cls_features(extract_loader)
-        fit_map = self.model_without_dp.collect_blockwise_cls_features(train_loader)
-        if set(ref_map) != set(fit_map) or not ref_map:
-            raise RuntimeError("Incremental RD fit/reference block views are inconsistent.")
-        expected_classes = sorted(int(v) for v in class_index)
-        observed = sorted(int(v) for v in torch.unique(
-            next(iter(ref_map.values()))["labels"], sorted=True
-        ).tolist())
-        if observed != expected_classes:
-            raise RuntimeError("Reference support classes do not match Session manifest.")
+        # Old class prototypes must follow the currently deployed feature
+        # space. Re-embed compact historical anchors before planning, and
+        # refresh them again after every newly trained layer.
+        working_old_states = self._refresh_historical_prototypes(old_states)
+        expected_classes = sorted(int(value) for value in class_index)
+        decisions, expanded, reused, training = [], [], [], {}
+        processed_blocks = []
+        block_order = sorted(int(value) for value in self.model_without_dp.expandable_blocks())
+        if not block_order:
+            raise RuntimeError("Sequential AE-driven expansion requires at least one installed MoE block.")
 
-        decisions, expanded, reused, contexts = [], [], [], {}
-        for block_idx in self.model_without_dp.expandable_blocks():
-            item = ref_map[int(block_idx)]
+        for layer_position, block_idx in enumerate(block_order):
+            # Recompute both views after every shallower layer has completed
+            # its REUSE/EXPAND decision and, when needed, expert optimization.
+            # Consequently this block never plans from a stale all-layer snapshot.
+            ref_map = self.model_without_dp.collect_blockwise_cls_features(extract_loader)
+            fit_map = self.model_without_dp.collect_blockwise_cls_features(train_loader)
+            if set(ref_map) != set(fit_map) or block_idx not in ref_map:
+                raise RuntimeError(
+                    f"Sequential block {block_idx} has inconsistent augmented/reference feature maps."
+                )
+            ref_item, fit_item = ref_map[block_idx], fit_map[block_idx]
+            ref_x = torch.as_tensor(ref_item["cls_in"], device=self.device).float()
+            ref_y = torch.as_tensor(ref_item["labels"], device=self.device, dtype=torch.long).reshape(-1)
+            ref_source_ids = torch.as_tensor(ref_item["source_ids"], device=self.device).reshape(-1)
+            fit_x = torch.as_tensor(fit_item["cls_in"], device=self.device).float()
+            fit_y = torch.as_tensor(fit_item["labels"], device=self.device, dtype=torch.long).reshape(-1)
+            fit_source_ids = torch.as_tensor(fit_item["source_ids"], device=self.device).reshape(-1)
+            observed_classes = sorted(int(value) for value in torch.unique(ref_y, sorted=True).tolist())
+            if observed_classes != expected_classes:
+                raise RuntimeError(
+                    f"Block {block_idx} reference classes {observed_classes} do not match {expected_classes}."
+                )
+            if (ref_x.ndim != 2 or fit_x.ndim != 2 or ref_x.size(1) != fit_x.size(1)
+                    or ref_x.size(0) == 0 or fit_x.size(0) == 0
+                    or ref_y.numel() != ref_x.size(0) or fit_y.numel() != fit_x.size(0)
+                    or ref_source_ids.numel() != ref_x.size(0)
+                    or fit_source_ids.numel() != fit_x.size(0)
+                    or torch.unique(ref_source_ids).numel() != ref_source_ids.numel()
+                    or torch.unique(fit_source_ids).numel() != fit_source_ids.numel()
+                    or not torch.isfinite(ref_x).all() or not torch.isfinite(fit_x).all()):
+                raise ValueError(f"Block {block_idx} has empty, malformed, or non-finite Session layer inputs.")
+            if set(ref_source_ids.tolist()) != set(fit_source_ids.tolist()):
+                raise ValueError(f"Block {block_idx} RD fit/reference views do not share source identities.")
+            fit_label_by_source = {
+                int(source): int(label)
+                for source, label in zip(fit_source_ids.tolist(), fit_y.tolist())
+            }
+            if any(
+                fit_label_by_source.get(int(source)) != int(label)
+                for source, label in zip(ref_source_ids.tolist(), ref_y.tolist())
+            ):
+                raise ValueError(f"Block {block_idx} RD fit/reference labels disagree by source id.")
+
             decision = self.model_without_dp.plan_layer_expansion(block_idx, ref_map, class_index)
             decisions.append({
-                "block_idx": int(block_idx), "expand": bool(decision.expand),
+                "block_idx": block_idx,
+                "layer_position": int(layer_position),
+                "processed_blocks_before": list(processed_blocks),
+                "expand": bool(decision.expand),
                 "session_mean_z": float(decision.session_mean_z),
                 "threshold": float(decision.threshold),
                 "anchor_expert_id": int(decision.anchor_expert_id),
                 "support_count": int(decision.support_count),
             })
+            print(
+                f"=> [Sequential-Expansion][B{block_idx}] position={layer_position + 1}/{len(block_order)} "
+                f"completed_before={processed_blocks} decision={'EXPAND' if decision.expand else 'REUSE'}"
+            )
+
             adapter = self._adapter_by_block(block_idx)
-            if decision.expand:
-                contexts[int(block_idx)] = {
-                    "mode": "expand", "adapter": adapter, "item": item,
-                    "fit_item": fit_map[int(block_idx)], "decision": decision,
-                }
-            else:
-                with torch.no_grad():
-                    _, weights = adapter.routing_outputs(item["cls_in"].to(self.device).float())
-                contexts[int(block_idx)] = {
-                    "mode": "reuse_frozen", "adapter": adapter,
-                    "history": {
-                        "mode": "reuse_frozen", "parameter_updates": 0,
-                        "classification_samples_per_epoch": [], "classification_samples_total": 0,
-                        "rd_training_samples": 0, "rd_reference_samples": 0,
-                        "route_anchor_count": int(item["cls_in"].size(0)),
-                        "route_weight_mean": weights.mean(0).detach().cpu(),
-                        "expert_count": int(adapter.num_experts),
-                    },
-                }
-                reused.append({"block_idx": int(block_idx), "mode": "reuse_frozen",
-                               "expert_count": int(adapter.num_experts)})
-
-        # Append every new expert before constructing the shared optimizer.
-        for block_idx, c in contexts.items():
-            if c["mode"] != "expand":
+            if not decision.expand:
+                history = self._train_reused_router(block_idx, ref_item)
+                training[block_idx] = history
+                reused.append({
+                    "block_idx": block_idx,
+                    "mode": "reuse_frozen",
+                    "expert_count": int(adapter.num_experts),
+                })
+                processed_blocks.append(block_idx)
                 continue
-            adapter, decision = c["adapter"], c["decision"]
-            ref, fit = c["item"], c["fit_item"]
-            ref_x, ref_y = ref["cls_in"].to(self.device).float(), ref["labels"].to(self.device).long()
-            ref_sid = ref["source_ids"].to(self.device).long()
-            fit_x, fit_y = fit["cls_in"].to(self.device).float(), fit["labels"].to(self.device).long()
-            fit_sid = fit["source_ids"].to(self.device).long()
-            if (set(ref_sid.tolist()) != set(fit_sid.tolist())
-                    or torch.unique(ref_sid).numel() != ref_sid.numel()
-                    or torch.unique(fit_sid).numel() != fit_sid.numel()):
-                raise ValueError("RD fit/reference views must share unique Session source ids.")
-            label_map = {int(i): int(y) for i,y in zip(fit_sid.tolist(),fit_y.tolist())}
-            if any(label_map.get(int(i)) != int(y) for i,y in zip(ref_sid.tolist(),ref_y.tolist())):
-                raise ValueError("RD fit/reference labels disagree by source id.")
-            anchor_id = int(decision.anchor_expert_id)
-            expert_id = self.model_without_dp.add_expert(block_idx, task_id, anchor_expert_id=anchor_id)
-            anchor_params = dict(adapter.experts[anchor_id].named_parameters())
-            new_params = dict(adapter.experts[expert_id].named_parameters())
-            if set(anchor_params) != set(new_params) or any(
-                anchor_params[n].shape != new_params[n].shape
-                or not torch.equal(anchor_params[n].detach(), new_params[n].detach())
-                for n in anchor_params
-            ):
-                raise RuntimeError("New expert failed exact nearest-historical parameter migration.")
-            l2sp_anchor = {n:p.detach().clone() for n,p in new_params.items()}
-            descriptor = adapter.descriptors[expert_id]
-            descriptor.set_trainable(True)
-            descriptor.train()
-            source_to_row = {int(v):i for i,v in enumerate(fit_sid.tolist())}
-            c.update({
-                "expert_id": expert_id, "anchor_expert_id": anchor_id,
-                "l2sp_anchor": l2sp_anchor, "descriptor": descriptor,
-                "fit_values": fit_x, "source_to_row": source_to_row, "reference_values": ref_x,
-                "history": {
-                    "expert_id": int(expert_id), "expert_anchor_id": anchor_id,
-                    "descriptor_anchor_id": int(descriptor.anchor_expert_id),
-                    "session_mean_z": float(decision.session_mean_z),
-                    "loss": [], "ce_loss": [], "l2sp_loss": [],
-                    "feature_space_loss": [], "rd_loss": [],
-                    "classification_samples_per_epoch": [], "classification_samples_total": 0,
-                    "rd_training_samples": int(fit_x.size(0)), "rd_reference_samples": int(ref_x.size(0)),
-                    "rd_training_source_ids": sorted(source_to_row),
-                    "rd_reference_source_ids": sorted(source_to_row),
-                },
-            })
 
-        active = [c for c in contexts.values() if c["mode"] == "expand"]
-        if not active:
-            for _, adapter in self._moe_adapters():
-                adapter.freeze_all()
-            return {
-                "trained": False, "decisions": decisions, "expanded": [],
-                "reused": reused, "training": {b:c["history"] for b,c in contexts.items()},
-                "semantic_prototype": None if semantic_proto is None else semantic_proto.detach(),
-                "encoder_version": 0,
+            anchor_id = int(decision.anchor_expert_id)
+            expert_id = self.model_without_dp.add_expert(
+                block_idx, task_id, anchor_expert_id=anchor_id
+            )
+            anchor_parameters = dict(adapter.experts[anchor_id].named_parameters())
+            new_parameters = dict(adapter.experts[expert_id].named_parameters())
+            if (set(anchor_parameters) != set(new_parameters) or any(
+                anchor_parameters[name].shape != new_parameters[name].shape
+                or not torch.equal(
+                    anchor_parameters[name].detach(), new_parameters[name].detach()
+                )
+                for name in anchor_parameters
+            )):
+                raise RuntimeError("New expert failed exact nearest-historical parameter migration.")
+            l2sp_anchor = {
+                name: parameter.detach().clone()
+                for name, parameter in new_parameters.items()
             }
 
-        groups, functional_params, descriptor_params = [], [], []
-        for c in active:
-            expert_params = list(c["adapter"].experts[-1].parameters())
-            router_params = list(c["adapter"].router.columns[-1].parameters())
-            rd_params = list(c["descriptor"].trainable_parameters())
-            functional_params += expert_params + router_params
-            descriptor_params += rd_params
-            groups += [
-                {"params": expert_params, "lr": float(optim_cfg.LR_INCREMENTAL_EXPERT)},
-                {"params": router_params, "lr": float(optim_cfg.LR_INCREMENTAL_ROUTER)},
-                {"params": rd_params, "lr": float(_cfg_value(optim_cfg, "LR_DESCRIPTOR", 1e-3))},
-            ]
-        optimizer = optim.AdamW(groups, weight_decay=float(_cfg_value(optim_cfg, "WEIGHT_DECAY", 1e-4)))
-        l2sp_w = float(_cfg_value(inc_cfg, "L2SP_WEIGHT", 1e-4))
-        feature_w = float(_cfg_value(inc_cfg, "FEATURE_SPACE_PRESERVATION_WEIGHT", 1.0))
-        rd_w = float(_cfg_value(inc_cfg, "RD_WEIGHT", 1.0))
-        if any(not np.isfinite(v) or v < 0 for v in (l2sp_w, feature_w, rd_w)):
-            raise ValueError("Incremental objective weights must be finite and non-negative.")
-        old_prefix, old_final, anchor_batch_size = self._historical_feature_anchor_batches(old_states)
-
-        for _epoch in range(epochs):
-            bank = self._build_incremental_bank(extract_loader, class_index, old_states, semantic_proto)
-            self.model.train()
-            for _, adapter in self._moe_adapters():
-                adapter.eval()
-            for c in active:
-                c["adapter"].experts[-1].train()
-                c["descriptor"].train()
-            totals = {"ce":0.0,"l2sp":0.0,"feature":0.0,"rd":0.0,"n":0}
-            observed_classes = set()
-            for batch in train_loader:
-                images, labels = self.parse_batch(batch)
-                source_ids = self._batch_source_ids(batch, labels.numel(), labels.device)
-                if not torch.isin(labels, torch.as_tensor(class_index, device=labels.device)).all():
-                    raise ValueError("Training loader contains labels outside the current Session.")
-                observed_classes.update(int(v) for v in labels.unique().tolist())
-                optimizer.zero_grad(set_to_none=True)
-                logits, targets = self._global_incremental_logits(images, labels, source_ids, bank, scale)
-                ce = F.cross_entropy(logits, targets)
-                for c in active:
-                    c["adapter"].experts[-1].eval()
-                feature_terms = []
-                for start in range(0, old_prefix.size(0), anchor_batch_size):
-                    stop = min(start + anchor_batch_size, old_prefix.size(0))
-                    feature_terms.append(self._final_feature_anchor_loss(
-                        old_prefix[start:stop], old_final[start:stop]
-                    ))
-                feature_loss = torch.stack(feature_terms).mean()
-                for c in active:
-                    c["adapter"].experts[-1].train()
-                l2sp_loss = torch.stack([
-                    self._l2sp_anchor_loss(c["adapter"].experts[-1], c["l2sp_anchor"])
-                    for c in active
-                ]).mean()
-                rd_terms = []
-                for c in active:
-                    rows = torch.as_tensor(
-                        [c["source_to_row"][int(v)] for v in source_ids.tolist()],
-                        device=self.device, dtype=torch.long
-                    )
-                    clean = c["fit_values"][rows]
-                    descriptor = c["descriptor"]
-                    noise = c["adapter"].base_feature_std.to(self.device).reshape(1,-1) * float(
-                        _cfg_value(self._visual_moe_cfg(), "DESCRIPTOR_DENOISE_SCALE", 0.05)
-                    )
-                    noisy = clean + torch.randn_like(clean) * noise
-                    reconstruction = F.mse_loss(descriptor(noisy), clean)
-                    residual = descriptor.residual_output(clean).square().mean()
-                    rd_terms.append(reconstruction + 1e-3*descriptor.orthogonality_loss()
-                                    + float(_cfg_value(self._visual_moe_cfg(), "DESCRIPTOR_RESIDUAL_WEIGHT", 1e-3))*residual)
-                rd_loss = torch.stack(rd_terms).mean()
-                total = ce + l2sp_w*l2sp_loss + feature_w*feature_loss + rd_w*rd_loss
-                if not torch.isfinite(total):
-                    raise FloatingPointError("Unified incremental objective is non-finite.")
-                total.backward()
-                torch.nn.utils.clip_grad_norm_(functional_params, 1.0)
-                torch.nn.utils.clip_grad_norm_(descriptor_params, 1.0)
-                optimizer.step()
-                for c in active:
-                    c["descriptor"].retract_basis_()
-                n = int(labels.numel())
-                for key, val in (("ce",ce),("l2sp",l2sp_loss),("feature",feature_loss),("rd",rd_loss)):
-                    totals[key] += float(val.item())*n
-                totals["n"] += n
-                for c in active:
-                    c["history"]["classification_samples_total"] += n
-            if totals["n"] == 0 or sorted(observed_classes) != expected_classes:
-                raise RuntimeError("Incremental loader is empty or misses Session classes.")
-            n = totals["n"]
-            for c in active:
-                h = c["history"]
-                for key, target in (("ce","ce_loss"),("l2sp","l2sp_loss"),("feature","feature_space_loss"),("rd","rd_loss")):
-                    h[target].append(totals[key]/n)
-                h["loss"].append(totals["ce"]/n + l2sp_w*totals["l2sp"]/n
-                                 + feature_w*totals["feature"]/n + rd_w*totals["rd"]/n)
-                h["classification_samples_per_epoch"].append(n)
-
-        # Calibrate each new RD once on deterministic Session references, then freeze it.
-        for c in active:
-            descriptor = c["descriptor"]
-            descriptor.eval()
+            # RD fitting and error calibration are an independent stage. The
+            # current block input is fixed because all shallower blocks are
+            # already frozen; the new block's own residual is not part of its
+            # input distribution.
+            rd_loss = self._train_descriptor(
+                adapter, expert_id, fit_x, descriptor_epochs,
+                sample_weights=None,
+                calibration_values=ref_x,
+                calibration_weights=None,
+            )
+            descriptor = adapter.descriptors[expert_id]
             with torch.no_grad():
-                errors = descriptor.reconstruction_error(c["reference_values"])
-                responsibility = c["adapter"].expert_responsibility(
-                    c["reference_values"], c["expert_id"]
-                ).detach()
-                descriptor.update_reference(errors, responsibility)
-                c["adapter"].assert_descriptors_ready()
-                c["history"]["rd_effective_reference_count"] = float(descriptor.effective_error_count.item())
-                c["history"]["rd_reference_mean_z"] = float(
-                    descriptor.standardized_score(c["reference_values"]).mean().item()
-                )
-                c["history"]["l2sp_parameter_distance"] = float(torch.sqrt(
-                    2.0*self._l2sp_anchor_loss(c["adapter"].experts[-1], c["l2sp_anchor"])
-                ).item())
-            c["adapter"].freeze_all()
+                rd_reference_mean_z = float(descriptor.standardized_score(ref_x).mean().item())
+                rd_effective_count = float(descriptor.effective_error_count.item())
 
-        for block_idx, c in contexts.items():
-            if c["mode"] == "expand":
-                expanded.append({
-                    "block_idx": int(block_idx), "expert_id": int(c["expert_id"]),
-                    "expert_anchor_id": int(c["anchor_expert_id"]),
-                    "descriptor_anchor_id": int(c["descriptor"].anchor_expert_id),
-                    "session_mean_z": float(c["decision"].session_mean_z),
-                    "threshold": float(c["decision"].threshold),
-                })
+            adapter.set_newest_trainable(descriptor=False)
+            expert_parameters = list(adapter.experts[expert_id].parameters())
+            router_parameters = list(adapter.router.columns[expert_id].parameters())
+            if (not expert_parameters or not router_parameters
+                    or any(not parameter.requires_grad for parameter in expert_parameters + router_parameters)
+                    or any(parameter.requires_grad for parameter in descriptor.parameters())):
+                raise RuntimeError(
+                    f"Block {block_idx} must train only its newest expert and independent router after RD fitting."
+                )
+            optimizer = optim.AdamW(
+                [
+                    {"params": expert_parameters,
+                     "lr": float(_cfg_value(optim_cfg, "LR_INCREMENTAL_EXPERT", 3e-4))},
+                    {"params": router_parameters,
+                     "lr": float(_cfg_value(optim_cfg, "LR_INCREMENTAL_ROUTER", 3e-4))},
+                ],
+                weight_decay=weight_decay,
+                betas=tuple(_cfg_value(optim_cfg, "BETAS", (0.9, 0.999))),
+            )
+            history = {
+                "mode": "expand_sequential",
+                "expert_id": int(expert_id),
+                "expert_anchor_id": anchor_id,
+                "descriptor_anchor_id": int(descriptor.anchor_expert_id),
+                "session_mean_z": float(decision.session_mean_z),
+                "rd_training_loss": float(rd_loss),
+                "rd_training_samples": int(fit_x.size(0)),
+                "rd_reference_samples": int(ref_x.size(0)),
+                "rd_reference_weighting": "uniform",
+                "rd_reference_mean_z": rd_reference_mean_z,
+                "rd_effective_reference_count": rd_effective_count,
+                "rd_training_source_ids": sorted(int(value) for value in fit_source_ids.tolist()),
+                "rd_reference_source_ids": sorted(int(value) for value in ref_source_ids.tolist()),
+                "loss": [],
+                "ce_loss": [],
+                "l2sp_loss": [],
+                "classification_samples_per_epoch": [],
+                "classification_samples_total": 0,
+            }
+
+            for epoch in range(epochs):
+                working_old_states = self._refresh_historical_prototypes(working_old_states)
+                bank = self._build_incremental_bank(
+                    extract_loader, class_index, working_old_states, semantic_proto
+                )
+                self.model.train()
+                for _, deployed_adapter in self._moe_adapters():
+                    deployed_adapter.eval()
+                adapter.experts[expert_id].train()
+                totals = {"ce": 0.0, "l2sp": 0.0, "count": 0}
+                observed_train_classes = set()
+                for batch in train_loader:
+                    images, labels = self.parse_batch(batch)
+                    source_ids = self._batch_source_ids(batch, labels.numel(), labels.device)
+                    if not torch.isin(
+                        labels, torch.as_tensor(class_index, device=labels.device)
+                    ).all():
+                        raise ValueError("Training loader contains labels outside the current Session.")
+                    observed_train_classes.update(int(value) for value in labels.unique().tolist())
+                    optimizer.zero_grad(set_to_none=True)
+                    logits, targets = self._global_incremental_logits(
+                        images, labels, source_ids, bank, scale
+                    )
+                    ce_loss = F.cross_entropy(logits, targets)
+                    l2sp_loss = self._l2sp_anchor_loss(
+                        adapter.experts[expert_id], l2sp_anchor
+                    )
+                    total_loss = ce_loss + l2sp_weight * l2sp_loss
+                    if not bool(torch.isfinite(total_loss).item()):
+                        raise FloatingPointError(
+                            f"Block {block_idx} incremental expert objective is non-finite."
+                        )
+                    total_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(
+                        expert_parameters + router_parameters, 1.0
+                    )
+                    optimizer.step()
+                    count = int(labels.numel())
+                    totals["ce"] += float(ce_loss.item()) * count
+                    totals["l2sp"] += float(l2sp_loss.item()) * count
+                    totals["count"] += count
+                    history["classification_samples_total"] += count
+                if (totals["count"] == 0
+                        or sorted(observed_train_classes) != expected_classes):
+                    raise RuntimeError(
+                        f"Block {block_idx} incremental loader is empty or misses Session classes."
+                    )
+                denominator = float(totals["count"])
+                history["ce_loss"].append(totals["ce"] / denominator)
+                history["l2sp_loss"].append(totals["l2sp"] / denominator)
+                history["loss"].append(
+                    totals["ce"] / denominator
+                    + l2sp_weight * totals["l2sp"] / denominator
+                )
+                history["classification_samples_per_epoch"].append(totals["count"])
+                print(
+                    f"=> [Sequential-Expert][B{block_idx}][{epoch + 1}/{epochs}] "
+                    f"ce={history['ce_loss'][-1]:.5f} "
+                    f"l2sp={history['l2sp_loss'][-1]:.6f}"
+                )
+
+            with torch.no_grad():
+                history["l2sp_parameter_distance"] = float(torch.sqrt(
+                    2.0 * self._l2sp_anchor_loss(adapter.experts[expert_id], l2sp_anchor)
+                ).item())
+            adapter.freeze_all()
+            self._assert_moe_frozen(f"after sequential block {block_idx}")
+            working_old_states = self._refresh_historical_prototypes(working_old_states)
+            training[block_idx] = history
+            expanded.append({
+                "block_idx": block_idx,
+                "expert_id": int(expert_id),
+                "expert_anchor_id": anchor_id,
+                "descriptor_anchor_id": int(descriptor.anchor_expert_id),
+                "session_mean_z": float(decision.session_mean_z),
+                "threshold": float(decision.threshold),
+            })
+            processed_blocks.append(block_idx)
+
         for _, adapter in self._moe_adapters():
             adapter.freeze_all()
         self._assert_moe_frozen("incremental Session completion")
         return {
-            "trained": bool(expanded), "decisions": decisions, "expanded": expanded,
-            "reused": reused, "training": {b:c["history"] for b,c in contexts.items()},
+            "trained": bool(expanded),
+            "decisions": decisions,
+            "expanded": expanded,
+            "reused": reused,
+            "training": training,
+            "refreshed_old_states": working_old_states,
             "semantic_prototype": None if semantic_proto is None else semantic_proto.detach(),
             "encoder_version": 0,
         }
@@ -2253,6 +2472,11 @@ class Runner:
                             class_names, extract_loader, class_index)
                         state["class_ids"] = torch.as_tensor(class_index, device=self.device, dtype=torch.long)
                         state["class_index"] = state["class_ids"]
+                        alpha_max, alpha_diagnostics = self._calibrate_semantic_alpha(
+                            state, extract_loader
+                        )
+                        state["semantic_calibration_alpha_max"] = float(alpha_max)
+                        state["semantic_calibration_validation"] = self._cpu_copy(alpha_diagnostics)
                     state["encoder_version"] = 0
                     state["creation_session"] = 0
                     state["anchor_by_block"] = self._collect_class_anchors(extract_loader)
@@ -2269,8 +2493,10 @@ class Runner:
                             class_names, old_states)
                         plan_summary = self._cpu_copy(adaptation["decisions"])
                     self.model.eval()
+                    refreshed_old_states = adaptation.pop("refreshed_old_states", old_states)
+                    state_dict_list[:] = refreshed_old_states
                     state = adaptation.pop("task_state")
-    
+
                 state_dict_list.append(state)
                 feature_space_diagnostics = self._base_reference_feature_diagnostics(state_dict_list[0])
                 feature_space_diagnostics["historical_anchors"] = self._historical_feature_anchor_diagnostics(

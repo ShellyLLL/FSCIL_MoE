@@ -869,46 +869,48 @@ class VisualMoEAdapter(nn.Module):
     def forward(self, x, route_input=None):
         if x.ndim != 3:
             raise ValueError("VisualMoEAdapter expects [tokens, batch, dim].")
-        # Every expert and router column consumes the frozen-reference token
-        # stream. The adapted stream is only the residual destination. This
-        # keeps Base and incremental expert input distributions invariant to
-        # upstream adapter updates, so all historical input anchors remain valid.
-        if route_input is None:
-            reference_tokens = self.layer_norm(x)
-        elif route_input.ndim == 2 and route_input.shape == x[0].shape:
-            # Backward-compatible CLS-only entry for direct adapter unit use.
-            reference_tokens = self.layer_norm(x)
-            route_features = self.layer_norm(route_input)
-        else:
-            if route_input.shape != x.shape:
-                raise ValueError("Reference expert tokens must match adapted token shape.")
-            reference_tokens = self.layer_norm(route_input)
-        if route_input is None or route_input.ndim == 3:
-            route_features = reference_tokens[0]
+        # Expert and router inputs are the actual adapted hidden state entering
+        # this insertion block. route_input is retained only as a frozen-stream
+        # diagnostic; it must never replace the adapted input for routing or
+        # expert evaluation.
+        adapted_tokens = self.layer_norm(x)
+        route_features = adapted_tokens[0]
+        reference_cls = None
+        if route_input is not None:
+            if route_input.ndim == 3 and route_input.shape == x.shape:
+                reference_cls = self.layer_norm(route_input)[0]
+            elif route_input.ndim == 2 and route_input.shape == x[0].shape:
+                reference_cls = self.layer_norm(route_input)
+            else:
+                raise ValueError("Optional frozen-reference tokens must match the adapted token shape.")
+
         logits, weights = self.routing_outputs(route_features)
         disabled = self._inference_disabled_expert_ids
         if disabled and self.training:
             raise RuntimeError("Inference expert masks must be cleared before training.")
         residual, norms, output_energies = torch.zeros_like(x), [], []
         for column, expert_id in enumerate(range(self.num_experts)):
-            expert_output = self.experts[expert_id](reference_tokens)
+            expert_output = self.experts[expert_id](adapted_tokens)
             output_energies.append(expert_output.float().pow(2).mean())
             if expert_id in disabled:
-                # Keep diagnostic tensor alignment while excluding only this
-                # expert's residual. Its router gate is not renormalized.
                 norms.append(expert_output.detach().float().new_zeros(()))
                 continue
             weighted = expert_output * weights[:, column].unsqueeze(0).unsqueeze(-1)
             residual = residual + weighted
             norms.append(weighted.detach().float().pow(2).mean().sqrt())
         residual = self.residual_scale.to(residual.dtype) * residual
-        return residual, {"logits": logits, "route_weights": weights,
-                          "top_k_indices": weights.argmax(dim=-1, keepdim=True),
-                          "cls_in": route_features,
-                          "expert_in": reference_tokens[0],
-                          "expert_residual_norms": torch.stack(norms),
-                          "expert_output_energy": torch.stack(output_energies),
-                          "token_residual": residual.detach()}
+        return residual, {
+            "logits": logits,
+            "route_weights": weights,
+            "top_k_indices": weights.argmax(dim=-1, keepdim=True),
+            "cls_in": route_features,
+            "expert_in": adapted_tokens[0],
+            "reference_cls_in": reference_cls,
+            "expert_residual_norms": torch.stack(norms),
+            "expert_output_energy": torch.stack(output_energies),
+            "token_residual": residual.detach(),
+        }
+
 
 
 class ResidualAttentionBlock(nn.Module):
@@ -940,8 +942,9 @@ class ResidualAttentionBlock(nn.Module):
 
     def forward_dual(self, adapted_x: torch.Tensor, reference_x: torch.Tensor):
         """Advance adapted and frozen-reference streams through one ViT block."""
-        # The reference stream is the original frozen CLIP path.  It never
-        # receives adapter residuals and never builds a backbone autograd graph.
+        # The reference stream is the original frozen CLIP path. It never
+        # receives adapter residuals and is retained only for feature-space
+        # diagnostics; the MoE consumes adapted_x at every insertion block.
         with torch.no_grad():
             reference_x = reference_x + self.attention(self.ln_1(reference_x))
             reference_x = reference_x + self.mlp(self.ln_2(reference_x))

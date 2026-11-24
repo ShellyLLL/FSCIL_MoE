@@ -72,6 +72,18 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         self.assertAlmostEqual(decision.session_mean_z, 0.5)
         self.assertFalse(decision.expand)
 
+    def test_router_and_experts_consume_adapted_stream_not_frozen_reference(self):
+        adapter = VisualMoEAdapter(8, num_experts=2, reduction=2, descriptor_dim=4)
+        adapted = torch.randn(3, 2, 8)
+        reference = adapted + 7.0
+        _, aux = adapter(adapted, route_input=reference)
+        expected_adapted = adapter.layer_norm(adapted)[0]
+        expected_reference = adapter.layer_norm(reference)[0]
+        torch.testing.assert_close(aux["cls_in"], expected_adapted)
+        torch.testing.assert_close(aux["expert_in"], expected_adapted)
+        torch.testing.assert_close(aux["reference_cls_in"], expected_reference)
+        self.assertFalse(torch.allclose(aux["cls_in"], aux["reference_cls_in"]))
+
     def test_new_expert_and_rd_share_nearest_anchor_and_exact_parameters(self):
         torch.manual_seed(7)
         adapter = VisualMoEAdapter(16, num_experts=2, reduction=4, descriptor_dim=4)

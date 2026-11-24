@@ -12,11 +12,12 @@ class ConfigSchemaTests(unittest.TestCase):
         incremental = cfg.TRAINER.BiMC.INCREMENTAL
 
         self.assertEqual(moe.INCREMENTAL_GATE_BIAS_INIT, -4.0)
+        self.assertEqual(moe.SEMANTIC_RETRIEVAL_TOP_K, 5)
         self.assertEqual(moe.FEATURE_SPACE_MIN_COSINE, 0.98)
         self.assertEqual(moe.FEATURE_SPACE_MAX_ACCURACY_DROP, 0.0)
         self.assertEqual(incremental.L2SP_WEIGHT, 1.0e-4)
-        self.assertEqual(incremental.FEATURE_SPACE_PRESERVATION_WEIGHT, 1.0)
-        self.assertEqual(incremental.RD_WEIGHT, 1.0)
+        self.assertFalse(hasattr(incremental, "FEATURE_SPACE_PRESERVATION_WEIGHT"))
+        self.assertFalse(hasattr(incremental, "RD_WEIGHT"))
         self.assertFalse(hasattr(moe, "EXPANSION_THRESHOLD_QUANTILE"))
         self.assertFalse(hasattr(moe, "INCREMENTAL_REDUCTION"))
         self.assertFalse(hasattr(incremental, "LOCAL_RESIDUAL_PRESERVATION_WEIGHT"))

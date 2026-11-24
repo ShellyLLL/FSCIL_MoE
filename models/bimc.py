@@ -162,7 +162,7 @@ class BiMC(nn.Module):
 
     @torch.no_grad()
     def collect_blockwise_cls_features(self, loader):
-        """Collect frozen-reference router CLS inputs, labels and stable support source ids."""
+        """Collect adapted layer-input CLS features and aligned frozen-reference diagnostics."""
         block_features, fallback_source_id = {}, 0
         moe_blocks = [
             idx for idx, block in enumerate(self.clip_model.visual.transformer.resblocks)
@@ -192,15 +192,20 @@ class BiMC(nn.Module):
                 for block_idx, aux in zip(moe_blocks, aux_list):
                     cls_in = aux.get("cls_in")
                     expert_in = aux.get("expert_in")
+                    reference_cls_in = aux.get("reference_cls_in")
                     if cls_in is None or cls_in.ndim != 2:
-                        raise RuntimeError(f"Block {block_idx} has invalid reference CLS features.")
+                        raise RuntimeError(f"Block {block_idx} has invalid adapted layer-input CLS features.")
                     if expert_in is None or expert_in.shape != cls_in.shape:
                         raise RuntimeError(f"Block {block_idx} has invalid adapted expert-input CLS features.")
+                    if reference_cls_in is None or reference_cls_in.shape != cls_in.shape:
+                        raise RuntimeError(f"Block {block_idx} has invalid frozen-reference diagnostic CLS features.")
                     item = block_features.setdefault(block_idx, {
-                        "cls_in": [], "expert_in": [], "labels": [], "source_ids": []
+                        "cls_in": [], "expert_in": [], "reference_cls_in": [],
+                        "labels": [], "source_ids": []
                     })
                     item["cls_in"].append(cls_in.detach().cpu())
                     item["expert_in"].append(expert_in.detach().cpu())
+                    item["reference_cls_in"].append(reference_cls_in.detach().cpu())
                     item["labels"].append(labels.detach().cpu())
                     item["source_ids"].append(source_ids.detach().cpu())
         finally:
@@ -208,6 +213,7 @@ class BiMC(nn.Module):
         for item in block_features.values():
             item["cls_in"] = torch.cat(item["cls_in"])
             item["expert_in"] = torch.cat(item["expert_in"])
+            item["reference_cls_in"] = torch.cat(item["reference_cls_in"])
             item["labels"] = torch.cat(item["labels"])
             item["source_ids"] = torch.cat(item["source_ids"])
         return block_features
@@ -269,7 +275,7 @@ class BiMC(nn.Module):
 
     @torch.no_grad()
     def plan_layer_expansion(self, block_idx, features, class_index):
-        """Use the minimum Session-mean standardized reconstruction error across deployed RDs."""
+        """Use the minimum Session-mean RD Z-score on the current adapted layer input."""
         block_idx = int(block_idx)
         if block_idx not in features:
             raise KeyError(f"Block {block_idx} did not produce support features.")

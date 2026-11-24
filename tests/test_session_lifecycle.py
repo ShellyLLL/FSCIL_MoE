@@ -194,6 +194,11 @@ class SessionLifecycleTests(unittest.TestCase):
         )
         self.assertEqual(len(result["expanded"]), 2)
         self.assertEqual(result["task_state"]["class_ids"].tolist(), [1,2])
+        self.assertEqual(len(result["refreshed_old_states"]), 1)
+        self.assertEqual(
+            result["refreshed_old_states"][0]["prototype_refresh"]["feature_space"],
+            "current_deployed_adapted_encoder",
+        )
         self.assertTrue(all(
             item["expert_anchor_id"] == item["descriptor_anchor_id"]
             for item in result["expanded"]
@@ -204,8 +209,10 @@ class SessionLifecycleTests(unittest.TestCase):
         for history in result["training"].values():
             self.assertEqual(history["classification_samples_per_epoch"], [16,16])
             self.assertEqual(len(history["l2sp_loss"]), 2)
-            self.assertEqual(len(history["feature_space_loss"]), 2)
-            self.assertEqual(len(history["rd_loss"]), 2)
+            self.assertEqual(len(history["ce_loss"]), 2)
+            self.assertEqual(len(history["l2sp_loss"]), 2)
+            self.assertNotIn("feature_space_loss", history)
+            self.assertNotIn("rd_loss", history)
             self.assertGreaterEqual(history["rd_effective_reference_count"], 1.0)
 
         # A second Session must detect and migrate from the already deployed
