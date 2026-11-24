@@ -1,6 +1,5 @@
 
 import json
-import math
 from dataclasses import dataclass
 import torch
 import torch.nn as nn
@@ -9,13 +8,17 @@ import numpy as np
 import models.clip.clip as clip
 
 
+SESSION_EXPANSION_Z_THRESHOLD = 1.0
+
+
 @dataclass
 class LayerExpansionDecision:
-    """One sample-pooled Session decision for a single transformer layer."""
+    """One Session-level AE novelty decision for a single transformer layer."""
     block_idx: int
     expand: bool
-    session_q90: float
+    session_mean_z: float
     threshold: float
+    anchor_expert_id: int
     support_count: int
 
 
@@ -265,12 +268,9 @@ class BiMC(nn.Module):
                 if getattr(block, "moe_adapter", None) is not None]
 
     @torch.no_grad()
-    def plan_layer_expansion(self, block_idx, features, class_index, threshold=None):
-        """Decide EXPAND/REUSE from the pooled Session-Q90 novelty score."""
+    def plan_layer_expansion(self, block_idx, features, class_index):
+        """Use the minimum Session-mean standardized reconstruction error across deployed RDs."""
         block_idx = int(block_idx)
-        if threshold is None or not math.isfinite(float(threshold)):
-            raise ValueError("A finite Base-calibrated Session Q95 threshold is required.")
-        tau = float(threshold)
         if block_idx not in features:
             raise KeyError(f"Block {block_idx} did not produce support features.")
 
@@ -292,43 +292,50 @@ class BiMC(nn.Module):
         if torch.unique(sources).numel() != sources.numel():
             raise ValueError("Session-level expansion requires one deterministic reference row per support source.")
 
-        # First select the best-matching deployed RD for each sample. Then
-        # aggregate all Session samples together: labels validate the Session
-        # manifest but never create per-class expansion decisions.
-        per_descriptor_z = adapter.descriptor_scores(values, require_ready=True)
-        sample_novelty = per_descriptor_z.min(dim=1).values
-        score = float(torch.quantile(sample_novelty, 0.90).item())
-        if not math.isfinite(score):
-            raise FloatingPointError(f"Block {block_idx} produced a non-finite pooled Session Q90.")
+        # One Session statistic per deployed RD: average standardized error
+        # over all support sources. The minimum is the best historical match.
+        per_descriptor_z = adapter.descriptor_scores(values, require_ready=True).float()
+        if (per_descriptor_z.ndim != 2 or per_descriptor_z.size(0) != values.size(0)
+                or per_descriptor_z.size(1) != adapter.num_experts
+                or not torch.isfinite(per_descriptor_z).all()):
+            raise FloatingPointError(f"Block {block_idx} produced invalid RD novelty scores.")
+        session_mean_z = per_descriptor_z.mean(dim=0)
+        anchor_expert_id = int(torch.argmin(session_mean_z).item())
+        score = float(session_mean_z[anchor_expert_id].item())
+        threshold = float(SESSION_EXPANSION_Z_THRESHOLD)
+        if not np.isfinite(score):
+            raise FloatingPointError(f"Block {block_idx} produced a non-finite Session mean Z-score.")
         decision = LayerExpansionDecision(
             block_idx=block_idx,
-            expand=score > tau,
-            session_q90=score,
-            threshold=tau,
+            expand=score > threshold,
+            session_mean_z=score,
+            threshold=threshold,
+            anchor_expert_id=anchor_expert_id,
             support_count=int(values.size(0)),
         )
         print(
             f"=> [Session-Expansion][B{block_idx}] support_n={decision.support_count} "
-            f"session_q90={score:.6f} base_q95={tau:.6f} "
+            f"min_session_mean_z={score:.6f} threshold={threshold:.1f} "
+            f"anchor_expert={anchor_expert_id} "
             f"decision={'EXPAND' if decision.expand else 'REUSE'}"
         )
         return decision
 
     def add_expert(
-        self, block_idx, session_id, anchor_expert_id=None, descriptor_residual_rank=None,
+        self, block_idx, session_id, anchor_expert_id, descriptor_residual_rank=None,
     ):
+        """Append an expert and RD migrated from the same nearest historical expert."""
         adapter = self.clip_model.visual.transformer.resblocks[int(block_idx)].moe_adapter
         moe_cfg = self.cfg.TRAINER.BiMC.VISUAL_MOE
-        reduction = int(getattr(moe_cfg, "INCREMENTAL_REDUCTION", 8))
         residual_rank = (
             int(getattr(moe_cfg, "DESCRIPTOR_RESIDUAL_RANK", 16))
             if descriptor_residual_rank is None else int(descriptor_residual_rank)
         )
         return adapter.add_expert(
             session_id=session_id,
-            reduction=reduction,
-            anchor_expert_id=anchor_expert_id,
+            anchor_expert_id=int(anchor_expert_id),
             descriptor_residual_rank=residual_rank,
+            gate_bias_init=float(getattr(moe_cfg, "INCREMENTAL_GATE_BIAS_INIT", -4.0)),
             dropout=float(getattr(moe_cfg, "INCREMENTAL_DROPOUT", 0.1)),
         )
 

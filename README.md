@@ -46,72 +46,66 @@ python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/t
 python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc_ensemble.yaml
 ~~~
 
-### Unified AE-driven dynamic FSCIL MoE (method model v1.0)
+### Unified AE-driven dynamic FSCIL MoE (method model v1.1)
 
-The branch implements the unified FSCIL method model:
-Session-level AE distribution-shift detection, on-demand residual expert expansion,
-Base-Softmax plus incremental-Sigmoid routing, historical-RD-anchored low-rank
-residual descriptor adaptation, selective training/freeze, semantic-guided novel
-visual prototype calibration, and one global visual prototype classifier.
+The method uses one Session-level novelty decision per expandable transformer
+layer. It combines the historical AE/RD pool, dynamic expert migration,
+Base-Softmax plus incremental-Sigmoid routing, selective training and freezing,
+historical feature-space preservation, semantic-guided visual prototype
+calibration, and one global visual prototype classifier.
 
 Lifecycle:
 
-1. The frozen CLIP ViT reference stream provides stable per-layer CLS features
-   for AE coverage detection and router inputs. The adapted stream receives the
-   residual expert adapters. Historical experts and routers remain frozen but
-   participate in every later forward pass.
-2. Base experts and the Base router are trained on Base classes. After Base
-   training, frozen-reference CLS sources are partitioned into disjoint AE-fit
-   and AE-error-reference sets. Each expert's centered low-rank linear AE is
-   fitted using its deployed Base-Softmax responsibility. The independent
-   holdout estimates that descriptor's reconstruction-error mean and standard
-   deviation. The same Base holdout pool is then used to form support-size-
-   matched pseudo-Sessions for Session-Q95 threshold calibration in step 3.
-3. At each incremental Session, collect frozen-reference CLS input
-   features for every support source. For each sample, compute its standardized
-   reconstruction error under every deployed RD and retain the minimum score:
-   u_i,l = min_k z_i,l,k. Aggregate all samples in the Session (without
-   class-wise grouping) using s_l^t = Q_0.90({u_i,l}). Base holdout sources are
-   grouped into pseudo-Sessions matching each configured support-set size;
-   each group is scored with the same Q90 statistic. The per-layer threshold
-   tau_l(N) is the Q0.95 quantile of those Base Session scores. Expand exactly
-   one expert in a layer when s_l^t > tau_l(N); otherwise reuse the pool.
-   The calibrated threshold table is checkpointed and restored with the model.
-4. Select the historical RD anchor whose current-Session 90th-percentile
-   standardized reconstruction error is lowest. The new RD reuses that frozen
-   descriptor function and adds a zero-output, low-rank residual branch
-   (Kaiming-initialized down projection, zero-initialized up projection).
-   Initialize the new residual expert with a Kaiming down projection and
-   zero output projection. Train the new expert, its independent sigmoid
-   router and the paired RD residual jointly on all current-Session K-shot
-   samples. The objective is CE + lambda_D RD + lambda_P PD: CE and PD update
-   only the new expert/router, while denoising reconstruction RD updates only
-   the new RD residual. Historical experts, router columns, RD anchors and ViT
-   remain frozen. The trained new RD's error mean/std are estimated from the
-   full current Session and it becomes a reusable historical descriptor.
-5. After expert training and freezing, compute each novel class's adapted
-   visual support prototype. Encode its class description with the frozen
-   CLIP text encoder. Description-semantic similarity retrieves related Base
-   description semantics and their corresponding Base **adapted visual**
-   prototypes. Blend the novel visual prototype with this retrieved visual
-   direction using a calibration strength controlled by semantic confidence
-   and support-prototype reliability. Only novel visual prototypes are
-   calibrated; historical prototypes remain unchanged.
-6. Merge all seen-class visual prototypes into one global visual classifier.
-   Training uses source-exclusive leave-one-out novel visual prototypes to
-   prevent support-query leakage. Inference uses one current CLIP+MoE feature
-   path and the global visual prototype bank. AE is not used at inference;
-   there is no task ID, task gate, task-specific classifier or text classifier.
-
-The semantic calibration does not use visual-neighbor weighting, prompt/
-description text intra-modal fusion, or BiMC inter-modal classifier fusion.
-Text descriptions only retrieve Base visual knowledge; the final classifier
-remains visual-only.
+1. The frozen CLIP ViT reference stream provides stable per-layer CLS inputs
+   for RD detection, routing, and all expert generations. The adapted stream
+   receives the routed residuals. The backbone remains frozen; historical
+   experts and router columns remain frozen but stay active in every forward.
+2. Base experts and the Base router are trained on Base classes. Base RDs are
+   fitted using responsibility-weighted Base CLS features. Their reconstruction
+   error means and standard deviations are estimated from a deterministic,
+   class-balanced Base reference set and are then frozen. This reference set
+   also supports later feature-space diagnostics; it is not used to construct
+   pseudo-Sessions or support-size-specific expansion thresholds.
+3. For an incremental Session and layer (l), every deployed RD (k) computes
+   a standardized reconstruction error for each support source:
+   (z_{i,l,k}=(e_{i,l,k}-mu_{l,k})/(sigma_{l,k}+epsilon)).
+   The Session statistic for each RD is the mean over all Session sources:
+   (ar z_{l,k}=N^{-1}sum_i z_{i,l,k}). The best historical explanation is
+   (k^*=argmin_kar z_{l,k}). Reuse the existing pool when
+   (ar z_{l,k^*}leq1.0); expand exactly one expert when
+   (ar z_{l,k^*}>1.0). Labels validate the Session manifest but do not
+   create class-wise expansion decisions.
+4. On expansion, the selected historical expert and its RD are the same
+   migration anchor. The new functional expert copies the selected expert's
+   parameters and hidden width exactly; the new RD starts from that RD function
+   and adds its low-rank residual branch. The new independent sigmoid Router
+   column starts with a low activation bias. Train the new expert, new Router
+   column, and new RD together. The incremental objective combines global
+   visual-prototype classification, L2-SP to the immutable expert-initialization
+   snapshot, historical final-feature replay, and RD reconstruction. Historical
+   experts, historical Router columns, historical RD statistics, and the ViT
+   remain frozen. The new RD's error statistics are calibrated on deterministic
+   current-Session reference CLS after fitting and then frozen.
+5. Reuse means no new modules and no historical parameter updates. All existing
+   experts remain active in the deployed forward path. Expansion is layer-wise,
+   and each layer can add at most one expert in a Session.
+6. After adaptation, novel visual prototypes are calibrated using the existing
+   Base-semantic retrieval rule. Semantic descriptions retrieve related Base
+   description semantics and their corresponding Base visual prototypes;
+   semantic confidence and support-prototype reliability determine the mixing
+   strength. Historical visual prototypes remain unchanged.
+7. All seen-class visual prototypes are merged into one global visual
+   classifier. Training uses source-exclusive leave-one-out novel prototypes
+   to prevent support-query leakage. Inference uses one current CLIP+MoE feature
+   path and the global visual prototype bank. AE is not used at inference; there
+   is no task ID, task gate, task-specific classifier, or text classifier.
 
 Run architecture tests:
 
 ~~~bash
 python -m unittest discover -s tests -p "test_risk_guided_moe.py" -v
+python -m unittest discover -s tests -p "test_session1_diagnostics.py" -v
+python -m unittest discover -s tests -p "test_config_schema.py" -v
 ~~~
 
 Do not start real-dataset acceptance until architecture tests, checkpoint

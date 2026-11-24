@@ -54,7 +54,6 @@ class Runner:
         self.model_without_dp = self.model.module if self.is_distributed else self.model
         self.acc_list, self.task_acc_list = [], []
         self.session_diagnostics = []
-        self.expansion_thresholds = {}
         self.base_reference_source_ids = []
         self.base_reference_cls_features = {}
         self.base_reference_prefix_cache = None
@@ -120,7 +119,6 @@ class Runner:
         base_prototype = getattr(self.model_without_dp, "base_enhanced_visual_prototype", None)
         return {
             "adapters": adapter_states,
-            "expansion_thresholds": copy.deepcopy(self.expansion_thresholds),
             "base_reference_source_ids": list(self.base_reference_source_ids),
             # These reference caches are immutable after Base completion; retain
             # their objects instead of duplicating potentially large CPU tensors.
@@ -147,7 +145,6 @@ class Runner:
             adapter.rebuild_topology(topology)
             adapter.load_state_dict(state, strict=True)
             adapter.freeze_all()
-        self.expansion_thresholds = copy.deepcopy(snapshot["expansion_thresholds"])
         self.base_reference_source_ids = list(snapshot["base_reference_source_ids"])
         self.base_reference_cls_features = snapshot["base_reference_cls_features"]
         self.base_reference_prefix_cache = snapshot["base_reference_prefix_cache"]
@@ -199,96 +196,55 @@ class Runner:
         return getattr(self.cfg.TRAINER.BiMC, "CHECKPOINT", None)
 
     def _expansion_policy(self):
-        """Checkpointed contract for all-support RD fitting and cached Base-reference expansion."""
-        moe_cfg = self._visual_moe_cfg()
-        model_cfg = _cfg_value(self.cfg, "MODEL", None)
-        backbone_cfg = _cfg_value(model_cfg, "BACKBONE", None)
-        trainer_cfg = self.cfg.TRAINER.BiMC
-        optim_cfg = _cfg_value(trainer_cfg, "OPTIM", None)
-        incremental_cfg = _cfg_value(trainer_cfg, "INCREMENTAL", None)
-        loss_cfg = _cfg_value(trainer_cfg, "LOSS", None)
-        dataset_cfg = _cfg_value(self.cfg, "DATASET", None)
+        """Versioned contract for Session-mean AE-Z expansion and nearest-expert migration."""
+        moe = self._visual_moe_cfg()
+        inc = self.cfg.TRAINER.BiMC.INCREMENTAL
+        opt = self.cfg.TRAINER.BiMC.OPTIM
+        data = _cfg_value(self.cfg, "DATASET", None)
         return {
-            "version": 18,
-            "decision_unit": "incremental_session_per_layer",
-            "sample_score": "minimum_standardized_reconstruction_error_over_current_deployed_RDs",
-            "threshold_refresh": "recalibrate_from_all_accepted_session_reference_cls_after_every_successful_session",
-            "session_score": "pooled_q90_of_all_session_sample_scores",
-            "decision": "pooled_session_q90_greater_than_base_pseudo_session_q95_for_same_support_size",
-            "prototype_training_calibration": "same_base_semantic_retrieval_for_full_and_source_exclusive_loo_visual_prototypes",
-            "reuse_policy": "freeze_existing_experts_descriptors_and_router_without_parameter_updates",
-            "feature_space_diagnostic": "fixed_historical_final_embedding_anchor_distillation_plus_base_reference_feature_drift_acceptance",
-            "threshold_quantile": float(_cfg_value(moe_cfg, "EXPANSION_THRESHOLD_QUANTILE", 0.95)),
-            "calibration_groups": int(_cfg_value(moe_cfg, "EXPANSION_CALIBRATION_GROUPS", 256)),
-            "expert_training_scope": "all_current_session_samples_jointly_across_all_expanded_layers",
-            "expert_input_space": "frozen_reference_vit_tokens_for_all_expert_generations",
-            "gradient_clipping": "joint_all_expanded_functional_parameters_and_all_new_descriptors_norm_1.0",
-            "base_descriptor_training_scope": "all_base_reference_cls_weighted_by_base_router_responsibility",
-            "descriptor_init_mode": str(_cfg_value(self._visual_moe_cfg(), "DESCRIPTOR_INIT_MODE", "anchored_residual")).lower(),
-            "descriptor_training_scope": "all_current_session_augmented_cls_views",
-            "descriptor_calibration_scope": "all_current_session_deterministic_reference_cls_weighted_by_deployed_expert_responsibility",
-            "base_threshold_reference_scope": "deterministic_class_balanced_cached_base_reference_cls",
-            "base_feature_diagnostic_scope": "cached_frozen_reference_prefix_replay_no_incremental_base_image_reload",
-            "threshold_calibration_scope": "base_reference_plus_all_historical_and_current_incremental_support_cls",
-            "feature_space_acceptance": "base_reference_accuracy_plus_all_historical_class_anchor_prototype_cosine",
-            "feature_space_min_cosine": float(_cfg_value(moe_cfg, "FEATURE_SPACE_MIN_COSINE", 0.98)),
-            "feature_space_max_accuracy_drop": float(_cfg_value(moe_cfg, "FEATURE_SPACE_MAX_ACCURACY_DROP", 0.0)),
-            "router_learning_signal": "joint_global_CE_projected_against_final_feature_and_local_residual_preservation",
-            "visual_moe_enabled": bool(_cfg_value(moe_cfg, "ENABLE", False)),
-            "insert_blocks": [int(value) for value in _cfg_value(moe_cfg, "INSERT_BLOCKS", [])],
-            "num_base_experts": int(_cfg_value(moe_cfg, "NUM_BASE_EXPERTS", 4)),
-            "base_reduction": int(_cfg_value(moe_cfg, "BASE_REDUCTION", 4)),
-            "incremental_reduction": int(_cfg_value(moe_cfg, "INCREMENTAL_REDUCTION", 8)),
-            "descriptor_dim": int(_cfg_value(moe_cfg, "DESCRIPTOR_DIM", 64)),
-            "descriptor_eps": float(_cfg_value(moe_cfg, "DESCRIPTOR_EPS", 1e-4)),
-            "descriptor_buffer_size": int(_cfg_value(moe_cfg, "DESCRIPTOR_BUFFER_SIZE", 500)),
-            "descriptor_initialization": "nearest_session_q90_historical_rd_plus_zero_up_low_rank_residual",
-            "descriptor_residual_rank": int(_cfg_value(moe_cfg, "DESCRIPTOR_RESIDUAL_RANK", 16)),
-            "descriptor_denoise_scale": float(_cfg_value(moe_cfg, "DESCRIPTOR_DENOISE_SCALE", 0.05)),
-            "descriptor_residual_weight": float(_cfg_value(moe_cfg, "DESCRIPTOR_RESIDUAL_WEIGHT", 1e-3)),
-            "incremental_gate_bias_init": float(_cfg_value(moe_cfg, "INCREMENTAL_GATE_BIAS_INIT", -1.0)),
-            "incremental_dropout": float(_cfg_value(moe_cfg, "INCREMENTAL_DROPOUT", 0.1)),
-            "base_scale_init": float(_cfg_value(moe_cfg, "BASE_SCALE_INIT", 1.0)),
-            "backbone_name": str(_cfg_value(backbone_cfg, "NAME", "unknown")),
-            "precision": str(_cfg_value(trainer_cfg, "PREC", "fp32")),
-            "freeze_visual_backbone": bool(_cfg_value(trainer_cfg, "FREEZE_VISUAL_BACKBONE", True)),
-            "freeze_text_encoder": bool(_cfg_value(trainer_cfg, "FREEZE_TEXT_ENCODER", True)),
-            "semantic_temperature": float(_cfg_value(moe_cfg, "SEMANTIC_TEMPERATURE", 0.07)),
-            "semantic_calibration_max_alpha": float(_cfg_value(moe_cfg, "SEMANTIC_CALIBRATION_MAX_ALPHA", 0.5)),
-            "prototype_reliability_k": float(_cfg_value(moe_cfg, "PROTOTYPE_RELIABILITY_K", 5.0)),
-            "incremental_training": {
-                "epochs": int(_cfg_value(incremental_cfg, "EPOCHS", 6)),
-                "logit_scale": float(_cfg_value(incremental_cfg, "LOGIT_SCALE", 100.0)),
-                "feature_space_preservation_weight": float(_cfg_value(incremental_cfg, "FEATURE_SPACE_PRESERVATION_WEIGHT", 1.0)),
-                "local_residual_preservation_weight": float(_cfg_value(incremental_cfg, "LOCAL_RESIDUAL_PRESERVATION_WEIGHT", 1.0)),
-                "feature_anchor_batch_size": int(_cfg_value(moe_cfg, "FEATURE_SPACE_ANCHOR_BATCH_SIZE", 16)),
-                "feature_anchors_per_class": int(_cfg_value(moe_cfg, "FEATURE_SPACE_ANCHORS_PER_CLASS", 2)),
-                "feature_anchor_batch_size": int(_cfg_value(moe_cfg, "FEATURE_SPACE_ANCHOR_BATCH_SIZE", 16)),
-                "rd_weight": float(_cfg_value(incremental_cfg, "RD_WEIGHT", 1.0)),
-            },
-            "optimizer": {
-                "base_epochs": int(_cfg_value(optim_cfg, "BASE_EPOCHS", 50)),
-                "base_descriptor_epochs": int(_cfg_value(optim_cfg, "BASE_DESCRIPTOR_EPOCHS", 8)),
-                "lr_base_moe": float(_cfg_value(optim_cfg, "LR_BASE_MOE", 1e-4)),
-                "lr_incremental_expert": float(_cfg_value(optim_cfg, "LR_INCREMENTAL_EXPERT", 3e-4)),
-                "lr_incremental_router": float(_cfg_value(optim_cfg, "LR_INCREMENTAL_ROUTER", 3e-4)),
-                "lr_descriptor": float(_cfg_value(optim_cfg, "LR_DESCRIPTOR", 1e-3)),
-                "weight_decay": float(_cfg_value(optim_cfg, "WEIGHT_DECAY", 1e-4)),
-                "betas": list(_cfg_value(optim_cfg, "BETAS", (0.9, 0.999))),
-            },
-            "loss": {
-                "ce_weight": float(_cfg_value(loss_cfg, "CE_WEIGHT", 1.0)),
-                "load_balance_weight": float(_cfg_value(loss_cfg, "LB_WEIGHT", 0.01)),
-                "kd_weight": float(_cfg_value(loss_cfg, "KD_WEIGHT", 0.5)),
-            },
-            "data_protocol": {
-                "seed": int(_cfg_value(self.cfg, "SEED", 1)),
-                "num_init_classes": int(_cfg_value(dataset_cfg, "NUM_INIT_CLS", -1)),
-                "num_incremental_classes": int(_cfg_value(dataset_cfg, "NUM_INC_CLS", -1)),
-                "base_shot": int(_cfg_value(dataset_cfg, "NUM_BASE_SHOT", -1)),
-                "incremental_shot": int(_cfg_value(dataset_cfg, "NUM_INC_SHOT", -1)),
-                "support_manifest_seed": int(_cfg_value(dataset_cfg, "SUPPORT_MANIFEST_SEED", -1)),
-            },
+            "version": 19, "decision": "expand_iff_minimum_historical_rd_session_mean_z_gt_1",
+            "threshold": 1.0, "session_statistic": "mean_standardized_reconstruction_error_per_historical_rd",
+            "migration": "same_argmin_rd_initializes_expert_and_anchored_rd",
+            "expert_initialization": "exact_historical_parameter_copy_and_hidden_width_inheritance",
+            "regularization": "l2_sp_to_frozen_migration_snapshot",
+            "reuse": "all_existing_experts_and_router_columns_frozen_and_active",
+            "rd_fit": "all_session_augmented_reference_aligned_cls_sources",
+            "rd_calibration": "deterministic_session_errors_weighted_by_new_sigmoid_responsibility",
+            "router": "base_softmax_plus_incremental_independent_sigmoid",
+            "feature_preservation": "frozen_prefix_replay_to_historical_final_feature_anchors",
+            "prototype_calibration": "existing_base_semantic_retrieval_and_support_reliability_calibration",
+            "visual_moe_enabled": bool(_cfg_value(moe, "ENABLE", False)),
+            "insert_blocks": [int(v) for v in _cfg_value(moe, "INSERT_BLOCKS", [])],
+            "num_base_experts": int(_cfg_value(moe, "NUM_BASE_EXPERTS", 4)),
+            "base_reduction": int(_cfg_value(moe, "BASE_REDUCTION", 4)),
+            "descriptor_dim": int(_cfg_value(moe, "DESCRIPTOR_DIM", 64)),
+            "descriptor_eps": float(_cfg_value(moe, "DESCRIPTOR_EPS", 1e-4)),
+            "descriptor_buffer_size": int(_cfg_value(moe, "DESCRIPTOR_BUFFER_SIZE", 500)),
+            "descriptor_residual_rank": int(_cfg_value(moe, "DESCRIPTOR_RESIDUAL_RANK", 16)),
+            "descriptor_denoise_scale": float(_cfg_value(moe, "DESCRIPTOR_DENOISE_SCALE", 0.05)),
+            "descriptor_residual_weight": float(_cfg_value(moe, "DESCRIPTOR_RESIDUAL_WEIGHT", 1e-3)),
+            "incremental_gate_bias_init": float(_cfg_value(moe, "INCREMENTAL_GATE_BIAS_INIT", -4.0)),
+            "incremental_dropout": float(_cfg_value(moe, "INCREMENTAL_DROPOUT", 0.1)),
+            "semantic_temperature": float(_cfg_value(moe, "SEMANTIC_TEMPERATURE", 0.07)),
+            "semantic_calibration_max_alpha": float(_cfg_value(moe, "SEMANTIC_CALIBRATION_MAX_ALPHA", 0.5)),
+            "prototype_reliability_k": float(_cfg_value(moe, "PROTOTYPE_RELIABILITY_K", 5.0)),
+            "incremental": {"epochs": int(_cfg_value(inc, "EPOCHS", 6)),
+                "logit_scale": float(_cfg_value(inc, "LOGIT_SCALE", 100.0)),
+                "l2sp_weight": float(_cfg_value(inc, "L2SP_WEIGHT", 1e-4)),
+                "feature_space_weight": float(_cfg_value(inc, "FEATURE_SPACE_PRESERVATION_WEIGHT", 1.0)),
+                "rd_weight": float(_cfg_value(inc, "RD_WEIGHT", 1.0))},
+            "optimizer": {"base_epochs": int(_cfg_value(opt, "BASE_EPOCHS", 50)),
+                "base_descriptor_epochs": int(_cfg_value(opt, "BASE_DESCRIPTOR_EPOCHS", 8)),
+                "lr_base_moe": float(_cfg_value(opt, "LR_BASE_MOE", 1e-4)),
+                "lr_incremental_expert": float(_cfg_value(opt, "LR_INCREMENTAL_EXPERT", 3e-4)),
+                "lr_incremental_router": float(_cfg_value(opt, "LR_INCREMENTAL_ROUTER", 3e-4)),
+                "lr_descriptor": float(_cfg_value(opt, "LR_DESCRIPTOR", 1e-3)),
+                "weight_decay": float(_cfg_value(opt, "WEIGHT_DECAY", 1e-4))},
+            "data": {"seed": int(_cfg_value(self.cfg, "SEED", 1)),
+                "num_init_classes": int(_cfg_value(data, "NUM_INIT_CLS", -1)),
+                "num_incremental_classes": int(_cfg_value(data, "NUM_INC_CLS", -1)),
+                "base_shot": int(_cfg_value(data, "NUM_BASE_SHOT", -1)),
+                "incremental_shot": int(_cfg_value(data, "NUM_INC_SHOT", -1))},
         }
 
     @staticmethod
@@ -579,7 +535,7 @@ class Runner:
             raise ValueError("Resume checkpoint must contain a dictionary payload.")
         required = (
             "schema_version", "completed_session", "model_state", "task_states",
-            "support_manifest", "moe_topology", "expansion_policy", "expansion_thresholds",
+            "support_manifest", "moe_topology", "expansion_policy",
             "base_reference_source_ids", "base_reference_cls_features",
             "base_reference_prefix_cache", "base_reference_feature_prototypes", "base_reference_class_ids",
             "base_reference_accuracy_baseline",
@@ -588,12 +544,8 @@ class Runner:
         if missing:
             raise ValueError(f"Resume checkpoint is missing required fields: {missing}")
         schema = int(payload["schema_version"])
-        if schema != 37:
-            raise ValueError(
-                "This branch uses all-support dual-view RD fitting, known-domain Session-Q90 threshold "
-                "calibration and cosine/accuracy feature-space acceptance checkpoint schema (37); "
-                "older expansion-policy checkpoints are incompatible."
-            )
+        if schema != 38:
+            raise ValueError("Checkpoint predates Session-mean AE-Z expansion and nearest-expert migration (schema 38).")
         checkpoint_policy = payload.get("expansion_policy")
         if checkpoint_policy != self._expansion_policy():
             raise ValueError(
@@ -631,13 +583,6 @@ class Runner:
                 "Checkpoint MoE topology blocks do not match configured insertion blocks: "
                 f"{set(topology)} versus {expected_topology_blocks}."
             )
-        thresholds = payload.get("expansion_thresholds")
-        if not isinstance(thresholds, dict) or not thresholds:
-            raise ValueError("Checkpoint is missing Base-calibrated Session expansion thresholds.")
-        self.expansion_thresholds = {
-            int(block): {int(size): float(value) for size, value in by_size.items()}
-            for block, by_size in thresholds.items()
-        }
         self.base_reference_source_ids = [
             int(value) for value in payload["base_reference_source_ids"]
         ]
@@ -705,13 +650,6 @@ class Runner:
                 "labels": prefix_labels.cpu(),
                 "source_ids": prefix_sources.cpu(),
             }
-        if any(
-            size <= 0 or not np.isfinite(value)
-            for by_size in self.expansion_thresholds.values()
-            for size, value in by_size.items()
-        ):
-            raise ValueError("Checkpoint contains invalid Session expansion thresholds.")
-
         holdout_prototypes = payload["base_reference_feature_prototypes"]
         holdout_class_ids = payload["base_reference_class_ids"]
         if (holdout_prototypes is None) != (holdout_class_ids is None):
@@ -917,18 +855,6 @@ class Runner:
         if manifest is None:
             raise ValueError("Resume checkpoint support_manifest must not be null.")
         self.data_manager.load_support_manifest(manifest)
-        expected_threshold_blocks = {int(block) for block in self.model_without_dp.expandable_blocks()}
-        if set(self.expansion_thresholds) != expected_threshold_blocks:
-            raise ValueError(
-                "Checkpoint Session threshold blocks do not match configured MoE insertion blocks."
-            )
-        expected_support_sizes = set(self._incremental_support_sizes())
-        for block_idx, by_size in self.expansion_thresholds.items():
-            if set(by_size) != expected_support_sizes:
-                raise ValueError(
-                    f"Checkpoint block {block_idx} Session thresholds do not cover exact support sizes: "
-                    f"{set(by_size)} versus {expected_support_sizes}."
-                )
         base_proto = payload.get("base_enhanced_visual_prototype")
         if base_proto is None:
             raise ValueError("Checkpoint is missing the frozen Base reference visual prototype bank.")
@@ -975,7 +901,6 @@ class Runner:
         self.acc_list = list(acc_list)
         self.task_acc_list = [list(values) for values in task_acc_list]
         self.session_diagnostics = diagnostics
-        # Thresholds were validated and installed before restoring support data.
         self._resume_completed_session = completed_session
         self._restore_rng_state(payload.get("rng_state"))
         print(f"=> Resumed session {self._resume_completed_session} from {path}")
@@ -988,7 +913,7 @@ class Runner:
         directory.mkdir(parents=True, exist_ok=True)
         topology = self.model_without_dp.export_moe_topology()
         payload = {
-            "schema_version": 37,
+            "schema_version": 38,
             "completed_session": int(completed_session),
             "base_reference_source_ids": list(self.base_reference_source_ids),
             "base_reference_cls_features": self._cpu_copy(self.base_reference_cls_features),
@@ -996,7 +921,6 @@ class Runner:
             "base_reference_feature_prototypes": self._cpu_copy(getattr(self, "base_reference_feature_prototypes", None)),
             "base_reference_class_ids": self._cpu_copy(getattr(self, "base_reference_class_ids", None)),
             "base_reference_accuracy_baseline": self._cpu_copy(getattr(self, "base_reference_accuracy_baseline", None)),
-            "expansion_thresholds": self._cpu_copy(self.expansion_thresholds),
             "model_state": self._cpu_copy(self.model_without_dp.state_dict()),
             "moe_topology": topology,
             "task_states": self._cpu_copy(state_dict_list),
@@ -1244,210 +1168,62 @@ class Runner:
             raise RuntimeError("Class-balanced Base reference selection produced an invalid row count.")
         return mask
 
-    @staticmethod
-    def _base_reference_per_class(support_sizes, session_class_count):
-        """Convert total Session support counts into per-class Base reference capacity.
-
-        Threshold pseudo-Sessions contain support_size examples distributed
-        across session_class_count classes. The Base descriptor split must
-        reserve the largest per-class count, not the total Session count, from
-        every Base class.
-        """
-        sizes = [int(value) for value in support_sizes]
-        class_count = int(session_class_count)
-        if not sizes or any(value < 1 for value in sizes):
-            raise ValueError("Base Session calibration requires positive support-set sizes.")
-        if class_count < 1:
-            raise ValueError("Base Session calibration requires a positive Session class count.")
-        return max(3, max((size + class_count - 1) // class_count for size in sizes))
-
-    def _incremental_support_sizes(self):
-        """Return exact total support counts for every configured incremental Session."""
-        sizes = set()
-        if hasattr(self, "data_manager") and hasattr(self.data_manager, "get_support_manifest"):
-            manifest = self.data_manager.get_support_manifest()
-            for session_key, class_map in manifest.get("sessions", {}).items():
-                if int(session_key) == 0:
-                    continue
-                size = sum(len(source_ids) for source_ids in class_map.values())
-                if size > 0:
-                    sizes.add(int(size))
-        if not sizes:
-            dataset_cfg = self.cfg.DATASET
-            configured = _cfg_value(dataset_cfg, "SESSION_SUPPORT_SIZES", [])
-            sizes.update(int(value) for value in configured)
-            if not sizes:
-                sizes.add(int(dataset_cfg.NUM_INC_CLS) * int(dataset_cfg.NUM_INC_SHOT))
-        return sorted(sizes)
-
-    @torch.no_grad()
-    def _calibrate_session_expansion_thresholds(
-        self, adapter, heldout_values, heldout_labels, support_sizes, block_idx
-    ):
-        """Calibrate one Session-Q95 threshold per support-set size from Base reference CLS."""
-        moe_cfg = self._visual_moe_cfg()
-        quantile = float(_cfg_value(moe_cfg, "EXPANSION_THRESHOLD_QUANTILE", 0.95))
-        groups = int(_cfg_value(moe_cfg, "EXPANSION_CALIBRATION_GROUPS", 256))
-        if not 0.0 < quantile < 1.0 or groups < 20:
-            raise ValueError("Session threshold calibration requires Q in (0,1) and at least 20 groups.")
-        heldout_values = torch.as_tensor(heldout_values, device=self.device).float()
-        if (heldout_values.ndim != 2 or heldout_values.size(0) < 2
-                or not torch.isfinite(heldout_values).all()):
-            raise ValueError(f"Block {block_idx} Base reference is insufficient for Session calibration.")
-        if not support_sizes:
-            raise ValueError("No incremental support-set sizes were supplied for Base threshold calibration.")
-        heldout_labels = torch.as_tensor(heldout_labels, device=heldout_values.device).long().reshape(-1)
-        if heldout_labels.numel() != heldout_values.size(0):
-            raise ValueError("Base reference labels must align with reference features.")
-        classes = torch.unique(heldout_labels, sorted=True)
-        configured_classes = int(self.cfg.DATASET.NUM_INC_CLS)
-        if configured_classes < 1 or classes.numel() < configured_classes:
-            raise ValueError("Base reference has fewer classes than an incremental Session.")
-        class_rows = {
-            int(class_id): torch.nonzero(heldout_labels.eq(class_id), as_tuple=False).flatten().cpu()
-            for class_id in classes.tolist()
-        }
-        scores = adapter.descriptor_scores(heldout_values, require_ready=True).min(dim=1).values
-        cpu_scores = scores.detach().cpu()
-        generator = torch.Generator(device="cpu").manual_seed(
-            int(_cfg_value(moe_cfg, "EXPANSION_CALIBRATION_SEED", 20261119)) + int(block_idx)
-        )
-        thresholds = {}
-        for size in support_sizes:
-            size = int(size)
-            quotient, remainder = divmod(size, configured_classes)
-            per_class_counts = [quotient + (1 if index < remainder else 0)
-                                for index in range(configured_classes)]
-            required_per_class = max(per_class_counts)
-            eligible_classes = [
-                class_id for class_id in class_rows
-                if class_rows[class_id].numel() >= required_per_class
-            ]
-            if configured_classes > len(eligible_classes):
-                raise ValueError(
-                    f"Known reference cache has only {len(eligible_classes)} classes with "
-                    f"at least {required_per_class} sources; cannot calibrate {configured_classes}-class Sessions."
-                )
-            group_scores = []
-            for _ in range(groups):
-                selected = torch.randperm(len(eligible_classes), generator=generator)[:configured_classes].tolist()
-                selected_classes = [eligible_classes[index] for index in selected]
-                session_rows = []
-                for position, class_id in enumerate(selected_classes):
-                    count = per_class_counts[position]
-                    if count:
-                        rows = class_rows[class_id]
-                        order = torch.randperm(rows.numel(), generator=generator)[:count]
-                        session_rows.append(cpu_scores[rows[order]])
-                if len(session_rows) != configured_classes:
-                    raise RuntimeError("Base pseudo-Session failed to sample every class.")
-                pooled_scores = torch.cat(session_rows, dim=0)
-                group_scores.append(torch.quantile(pooled_scores, 0.90))
-            thresholds[int(size)] = float(torch.quantile(torch.stack(group_scores), quantile).item())
-        print(
-            f"=> [Session-Threshold][B{block_idx}] "
-            + " ".join(f"N={size}:Q95={value:.6f}" for size, value in sorted(thresholds.items()))
-        )
-        return thresholds
-
     def _train_base_descriptors(self, train_loader, extract_loader):
-        """Fit Base RDs on all augmented Base views and calibrate on all deterministic reference views."""
+        """Fit Base RDs on augmented CLS and calibrate immutable reconstruction statistics."""
         epochs = int(_cfg_value(self.cfg.TRAINER.BiMC.OPTIM, "BASE_DESCRIPTOR_EPOCHS", 8))
-        print(f"\n========== Fit Base AE Distribution Descriptors ({epochs} epochs) ==========")
-        fit_feature_map = self.model_without_dp.collect_blockwise_cls_features(train_loader)
-        reference_feature_map = self.model_without_dp.collect_blockwise_cls_features(extract_loader)
-        if set(fit_feature_map) != set(reference_feature_map):
-            raise RuntimeError("Base RD fit/reference feature views have different MoE blocks.")
-        support_sizes = self._incremental_support_sizes()
-        self.expansion_thresholds = {}
-        self.base_reference_cls_features = {}
+        fit_map = self.model_without_dp.collect_blockwise_cls_features(train_loader)
+        ref_map = self.model_without_dp.collect_blockwise_cls_features(extract_loader)
+        if set(fit_map) != set(ref_map):
+            raise RuntimeError("Base RD fit/reference block views differ.")
+        self.base_reference_cls_features, self.base_reference_source_ids = {}, []
         for block_idx, adapter in self._moe_adapters():
-            fit_item = fit_feature_map[block_idx]
-            reference_item = reference_feature_map[block_idx]
-            fit_values = fit_item["cls_in"].to(self.device).float()
-            fit_labels = fit_item["labels"].to(self.device).long()
-            fit_source_ids = fit_item["source_ids"].to(self.device).long()
-            values = reference_item["cls_in"].to(self.device).float()
-            labels = reference_item["labels"].to(self.device).long()
-            source_ids = reference_item["source_ids"].to(self.device).long()
-            if (set(fit_source_ids.tolist()) != set(source_ids.tolist())
-                    or len(set(fit_source_ids.tolist())) != fit_source_ids.numel()
-                    or len(set(source_ids.tolist())) != source_ids.numel()):
-                raise RuntimeError(f"Block {block_idx} Base RD fit/reference views lost source identity alignment.")
-            fit_label_by_source = {
-                int(source): int(label)
-                for source, label in zip(fit_source_ids.tolist(), fit_labels.tolist())
-            }
-            if any(fit_label_by_source.get(int(source)) != int(label)
-                   for source, label in zip(source_ids.tolist(), labels.tolist())):
-                raise RuntimeError(f"Block {block_idx} Base RD fit/reference views disagree on source labels.")
-            adapter.set_base_feature_stats(fit_values)
-
-            session_class_count = int(self.cfg.DATASET.NUM_INC_CLS)
-            threshold_reference_per_class = self._base_reference_per_class(
-                support_sizes, session_class_count
-            )
-            threshold_mask = self._select_class_balanced_reference_mask(
-                labels, source_ids, per_class_count=threshold_reference_per_class
-            )
-            error_reference_count = min(
-                int(adapter.descriptors[0].buffer_size), int(values.size(0))
-            )
-            error_reference_mask = self._select_class_balanced_reference_mask(
-                labels, source_ids, total_count=error_reference_count
-            )
-            threshold_source_ids = [int(value) for value in source_ids[threshold_mask].tolist()]
-            existing_source_ids = getattr(self, "base_reference_source_ids", [])
-            if not existing_source_ids:
-                self.base_reference_source_ids = threshold_source_ids
-            elif existing_source_ids != threshold_source_ids:
-                raise RuntimeError("Base reference source identities changed across MoE blocks.")
-
-            threshold_values = values[threshold_mask]
-            threshold_labels = labels[threshold_mask]
+            fit, ref = fit_map[block_idx], ref_map[block_idx]
+            fit_x, fit_y = fit["cls_in"].to(self.device).float(), fit["labels"].to(self.device).long()
+            fit_sid = fit["source_ids"].to(self.device).long()
+            ref_x, ref_y = ref["cls_in"].to(self.device).float(), ref["labels"].to(self.device).long()
+            ref_sid = ref["source_ids"].to(self.device).long()
+            if (set(fit_sid.tolist()) != set(ref_sid.tolist())
+                    or torch.unique(fit_sid).numel() != fit_sid.numel()
+                    or torch.unique(ref_sid).numel() != ref_sid.numel()):
+                raise RuntimeError(f"Block {block_idx} Base fit/reference source ids are misaligned.")
+            label_map = {int(i): int(y) for i,y in zip(fit_sid.tolist(),fit_y.tolist())}
+            if any(label_map.get(int(i)) != int(y) for i,y in zip(ref_sid.tolist(),ref_y.tolist())):
+                raise RuntimeError(f"Block {block_idx} Base fit/reference labels disagree.")
+            adapter.set_base_feature_stats(fit_x)
+            count = min(int(adapter.descriptors[0].buffer_size), int(ref_x.size(0)))
+            mask = self._select_class_balanced_reference_mask(ref_y, ref_sid, total_count=count)
+            selected = [int(v) for v in ref_sid[mask].tolist()]
+            if not self.base_reference_source_ids:
+                self.base_reference_source_ids = selected
+            elif self.base_reference_source_ids != selected:
+                raise RuntimeError("Base reference source ids differ across MoE blocks.")
+            ref_values = ref_x[mask]
             self.base_reference_cls_features[int(block_idx)] = {
-                "cls_in": threshold_values.detach().cpu().half(),
-                "labels": threshold_labels.detach().cpu(),
-                "source_ids": source_ids[threshold_mask].detach().cpu(),
+                "cls_in": ref_values.detach().cpu().half(),
+                "labels": ref_y[mask].detach().cpu(),
+                "source_ids": ref_sid[mask].detach().cpu(),
             }
-            error_reference_values = values[error_reference_mask]
             with torch.no_grad():
-                fit_responsibilities = torch.stack([
-                    adapter.expert_responsibility(fit_values, expert_id)
-                    for expert_id in range(adapter.num_experts)
-                ], dim=-1)
-                reference_responsibilities = torch.stack([
-                    adapter.expert_responsibility(error_reference_values, expert_id)
-                    for expert_id in range(adapter.num_experts)
-                ], dim=-1)
-
+                fit_resp = torch.stack([adapter.expert_responsibility(fit_x, i)
+                                        for i in range(adapter.num_experts)], dim=-1)
+                ref_resp = torch.stack([adapter.expert_responsibility(ref_values, i)
+                                        for i in range(adapter.num_experts)], dim=-1)
             for expert_id in range(adapter.num_experts):
                 loss = self._train_descriptor(
-                    adapter, expert_id, fit_values, epochs,
-                    fit_responsibilities[:, expert_id],
-                    calibration_values=error_reference_values,
-                    calibration_weights=reference_responsibilities[:, expert_id],
+                    adapter, expert_id, fit_x, epochs, fit_resp[:, expert_id],
+                    calibration_values=ref_values, calibration_weights=ref_resp[:, expert_id],
                 )
                 descriptor = adapter.descriptors[expert_id]
-                if int(descriptor.error_count.item()) < 2:
-                    raise RuntimeError("Base descriptor requires at least two weighted reference errors.")
-                print(
-                    f"=> [AE-Descriptor][B{block_idx}][E{expert_id}] "
-                    f"loss={loss:.6f} fit_n={int(values.size(0))} "
-                    f"error_reference_n={int(descriptor.error_count.item())} "
-                    f"effective_n={descriptor.effective_error_count.item():.2f} "
-                    f"mean={descriptor.error_mean.item():.6f} "
-                    f"std={descriptor.error_std.item():.6f}"
-                )
+                if not descriptor.is_ready() or int(descriptor.error_count.item()) < 2:
+                    raise RuntimeError("Base RD failed to calibrate reconstruction statistics.")
+                print(f"=> [AE-Descriptor][B{block_idx}][E{expert_id}] loss={loss:.6f} "
+                      f"mean={descriptor.error_mean.item():.6f} std={descriptor.error_std.item():.6f}")
             adapter.assert_descriptors_ready()
             adapter.freeze_all()
-            self.expansion_thresholds[int(block_idx)] = self._calibrate_session_expansion_thresholds(
-                adapter, threshold_values, threshold_labels, support_sizes, block_idx
-            )
-
+        if not self.base_reference_source_ids:
+            raise RuntimeError("Base RD calibration produced no reference sources.")
         self._capture_base_reference_feature_anchors()
 
-    @torch.no_grad()
     def _capture_base_reference_feature_anchors(self):
         """Cache frozen-reference ViT prefix tokens and Base feature anchors once at Base completion."""
         data_manager = getattr(self, "data_manager", None)
@@ -1732,71 +1508,6 @@ class Runner:
         return result
 
     @torch.no_grad()
-    def _refresh_block_expansion_threshold(
-        self, block_idx, current_reference_features=None, old_states=None,
-    ):
-        """Recalibrate a changed pool over Base and every previously accepted Session domain."""
-        feature_items = []
-        base_cache = getattr(self, "base_reference_cls_features", {}).get(int(block_idx))
-        if base_cache is not None:
-            feature_items.append(base_cache)
-        for state in (old_states or []):
-            cache_by_block = state.get("reference_cls_by_block", {})
-            cache = cache_by_block.get(int(block_idx), cache_by_block.get(str(block_idx)))
-            if cache is not None:
-                feature_items.append(cache)
-        if current_reference_features is not None:
-            current = current_reference_features.get(int(block_idx))
-            if current is not None:
-                feature_items.append(current)
-        if not feature_items:
-            raise RuntimeError(
-                f"Block {int(block_idx)} has no cached known-domain CLS features for threshold refresh."
-            )
-
-        # Base cache and Base task-state cache may overlap. Deduplicate by stable
-        # source identity while rejecting inconsistent labels or feature rows.
-        rows_by_source = {}
-        for item in feature_items:
-            values = torch.as_tensor(item["cls_in"]).float()
-            labels = torch.as_tensor(item["labels"]).long().reshape(-1)
-            sources = torch.as_tensor(item["source_ids"]).long().reshape(-1)
-            if (values.ndim != 2 or values.size(0) == 0
-                    or values.size(0) != labels.numel() or labels.numel() != sources.numel()
-                    or not torch.isfinite(values).all()):
-                raise ValueError("Known-domain threshold CLS cache contains malformed rows.")
-            for row, source in enumerate(sources.tolist()):
-                source = int(source)
-                label = int(labels[row])
-                if source in rows_by_source:
-                    old_label, old_value = rows_by_source[source]
-                    if old_label != label or not torch.allclose(
-                        old_value.float(), values[row].float(), rtol=1e-3, atol=1e-3
-                    ):
-                        raise ValueError(
-                            f"Known-domain threshold caches disagree for source {source}."
-                        )
-                    continue
-                rows_by_source[source] = (label, values[row].detach().cpu())
-        ordered_sources = sorted(rows_by_source)
-        values = torch.stack([rows_by_source[source][1] for source in ordered_sources])
-        labels = torch.as_tensor(
-            [rows_by_source[source][0] for source in ordered_sources], dtype=torch.long
-        )
-        adapter = self._adapter_by_block(block_idx)
-        sizes = sorted(self.expansion_thresholds.get(int(block_idx), {}).keys())
-        if not sizes:
-            sizes = self._incremental_support_sizes()
-        refreshed = self._calibrate_session_expansion_thresholds(
-            adapter, values.to(self.device), labels.to(self.device), sizes, int(block_idx)
-        )
-        self.expansion_thresholds[int(block_idx)] = refreshed
-        print(
-            f"=> [Session-Threshold][B{int(block_idx)}] refreshed for {adapter.num_experts} experts "
-            f"from {len(feature_items)} accepted Session caches / {values.size(0)} unique reference rows."
-        )
-
-    @torch.no_grad()
     def _collect_final_feature_anchors(self, loader, session_id):
         """Cache a deterministic, class-balanced set of frozen-prefix tokens and final embeddings."""
         visual_cfg = self._visual_moe_cfg()
@@ -1869,6 +1580,22 @@ class Runner:
         if current.shape != target.shape or not torch.isfinite(current).all():
             raise RuntimeError("Final feature-space replay produced invalid or misaligned embeddings.")
         return (1.0 - F.cosine_similarity(current, target, dim=-1)).mean()
+
+    @staticmethod
+    def _l2sp_anchor_loss(module, anchor_parameters):
+        current = dict(module.named_parameters())
+        if not current or set(current) != set(anchor_parameters):
+            raise ValueError("L2-SP anchors must exactly match migrated expert parameters.")
+        terms = []
+        for name, parameter in current.items():
+            anchor = torch.as_tensor(anchor_parameters[name], device=parameter.device, dtype=torch.float32)
+            if anchor.shape != parameter.shape or not torch.isfinite(anchor).all():
+                raise ValueError(f"Invalid L2-SP anchor tensor: {name}")
+            terms.append((parameter.float() - anchor).square().sum())
+        loss = 0.5 * torch.stack(terms).sum()
+        if not torch.isfinite(loss):
+            raise FloatingPointError("L2-SP loss is non-finite.")
+        return loss
 
     @torch.no_grad()
     def _collect_reference_cls_cache(self, loader):
@@ -2140,7 +1867,6 @@ class Runner:
                                current_class_name, old_states):
         """Transactional wrapper: a failed session cannot leave partial experts."""
         snapshots = []
-        threshold_snapshot = copy.deepcopy(self.expansion_thresholds)
         rng_snapshot = self._rng_state()
         training_modes = {id(module): bool(module.training) for module in self.model.modules()}
         for block_idx, adapter in self._moe_adapters():
@@ -2159,11 +1885,18 @@ class Runner:
             feature_check = self._base_reference_feature_diagnostics(old_states[0])
             historical_feature_check = self._historical_feature_anchor_diagnostics(old_states)
             if feature_check.get("available", False) and not feature_check.get("within_target", False):
-                raise RuntimeError(
-                    "Session rejected: Base reference feature-space alignment fell below "
-                    f"{feature_check.get('minimum_cosine_target')}; observed "
-                    f"{feature_check.get('prototype_cosine_min')}."
-                )
+                failures = []
+                if not feature_check.get("within_cosine_target", False):
+                    failures.append(
+                        f"minimum cosine {feature_check.get('prototype_cosine_min')} < "
+                        f"{feature_check.get('minimum_cosine_target')}"
+                    )
+                if not feature_check.get("within_accuracy_target", False):
+                    failures.append(
+                        f"accuracy drop {feature_check.get('base_reference_accuracy_drop')} pp > "
+                        f"{feature_check.get('max_accuracy_drop')} pp"
+                    )
+                raise RuntimeError("Session rejected: Base feature-space acceptance failed: " + "; ".join(failures))
             production_data_protocol = hasattr(self, "data_manager") and callable(
                 getattr(self.data_manager, "get_base_source_dataloader", None)
             )
@@ -2198,9 +1931,6 @@ class Runner:
                 adapter.rebuild_topology(topology)
                 adapter.load_state_dict(state, strict=True)
                 adapter.freeze_all()
-            # Thresholds are part of the deployed expert-pool state. A failed
-            # Session must roll back their recalibration together with topology.
-            self.expansion_thresholds = threshold_snapshot
             self._restore_rng_state(rng_snapshot)
             for module in self.model.modules():
                 module.training = training_modes.get(id(module), False)
@@ -2229,56 +1959,48 @@ class Runner:
 
     def _train_incremental_task_impl(self, task_id, train_loader, extract_loader, class_index,
                                       current_class_name, old_states, semantic_proto=None):
-        """Plan every layer first, then jointly optimize all expanded modules in one Session."""
+        """Plan all layers, migrate nearest experts, then jointly optimize new Session modules."""
         optim_cfg = self.cfg.TRAINER.BiMC.OPTIM
-        incremental_cfg = self.cfg.TRAINER.BiMC.INCREMENTAL
-        epochs = int(incremental_cfg.EPOCHS)
-        scale = float(incremental_cfg.LOGIT_SCALE)
+        inc_cfg = self.cfg.TRAINER.BiMC.INCREMENTAL
+        epochs, scale = int(inc_cfg.EPOCHS), float(inc_cfg.LOGIT_SCALE)
         if epochs < 1:
-            raise ValueError("Incremental Session epochs must be positive.")
-        if not self.expansion_thresholds:
-            raise RuntimeError("Base Session-Q95 expansion thresholds have not been calibrated.")
+            raise ValueError("Incremental epochs must be positive.")
         self._build_incremental_bank(extract_loader, class_index, old_states, semantic_proto)
         for _, adapter in self._moe_adapters():
             adapter.freeze_all()
 
-        # One immutable Session snapshot drives every layer's decision.
-        expansion_features = self.model_without_dp.collect_blockwise_cls_features(extract_loader)
-        rd_fit_features = self.model_without_dp.collect_blockwise_cls_features(train_loader)
-        if set(expansion_features) != set(rd_fit_features):
-            raise RuntimeError("Incremental RD fit/reference feature views have different MoE blocks.")
-        expected_classes = sorted(int(value) for value in class_index)
-        if not expansion_features:
-            raise RuntimeError("Session-level expansion received no blockwise reference features.")
-        reference_labels = sorted(int(value) for value in torch.unique(
-            next(iter(expansion_features.values()))["labels"], sorted=True
+        # Plan all layers against one immutable deterministic Session snapshot.
+        ref_map = self.model_without_dp.collect_blockwise_cls_features(extract_loader)
+        fit_map = self.model_without_dp.collect_blockwise_cls_features(train_loader)
+        if set(ref_map) != set(fit_map) or not ref_map:
+            raise RuntimeError("Incremental RD fit/reference block views are inconsistent.")
+        expected_classes = sorted(int(v) for v in class_index)
+        observed = sorted(int(v) for v in torch.unique(
+            next(iter(ref_map.values()))["labels"], sorted=True
         ).tolist())
-        if reference_labels != expected_classes:
-            raise RuntimeError(
-                f"Reference support classes {reference_labels} do not match Session classes {expected_classes}."
-            )
+        if observed != expected_classes:
+            raise RuntimeError("Reference support classes do not match Session manifest.")
 
         decisions, expanded, reused, contexts = [], [], [], {}
-        # Phase 1: decide for all layers without mutating any layer topology.
         for block_idx in self.model_without_dp.expandable_blocks():
-            item = expansion_features[int(block_idx)]
-            support_size = int(item["cls_in"].size(0))
-            threshold = self.expansion_thresholds.get(int(block_idx), {}).get(support_size)
-            decision = self.model_without_dp.plan_layer_expansion(
-                block_idx, expansion_features, class_index, threshold
-            )
+            item = ref_map[int(block_idx)]
+            decision = self.model_without_dp.plan_layer_expansion(block_idx, ref_map, class_index)
             decisions.append({
                 "block_idx": int(block_idx), "expand": bool(decision.expand),
-                "session_q90": float(decision.session_q90),
-                "session_q95_threshold": float(decision.threshold),
+                "session_mean_z": float(decision.session_mean_z),
+                "threshold": float(decision.threshold),
+                "anchor_expert_id": int(decision.anchor_expert_id),
                 "support_count": int(decision.support_count),
             })
-            if not decision.expand:
-                adapter = self._adapter_by_block(block_idx)
+            adapter = self._adapter_by_block(block_idx)
+            if decision.expand:
+                contexts[int(block_idx)] = {
+                    "mode": "expand", "adapter": adapter, "item": item,
+                    "fit_item": fit_map[int(block_idx)], "decision": decision,
+                }
+            else:
                 with torch.no_grad():
                     _, weights = adapter.routing_outputs(item["cls_in"].to(self.device).float())
-                reused.append({"block_idx": int(block_idx), "mode": "reuse_frozen",
-                               "expert_count": int(adapter.num_experts)})
                 contexts[int(block_idx)] = {
                     "mode": "reuse_frozen", "adapter": adapter,
                     "history": {
@@ -2290,324 +2012,201 @@ class Runner:
                         "expert_count": int(adapter.num_experts),
                     },
                 }
-            else:
-                contexts[int(block_idx)] = {"mode": "expand", "adapter": self._adapter_by_block(block_idx),
-                                            "item": item, "decision": decision}
+                reused.append({"block_idx": int(block_idx), "mode": "reuse_frozen",
+                               "expert_count": int(adapter.num_experts)})
 
-        # Phase 2: instantiate all new experts/RDs before the first optimizer step.
-        for block_idx, context in contexts.items():
-            if context["mode"] != "expand":
+        # Append every new expert before constructing the shared optimizer.
+        for block_idx, c in contexts.items():
+            if c["mode"] != "expand":
                 continue
-            adapter = context["adapter"]
-            item = context["item"]
-            values = item["cls_in"].to(self.device).float()
-            labels = item["labels"].to(self.device).long()
-            sources = item["source_ids"].to(self.device).long()
-            fit_item = rd_fit_features[int(block_idx)]
-            fit_values = fit_item["cls_in"].to(self.device).float()
-            fit_labels = fit_item["labels"].to(self.device).long()
-            fit_sources = fit_item["source_ids"].to(self.device).long()
-            if (sources.numel() != values.size(0) or fit_sources.numel() != fit_values.size(0)
-                    or torch.unique(sources).numel() != sources.numel()
-                    or torch.unique(fit_sources).numel() != fit_sources.numel()
-                    or set(sources.tolist()) != set(fit_sources.tolist())
-                    or sorted(int(value) for value in torch.unique(labels, sorted=True).tolist()) != expected_classes
-                    or sorted(int(value) for value in torch.unique(fit_labels, sorted=True).tolist()) != expected_classes):
-                raise ValueError("New RD fit/reference views must cover the same stable Session support sources.")
-            fit_label_by_source = {
-                int(source): int(label)
-                for source, label in zip(fit_sources.tolist(), fit_labels.tolist())
-            }
-            if any(fit_label_by_source.get(int(source)) != int(label)
-                   for source, label in zip(sources.tolist(), labels.tolist())):
-                raise ValueError("New RD fit/reference views disagree on source labels.")
-            # Every Session source is used in both its augmented RD fitting view
-            # and deterministic reference view; no support source is held out.
-            reference_source_ids = set(int(value) for value in sources.detach().cpu().tolist())
-            descriptor_init_mode = str(_cfg_value(
-                self._visual_moe_cfg(), "DESCRIPTOR_INIT_MODE", "anchored_residual"
-            )).lower()
-            if descriptor_init_mode == "anchored_residual":
-                anchor_expert_id, anchor_q90 = adapter.select_descriptor_anchor(values)
-                descriptor_residual_rank = int(_cfg_value(
-                    self._visual_moe_cfg(), "DESCRIPTOR_RESIDUAL_RANK", 16
-                ))
-            elif descriptor_init_mode == "independent":
-                anchor_expert_id, anchor_q90 = -1, torch.empty(0)
-                descriptor_residual_rank = 0
-            else:
-                raise ValueError(
-                    "DESCRIPTOR_INIT_MODE must be 'anchored_residual' or 'independent'."
-                )
-            expert_id = self.model_without_dp.add_expert(
-                block_idx, task_id, anchor_expert_id=anchor_expert_id,
-                descriptor_residual_rank=descriptor_residual_rank,
-            )
+            adapter, decision = c["adapter"], c["decision"]
+            ref, fit = c["item"], c["fit_item"]
+            ref_x, ref_y = ref["cls_in"].to(self.device).float(), ref["labels"].to(self.device).long()
+            ref_sid = ref["source_ids"].to(self.device).long()
+            fit_x, fit_y = fit["cls_in"].to(self.device).float(), fit["labels"].to(self.device).long()
+            fit_sid = fit["source_ids"].to(self.device).long()
+            if (set(ref_sid.tolist()) != set(fit_sid.tolist())
+                    or torch.unique(ref_sid).numel() != ref_sid.numel()
+                    or torch.unique(fit_sid).numel() != fit_sid.numel()):
+                raise ValueError("RD fit/reference views must share unique Session source ids.")
+            label_map = {int(i): int(y) for i,y in zip(fit_sid.tolist(),fit_y.tolist())}
+            if any(label_map.get(int(i)) != int(y) for i,y in zip(ref_sid.tolist(),ref_y.tolist())):
+                raise ValueError("RD fit/reference labels disagree by source id.")
+            anchor_id = int(decision.anchor_expert_id)
+            expert_id = self.model_without_dp.add_expert(block_idx, task_id, anchor_expert_id=anchor_id)
+            anchor_params = dict(adapter.experts[anchor_id].named_parameters())
+            new_params = dict(adapter.experts[expert_id].named_parameters())
+            if set(anchor_params) != set(new_params) or any(
+                anchor_params[n].shape != new_params[n].shape
+                or not torch.equal(anchor_params[n].detach(), new_params[n].detach())
+                for n in anchor_params
+            ):
+                raise RuntimeError("New expert failed exact nearest-historical parameter migration.")
+            l2sp_anchor = {n:p.detach().clone() for n,p in new_params.items()}
             descriptor = adapter.descriptors[expert_id]
             descriptor.set_trainable(True)
-            if not descriptor.is_anchored:
-                descriptor.set_center(fit_values)
             descriptor.train()
-            anchor_sets = self._all_old_anchor_sets(old_states, block_idx)
-            if any(anchor_sets[key] is None for key in ("route_mean", "route_var", "expert_mean", "expert_var")):
-                raise RuntimeError(f"Block {block_idx} expansion lacks historical route/expert feature anchors.")
-            context.update({
-                "expert_id": int(expert_id), "descriptor": descriptor,
-                "values": fit_values, "labels": fit_labels, "sources": fit_sources,
-                "calibration_values": values, "calibration_labels": labels,
-                "reference_source_ids": reference_source_ids,
-                "source_to_row": {int(source): row for row, source in enumerate(fit_sources.tolist())},
-                "anchor_q90": anchor_q90.detach().cpu(),
-                "anchor_sets": anchor_sets,
+            source_to_row = {int(v):i for i,v in enumerate(fit_sid.tolist())}
+            c.update({
+                "expert_id": expert_id, "anchor_expert_id": anchor_id,
+                "l2sp_anchor": l2sp_anchor, "descriptor": descriptor,
+                "fit_values": fit_x, "source_to_row": source_to_row, "reference_values": ref_x,
                 "history": {
-                    "expert_id": int(expert_id), "descriptor_init_mode": descriptor_init_mode,
-                    "descriptor_anchor_id": int(anchor_expert_id),
-                    "descriptor_anchor_q90": [float(value) for value in anchor_q90.detach().cpu().tolist()],
-                    "loss": [], "ce_loss": [], "rd_loss": [], "feature_space_loss": [],
-                    "local_preservation_loss": [], "gradient_projection": [],
+                    "expert_id": int(expert_id), "expert_anchor_id": anchor_id,
+                    "descriptor_anchor_id": int(descriptor.anchor_expert_id),
+                    "session_mean_z": float(decision.session_mean_z),
+                    "loss": [], "ce_loss": [], "l2sp_loss": [],
+                    "feature_space_loss": [], "rd_loss": [],
                     "classification_samples_per_epoch": [], "classification_samples_total": 0,
-                    "rd_training_samples": int(values.size(0)),
-                    "rd_reference_samples": int(values.size(0)),
-                    "rd_training_source_ids": sorted(reference_source_ids),
-                    "rd_reference_source_ids": sorted(reference_source_ids),
-                    "rd_session_classes": sorted(int(value) for value in torch.unique(labels).tolist()),
+                    "rd_training_samples": int(fit_x.size(0)), "rd_reference_samples": int(ref_x.size(0)),
+                    "rd_training_source_ids": sorted(source_to_row),
+                    "rd_reference_source_ids": sorted(source_to_row),
                 },
             })
 
-        expanded_contexts = [context for context in contexts.values() if context["mode"] == "expand"]
-        if not expanded_contexts:
+        active = [c for c in contexts.values() if c["mode"] == "expand"]
+        if not active:
             for _, adapter in self._moe_adapters():
                 adapter.freeze_all()
-            # Even when every layer reuses its pool, the accepted Session adds
-            # a known feature domain for the next Session's novelty threshold.
-            for block_idx in self.model_without_dp.expandable_blocks():
-                self._refresh_block_expansion_threshold(
-                    block_idx, current_reference_features=expansion_features, old_states=old_states
-                )
             return {
                 "trained": False, "decisions": decisions, "expanded": [],
-                "reused": reused, "training": {block: value["history"] for block, value in contexts.items()},
+                "reused": reused, "training": {b:c["history"] for b,c in contexts.items()},
                 "semantic_prototype": None if semantic_proto is None else semantic_proto.detach(),
                 "encoder_version": 0,
             }
 
-        # One optimizer owns every newly created functional module and descriptor.
-        parameter_groups, functional_parameters, descriptor_parameters = [], [], []
-        for context in expanded_contexts:
-            adapter = context["adapter"]
-            expert_parameters = list(adapter.experts[-1].parameters())
-            router_parameters = list(adapter.router.columns[-1].parameters())
-            rd_parameters = list(context["descriptor"].trainable_parameters())
-            functional_parameters.extend(expert_parameters + router_parameters)
-            descriptor_parameters.extend(rd_parameters)
-            parameter_groups.extend([
-                {"params": expert_parameters, "lr": float(optim_cfg.LR_INCREMENTAL_EXPERT)},
-                {"params": router_parameters, "lr": float(optim_cfg.LR_INCREMENTAL_ROUTER)},
-                {"params": rd_parameters, "lr": float(_cfg_value(optim_cfg, "LR_DESCRIPTOR", 1e-3))},
-            ])
-        optimizer = optim.AdamW(parameter_groups, weight_decay=float(optim_cfg.WEIGHT_DECAY))
-        rd_weight = float(_cfg_value(incremental_cfg, "RD_WEIGHT", 1.0))
-        feature_weight = float(_cfg_value(incremental_cfg, "FEATURE_SPACE_PRESERVATION_WEIGHT", 1.0))
-        local_weight = float(_cfg_value(incremental_cfg, "LOCAL_RESIDUAL_PRESERVATION_WEIGHT", 1.0))
-        if any(not np.isfinite(value) or value < 0 for value in (rd_weight, feature_weight, local_weight)):
-            raise ValueError("Session objective weights must be finite and non-negative.")
-
+        groups, functional_params, descriptor_params = [], [], []
+        for c in active:
+            expert_params = list(c["adapter"].experts[-1].parameters())
+            router_params = list(c["adapter"].router.columns[-1].parameters())
+            rd_params = list(c["descriptor"].trainable_parameters())
+            functional_params += expert_params + router_params
+            descriptor_params += rd_params
+            groups += [
+                {"params": expert_params, "lr": float(optim_cfg.LR_INCREMENTAL_EXPERT)},
+                {"params": router_params, "lr": float(optim_cfg.LR_INCREMENTAL_ROUTER)},
+                {"params": rd_params, "lr": float(_cfg_value(optim_cfg, "LR_DESCRIPTOR", 1e-3))},
+            ]
+        optimizer = optim.AdamW(groups, weight_decay=float(_cfg_value(optim_cfg, "WEIGHT_DECAY", 1e-4)))
+        l2sp_w = float(_cfg_value(inc_cfg, "L2SP_WEIGHT", 1e-4))
+        feature_w = float(_cfg_value(inc_cfg, "FEATURE_SPACE_PRESERVATION_WEIGHT", 1.0))
+        rd_w = float(_cfg_value(inc_cfg, "RD_WEIGHT", 1.0))
+        if any(not np.isfinite(v) or v < 0 for v in (l2sp_w, feature_w, rd_w)):
+            raise ValueError("Incremental objective weights must be finite and non-negative.")
         old_prefix, old_final, anchor_batch_size = self._historical_feature_anchor_batches(old_states)
-        loss_projection_history = []
-        for epoch in range(epochs):
+
+        for _epoch in range(epochs):
             bank = self._build_incremental_bank(extract_loader, class_index, old_states, semantic_proto)
             self.model.train()
-            for _, layer_adapter in self._moe_adapters():
-                layer_adapter.eval()
-            for context in expanded_contexts:
-                context["adapter"].experts[-1].train()
-                context["descriptor"].train()
-            epoch_totals = {"ce": 0.0, "feature": 0.0, "local": 0.0, "rd": 0.0, "n": 0}
-            observed_classes, projection_rows = set(), []
+            for _, adapter in self._moe_adapters():
+                adapter.eval()
+            for c in active:
+                c["adapter"].experts[-1].train()
+                c["descriptor"].train()
+            totals = {"ce":0.0,"l2sp":0.0,"feature":0.0,"rd":0.0,"n":0}
+            observed_classes = set()
             for batch in train_loader:
                 images, labels = self.parse_batch(batch)
                 source_ids = self._batch_source_ids(batch, labels.numel(), labels.device)
                 if not torch.isin(labels, torch.as_tensor(class_index, device=labels.device)).all():
                     raise ValueError("Training loader contains labels outside the current Session.")
-                observed_classes.update(int(value) for value in labels.unique().tolist())
+                observed_classes.update(int(v) for v in labels.unique().tolist())
                 optimizer.zero_grad(set_to_none=True)
                 logits, targets = self._global_incremental_logits(images, labels, source_ids, bank, scale)
-                classification = F.cross_entropy(logits, targets)
-
-                # Replay historical frozen-prefix tokens through the complete current adapter stack.
-                feature_losses = []
-                for offset in range(0, old_prefix.size(0), anchor_batch_size):
-                    stop = min(offset + anchor_batch_size, old_prefix.size(0))
-                    feature_losses.append(self._final_feature_anchor_loss(
-                        old_prefix[offset:stop], old_final[offset:stop]
+                ce = F.cross_entropy(logits, targets)
+                for c in active:
+                    c["adapter"].experts[-1].eval()
+                feature_terms = []
+                for start in range(0, old_prefix.size(0), anchor_batch_size):
+                    stop = min(start + anchor_batch_size, old_prefix.size(0))
+                    feature_terms.append(self._final_feature_anchor_loss(
+                        old_prefix[start:stop], old_final[start:stop]
                     ))
-                feature_preservation = torch.stack(feature_losses).mean()
-
-                local_losses, rd_losses = [], []
-                for context in expanded_contexts:
-                    adapter = context["adapter"]
-                    anchors = context["anchor_sets"]
-                    local_losses.append(adapter.old_feature_preservation_loss(
-                        anchors["route_mean"], anchors["route_var"],
-                        anchors["expert_mean"], anchors["expert_var"],
-                    ))
-                    source_to_row = context["source_to_row"]
-                    try:
-                        rows = torch.as_tensor(
-                            [source_to_row[int(source)] for source in source_ids.tolist()],
-                            device=self.device, dtype=torch.long,
-                        )
-                    except KeyError as error:
-                        raise KeyError(f"Training source {error.args[0]} is absent from the Session reference cache.") from error
-                    clean = context["values"][rows]
-                    descriptor = context["descriptor"]
-                    if descriptor.is_anchored:
-                        noise_scale = float(_cfg_value(
-                            self._visual_moe_cfg(), "DESCRIPTOR_DENOISE_SCALE", 0.05
-                        ))
-                        residual_weight = float(_cfg_value(
-                            self._visual_moe_cfg(), "DESCRIPTOR_RESIDUAL_WEIGHT", 1e-3
-                        ))
-                    else:
-                        noise_scale, residual_weight = 0.0, 0.0
-                    noise = context["adapter"].base_feature_std.to(self.device).reshape(1, -1) * noise_scale
-                    if clean.numel():
-                        noisy = clean + torch.randn_like(clean) * noise
-                        reconstruction = F.mse_loss(descriptor(noisy), clean)
-                        residual = descriptor.residual_output(clean).square().mean()
-                        orthogonality = descriptor.orthogonality_loss()
-                        rd_losses.append(reconstruction + 1e-3 * orthogonality + residual_weight * residual)
-                    else:
-                        rd_losses.append(classification.new_zeros(()))
-                local_preservation = torch.stack(local_losses).mean()
-                rd_loss = torch.stack(rd_losses).mean()
-                preservation = feature_weight * feature_preservation + local_weight * local_preservation
-                total_loss = classification + preservation + rd_weight * rd_loss
-                if not torch.isfinite(total_loss):
-                    raise FloatingPointError("Unified Session objective became non-finite.")
-
-                # Project the single global CE gradient against the complete historical-preservation gradient.
-                ce_grad = torch.autograd.grad(
-                    classification, functional_parameters, retain_graph=True, allow_unused=True
-                )
-                preservation_grad = torch.autograd.grad(
-                    preservation, functional_parameters, retain_graph=True, allow_unused=True
-                )
-                projected_ce, projection_diag = self._project_conflicting_gradients(
-                    ce_grad, preservation_grad
-                )
-                for parameter, ce_value, preserve_value in zip(
-                    functional_parameters, projected_ce, preservation_grad
-                ):
-                    if ce_value is None and preserve_value is None:
-                        parameter.grad = None
-                    else:
-                        combined = torch.zeros_like(parameter) if ce_value is None else ce_value
-                        if preserve_value is not None:
-                            combined = combined + preserve_value
-                        parameter.grad = combined.detach()
-                rd_grad = torch.autograd.grad(
-                    rd_weight * rd_loss, descriptor_parameters, allow_unused=True
-                )
-                for parameter, gradient in zip(descriptor_parameters, rd_grad):
-                    parameter.grad = None if gradient is None else gradient.detach()
-                torch.nn.utils.clip_grad_norm_(functional_parameters, 1.0)
-                torch.nn.utils.clip_grad_norm_(descriptor_parameters, 1.0)
+                feature_loss = torch.stack(feature_terms).mean()
+                for c in active:
+                    c["adapter"].experts[-1].train()
+                l2sp_loss = torch.stack([
+                    self._l2sp_anchor_loss(c["adapter"].experts[-1], c["l2sp_anchor"])
+                    for c in active
+                ]).mean()
+                rd_terms = []
+                for c in active:
+                    rows = torch.as_tensor(
+                        [c["source_to_row"][int(v)] for v in source_ids.tolist()],
+                        device=self.device, dtype=torch.long
+                    )
+                    clean = c["fit_values"][rows]
+                    descriptor = c["descriptor"]
+                    noise = c["adapter"].base_feature_std.to(self.device).reshape(1,-1) * float(
+                        _cfg_value(self._visual_moe_cfg(), "DESCRIPTOR_DENOISE_SCALE", 0.05)
+                    )
+                    noisy = clean + torch.randn_like(clean) * noise
+                    reconstruction = F.mse_loss(descriptor(noisy), clean)
+                    residual = descriptor.residual_output(clean).square().mean()
+                    rd_terms.append(reconstruction + 1e-3*descriptor.orthogonality_loss()
+                                    + float(_cfg_value(self._visual_moe_cfg(), "DESCRIPTOR_RESIDUAL_WEIGHT", 1e-3))*residual)
+                rd_loss = torch.stack(rd_terms).mean()
+                total = ce + l2sp_w*l2sp_loss + feature_w*feature_loss + rd_w*rd_loss
+                if not torch.isfinite(total):
+                    raise FloatingPointError("Unified incremental objective is non-finite.")
+                total.backward()
+                torch.nn.utils.clip_grad_norm_(functional_params, 1.0)
+                torch.nn.utils.clip_grad_norm_(descriptor_params, 1.0)
                 optimizer.step()
-                for context in expanded_contexts:
-                    context["descriptor"].retract_basis_()
+                for c in active:
+                    c["descriptor"].retract_basis_()
+                n = int(labels.numel())
+                for key, val in (("ce",ce),("l2sp",l2sp_loss),("feature",feature_loss),("rd",rd_loss)):
+                    totals[key] += float(val.item())*n
+                totals["n"] += n
+                for c in active:
+                    c["history"]["classification_samples_total"] += n
+            if totals["n"] == 0 or sorted(observed_classes) != expected_classes:
+                raise RuntimeError("Incremental loader is empty or misses Session classes.")
+            n = totals["n"]
+            for c in active:
+                h = c["history"]
+                for key, target in (("ce","ce_loss"),("l2sp","l2sp_loss"),("feature","feature_space_loss"),("rd","rd_loss")):
+                    h[target].append(totals[key]/n)
+                h["loss"].append(totals["ce"]/n + l2sp_w*totals["l2sp"]/n
+                                 + feature_w*totals["feature"]/n + rd_w*totals["rd"]/n)
+                h["classification_samples_per_epoch"].append(n)
 
-                batch_size = int(labels.numel())
-                epoch_totals["ce"] += float(classification.item()) * batch_size
-                epoch_totals["feature"] += float(feature_preservation.item()) * batch_size
-                epoch_totals["local"] += float(local_preservation.item()) * batch_size
-                epoch_totals["rd"] += float(rd_loss.item()) * batch_size
-                epoch_totals["n"] += batch_size
-                projection_rows.append(projection_diag)
-                for context in expanded_contexts:
-                    context["history"]["classification_samples_total"] += batch_size
-            if epoch_totals["n"] == 0 or sorted(observed_classes) != expected_classes:
-                raise RuntimeError("Joint Session loader was empty or failed to cover all Session classes.")
-            n = epoch_totals["n"]
-            for context in expanded_contexts:
-                history = context["history"]
-                history["ce_loss"].append(epoch_totals["ce"] / n)
-                history["feature_space_loss"].append(epoch_totals["feature"] / n)
-                history["local_preservation_loss"].append(epoch_totals["local"] / n)
-                history["rd_loss"].append(epoch_totals["rd"] / n)
-                history["loss"].append(
-                    epoch_totals["ce"] / n + epoch_totals["feature"] / n +
-                    epoch_totals["local"] / n + rd_weight * epoch_totals["rd"] / n
-                )
-                history["classification_samples_per_epoch"].append(n)
-            loss_projection_history.append(projection_diag)
-
-        # Calibrate all newly trained RDs only after the shared functional training has finished.
-        for context in expanded_contexts:
-            descriptor = context["descriptor"]
+        # Calibrate each new RD once on deterministic Session references, then freeze it.
+        for c in active:
+            descriptor = c["descriptor"]
             descriptor.eval()
             with torch.no_grad():
-                reference_values = context["calibration_values"]
-                errors = descriptor.reconstruction_error(reference_values)
-                responsibility = context["adapter"].expert_responsibility(
-                    reference_values, context["expert_id"]
+                errors = descriptor.reconstruction_error(c["reference_values"])
+                responsibility = c["adapter"].expert_responsibility(
+                    c["reference_values"], c["expert_id"]
                 ).detach()
                 descriptor.update_reference(errors, responsibility)
-                context['adapter'].assert_descriptors_ready()
-                reference_scores = descriptor.standardized_score(reference_values)
-                context["history"]["rd_effective_reference_count"] = float(
-                    descriptor.effective_error_count.item()
+                c["adapter"].assert_descriptors_ready()
+                c["history"]["rd_effective_reference_count"] = float(descriptor.effective_error_count.item())
+                c["history"]["rd_reference_mean_z"] = float(
+                    descriptor.standardized_score(c["reference_values"]).mean().item()
                 )
-                context["history"]["rd_reference_q90"] = float(
-                    torch.quantile(reference_scores, 0.90).item()
-                )
-                context["history"]["rd_reference_responsibility_mean"] = float(
-                    responsibility.mean().item()
-                )
-                context["history"]["rd_fit_reference_view_cosine"] = float(
-                    F.cosine_similarity(
-                        F.normalize(context["values"], dim=-1),
-                        F.normalize(reference_values, dim=-1),
-                        dim=-1,
-                    ).mean().item()
-                )
-                context["history"]["session_q90"] = float(context["decision"].session_q90)
-                context["history"]["session_q95_threshold"] = float(context["decision"].threshold)
-                context["history"]["old_anchor_gate_mean"] = context["adapter"].old_anchor_response(
-                    context["anchor_sets"]["route_mean"], context["anchor_sets"]["route_var"]
-                )
-                context["history"]["old_anchor_residual_norm"] = context["adapter"].old_anchor_residual_response(
-                    context["anchor_sets"]["route_mean"], context["anchor_sets"]["route_var"],
-                    context["anchor_sets"]["expert_mean"], context["anchor_sets"]["expert_var"]
-                )
-            context["adapter"].freeze_all()
-        # Recalibrate thresholds after every new RD has joined its layer's deployed pool.
-        for block_idx, context in contexts.items():
-            if context["mode"] == "expand":
+                c["history"]["l2sp_parameter_distance"] = float(torch.sqrt(
+                    2.0*self._l2sp_anchor_loss(c["adapter"].experts[-1], c["l2sp_anchor"])
+                ).item())
+            c["adapter"].freeze_all()
+
+        for block_idx, c in contexts.items():
+            if c["mode"] == "expand":
                 expanded.append({
-                    "block_idx": int(block_idx), "expert_id": int(context["expert_id"]),
-                    "descriptor_init_mode": str(context["history"]["descriptor_init_mode"]),
-                    "descriptor_anchor_id": int(context["adapter"].descriptors[-1].anchor_expert_id),
-                    "session_q90": float(context["decision"].session_q90),
-                    "session_q95_threshold": float(context["decision"].threshold),
+                    "block_idx": int(block_idx), "expert_id": int(c["expert_id"]),
+                    "expert_anchor_id": int(c["anchor_expert_id"]),
+                    "descriptor_anchor_id": int(c["descriptor"].anchor_expert_id),
+                    "session_mean_z": float(c["decision"].session_mean_z),
+                    "threshold": float(c["decision"].threshold),
                 })
         for _, adapter in self._moe_adapters():
             adapter.freeze_all()
-        # Recalibrate every layer after all new RDs have valid error statistics.
-        # Reused-only layers also learn from this accepted Session's known domain.
-        for block_idx in self.model_without_dp.expandable_blocks():
-            self._refresh_block_expansion_threshold(
-                block_idx, current_reference_features=expansion_features, old_states=old_states
-            )
-        self._assert_moe_frozen("joint incremental Session completion")
-        histories = {block: context["history"] for block, context in contexts.items()}
-        for block, history in histories.items():
-            if history.get("mode") == "reuse_frozen":
-                continue
-            history["gradient_projection"] = loss_projection_history
+        self._assert_moe_frozen("incremental Session completion")
         return {
             "trained": bool(expanded), "decisions": decisions, "expanded": expanded,
-            "reused": reused, "training": histories,
+            "reused": reused, "training": {b:c["history"] for b,c in contexts.items()},
             "semantic_prototype": None if semantic_proto is None else semantic_proto.detach(),
             "encoder_version": 0,
         }

@@ -385,12 +385,16 @@ class ExpandableRouter(nn.Module):
 
 
 class BottleneckExpert(nn.Module):
-    def __init__(self, d_model, reduction=4, zero_init_up=False, dropout=0.0):
+    def __init__(self, d_model, reduction=4, zero_init_up=False, dropout=0.0, hidden_dim=None):
         super().__init__()
         dropout = float(dropout)
         if not 0.0 <= dropout < 1.0:
             raise ValueError("Expert dropout must be in [0, 1).")
-        hidden_dim = max(1, int(d_model) // max(1, int(reduction)))
+        hidden_dim = (
+            max(1, int(hidden_dim))
+            if hidden_dim is not None
+            else max(1, int(d_model) // max(1, int(reduction)))
+        )
         self.c_fc, self.gelu = nn.Linear(d_model, hidden_dim), QuickGELU()
         nn.init.kaiming_normal_(self.c_fc.weight, nonlinearity="relu")
         nn.init.zeros_(self.c_fc.bias)
@@ -433,6 +437,7 @@ class VisualMoEAdapter(nn.Module):
         ])
         self.router = ExpandableRouter(self.d_model, self.base_expert_count)
         self.expert_birth_sessions = [0] * self.base_expert_count
+        self.expert_anchor_ids = [-1] * self.base_expert_count
         # Runtime-only diagnostic mask. It is deliberately excluded from state_dict.
         self._inference_disabled_expert_ids = frozenset()
 
@@ -472,13 +477,13 @@ class VisualMoEAdapter(nn.Module):
 
     @torch.no_grad()
     def select_descriptor_anchor(self, session_features):
-        """Select the historical RD with the lowest Session-level 90th-percentile z-score."""
+        """Select the historical RD with the minimum Session-mean standardized error."""
         scores = self.descriptor_scores(session_features, require_ready=True).float()
         if scores.ndim != 2 or scores.size(0) == 0 or not torch.isfinite(scores).all():
             raise ValueError("RD anchor selection requires finite [session, experts] scores.")
-        upper_scores = torch.quantile(scores, 0.90, dim=0)
-        anchor_id = int(torch.argmin(upper_scores).item())
-        return anchor_id, upper_scores.detach()
+        mean_scores = scores.mean(dim=0)
+        anchor_id = int(torch.argmin(mean_scores).item())
+        return anchor_id, mean_scores.detach()
 
     @torch.no_grad()
     def update_descriptor_stats(self, errors, expert_id):
@@ -664,30 +669,25 @@ class VisualMoEAdapter(nn.Module):
 
     def add_expert(self, session_id, reduction=None, gate_bias_init=None,
                    anchor_expert_id=None, descriptor_residual_rank=None, dropout=None):
-        # Validate the complete expert/RD/router contract before changing the
-        # live topology or freezing any currently trainable module.
+        # The same nearest historical expert initializes the functional
+        # bottleneck and its anchored RD. Its hidden width is inherited exactly.
         if isinstance(session_id, bool) or int(session_id) <= 0:
             raise ValueError("Incremental expert birth session must be a positive integer.")
         session_id = int(session_id)
-        reduction = self.default_reduction if reduction is None else int(reduction)
-        if reduction < 1:
-            raise ValueError("Incremental expert reduction must be positive.")
         anchor_expert_id = 0 if anchor_expert_id is None else int(anchor_expert_id)
-        if anchor_expert_id < -1 or anchor_expert_id >= self.num_experts:
+        if anchor_expert_id < 0 or anchor_expert_id >= self.num_experts:
             raise ValueError(
-                f"RD anchor expert id {anchor_expert_id} is outside the historical pool."
+                f"Expert migration anchor id {anchor_expert_id} is outside the historical pool."
             )
+        if reduction is not None and (isinstance(reduction, bool) or int(reduction) < 1):
+            raise ValueError("Legacy reduction must be a positive integer when supplied.")
         residual_rank = (
             self.descriptor_residual_rank if descriptor_residual_rank is None
             else int(descriptor_residual_rank)
         )
-        if anchor_expert_id == -1:
-            if residual_rank != 0:
-                raise ValueError("Independent RD initialization requires residual_rank=0.")
-        else:
-            if residual_rank < 1:
-                raise ValueError("Anchored RD initialization requires a positive residual rank.")
-            residual_rank = min(residual_rank, self.d_model)
+        if residual_rank < 1:
+            raise ValueError("Anchored RD migration requires a positive residual rank.")
+        residual_rank = min(residual_rank, self.d_model)
         expert_dropout = self.incremental_dropout if dropout is None else float(dropout)
         gate_bias = self.incremental_gate_bias_init if gate_bias_init is None else float(gate_bias_init)
         if not np.isfinite(expert_dropout) or not 0.0 <= expert_dropout < 1.0:
@@ -696,25 +696,29 @@ class VisualMoEAdapter(nn.Module):
             raise ValueError("Incremental router gate bias must be finite.")
 
         device, dtype = self.residual_scale.device, self.residual_scale.dtype
+        historical_expert = self.experts[anchor_expert_id]
         new_expert = BottleneckExpert(
-            self.d_model, reduction, zero_init_up=True, dropout=expert_dropout
+            self.d_model, hidden_dim=historical_expert.c_fc.out_features,
+            dropout=expert_dropout,
         ).to(device=device, dtype=dtype)
+        new_expert.load_state_dict(historical_expert.state_dict(), strict=True)
+        new_expert.eval()
         new_descriptor = RepresentationDescriptor(
             self.d_model, self.descriptor_dim, self.descriptor_eps, self.descriptor_buffer_size
         ).to(device=device)
         new_router_column = nn.Linear(self.d_model, 1).to(device=device, dtype=dtype)
         nn.init.normal_(new_router_column.weight, std=0.02)
         nn.init.constant_(new_router_column.bias, gate_bias)
-        if anchor_expert_id >= 0:
-            new_descriptor.initialize_from_anchor(
-                self.descriptors[anchor_expert_id], anchor_expert_id, residual_rank
-            )
+        new_descriptor.initialize_from_anchor(
+            self.descriptors[anchor_expert_id], anchor_expert_id, residual_rank
+        )
 
         self.freeze_all()
         self.experts.append(new_expert)
         self.descriptors.append(new_descriptor)
         self.router.columns.append(new_router_column)
         self.expert_birth_sessions.append(session_id)
+        self.expert_anchor_ids.append(anchor_expert_id)
         self.set_newest_trainable()
         return self.num_experts - 1
 
@@ -733,14 +737,16 @@ class VisualMoEAdapter(nn.Module):
 
     def export_topology(self):
         return {
-            "version": 4,
+            "version": 5,
             "d_model": self.d_model,
             "base_expert_count": self.base_expert_count,
             "experts": [
                 {
+                    "hidden_dim": int(expert.c_fc.out_features),
                     "reduction": max(1, self.d_model // expert.c_fc.out_features),
                     "dropout": float(expert.dropout.p),
                     "birth_session": int(self.expert_birth_sessions[index]),
+                    "expert_anchor_id": int(self.expert_anchor_ids[index]),
                     "descriptor_anchor_id": int(self.descriptors[index].anchor_expert_id),
                     "descriptor_residual_rank": int(self.descriptors[index].residual_rank),
                 }
@@ -751,19 +757,20 @@ class VisualMoEAdapter(nn.Module):
     def rebuild_topology(self, topology):
         if topology is None:
             topology = {
-                "version": 4,
+                "version": 5,
                 "d_model": self.d_model,
                 "base_expert_count": self.base_expert_count,
                 "experts": [
-                    {"reduction": self.default_reduction, "birth_session": 0,
-                     "descriptor_anchor_id": -1, "descriptor_residual_rank": 0}
-                    for _ in range(self.base_expert_count)
+                    {"hidden_dim": int(expert.c_fc.out_features), "birth_session": 0,
+                     "expert_anchor_id": -1, "descriptor_anchor_id": -1,
+                     "descriptor_residual_rank": 0, "dropout": 0.0}
+                    for expert in self.experts[:self.base_expert_count]
                 ],
             }
         if not isinstance(topology, dict):
             raise ValueError("MoE topology must be a mapping.")
-        if int(topology.get("version", 4)) != 4:
-            raise ValueError("Unsupported MoE topology version.")
+        if int(topology.get("version", -1)) != 5:
+            raise ValueError("Unsupported MoE topology version; expected migrated-expert topology v5.")
         if int(topology.get("d_model", self.d_model)) != self.d_model:
             raise ValueError("MoE topology d_model mismatch.")
         if int(topology.get("base_expert_count", self.base_expert_count)) != self.base_expert_count:
@@ -776,60 +783,71 @@ class VisualMoEAdapter(nn.Module):
             if not isinstance(spec, dict):
                 raise ValueError(f"MoE topology expert {index} must be a mapping.")
             reduction = spec.get("reduction", self.default_reduction)
+            hidden_dim = spec.get("hidden_dim")
+            if hidden_dim is None:
+                if isinstance(reduction, bool) or int(reduction) < 1:
+                    raise ValueError(f"MoE topology expert {index} has invalid reduction.")
+                hidden_dim = max(1, self.d_model // int(reduction))
             birth_session = spec.get("birth_session", 0)
-            anchor_id = spec.get("descriptor_anchor_id", -1 if index < self.base_expert_count else 0)
+            expert_anchor_id = spec.get("expert_anchor_id", -1 if index < self.base_expert_count else 0)
+            descriptor_anchor_id = spec.get(
+                "descriptor_anchor_id", -1 if index < self.base_expert_count else expert_anchor_id
+            )
             residual_rank = spec.get(
                 "descriptor_residual_rank",
                 0 if index < self.base_expert_count else self.descriptor_residual_rank,
             )
             dropout = spec.get("dropout", 0.0 if index < self.base_expert_count else self.incremental_dropout)
-            if isinstance(reduction, bool) or int(reduction) < 1:
-                raise ValueError(f"MoE topology expert {index} has invalid reduction.")
+            if isinstance(hidden_dim, bool) or int(hidden_dim) < 1 or int(hidden_dim) > self.d_model:
+                raise ValueError(f"MoE topology expert {index} has invalid hidden dimension.")
             if isinstance(birth_session, bool) or int(birth_session) < 0:
                 raise ValueError(f"MoE topology expert {index} has invalid birth session.")
-            if not 0.0 <= float(dropout) < 1.0:
+            if not np.isfinite(float(dropout)) or not 0.0 <= float(dropout) < 1.0:
                 raise ValueError(f"MoE topology expert {index} has invalid dropout.")
             if index < self.base_expert_count:
-                if float(dropout) != 0.0:
-                    raise ValueError("Base experts must have dropout=0.0.")
-                if int(birth_session) != 0:
-                    raise ValueError("Base experts must have birth_session=0.")
-                if int(anchor_id) != -1 or int(residual_rank) != 0:
-                    raise ValueError("Base descriptors cannot have a historical RD anchor or residual branch.")
+                if float(dropout) != 0.0 or int(birth_session) != 0:
+                    raise ValueError("Base experts require zero dropout and birth_session=0.")
+                if int(expert_anchor_id) != -1 or int(descriptor_anchor_id) != -1 or int(residual_rank) != 0:
+                    raise ValueError("Base experts cannot declare migration anchors or RD residual branches.")
             else:
                 if int(birth_session) <= 0:
                     raise ValueError("Incremental experts must have a positive birth session.")
-                if int(anchor_id) == -1:
-                    if isinstance(residual_rank, bool) or int(residual_rank) != 0:
-                        raise ValueError(
-                            f"Independent incremental descriptor {index} must have residual_rank=0."
-                        )
-                else:
-                    if int(anchor_id) < 0 or int(anchor_id) >= index:
-                        raise ValueError(
-                            f"Incremental descriptor {index} must reference an earlier expert as its anchor."
-                        )
-                    if isinstance(residual_rank, bool) or int(residual_rank) < 1:
-                        raise ValueError(f"Incremental descriptor {index} has invalid residual rank.")
-            validated.append((int(reduction), int(birth_session), int(anchor_id), int(residual_rank), float(dropout)))
+                if int(expert_anchor_id) < 0 or int(expert_anchor_id) >= index:
+                    raise ValueError(f"Incremental expert {index} must reference an earlier expert.")
+                if int(descriptor_anchor_id) != int(expert_anchor_id):
+                    raise ValueError("Expert and RD migration anchors must identify the same historical expert.")
+                if isinstance(residual_rank, bool) or int(residual_rank) < 1:
+                    raise ValueError(f"Incremental descriptor {index} has invalid residual rank.")
+                if int(hidden_dim) != validated[int(expert_anchor_id)][0]:
+                    raise ValueError("Migrated expert hidden dimension must match its selected historical anchor.")
+            validated.append((
+                int(hidden_dim), int(birth_session), int(expert_anchor_id),
+                int(descriptor_anchor_id), int(residual_rank), float(dropout),
+            ))
 
-        # Build the complete topology only after every expert/anchor specification is valid.
-        self.experts, self.descriptors = nn.ModuleList(), nn.ModuleList()
-        self.router, self.expert_birth_sessions = ExpandableRouter(self.d_model), []
-        self._inference_disabled_expert_ids = frozenset()
-        for index, (reduction, birth_session, anchor_id, residual_rank, dropout) in enumerate(validated):
-            self.experts.append(BottleneckExpert(self.d_model, reduction, dropout=dropout))
+        experts, descriptors = nn.ModuleList(), nn.ModuleList()
+        router, births, expert_anchors = ExpandableRouter(self.d_model), [], []
+        for hidden_dim, birth_session, expert_anchor_id, descriptor_anchor_id, residual_rank, dropout in validated:
+            expert = BottleneckExpert(self.d_model, hidden_dim=hidden_dim, dropout=dropout)
+            if expert_anchor_id >= 0:
+                expert.load_state_dict(experts[expert_anchor_id].state_dict(), strict=True)
+            experts.append(expert)
             descriptor = RepresentationDescriptor(
                 self.d_model, self.descriptor_dim, self.descriptor_eps, self.descriptor_buffer_size
             )
-            if anchor_id >= 0:
+            if descriptor_anchor_id >= 0:
                 descriptor.initialize_from_anchor(
-                    self.descriptors[anchor_id], anchor_id, residual_rank
+                    descriptors[descriptor_anchor_id], descriptor_anchor_id, residual_rank
                 )
-            self.descriptors.append(descriptor)
-            self.router.add_column()
-            self.expert_birth_sessions.append(birth_session)
+            descriptors.append(descriptor)
+            router.add_column()
+            births.append(birth_session)
+            expert_anchors.append(expert_anchor_id)
+
         device, dtype = self.residual_scale.device, self.residual_scale.dtype
+        self.experts, self.descriptors, self.router = experts, descriptors, router
+        self.expert_birth_sessions, self.expert_anchor_ids = births, expert_anchors
+        self._inference_disabled_expert_ids = frozenset()
         self.experts.to(device=device, dtype=dtype)
         self.router.to(device=device, dtype=dtype)
         self.descriptors.to(device=device, dtype=torch.float32)
@@ -845,6 +863,7 @@ class VisualMoEAdapter(nn.Module):
         del self.descriptors[-1]
         del self.router.columns[-1]
         self.expert_birth_sessions.pop()
+        self.expert_anchor_ids.pop()
         self.freeze_all()
 
     def forward(self, x, route_input=None):
