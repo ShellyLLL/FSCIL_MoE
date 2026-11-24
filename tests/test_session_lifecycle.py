@@ -71,6 +71,42 @@ def make_batch(class_id, vector, source, count=8):
     }
 
 
+class CheckpointSourceIdentityTests(unittest.TestCase):
+    def test_base_reference_subset_and_feature_anchors_validate_against_full_manifest(self):
+        # Base RD calibration intentionally retains only a balanced holdout
+        # subset, while final-feature anchors are selected from all Base
+        # support sources. Both sets must belong to the manifest, but need
+        # not be subsets of one another.
+        source_to_class = {10: 0, 11: 0, 20: 1, 21: 1}
+        reference_sources = Runner._validate_checkpoint_source_rows(
+            0, source_to_class, torch.tensor([10, 20]), torch.tensor([0, 1]),
+            "reference CLS cache",
+        )
+        anchor_sources = Runner._validate_checkpoint_source_rows(
+            0, source_to_class, torch.tensor([11, 21]), torch.tensor([0, 1]),
+            "final feature anchors",
+        )
+        self.assertEqual(reference_sources, {10, 20})
+        self.assertEqual(anchor_sources, {11, 21})
+        self.assertTrue(reference_sources.isdisjoint(anchor_sources))
+
+    def test_rejects_anchor_sources_outside_manifest(self):
+        source_to_class = {10: 0, 20: 1}
+        with self.assertRaisesRegex(ValueError, "outside its support manifest"):
+            Runner._validate_checkpoint_source_rows(
+                0, source_to_class, torch.tensor([10, 99]), torch.tensor([0, 1]),
+                "final feature anchors",
+            )
+
+    def test_rejects_source_label_mismatch_against_manifest(self):
+        source_to_class = {10: 0, 20: 1}
+        with self.assertRaisesRegex(ValueError, "labels disagree"):
+            Runner._validate_checkpoint_source_rows(
+                0, source_to_class, torch.tensor([10, 20]), torch.tensor([1, 0]),
+                "reference CLS cache",
+            )
+
+
 class SessionLifecycleTests(unittest.TestCase):
     def test_base_to_incremental_session_trains_migrated_experts_and_freezes(self):
         torch.manual_seed(23)
