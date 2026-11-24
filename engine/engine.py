@@ -342,6 +342,42 @@ class Runner:
             raise ValueError("Batch source ids must align with image batch size.")
         return source_ids
 
+    @staticmethod
+    def _validate_checkpoint_source_rows(session_index, source_to_class, source_ids, labels, source_kind):
+        """Validate cached rows against the complete session support manifest.
+
+        Reference CLS caches may intentionally be a subset (the Base RD
+        calibration holdout), while final-feature anchors are selected from
+        the complete Session support set. They must both belong to the same
+        manifest, but need not be subsets of one another.
+        """
+        source_ids = torch.as_tensor(source_ids, dtype=torch.long).reshape(-1)
+        labels = torch.as_tensor(labels, dtype=torch.long).reshape(-1)
+        if (source_ids.numel() == 0 or source_ids.numel() != labels.numel()
+                or torch.unique(source_ids).numel() != source_ids.numel()):
+            raise ValueError(
+                f"Checkpoint task state {session_index} {source_kind} source ids/labels are malformed."
+            )
+        source_values = [int(value) for value in source_ids.tolist()]
+        label_values = [int(value) for value in labels.tolist()]
+        missing = [value for value in source_values if value not in source_to_class]
+        if missing:
+            raise ValueError(
+                f"Checkpoint task state {session_index} {source_kind} contains source ids "
+                f"outside its support manifest: {missing[:8]}"
+            )
+        mismatched = [
+            (source_id, label, int(source_to_class[source_id]))
+            for source_id, label in zip(source_values, label_values)
+            if int(source_to_class[source_id]) != label
+        ]
+        if mismatched:
+            raise ValueError(
+                f"Checkpoint task state {session_index} {source_kind} labels disagree "
+                f"with its support manifest: {mismatched[:8]}"
+            )
+        return set(source_values)
+
     def _support_manifest_hash(self):
         """Short stable identity for the exact support protocol in this run."""
         manifest = self.data_manager.get_support_manifest()
@@ -475,6 +511,12 @@ class Runner:
         completed_session = int(payload["completed_session"])
         if completed_session < 0 or completed_session >= self.data_manager.num_tasks:
             raise ValueError("Checkpoint completed_session is outside the configured FSCIL task range.")
+        manifest = payload.get("support_manifest")
+        if manifest is None:
+            raise ValueError("Resume checkpoint support_manifest must not be null.")
+        # Validate the checkpoint's complete support protocol before using it
+        # to verify cached reference and feature-anchor source identities.
+        self.data_manager._validate_support_manifest(manifest)
         if completed_session != len(payload["task_states"]) - 1:
             raise ValueError(
                 "Resume checkpoint has inconsistent completed_session/task_states length: "
@@ -626,6 +668,24 @@ class Runner:
                     f"Checkpoint session {session_index} class ids do not match the configured FSCIL split."
                 )
             checkpoint_class_ids.append(class_ids)
+            session_manifest = manifest["sessions"][str(session_index)]
+            expected_manifest_classes = {str(int(value)) for value in class_ids.tolist()}
+            if set(session_manifest) != expected_manifest_classes:
+                raise ValueError(
+                    f"Checkpoint task state {session_index} support-manifest classes "
+                    "do not match its classifier classes."
+                )
+            session_support_source_to_class = {}
+            for class_key, raw_source_ids in session_manifest.items():
+                class_id = int(class_key)
+                for raw_source_id in raw_source_ids:
+                    source_id = int(raw_source_id)
+                    if source_id in session_support_source_to_class:
+                        raise ValueError(
+                            f"Checkpoint session {session_index} support manifest reuses source {source_id}."
+                        )
+                    session_support_source_to_class[source_id] = class_id
+            session_support_sources = set(session_support_source_to_class)
             support_count = torch.as_tensor(state["support_count"], dtype=torch.long).reshape(-1)
             if support_count.numel() != class_ids.numel() or (support_count <= 0).any():
                 raise ValueError(f"Checkpoint session {session_index} has invalid per-class support counts.")
@@ -667,6 +727,10 @@ class Runner:
                     raise ValueError(
                         f"Checkpoint task state {session_index} block {block_idx} reference CLS cache is malformed."
                     )
+                self._validate_checkpoint_source_rows(
+                    session_index, session_support_source_to_class,
+                    source_ids, labels, "reference CLS cache",
+                )
                 if session_reference_sources is None:
                     session_reference_sources = set(int(value) for value in source_ids.tolist())
                 elif session_reference_sources != set(int(value) for value in source_ids.tolist()):
@@ -674,12 +738,12 @@ class Runner:
                         f"Checkpoint task state {session_index} reference CLS blocks disagree on source identity."
                     )
             if not session_reference_sources:
-                raise ValueError(f"Checkpoint task state {session_index} has an empty support source set.")
-            if checkpoint_support_sources.intersection(session_reference_sources):
+                raise ValueError(f"Checkpoint task state {session_index} has an empty reference CLS source set.")
+            if checkpoint_support_sources.intersection(session_support_sources):
                 raise ValueError(
                     f"Checkpoint task state {session_index} reuses support sources from an earlier Session."
                 )
-            checkpoint_support_sources.update(session_reference_sources)
+            checkpoint_support_sources.update(session_support_sources)
             feature_anchors = state["final_feature_anchors"]
             if not isinstance(feature_anchors, dict):
                 raise ValueError(f"Checkpoint task state {session_index} has no final feature-space anchors.")
@@ -702,14 +766,13 @@ class Runner:
                     or not torch.isfinite(final_features.float()).all()
                     or torch.unique(anchor_sources).numel() != anchor_sources.numel()):
                 raise ValueError(f"Checkpoint task state {session_index} has malformed final feature anchors.")
-            anchor_source_set = set(int(value) for value in anchor_sources.tolist())
+            anchor_source_set = self._validate_checkpoint_source_rows(
+                session_index, session_support_source_to_class,
+                anchor_sources, anchor_labels, "final feature anchors",
+            )
             if checkpoint_anchor_sources.intersection(anchor_source_set):
                 raise ValueError(
                     f"Checkpoint task state {session_index} reuses historical feature-anchor sources."
-                )
-            if not anchor_source_set.issubset(session_reference_sources):
-                raise ValueError(
-                    f"Checkpoint task state {session_index} feature anchors are not a subset of its support sources."
                 )
             checkpoint_anchor_sources.update(anchor_source_set)
             anchor_by_block = state["anchor_by_block"]
@@ -764,9 +827,6 @@ class Runner:
         all_checkpoint_ids = torch.cat(checkpoint_class_ids)
         if torch.unique(all_checkpoint_ids).numel() != all_checkpoint_ids.numel():
             raise ValueError("Checkpoint task states contain duplicate global class ids.")
-        manifest = payload.get("support_manifest")
-        if manifest is None:
-            raise ValueError("Resume checkpoint support_manifest must not be null.")
         self.data_manager.load_support_manifest(manifest)
         base_proto = payload.get("base_enhanced_visual_prototype")
         if base_proto is None:
