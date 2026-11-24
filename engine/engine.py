@@ -213,6 +213,14 @@ class Runner:
             "router": "base_softmax_plus_incremental_independent_sigmoid",
             "feature_preservation": "frozen_prefix_replay_to_historical_final_feature_anchors",
             "prototype_calibration": "existing_base_semantic_retrieval_and_support_reliability_calibration",
+            "feature_space_acceptance": {
+                "minimum_class_prototype_cosine": float(_cfg_value(moe, "FEATURE_SPACE_MIN_COSINE", 0.98)),
+                "maximum_base_reference_accuracy_drop_pp": float(
+                    _cfg_value(moe, "FEATURE_SPACE_MAX_ACCURACY_DROP", 0.0)
+                ),
+                "anchors_per_class": int(_cfg_value(moe, "FEATURE_SPACE_ANCHORS_PER_CLASS", 2)),
+                "anchor_batch_size": int(_cfg_value(moe, "FEATURE_SPACE_ANCHOR_BATCH_SIZE", 16)),
+            },
             "visual_moe_enabled": bool(_cfg_value(moe, "ENABLE", False)),
             "insert_blocks": [int(v) for v in _cfg_value(moe, "INSERT_BLOCKS", [])],
             "num_base_experts": int(_cfg_value(moe, "NUM_BASE_EXPERTS", 4)),
