@@ -89,7 +89,7 @@ class SessionLifecycleTests(unittest.TestCase):
             INCREMENTAL_GATE_BIAS_INIT=-4.0, INCREMENTAL_DROPOUT=0.0,
             SEMANTIC_TEMPERATURE=0.07, SEMANTIC_CALIBRATION_MAX_ALPHA=0.5,
             PROTOTYPE_RELIABILITY_K=5.0, FEATURE_SPACE_ANCHORS_PER_CLASS=2,
-            FEATURE_SPACE_ANCHOR_BATCH_SIZE=8, FEATURE_SPACE_MIN_COSINE=0.98,
+            FEATURE_SPACE_ANCHOR_BATCH_SIZE=8, FEATURE_SPACE_MIN_COSINE=0.0,
             FEATURE_SPACE_MAX_ACCURACY_DROP=100.0,
         )
         cfg = SimpleNamespace(
@@ -171,6 +171,25 @@ class SessionLifecycleTests(unittest.TestCase):
             self.assertEqual(len(history["feature_space_loss"]), 2)
             self.assertEqual(len(history["rd_loss"]), 2)
             self.assertGreaterEqual(history["rd_effective_reference_count"], 1.0)
+
+        # A second Session must detect and migrate from the already deployed
+        # incremental generation, not assume that all anchors are Base experts.
+        def expand_from_generation_two(_self, block_idx, feature_map, class_ids):
+            count = int(feature_map[int(block_idx)]["cls_in"].size(0))
+            return LayerExpansionDecision(int(block_idx), True, 2.5, 1.0, 2, count)
+        model.plan_layer_expansion = expand_from_generation_two.__get__(model, BiMC)
+        novel_c = make_batch(3, torch.tensor([0.,0.,0.,1.,0.,0.,0.,0.]), 40)
+        novel_d = make_batch(4, torch.tensor([0.,0.,0.,0.,1.,0.,0.,0.]), 50)
+        result2 = runner.train_incremental_task(
+            2, [novel_c, novel_d], [novel_c, novel_d], [3,4],
+            ["novel_c", "novel_d"], [base_state, result["task_state"]],
+        )
+        self.assertEqual(len(result2["expanded"]), 2)
+        self.assertTrue(all(item["expert_anchor_id"] == 2 for item in result2["expanded"]))
+        self.assertTrue(all(item["descriptor_anchor_id"] == 2 for item in result2["expanded"]))
+        for _, adapter in runner._moe_adapters():
+            self.assertEqual(adapter.num_experts, 4)
+            self.assertTrue(all(not p.requires_grad for p in adapter.parameters()))
 
 
 if __name__ == "__main__":
