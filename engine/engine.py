@@ -1981,11 +1981,25 @@ class Runner:
                 if not bool(mask.any().item()):
                     raise ValueError(f"Historical anchors are missing class {int(class_id.item())}.")
                 prototypes.append(F.normalize(features[mask].mean(0), dim=-1))
-            refreshed_state["image_proto"] = torch.stack(prototypes).detach()
+            raw_visual = torch.stack(prototypes).detach()
+            if len(refreshed) == 0:
+                calibrated_visual = raw_visual
+                calibration_diagnostics = None
+            else:
+                calibrated_visual, calibration_diagnostics = (
+                    self._semantic_guided_visual_prototype_calibration(
+                        raw_visual,
+                        torch.as_tensor(state["description_proto"], device=self.device).float(),
+                        torch.as_tensor(state["support_count"], device=self.device),
+                        [refreshed[0]],
+                    )
+                )
+            refreshed_state["image_proto"] = calibrated_visual.detach()
             refreshed_state["prototype_refresh"] = {
                 "feature_space": "current_deployed_adapted_encoder",
                 "anchor_count": int(prefixes.size(0)),
                 "source_ids": source_ids.detach().cpu(),
+                "semantic_calibration": calibration_diagnostics,
             }
             refreshed.append(refreshed_state)
         return refreshed

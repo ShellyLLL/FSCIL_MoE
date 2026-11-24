@@ -75,7 +75,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
     def test_router_and_experts_consume_adapted_stream_not_frozen_reference(self):
         adapter = VisualMoEAdapter(8, num_experts=2, reduction=2, descriptor_dim=4)
         adapted = torch.randn(3, 2, 8)
-        reference = adapted + 7.0
+        reference = adapted.roll(1, dims=-1)
         _, aux = adapter(adapted, route_input=reference)
         expected_adapted = adapter.layer_norm(adapted)[0]
         expected_reference = adapter.layer_norm(reference)[0]
