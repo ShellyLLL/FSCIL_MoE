@@ -184,6 +184,28 @@ class UnifiedDynamicMoETests(unittest.TestCase):
                 bank, 10.0,
             )
 
+    def test_session_decision_preserves_global_rule_and_reports_classwise_coverage(self):
+        adapter = VisualMoEAdapter(8, num_experts=2, reduction=2, descriptor_dim=4)
+        for descriptor in adapter.descriptors:
+            descriptor.update_reference(torch.tensor([0.1, 0.11, 0.09, 0.1]))
+        scores = torch.tensor([
+            [0.1, 2.0], [0.1, 2.0], [2.0, 0.1], [2.0, 0.1],
+        ])
+        adapter.descriptor_scores = lambda values, require_ready=True: scores
+        model = make_bimc(adapter)
+        features = {0: {
+            "cls_in": torch.randn(4, 8),
+            "labels": torch.tensor([7, 7, 8, 8]),
+            "source_ids": torch.tensor([10, 11, 12, 13]),
+        }}
+        decision = model.plan_layer_expansion(0, features, [7, 8])
+        self.assertFalse(decision.expand)
+        self.assertAlmostEqual(decision.session_mean_z, 1.05)
+        self.assertEqual(decision.class_diagnostics[7]["best_historical_mean_z"], 0.1)
+        self.assertEqual(decision.class_diagnostics[8]["best_historical_mean_z"], 0.1)
+        self.assertEqual(decision.class_diagnostics[7]["support_count"], 2)
+        self.assertEqual(decision.class_diagnostics[8]["support_count"], 2)
+
     def test_rd_fit_and_reference_calibration_are_source_exclusive_and_class_balanced(self):
         labels = torch.tensor([0] * 5 + [1] * 5)
         sources = torch.tensor([10, 11, 12, 13, 14, 20, 21, 22, 23, 24])

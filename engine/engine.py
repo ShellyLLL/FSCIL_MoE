@@ -2286,6 +2286,7 @@ class Runner:
                 "threshold": float(decision.threshold),
                 "anchor_expert_id": int(decision.anchor_expert_id),
                 "support_count": int(decision.support_count),
+                "class_diagnostics": self._cpu_copy(decision.class_diagnostics or {}),
             })
             print(
                 f"=> [Sequential-Expansion][B{block_idx}] position={layer_position + 1}/{len(block_order)} "

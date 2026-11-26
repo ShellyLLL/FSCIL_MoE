@@ -20,6 +20,7 @@ class LayerExpansionDecision:
     threshold: float
     anchor_expert_id: int
     support_count: int
+    class_diagnostics: dict = None
 
 
 def build_loo_cache_from_embeddings(features, labels, source_ids, class_index=None):
@@ -311,6 +312,27 @@ class BiMC(nn.Module):
         threshold = float(SESSION_EXPANSION_Z_THRESHOLD)
         if not np.isfinite(score):
             raise FloatingPointError(f"Block {block_idx} produced a non-finite Session mean Z-score.")
+
+        # Keep the deployed decision Session-level and unchanged, but expose
+        # class-conditional coverage so a good global mean cannot hide a
+        # poorly covered minority/new class in diagnostics.
+        class_diagnostics = {}
+        for class_id in expected:
+            class_mask = labels.eq(int(class_id))
+            if not bool(class_mask.any().item()):
+                raise RuntimeError(f"Block {block_idx} has no RD evidence for class {class_id}.")
+            class_scores = per_descriptor_z[class_mask].mean(dim=0)
+            class_anchor = int(torch.argmin(class_scores).item())
+            class_best_z = float(class_scores[class_anchor].item())
+            class_diagnostics[int(class_id)] = {
+                "support_count": int(class_mask.sum().item()),
+                "best_historical_rd_id": class_anchor,
+                "best_historical_mean_z": class_best_z,
+                "session_threshold_exceeded": bool(class_best_z > threshold),
+            }
+        class_best_values = [
+            item["best_historical_mean_z"] for item in class_diagnostics.values()
+        ]
         decision = LayerExpansionDecision(
             block_idx=block_idx,
             expand=score > threshold,
@@ -318,10 +340,12 @@ class BiMC(nn.Module):
             threshold=threshold,
             anchor_expert_id=anchor_expert_id,
             support_count=int(values.size(0)),
+            class_diagnostics=class_diagnostics,
         )
         print(
             f"=> [Session-Expansion][B{block_idx}] support_n={decision.support_count} "
             f"min_session_mean_z={score:.6f} threshold={threshold:.1f} "
+            f"class_best_z_range=({min(class_best_values):.6f},{max(class_best_values):.6f}) "
             f"anchor_expert={anchor_expert_id} "
             f"decision={'EXPAND' if decision.expand else 'REUSE'}"
         )
