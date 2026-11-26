@@ -206,8 +206,8 @@ class UnifiedDynamicMoETests(unittest.TestCase):
             )
         with self.assertRaisesRegex(ValueError, "at least three"):
             Runner._source_exclusive_rd_split(
-                torch.tensor([0, 0, 0, 1]), torch.tensor([1, 2, 3, 4]),
-                torch.tensor([0, 0, 0, 1]), torch.tensor([1, 2, 3, 4]),
+                torch.tensor([0, 0, 1, 1]), torch.tensor([1, 2, 3, 4]),
+                torch.tensor([0, 0, 1, 1]), torch.tensor([1, 2, 3, 4]),
                 per_class_reference=1,
             )
 
