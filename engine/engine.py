@@ -1953,7 +1953,16 @@ class Runner:
                 "semantic_calibration_full": full_diag, "semantic_calibration_loo": loo_diag,
                 "global_full": global_full, "global_ids": global_ids, "old_class_count": old_ids.numel()}
 
-    def _global_incremental_logits(self, images, labels, source_ids, bank, scale):
+    def _global_incremental_logits(
+        self, images, labels, source_ids, bank, scale, expected_encoder_step=None,
+    ):
+        if expected_encoder_step is not None:
+            observed_step = bank.get("encoder_step")
+            if observed_step is None or int(observed_step) != int(expected_encoder_step):
+                raise RuntimeError(
+                    "Incremental prototype bank is stale: "
+                    f"bank_step={observed_step}, query_step={expected_encoder_step}."
+                )
         if torch.is_grad_enabled():
             features, _ = self.model_without_dp.extract_img_feature_train(images)
         else:
@@ -1963,10 +1972,22 @@ class Runner:
         prototypes[:, int(bank["old_class_count"]):] = bank["novel_full"].unsqueeze(0)
         if source_ids is not None:
             source_ids = torch.as_tensor(source_ids, device=images.device).reshape(-1)
-            match = source_ids[:, None].eq(bank["source_ids"][None, :])
+            if source_ids.numel() != images.size(0):
+                raise ValueError("Training query source ids must align with the image batch.")
+            support_source_ids = torch.as_tensor(
+                bank["source_ids"], device=images.device
+            ).reshape(-1)
+            match = source_ids[:, None].eq(support_source_ids[None, :])
             if not bool(match.any(dim=1).all().item()):
                 raise KeyError("Training query source is absent from the LOO support bank.")
             rows = match.long().argmax(dim=1)
+            support_labels = torch.as_tensor(
+                bank["labels"], device=labels.device, dtype=labels.dtype
+            ).reshape(-1)[rows]
+            if not torch.equal(support_labels, labels.reshape(-1)):
+                raise ValueError(
+                    "Training query source ids and labels disagree with the LOO support bank."
+                )
             own = self._targets_to_columns(labels, {"class_ids": bank["global_ids"]})
             novel_loo = bank["novel_loo"][rows]
             novel_columns = own - int(bank["old_class_count"])
@@ -2298,16 +2319,24 @@ class Runner:
                 "classification_samples_total": 0,
             }
 
+            history["prototype_refresh_policy"] = (
+                "rebuild_source_exclusive_support_bank_before_every_optimizer_update"
+            )
+            history["prototype_feature_mode"] = "deterministic_eval_with_query_gradients"
+            history["prototype_refreshes_per_epoch"] = []
+            history["prototype_encoder_steps_per_epoch"] = []
+            optimizer_update_step = 0
+
             for epoch in range(epochs):
-                bank = self._build_incremental_bank(
-                    extract_loader, class_index, old_states, semantic_proto
-                )
-                self.model.train()
-                for _, deployed_adapter in self._moe_adapters():
-                    deployed_adapter.eval()
-                adapter.experts[expert_id].train()
+                # Prototype-based classification requires a deterministic
+                # feature function shared by support and query paths. eval()
+                # disables expert dropout but does not disable autograd or
+                # optimizer updates on the newest expert/router parameters.
+                self.model.eval()
                 totals = {"ce": 0.0, "l2sp": 0.0, "feature": 0.0, "count": 0}
                 observed_train_classes = set()
+                epoch_refreshes = 0
+                epoch_encoder_steps = []
                 for batch in train_loader:
                     images, labels = self.parse_batch(batch)
                     source_ids = self._batch_source_ids(batch, labels.numel(), labels.device)
@@ -2316,9 +2345,24 @@ class Runner:
                     ).all():
                         raise ValueError("Training loader contains labels outside the current Session.")
                     observed_train_classes.update(int(value) for value in labels.unique().tolist())
+
+                    # Recompute support features after every preceding optimizer
+                    # update. The bank and this query therefore use the exact
+                    # same parameter version; an epoch-level cache is stale as
+                    # soon as its first optimizer step changes the new expert.
+                    self.model.eval()
+                    bank = self._build_incremental_bank(
+                        extract_loader, class_index, old_states, semantic_proto
+                    )
+                    bank["encoder_step"] = int(optimizer_update_step)
+                    epoch_encoder_steps.append(int(optimizer_update_step))
+                    epoch_refreshes += 1
+                    self.model.eval()
+
                     optimizer.zero_grad(set_to_none=True)
                     logits, targets = self._global_incremental_logits(
-                        images, labels, source_ids, bank, scale
+                        images, labels, source_ids, bank, scale,
+                        expected_encoder_step=optimizer_update_step,
                     )
                     ce_loss = F.cross_entropy(logits, targets)
                     l2sp_loss = self._l2sp_anchor_loss(
@@ -2331,18 +2375,12 @@ class Runner:
                         selected = torch.randperm(
                             anchor_count, device=self.device
                         )[:selected_count]
-                        # Compare deterministic evaluation-mode features with
-                        # the historical targets; restore the exact training
-                        # mode policy before the optimizer step.
-                        self.model.eval()
+                        # Keep the same deterministic feature mode used by
+                        # support-bank construction and query classification.
                         feature_loss = self._final_feature_anchor_loss(
                             old_prefix_tokens.index_select(0, selected),
                             old_final_features.index_select(0, selected),
                         )
-                        self.model.train()
-                        for _, deployed_adapter in self._moe_adapters():
-                            deployed_adapter.eval()
-                        adapter.experts[expert_id].train()
                     total_loss = (
                         ce_loss
                         + l2sp_weight * l2sp_loss
@@ -2357,6 +2395,7 @@ class Runner:
                         expert_parameters + router_parameters, 1.0
                     )
                     optimizer.step()
+                    optimizer_update_step += 1
                     count = int(labels.numel())
                     totals["ce"] += float(ce_loss.item()) * count
                     totals["l2sp"] += float(l2sp_loss.item()) * count
@@ -2378,11 +2417,14 @@ class Runner:
                     + feature_preservation_weight * totals["feature"] / denominator
                 )
                 history["classification_samples_per_epoch"].append(totals["count"])
+                history["prototype_refreshes_per_epoch"].append(int(epoch_refreshes))
+                history["prototype_encoder_steps_per_epoch"].append(epoch_encoder_steps)
                 print(
                     f"=> [Sequential-Expert][B{block_idx}][{epoch + 1}/{epochs}] "
                     f"ce={history['ce_loss'][-1]:.5f} "
                     f"l2sp={history['l2sp_loss'][-1]:.6f} "
-                    f"feature={history['feature_space_loss'][-1]:.6f}"
+                    f"feature={history['feature_space_loss'][-1]:.6f} "
+                    f"prototype_refreshes={epoch_refreshes}"
                 )
 
             with torch.no_grad():

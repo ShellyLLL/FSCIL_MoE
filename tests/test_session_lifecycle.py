@@ -235,6 +235,13 @@ class SessionLifecycleTests(unittest.TestCase):
             self.assertEqual(len(history["l2sp_loss"]), 2)
             self.assertEqual(len(history["ce_loss"]), 2)
             self.assertEqual(len(history["feature_space_loss"]), 2)
+            self.assertEqual(
+                history["prototype_refresh_policy"],
+                "rebuild_source_exclusive_support_bank_before_every_optimizer_update",
+            )
+            self.assertEqual(history["prototype_feature_mode"], "deterministic_eval_with_query_gradients")
+            self.assertEqual(history["prototype_refreshes_per_epoch"], [2,2])
+            self.assertEqual(history["prototype_encoder_steps_per_epoch"], [[0,1],[2,3]])
             self.assertNotIn("rd_loss", history)
             self.assertGreaterEqual(history["rd_effective_reference_count"], 1.0)
 

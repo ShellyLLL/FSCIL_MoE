@@ -148,6 +148,42 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         adapter.freeze_all()
         self.assertTrue(all(not p.requires_grad for p in adapter.parameters()))
 
+    def test_global_logits_rejects_stale_prototype_bank_version(self):
+        class DummyModel:
+            def extract_img_feature_train(self, images):
+                return images.float(), []
+
+        runner = Runner.__new__(Runner)
+        runner.model_without_dp = DummyModel()
+        bank = {"encoder_step": 3}
+        with self.assertRaisesRegex(RuntimeError, "prototype bank is stale"):
+            runner._global_incremental_logits(
+                torch.tensor([[1.0, 0.0]]), torch.tensor([1]), torch.tensor([10]),
+                bank, 10.0, expected_encoder_step=4,
+            )
+
+    def test_global_logits_rejects_source_label_mismatch(self):
+        class DummyModel:
+            def extract_img_feature_train(self, images):
+                return images.float(), []
+
+        runner = Runner.__new__(Runner)
+        runner.model_without_dp = DummyModel()
+        bank = {
+            "global_full": torch.tensor([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]]),
+            "global_ids": torch.tensor([0, 1, 2]),
+            "old_class_count": 1,
+            "novel_full": torch.tensor([[0.0, 1.0], [-1.0, 0.0]]),
+            "novel_loo": torch.tensor([[[0.0, 1.0], [-1.0, 0.0]]]),
+            "source_ids": torch.tensor([10]),
+            "labels": torch.tensor([1]),
+        }
+        with self.assertRaisesRegex(ValueError, "source ids and labels disagree"):
+            runner._global_incremental_logits(
+                torch.tensor([[1.0, 0.0]]), torch.tensor([2]), torch.tensor([10]),
+                bank, 10.0,
+            )
+
     def test_invalid_migration_anchor_does_not_mutate_topology(self):
         adapter = VisualMoEAdapter(8, num_experts=2, reduction=2, descriptor_dim=4)
         before = adapter.export_topology()
