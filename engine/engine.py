@@ -1161,6 +1161,45 @@ class Runner:
             raise RuntimeError("Class-balanced Base reference selection produced an invalid row count.")
         return mask
 
+    @classmethod
+    def _source_exclusive_rd_split(
+        cls, fit_labels, fit_source_ids, reference_labels, reference_source_ids,
+        per_class_reference=1,
+    ):
+        """Split RD fitting and error calibration by source identity, not augmentation view."""
+        fit_labels = torch.as_tensor(fit_labels).long().reshape(-1)
+        fit_source_ids = torch.as_tensor(fit_source_ids, device=fit_labels.device).long().reshape(-1)
+        reference_labels = torch.as_tensor(reference_labels, device=fit_labels.device).long().reshape(-1)
+        reference_source_ids = torch.as_tensor(reference_source_ids, device=fit_labels.device).long().reshape(-1)
+        if (fit_labels.numel() == 0 or reference_labels.numel() == 0
+                or fit_source_ids.numel() != fit_labels.numel()
+                or reference_source_ids.numel() != reference_labels.numel()):
+            raise ValueError("RD fit/reference labels and source ids must be non-empty and aligned.")
+        if (torch.unique(fit_source_ids).numel() != fit_source_ids.numel()
+                or torch.unique(reference_source_ids).numel() != reference_source_ids.numel()):
+            raise ValueError("RD fit/reference loaders must expose one row per support source.")
+        if set(fit_source_ids.tolist()) != set(reference_source_ids.tolist()):
+            raise ValueError("RD fit/reference loaders must cover the same support sources.")
+        fit_label_map = {int(source): int(label) for source, label in zip(fit_source_ids.tolist(), fit_labels.tolist())}
+        if any(fit_label_map.get(int(source)) != int(label)
+               for source, label in zip(reference_source_ids.tolist(), reference_labels.tolist())):
+            raise ValueError("RD fit/reference labels disagree by source id.")
+        reference_mask = cls._select_class_balanced_reference_mask(
+            reference_labels, reference_source_ids, per_class_count=int(per_class_reference),
+        )
+        held_out_sources = reference_source_ids[reference_mask]
+        fit_mask = ~torch.isin(fit_source_ids, held_out_sources)
+        fit_classes = torch.unique(fit_labels[fit_mask], sorted=True)
+        expected_classes = torch.unique(reference_labels, sorted=True)
+        if not torch.equal(fit_classes, expected_classes):
+            missing = expected_classes[~torch.isin(expected_classes, fit_classes)].tolist()
+            raise ValueError(f"RD source-exclusive fitting split leaves classes without fit samples: {missing}.")
+        if int(fit_mask.sum().item()) < 3:
+            raise ValueError("RD source-exclusive fitting split requires at least three non-calibration sources.")
+        if torch.isin(fit_source_ids[fit_mask], held_out_sources).any():
+            raise RuntimeError("RD fit/calibration source split is not disjoint.")
+        return fit_mask, reference_mask
+
     def _train_base_descriptors(self, train_loader, extract_loader):
         """Fit Base RDs on augmented CLS and calibrate immutable reconstruction statistics."""
         epochs = int(_cfg_value(self.cfg.TRAINER.BiMC.OPTIM, "BASE_DESCRIPTOR_EPOCHS", 8))
@@ -1182,9 +1221,15 @@ class Runner:
             label_map = {int(i): int(y) for i,y in zip(fit_sid.tolist(),fit_y.tolist())}
             if any(label_map.get(int(i)) != int(y) for i,y in zip(ref_sid.tolist(),ref_y.tolist())):
                 raise RuntimeError(f"Block {block_idx} Base fit/reference labels disagree.")
-            adapter.set_base_feature_stats(fit_x)
-            count = min(int(adapter.descriptors[0].buffer_size), int(ref_x.size(0)))
-            mask = self._select_class_balanced_reference_mask(ref_y, ref_sid, total_count=count)
+            classes = torch.unique(ref_y, sorted=True)
+            reference_per_class = max(
+                1, min(5, int(adapter.descriptors[0].buffer_size) // int(classes.numel()))
+            )
+            fit_mask, mask = self._source_exclusive_rd_split(
+                fit_y, fit_sid, ref_y, ref_sid, per_class_reference=reference_per_class,
+            )
+            fit_values = fit_x[fit_mask]
+            adapter.set_base_feature_stats(fit_values)
             selected = [int(v) for v in ref_sid[mask].tolist()]
             if not self.base_reference_source_ids:
                 self.base_reference_source_ids = selected
@@ -1197,11 +1242,13 @@ class Runner:
                 "source_ids": ref_sid[mask].detach().cpu(),
             }
             with torch.no_grad():
-                fit_resp = torch.stack([adapter.expert_responsibility(fit_x, i)
-                                        for i in range(adapter.num_experts)], dim=-1)
+                fit_resp = torch.stack([
+                    adapter.expert_responsibility(fit_values, i)
+                    for i in range(adapter.num_experts)
+                ], dim=-1)
             for expert_id in range(adapter.num_experts):
                 loss = self._train_descriptor(
-                    adapter, expert_id, fit_x, epochs, fit_resp[:, expert_id],
+                    adapter, expert_id, fit_values, epochs, fit_resp[:, expert_id],
                     calibration_values=ref_values, calibration_weights=None,
                 )
                 descriptor = adapter.descriptors[expert_id]
@@ -2216,6 +2263,19 @@ class Runner:
             ):
                 raise ValueError(f"Block {block_idx} RD fit/reference labels disagree by source id.")
 
+            # RD fitting and reference-error calibration must use disjoint
+            # support identities. Different augmentations of the same image
+            # are not independent calibration samples.
+            fit_mask, rd_reference_mask = self._source_exclusive_rd_split(
+                fit_y, fit_source_ids, ref_y, ref_source_ids, per_class_reference=1,
+            )
+            rd_fit_x = fit_x[fit_mask]
+            rd_fit_sources = fit_source_ids[fit_mask]
+            rd_reference_x = ref_x[rd_reference_mask]
+            rd_reference_sources = ref_source_ids[rd_reference_mask]
+            if set(rd_fit_sources.tolist()) & set(rd_reference_sources.tolist()):
+                raise RuntimeError(f"Block {block_idx} RD fit and calibration sources overlap.")
+
             decision = self.model_without_dp.plan_layer_expansion(block_idx, ref_map, class_index)
             decisions.append({
                 "block_idx": block_idx,
@@ -2268,14 +2328,14 @@ class Runner:
             # already frozen; the new block's own residual is not part of its
             # input distribution.
             rd_loss = self._train_descriptor(
-                adapter, expert_id, fit_x, descriptor_epochs,
+                adapter, expert_id, rd_fit_x, descriptor_epochs,
                 sample_weights=None,
-                calibration_values=ref_x,
+                calibration_values=rd_reference_x,
                 calibration_weights=None,
             )
             descriptor = adapter.descriptors[expert_id]
             with torch.no_grad():
-                rd_reference_mean_z = float(descriptor.standardized_score(ref_x).mean().item())
+                rd_reference_mean_z = float(descriptor.standardized_score(rd_reference_x).mean().item())
                 rd_effective_count = float(descriptor.effective_error_count.item())
 
             adapter.set_newest_trainable(descriptor=False)
@@ -2304,13 +2364,22 @@ class Runner:
                 "descriptor_anchor_id": int(descriptor.anchor_expert_id),
                 "session_mean_z": float(decision.session_mean_z),
                 "rd_training_loss": float(rd_loss),
-                "rd_training_samples": int(fit_x.size(0)),
-                "rd_reference_samples": int(ref_x.size(0)),
-                "rd_reference_weighting": "uniform",
+                "rd_training_samples": int(rd_fit_x.size(0)),
+                "rd_reference_samples": int(rd_reference_x.size(0)),
+                "rd_reference_weighting": "uniform_source_exclusive_class_balanced",
                 "rd_reference_mean_z": rd_reference_mean_z,
                 "rd_effective_reference_count": rd_effective_count,
-                "rd_training_source_ids": sorted(int(value) for value in fit_source_ids.tolist()),
-                "rd_reference_source_ids": sorted(int(value) for value in ref_source_ids.tolist()),
+                "rd_training_source_ids": sorted(int(value) for value in rd_fit_sources.tolist()),
+                "rd_reference_source_ids": sorted(int(value) for value in rd_reference_sources.tolist()),
+                "rd_fit_reference_source_overlap": 0,
+                "rd_fit_source_count_by_class": {
+                    int(class_id): int(fit_y[fit_mask].eq(int(class_id)).sum().item())
+                    for class_id in torch.unique(fit_y, sorted=True).tolist()
+                },
+                "rd_reference_source_count_by_class": {
+                    int(class_id): int(ref_y[rd_reference_mask].eq(int(class_id)).sum().item())
+                    for class_id in torch.unique(ref_y, sorted=True).tolist()
+                },
                 "loss": [],
                 "ce_loss": [],
                 "l2sp_loss": [],

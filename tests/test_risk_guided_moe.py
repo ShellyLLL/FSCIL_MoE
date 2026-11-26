@@ -184,6 +184,33 @@ class UnifiedDynamicMoETests(unittest.TestCase):
                 bank, 10.0,
             )
 
+    def test_rd_fit_and_reference_calibration_are_source_exclusive_and_class_balanced(self):
+        labels = torch.tensor([0] * 5 + [1] * 5)
+        sources = torch.tensor([10, 11, 12, 13, 14, 20, 21, 22, 23, 24])
+        fit_mask, reference_mask = Runner._source_exclusive_rd_split(
+            labels, sources, labels.clone(), sources.clone(), per_class_reference=1,
+        )
+        fit_ids = set(sources[fit_mask].tolist())
+        reference_ids = set(sources[reference_mask].tolist())
+        self.assertEqual(len(reference_ids), 2)
+        self.assertTrue(fit_ids.isdisjoint(reference_ids))
+        self.assertEqual(torch.unique(labels[reference_mask], return_counts=True)[1].tolist(), [1, 1])
+        self.assertEqual(torch.unique(labels[fit_mask], return_counts=True)[1].tolist(), [4, 4])
+
+    def test_rd_source_split_rejects_label_mismatch_and_insufficient_fit_sources(self):
+        with self.assertRaisesRegex(ValueError, "labels disagree"):
+            Runner._source_exclusive_rd_split(
+                torch.tensor([0, 0, 1, 1]), torch.tensor([1, 2, 3, 4]),
+                torch.tensor([0, 1, 1, 1]), torch.tensor([1, 2, 3, 4]),
+                per_class_reference=1,
+            )
+        with self.assertRaisesRegex(ValueError, "at least three"):
+            Runner._source_exclusive_rd_split(
+                torch.tensor([0, 0, 0, 1]), torch.tensor([1, 2, 3, 4]),
+                torch.tensor([0, 0, 0, 1]), torch.tensor([1, 2, 3, 4]),
+                per_class_reference=1,
+            )
+
     def test_invalid_migration_anchor_does_not_mutate_topology(self):
         adapter = VisualMoEAdapter(8, num_experts=2, reduction=2, descriptor_dim=4)
         before = adapter.export_topology()
