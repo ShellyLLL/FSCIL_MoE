@@ -189,7 +189,7 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         for descriptor in adapter.descriptors:
             descriptor.update_reference(torch.tensor([0.1, 0.11, 0.09, 0.1]))
         scores = torch.tensor([
-            [0.1, 2.0], [0.1, 2.0], [2.0, 0.1], [2.0, 0.1],
+            [0.1, 2.0], [0.1, 2.0], [1.2, 1.3], [1.2, 1.3],
         ])
         adapter.descriptor_scores = lambda values, require_ready=True: scores
         model = make_bimc(adapter)
@@ -200,9 +200,10 @@ class UnifiedDynamicMoETests(unittest.TestCase):
         }}
         decision = model.plan_layer_expansion(0, features, [7, 8])
         self.assertFalse(decision.expand)
-        self.assertAlmostEqual(decision.session_mean_z, 1.05)
+        self.assertAlmostEqual(decision.session_mean_z, 0.65)
         self.assertEqual(decision.class_diagnostics[7]["best_historical_mean_z"], 0.1)
-        self.assertEqual(decision.class_diagnostics[8]["best_historical_mean_z"], 0.1)
+        self.assertEqual(decision.class_diagnostics[8]["best_historical_mean_z"], 1.2)
+        self.assertTrue(decision.class_diagnostics[8]["session_threshold_exceeded"])
         self.assertEqual(decision.class_diagnostics[7]["support_count"], 2)
         self.assertEqual(decision.class_diagnostics[8]["support_count"], 2)
 
