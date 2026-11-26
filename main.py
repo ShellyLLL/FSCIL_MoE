@@ -80,9 +80,10 @@ def extend_cfg(cfg):
     cfg.TRAINER.BiMC.INCREMENTAL = CN()
     cfg.TRAINER.BiMC.INCREMENTAL.EPOCHS = 6
     cfg.TRAINER.BiMC.INCREMENTAL.LOGIT_SCALE = 100.0
-    # Incremental classification uses CE + L2-SP; feature-space preservation
-    # remains an explicit diagnostic and RD fitting is a separate stage.
+    # New experts optimize current-class CE, migration L2-SP, and historical
+    # final-feature replay; RD fitting remains a separate reconstruction stage.
     cfg.TRAINER.BiMC.INCREMENTAL.L2SP_WEIGHT = 1.0e-4
+    cfg.TRAINER.BiMC.INCREMENTAL.FEATURE_SPACE_PRESERVATION_WEIGHT = 1.0
 
     cfg.TRAINER.BiMC.CHECKPOINT = CN()
     cfg.TRAINER.BiMC.CHECKPOINT.ENABLE = True

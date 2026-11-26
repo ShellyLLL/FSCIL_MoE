@@ -179,6 +179,25 @@ class SessionLifecycleTests(unittest.TestCase):
             "creation_session": 0,
         }
 
+        # A REUSE-only Session must preserve the original five-shot prototype
+        # exactly; it must not replace it with the compact feature-anchor mean.
+        original_base_prototype = base_state["image_proto"].clone()
+        def force_reuse(_self, block_idx, feature_map, class_ids):
+            count = int(feature_map[int(block_idx)]["cls_in"].size(0))
+            return LayerExpansionDecision(int(block_idx), False, 0.2, 1.0, 0, count)
+        model.plan_layer_expansion = force_reuse.__get__(model, BiMC)
+        reuse_result = runner.train_incremental_task(
+            1, [make_batch(1, torch.tensor([0.,1.,0.,0.,0.,0.,0.,0.]), 20),
+                make_batch(2, torch.tensor([0.,0.,1.,0.,0.,0.,0.,0.]), 30)],
+            [make_batch(1, torch.tensor([0.,1.,0.,0.,0.,0.,0.,0.]), 20),
+             make_batch(2, torch.tensor([0.,0.,1.,0.,0.,0.,0.,0.]), 30)],
+            [1,2], ["novel_a", "novel_b"], [base_state],
+        )
+        self.assertEqual(len(reuse_result["expanded"]), 0)
+        self.assertEqual(len(reuse_result["reused"]), 2)
+        torch.testing.assert_close(base_state["image_proto"], original_base_prototype, rtol=0, atol=0)
+        self.assertNotIn("refreshed_old_states", reuse_result)
+
         # Force the two layer decisions only in this integration test; the
         # numeric Session-mean Z boundary is independently tested in unit tests.
         sequential_checks = []
@@ -202,11 +221,8 @@ class SessionLifecycleTests(unittest.TestCase):
         self.assertEqual(len(result["expanded"]), 2)
         self.assertEqual(sequential_checks, ["block0_trained_and_frozen_before_block1_decision"])
         self.assertEqual(result["task_state"]["class_ids"].tolist(), [1,2])
-        self.assertEqual(len(result["refreshed_old_states"]), 1)
-        self.assertEqual(
-            result["refreshed_old_states"][0]["prototype_refresh"]["feature_space"],
-            "current_deployed_adapted_encoder",
-        )
+        torch.testing.assert_close(base_state["image_proto"], original_base_prototype, rtol=0, atol=0)
+        self.assertNotIn("refreshed_old_states", result)
         self.assertTrue(all(
             item["expert_anchor_id"] == item["descriptor_anchor_id"]
             for item in result["expanded"]
@@ -218,8 +234,7 @@ class SessionLifecycleTests(unittest.TestCase):
             self.assertEqual(history["classification_samples_per_epoch"], [16,16])
             self.assertEqual(len(history["l2sp_loss"]), 2)
             self.assertEqual(len(history["ce_loss"]), 2)
-            self.assertEqual(len(history["l2sp_loss"]), 2)
-            self.assertNotIn("feature_space_loss", history)
+            self.assertEqual(len(history["feature_space_loss"]), 2)
             self.assertNotIn("rd_loss", history)
             self.assertGreaterEqual(history["rd_effective_reference_count"], 1.0)
 

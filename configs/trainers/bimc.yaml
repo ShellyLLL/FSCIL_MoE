@@ -57,10 +57,11 @@ TRAINER:
       EPOCHS: 6
       LOGIT_SCALE: 100.0
       L2SP_WEIGHT: 1.0e-4
+      FEATURE_SPACE_PRESERVATION_WEIGHT: 1.0
 
     CHECKPOINT:
       ENABLE: True
-      DIR: "checkpoints/fscil_ae_unified"
+      DIR: "checkpoints/fscil_ae_unified_v21"
       RESUME: ""
       SAVE_EVERY_SESSION: True
 

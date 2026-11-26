@@ -202,7 +202,7 @@ class Runner:
         opt = self.cfg.TRAINER.BiMC.OPTIM
         data = _cfg_value(self.cfg, "DATASET", None)
         return {
-            "version": 20,
+            "version": 21,
             "decision": "sequential_layerwise_expand_iff_minimum_historical_rd_session_mean_z_gt_1",
             "threshold": 1.0,
             "session_statistic": "mean_unweighted_standardized_reconstruction_error_per_historical_rd",
@@ -214,7 +214,8 @@ class Runner:
             "rd_fit": "separate_reconstruction_only_on_current_layer_augmented_session_inputs",
             "rd_calibration": "unweighted_deterministic_current_session_reference_errors",
             "router": "base_softmax_plus_incremental_independent_sigmoid_on_adapted_layer_input",
-            "feature_preservation": "frozen_prefix_replay_diagnostic_only_no_incremental_training_loss",
+            "feature_preservation": "frozen_prefix_replay_cosine_distillation_plus_hard_acceptance_gate",
+            "historical_prototypes": "immutable_original_support_prototypes",
             "prototype_calibration": "topk_base_semantic_retrieval_with_base_support_loo_alpha_selection",
             "semantic_alpha_selection": "deterministic_leave_one_source_out_base_support_grid_search_no_test_labels",
             "visual_moe_enabled": bool(_cfg_value(moe, "ENABLE", False)),
@@ -245,6 +246,9 @@ class Runner:
                 "epochs": int(_cfg_value(inc, "EPOCHS", 6)),
                 "logit_scale": float(_cfg_value(inc, "LOGIT_SCALE", 100.0)),
                 "l2sp_weight": float(_cfg_value(inc, "L2SP_WEIGHT", 1e-4)),
+                "feature_space_preservation_weight": float(
+                    _cfg_value(inc, "FEATURE_SPACE_PRESERVATION_WEIGHT", 1.0)
+                ),
             },
             "optimizer": {
                 "base_epochs": int(_cfg_value(opt, "BASE_EPOCHS", 50)),
@@ -503,8 +507,8 @@ class Runner:
         if missing:
             raise ValueError(f"Resume checkpoint is missing required fields: {missing}")
         schema = int(payload["schema_version"])
-        if schema != 39:
-            raise ValueError("Checkpoint predates sequential adapted-stream expansion, independent RD fitting, or Top-K semantic calibration (schema 39).")
+        if schema != 40:
+            raise ValueError("Checkpoint predates immutable historical prototypes and replay-constrained sequential expansion (schema 40).")
         checkpoint_policy = payload.get("expansion_policy")
         if checkpoint_policy != self._expansion_policy():
             raise ValueError(
@@ -902,7 +906,7 @@ class Runner:
         directory.mkdir(parents=True, exist_ok=True)
         topology = self.model_without_dp.export_moe_topology()
         payload = {
-            "schema_version": 39,
+            "schema_version": 40,
             "completed_session": int(completed_session),
             "base_reference_source_ids": list(self.base_reference_source_ids),
             "base_reference_cls_features": self._cpu_copy(self.base_reference_cls_features),
@@ -1949,61 +1953,6 @@ class Runner:
                 "semantic_calibration_full": full_diag, "semantic_calibration_loo": loo_diag,
                 "global_full": global_full, "global_ids": global_ids, "old_class_count": old_ids.numel()}
 
-    @torch.no_grad()
-    def _refresh_historical_prototypes(self, old_states):
-        """Re-embed compact historical prefix anchors in the currently deployed feature space."""
-        refreshed = []
-        for state in old_states:
-            anchors = state.get("final_feature_anchors")
-            if not isinstance(anchors, dict):
-                raise RuntimeError("Historical prototype refresh requires stored final_feature_anchors.")
-            prefixes = torch.as_tensor(anchors.get("prefix_tokens"), device=self.device)
-            labels = torch.as_tensor(anchors.get("labels"), device=self.device, dtype=torch.long).reshape(-1)
-            source_ids = torch.as_tensor(anchors.get("source_ids"), device=self.device).reshape(-1)
-            class_ids = torch.as_tensor(
-                state.get("class_ids", state.get("class_index")),
-                device=self.device, dtype=torch.long,
-            ).reshape(-1)
-            if (prefixes.ndim != 3 or prefixes.size(0) == 0
-                    or labels.numel() != prefixes.size(0)
-                    or source_ids.numel() != prefixes.size(0)
-                    or torch.unique(source_ids).numel() != source_ids.numel()
-                    or not torch.equal(torch.unique(labels, sorted=True), class_ids.sort().values)):
-                raise ValueError("Historical prefix anchors are malformed or class-misaligned.")
-            features = F.normalize(
-                self.model_without_dp.extract_img_feature_from_reference_prefix(prefixes).float(),
-                dim=-1,
-            )
-            refreshed_state = dict(state)
-            prototypes = []
-            for class_id in class_ids:
-                mask = labels.eq(class_id)
-                if not bool(mask.any().item()):
-                    raise ValueError(f"Historical anchors are missing class {int(class_id.item())}.")
-                prototypes.append(F.normalize(features[mask].mean(0), dim=-1))
-            raw_visual = torch.stack(prototypes).detach()
-            if len(refreshed) == 0:
-                calibrated_visual = raw_visual
-                calibration_diagnostics = None
-            else:
-                calibrated_visual, calibration_diagnostics = (
-                    self._semantic_guided_visual_prototype_calibration(
-                        raw_visual,
-                        torch.as_tensor(state["description_proto"], device=self.device).float(),
-                        torch.as_tensor(state["support_count"], device=self.device),
-                        [refreshed[0]],
-                    )
-                )
-            refreshed_state["image_proto"] = calibrated_visual.detach()
-            refreshed_state["prototype_refresh"] = {
-                "feature_space": "current_deployed_adapted_encoder",
-                "anchor_count": int(prefixes.size(0)),
-                "source_ids": source_ids.detach().cpu(),
-                "semantic_calibration": calibration_diagnostics,
-            }
-            refreshed.append(refreshed_state)
-        return refreshed
-
     def _global_incremental_logits(self, images, labels, source_ids, bank, scale):
         if torch.is_grad_enabled():
             features, _ = self.model_without_dp.extract_img_feature_train(images)
@@ -2099,16 +2048,26 @@ class Runner:
                     "Session diagnostics failed: historical class feature-anchor measurement is unavailable: "
                     f"{historical_feature_check.get('reason', 'unknown')}."
                 )
-            # Feature-space cosine and Base-reference accuracy are acceptance
-            # diagnostics, not an extra optimization loss or an unvalidated
-            # hard rejection gate. Preserve the measurements for analysis.
-            # Historical prototypes are refreshed from compact support anchors
-            # in the current feature space before constructing the new task bank.
-            refreshed_old_states = result.get("refreshed_old_states", old_states)
+            if production_data_protocol and not feature_check.get("within_target", False):
+                raise RuntimeError(
+                    "Session rejected: Base feature-space acceptance failed: "
+                    f"cosine_min={feature_check.get('prototype_cosine_min')}, "
+                    f"accuracy_drop={feature_check.get('base_reference_accuracy_drop')} pp, "
+                    f"targets=({feature_check.get('minimum_cosine_target')}, "
+                    f"{feature_check.get('max_accuracy_drop')} pp)."
+                )
+            if production_data_protocol and not historical_feature_check.get("within_target", False):
+                raise RuntimeError(
+                    "Session rejected: historical feature-anchor drift exceeded the configured cosine target: "
+                    f"minimum={historical_feature_check.get('class_prototype_cosine_min')}, "
+                    f"target={historical_feature_check.get('minimum_cosine_target')}."
+                )
+            # Historical visual prototypes remain immutable. Only the current
+            # Session's novel prototypes are built and semantically calibrated.
             # Prototype construction and compact feature-anchor capture are
             # part of the same Session transaction, not post-commit side effects.
             result["task_state"] = self._build_and_refine_task_state(
-                current_class_name, extract_loader, class_index, refreshed_old_states,
+                current_class_name, extract_loader, class_index, old_states,
                 semantic_proto=semantic_proto, session_id=int(task_id),
             )
             result["feature_space_acceptance"] = self._cpu_copy(feature_check)
@@ -2159,19 +2118,33 @@ class Runner:
             _cfg_value(optim_cfg, "BASE_DESCRIPTOR_EPOCHS", 8),
         ))
         l2sp_weight = float(_cfg_value(inc_cfg, "L2SP_WEIGHT", 1e-4))
+        feature_preservation_weight = float(_cfg_value(
+            inc_cfg, "FEATURE_SPACE_PRESERVATION_WEIGHT", 1.0
+        ))
         weight_decay = float(_cfg_value(optim_cfg, "WEIGHT_DECAY", 1e-4))
         if epochs < 1 or descriptor_epochs < 1:
             raise ValueError("Incremental expert and independent RD epochs must be positive.")
-        if any(not np.isfinite(value) or value < 0 for value in (l2sp_weight, weight_decay)):
-            raise ValueError("Incremental L2-SP and weight decay must be finite and non-negative.")
+        if any(not np.isfinite(value) or value < 0 for value in (
+            l2sp_weight, feature_preservation_weight, weight_decay
+        )):
+            raise ValueError(
+                "Incremental L2-SP, feature preservation, and weight decay must be finite and non-negative."
+            )
+        if feature_preservation_weight > 0:
+            old_prefix_tokens, old_final_features, anchor_batch_size = (
+                self._historical_feature_anchor_batches(old_states)
+            )
+            if old_prefix_tokens.size(0) == 0:
+                raise RuntimeError("Feature-space preservation requires non-empty historical anchors.")
+        else:
+            old_prefix_tokens = old_final_features = None
+            anchor_batch_size = 0
 
         for _, adapter in self._moe_adapters():
             adapter.freeze_all()
 
-        # Old class prototypes must follow the currently deployed feature
-        # space. Re-embed compact historical anchors before planning, and
-        # refresh them again after every newly trained layer.
-        working_old_states = self._refresh_historical_prototypes(old_states)
+        # Historical visual prototypes are immutable. Feature-space replay
+        # constrains newly trained experts; acceptance diagnostics reject drift.
         expected_classes = sorted(int(value) for value in class_index)
         decisions, expanded, reused, training = [], [], [], {}
         processed_blocks = []
@@ -2320,20 +2293,20 @@ class Runner:
                 "loss": [],
                 "ce_loss": [],
                 "l2sp_loss": [],
+                "feature_space_loss": [],
                 "classification_samples_per_epoch": [],
                 "classification_samples_total": 0,
             }
 
             for epoch in range(epochs):
-                working_old_states = self._refresh_historical_prototypes(working_old_states)
                 bank = self._build_incremental_bank(
-                    extract_loader, class_index, working_old_states, semantic_proto
+                    extract_loader, class_index, old_states, semantic_proto
                 )
                 self.model.train()
                 for _, deployed_adapter in self._moe_adapters():
                     deployed_adapter.eval()
                 adapter.experts[expert_id].train()
-                totals = {"ce": 0.0, "l2sp": 0.0, "count": 0}
+                totals = {"ce": 0.0, "l2sp": 0.0, "feature": 0.0, "count": 0}
                 observed_train_classes = set()
                 for batch in train_loader:
                     images, labels = self.parse_batch(batch)
@@ -2351,7 +2324,30 @@ class Runner:
                     l2sp_loss = self._l2sp_anchor_loss(
                         adapter.experts[expert_id], l2sp_anchor
                     )
-                    total_loss = ce_loss + l2sp_weight * l2sp_loss
+                    feature_loss = ce_loss.new_zeros(())
+                    if feature_preservation_weight > 0:
+                        anchor_count = int(old_prefix_tokens.size(0))
+                        selected_count = min(int(anchor_batch_size), anchor_count)
+                        selected = torch.randperm(
+                            anchor_count, device=self.device
+                        )[:selected_count]
+                        # Compare deterministic evaluation-mode features with
+                        # the historical targets; restore the exact training
+                        # mode policy before the optimizer step.
+                        self.model.eval()
+                        feature_loss = self._final_feature_anchor_loss(
+                            old_prefix_tokens.index_select(0, selected),
+                            old_final_features.index_select(0, selected),
+                        )
+                        self.model.train()
+                        for _, deployed_adapter in self._moe_adapters():
+                            deployed_adapter.eval()
+                        adapter.experts[expert_id].train()
+                    total_loss = (
+                        ce_loss
+                        + l2sp_weight * l2sp_loss
+                        + feature_preservation_weight * feature_loss
+                    )
                     if not bool(torch.isfinite(total_loss).item()):
                         raise FloatingPointError(
                             f"Block {block_idx} incremental expert objective is non-finite."
@@ -2364,6 +2360,7 @@ class Runner:
                     count = int(labels.numel())
                     totals["ce"] += float(ce_loss.item()) * count
                     totals["l2sp"] += float(l2sp_loss.item()) * count
+                    totals["feature"] += float(feature_loss.item()) * count
                     totals["count"] += count
                     history["classification_samples_total"] += count
                 if (totals["count"] == 0
@@ -2374,15 +2371,18 @@ class Runner:
                 denominator = float(totals["count"])
                 history["ce_loss"].append(totals["ce"] / denominator)
                 history["l2sp_loss"].append(totals["l2sp"] / denominator)
+                history["feature_space_loss"].append(totals["feature"] / denominator)
                 history["loss"].append(
                     totals["ce"] / denominator
                     + l2sp_weight * totals["l2sp"] / denominator
+                    + feature_preservation_weight * totals["feature"] / denominator
                 )
                 history["classification_samples_per_epoch"].append(totals["count"])
                 print(
                     f"=> [Sequential-Expert][B{block_idx}][{epoch + 1}/{epochs}] "
                     f"ce={history['ce_loss'][-1]:.5f} "
-                    f"l2sp={history['l2sp_loss'][-1]:.6f}"
+                    f"l2sp={history['l2sp_loss'][-1]:.6f} "
+                    f"feature={history['feature_space_loss'][-1]:.6f}"
                 )
 
             with torch.no_grad():
@@ -2391,7 +2391,6 @@ class Runner:
                 ).item())
             adapter.freeze_all()
             self._assert_moe_frozen(f"after sequential block {block_idx}")
-            working_old_states = self._refresh_historical_prototypes(working_old_states)
             training[block_idx] = history
             expanded.append({
                 "block_idx": block_idx,
@@ -2412,7 +2411,6 @@ class Runner:
             "expanded": expanded,
             "reused": reused,
             "training": training,
-            "refreshed_old_states": working_old_states,
             "semantic_prototype": None if semantic_proto is None else semantic_proto.detach(),
             "encoder_version": 0,
         }
@@ -2507,8 +2505,6 @@ class Runner:
                             class_names, old_states)
                         plan_summary = self._cpu_copy(adaptation["decisions"])
                     self.model.eval()
-                    refreshed_old_states = adaptation.pop("refreshed_old_states", old_states)
-                    state_dict_list[:] = refreshed_old_states
                     state = adaptation.pop("task_state")
 
                 state_dict_list.append(state)
