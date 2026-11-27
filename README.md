@@ -46,56 +46,71 @@ python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/t
 python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc_ensemble.yaml
 ~~~
 
-### Dynamic FSCIL MoE runs
+### Unified AE-driven dynamic FSCIL MoE (method model v1.1)
 
-The `bimc.yaml` configuration now auto-saves a dataset/seed-specific fixed
-support manifest, alongside session checkpoints, query-exclusive LOO training
-and demand-driven dynamic experts. For reproducible comparisons across model
-variants, explicitly reuse one manifest and run a no-expansion baseline:
+The method uses one Session-level novelty decision per expandable transformer
+layer. It combines the historical AE/RD pool, dynamic expert migration,
+Base-Softmax plus incremental-Sigmoid routing, selective training and freezing,
+historical feature-space preservation, semantic-guided visual prototype
+calibration, and one global visual prototype classifier.
 
-~~~BASH
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --support_manifest checkpoints/fscil_moe/cub_seed1_support.json --expansion_mode none
+Lifecycle:
+
+1. The frozen CLIP ViT reference stream provides stable per-layer CLS inputs
+   for RD detection, routing, and all expert generations. The adapted stream
+   receives the routed residuals. The backbone remains frozen; historical
+   experts and router columns remain frozen but stay active in every forward.
+2. Base experts and the Base router are trained on Base classes. Base RDs are
+   fitted using responsibility-weighted Base CLS features. Their reconstruction
+   error means and standard deviations are estimated from a deterministic,
+   class-balanced Base reference set and are then frozen. This reference set
+   also supports later feature-space diagnostics; it is not used to construct
+   pseudo-Sessions or support-size-specific expansion thresholds.
+3. For an incremental Session and layer (l), every deployed RD (k) computes
+   a standardized reconstruction error for each support source:
+   (z_{i,l,k}=(e_{i,l,k}-mu_{l,k})/(sigma_{l,k}+epsilon)).
+   The Session statistic for each RD is the mean over all Session sources:
+   (ar z_{l,k}=N^{-1}sum_i z_{i,l,k}). The best historical explanation is
+   (k^*=argmin_kar z_{l,k}). Reuse the existing pool when
+   (ar z_{l,k^*}leq1.0); expand exactly one expert when
+   (ar z_{l,k^*}>1.0). Labels validate the Session manifest but do not
+   create class-wise expansion decisions.
+4. On expansion, the selected historical expert and its RD are the same
+   migration anchor. The new functional expert copies the selected expert's
+   parameters and hidden width exactly; the new RD starts from that RD function
+   and adds its low-rank residual branch. The new independent sigmoid Router
+   column starts with a low activation bias. Train the new expert, new Router
+   column, and new RD together. The incremental objective combines global
+   visual-prototype classification, L2-SP to the immutable expert-initialization
+   snapshot, historical final-feature replay, and RD reconstruction. Historical
+   experts, historical Router columns, historical RD statistics, and the ViT
+   remain frozen. The new RD's error statistics are calibrated on deterministic
+   current-Session reference CLS after fitting and then frozen.
+5. Reuse means no new modules and no historical parameter updates. All existing
+   experts remain active in the deployed forward path. Expansion is layer-wise,
+   and each layer can add at most one expert in a Session.
+6. After adaptation, novel visual prototypes are calibrated using the existing
+   Base-semantic retrieval rule. Semantic descriptions retrieve related Base
+   description semantics and their corresponding Base visual prototypes;
+   semantic confidence and support-prototype reliability determine the mixing
+   strength. Historical visual prototypes remain unchanged.
+7. All seen-class visual prototypes are merged into one global visual
+   classifier. Training uses source-exclusive leave-one-out novel prototypes
+   to prevent support-query leakage. Inference uses one current CLIP+MoE feature
+   path and the global visual prototype bank. AE is not used at inference; there
+   is no task ID, task gate, task-specific classifier, or text classifier.
+
+Run architecture tests:
+
+~~~bash
+python -m unittest discover -s tests -p "test_risk_guided_moe.py" -v
+python -m unittest discover -s tests -p "test_session1_diagnostics.py" -v
+python -m unittest discover -s tests -p "test_config_schema.py" -v
 ~~~
 
-The default `auto` mode computes each layer's discriminative coverage deficit:
-only samples with a negative all-seen visual LOO margin and descriptor coverage
-excess contribute expansion evidence. The largest positive eligible layer adds
-one Linear Gate, Expert and Scale. Training uses one softmax over `NULL` and all
-dynamic experts, refreshed query-exclusive visual prototypes each epoch, and only
-visual classification plus historical-path invariance losses. Deployment uses the
-same logits with hard Top-1 routing. A candidate is retained only when its hard
-deployment LOO objective plus historical invariance is lower than the pre-candidate
-objective; otherwise the exact pre-expansion state is restored. Force/session/block
-overrides are intentionally unavailable in the production path.
-The explicit full-auto CUB200 command is:
-
-~~~BASH
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --expansion_mode auto
-~~~
-
-For staged development, reuse Session 0 and stop after Task 3 without changing
-the normal full-run default:
-
-~~~BASH
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --resume checkpoints/fscil_moe/session_00.pth --expansion_mode auto --end_session 3
-~~~
-
-Resume from a checkpoint produced by this safety-bounded version with:
-
-~~~BASH
-python main.py --data_cfg ./configs/datasets/cub200.yaml --train_cfg ./configs/trainers/bimc.yaml --resume checkpoints/fscil_moe/session_03.pth
-~~~
-
-Legacy dynamic-expert checkpoint schemas are intentionally rejected when they
-predate the current logit-NULL routing and transactional safety contract.
-
-Each completed session also records per-expert/null routing and a deterministic
-support-proxy leave-one-expert-out diagnostic (`accuracy_gain` and
-`margin_gain`). It masks the selected residual without re-routing to another
-expert, so the reported value is that expert's direct marginal contribution.
-Historical experts additionally receive a support-only forward-interference
-report. Accuracy targets are kept outside runtime; use
-`python tools/report_regression.py --accuracies ...` after a run.
+Do not start real-dataset acceptance until architecture tests, checkpoint
+roundtrip, multi-session lifecycle, freeze-boundary checks, and reference/
+adapted feature-space checks all pass.
 
 ## Acknowledgment
 
@@ -106,6 +121,6 @@ In this repository, we build our code based on the following excellent open-sour
 - [FeCAM](https://github.com/dipamgoswami/FeCAM)
 - [CuPL](https://github.com/sarahpratt/CuPL)
 - [AdaptCLIPZS](https://github.com/cvl-umass/AdaptCLIPZS)
-
-
+- [SEMA-CL](https://github.com/huiyiwang01/SEMA-CL), for the linear AE descriptor and reconstruction-error outlier detection
+- [MoE-Adapters4CL](https://github.com/JiazuoYu/MoE-Adapters4CL), for dynamic expert routing design
 

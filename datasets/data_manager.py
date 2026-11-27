@@ -211,6 +211,32 @@ class DatasetManager:
             dataset, batch_size=batchsize, shuffle=False,
             num_workers=self.num_workers, drop_last=False, pin_memory=True,
         )
+
+    def get_base_source_dataloader(self, source_ids):
+        """Rebuild a deterministic Base-only calibration loader from stable source ids.
+
+        This loader is used only to recalibrate the current deployed RD pool.
+        It does not expose old-class images to incremental optimizer steps.
+        """
+        source_ids = np.asarray(source_ids, dtype=np.int64).reshape(-1)
+        if source_ids.size == 0 or np.unique(source_ids).size != source_ids.size:
+            raise ValueError("Base calibration source ids must be non-empty and unique.")
+        if np.any(source_ids < 0) or np.any(source_ids >= len(self.train_targets)):
+            raise ValueError("Base calibration source ids are outside the training dataset.")
+        labels = self.train_targets[source_ids]
+        base_classes = np.asarray(self.class_index_in_task[0], dtype=np.int64)
+        if not np.isin(labels, base_classes).all():
+            raise ValueError("Base calibration loader may contain Base classes only.")
+        class_to_task_id = {int(class_id): 0 for class_id in base_classes.tolist()}
+        images = np.asarray(self.train_data)[source_ids]
+        dataset = TaskDataset(
+            images, labels, self.test_transform, class_to_task_id,
+            self.class_names, source_ids,
+        )
+        return DataLoader(
+            dataset, batch_size=self.train_batchsize_base, shuffle=False,
+            num_workers=self.num_workers, drop_last=False, pin_memory=True,
+        )
     
 
 
